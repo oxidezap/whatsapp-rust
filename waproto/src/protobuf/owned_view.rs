@@ -6,6 +6,15 @@ use bytes::Bytes;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 
+pub(crate) mod sealed {
+    pub trait View {}
+}
+
+/// Views whose implementations cannot publish the buffer's widened references.
+/// Only repository-generated views participate in safe lifetime-erasing decode.
+pub trait OwnedViewSource: sealed::View {}
+impl<T: sealed::View> OwnedViewSource for T {}
+
 pub struct OwnedView<V> {
     // View must drop while its backing bytes still exist. No Drop impl may be
     // added here: into_bytes relies on moving both fields and dropping V once.
@@ -53,9 +62,32 @@ fn conversion_contract_failed(error: DecodeError) -> ! {
 }
 
 impl<V: MessageView<'static>> OwnedView<V> {
-    pub fn decode(bytes: Bytes) -> Result<Self, DecodeError> {
+    /// Decode with a generated view that cannot leak the synthetic lifetime.
+    ///
+    /// ```
+    /// use waproto::buffa::{MessageView, OwnedView, OwnedViewSource, bytes::Bytes};
+    /// fn generated<V: MessageView<'static> + OwnedViewSource>(bytes: Bytes) -> OwnedView<V> {
+    ///     OwnedView::decode(bytes).expect("valid generated message")
+    /// }
+    /// let handle = generated::<waproto::whatsapp::MessageView<'static>>(
+    ///     Bytes::from_static(&[10, 1, b'x']),
+    /// );
+    /// assert_eq!(handle.reborrow().conversation, Some("x"));
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use waproto::buffa::{MessageView, OwnedView, bytes::Bytes};
+    /// fn arbitrary_view<V: MessageView<'static>>(bytes: Bytes) {
+    ///     let _ = OwnedView::<V>::decode(bytes);
+    /// }
+    /// ```
+    pub fn decode(bytes: Bytes) -> Result<Self, DecodeError>
+    where
+        V: OwnedViewSource,
+    {
         // SAFETY: Bytes keeps its data pointer stable across moves. Every
         // borrow decoded from this slice is retained by bytes until view drops.
+        // The sealed generated decoder cannot publish the widened references.
         let view = unsafe {
             let input: &'static [u8] = std::mem::transmute::<&[u8], &'static [u8]>(&bytes);
             V::decode_view(input)?
@@ -65,7 +97,16 @@ impl<V: MessageView<'static>> OwnedView<V> {
             bytes,
         })
     }
-    pub fn decode_with_options(bytes: Bytes, options: &DecodeOptions) -> Result<Self, DecodeError> {
+    /// ```compile_fail
+    /// use waproto::buffa::{DecodeOptions, MessageView, OwnedView, bytes::Bytes};
+    /// fn arbitrary_view<V: MessageView<'static>>(bytes: Bytes) {
+    ///     let _ = OwnedView::<V>::decode_with_options(bytes, &DecodeOptions::new());
+    /// }
+    /// ```
+    pub fn decode_with_options(bytes: Bytes, options: &DecodeOptions) -> Result<Self, DecodeError>
+    where
+        V: OwnedViewSource,
+    {
         // SAFETY: identical ownership and drop-order invariants to decode.
         let view = unsafe {
             let input: &'static [u8] = std::mem::transmute::<&[u8], &'static [u8]>(&bytes);
@@ -76,7 +117,16 @@ impl<V: MessageView<'static>> OwnedView<V> {
             bytes,
         })
     }
-    pub fn from_owned(message: &V::Owned) -> Result<Self, DecodeError> {
+    /// ```compile_fail
+    /// use waproto::buffa::{MessageView, OwnedView};
+    /// fn arbitrary_view<V: MessageView<'static>>(message: &V::Owned) {
+    ///     let _ = OwnedView::<V>::from_owned(message);
+    /// }
+    /// ```
+    pub fn from_owned(message: &V::Owned) -> Result<Self, DecodeError>
+    where
+        V: OwnedViewSource,
+    {
         Self::decode(Bytes::from(
             message
                 .try_encode_to_vec()
@@ -95,6 +145,8 @@ impl<V: MessageView<'static>> OwnedView<V> {
     /// The view must have been wire-decoded from bytes or a sub-slice fully
     /// contained by bytes. Every borrow must remain valid while bytes lives,
     /// and successful decoding must imply successful conversion to Owned.
+    /// No method on V may let widened references escape the retained buffer's
+    /// lifetime, including through trait callbacks such as Clone or Serialize.
     pub unsafe fn from_parts(bytes: Bytes, view: V) -> Self {
         Self {
             view: MaybeDangling::new(view),
@@ -166,6 +218,7 @@ mod tests {
     struct Probe<'a> {
         bytes: &'a [u8],
     }
+    impl sealed::View for Probe<'_> {}
     impl<'a> MessageView<'a> for Probe<'a> {
         type Owned = crate::protobuf::generated::whatsapp::Message;
         fn decode_view(bytes: &'a [u8]) -> Result<Self, DecodeError> {

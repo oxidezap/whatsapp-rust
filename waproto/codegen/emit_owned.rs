@@ -1322,7 +1322,7 @@ impl Emitter<'_> {
             out.push_str(&format!("d.field({n:?},&self.{n});"));
         }
         out.push_str("d.finish()}}\n");
-        out.push_str(&format!("impl {RT}::ViewReborrow for {name}<'static>{{type Reborrowed<'b>={name}<'b>;fn reborrow<'b>(this:&'b Self)->&'b Self::Reborrowed<'b>{{this}}}}impl<'a>{RT}::MessageName for {name}<'a>{{const NAME:&'static str=<{owned} as {RT}::MessageName>::NAME;const PACKAGE:&'static str=<{owned} as {RT}::MessageName>::PACKAGE;const FULL_NAME:&'static str=<{owned} as {RT}::MessageName>::FULL_NAME;const TYPE_URL:&'static str=<{owned} as {RT}::MessageName>::TYPE_URL;}}\n"));
+        out.push_str(&format!("impl<'a>{RT}::owned_view::sealed::View for {name}<'a>{{}}impl {RT}::ViewReborrow for {name}<'static>{{type Reborrowed<'b>={name}<'b>;fn reborrow<'b>(this:&'b Self)->&'b Self::Reborrowed<'b>{{this}}}}impl<'a>{RT}::MessageName for {name}<'a>{{const NAME:&'static str=<{owned} as {RT}::MessageName>::NAME;const PACKAGE:&'static str=<{owned} as {RT}::MessageName>::PACKAGE;const FULL_NAME:&'static str=<{owned} as {RT}::MessageName>::FULL_NAME;const TYPE_URL:&'static str=<{owned} as {RT}::MessageName>::TYPE_URL;}}\n"));
         let dispatch = if message.fields.is_empty() {
             ""
         } else {

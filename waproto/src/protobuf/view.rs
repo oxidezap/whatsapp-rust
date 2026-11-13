@@ -54,7 +54,7 @@ pub trait MessageView<'a>: Sized {
 }
 
 pub trait HasMessageView: Message + Sized {
-    type View<'a>: MessageView<'a, Owned = Self> + Send + Sync;
+    type View<'a>: MessageView<'a, Owned = Self> + super::OwnedViewSource + Send + Sync;
     type ViewHandle: From<super::OwnedView<Self::View<'static>>>
         + AsRef<super::OwnedView<Self::View<'static>>>
         + Send

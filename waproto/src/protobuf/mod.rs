@@ -15,7 +15,7 @@ mod sink;
 mod size_cache;
 pub mod types;
 pub mod view;
-pub use owned_view::OwnedView;
+pub use owned_view::{OwnedView, OwnedViewSource};
 
 pub use decode::{
     DEFAULT_ELEMENT_MEMORY_LIMIT, DEFAULT_UNKNOWN_FIELD_LIMIT, DecodeContext, DecodeOptions,

@@ -2,8 +2,16 @@
 
 `wacore` owns protocol, crypto, typed IQs and platform-neutral storage/runtime
 traits. It builds for WASM and ESP32; do not introduce Tokio there. `waproto`
-contains buffa-generated protobufs. `src/features` exposes the Tokio SDK.
+contains statically generated protobuf codecs. `src/features` exposes the Tokio SDK.
 Host tools under `tools/` stay outside published runtime dependencies.
+
+Safe `OwnedView` factories accept only sealed `OwnedViewSource` types. An
+arbitrary `MessageView<'static>` implementation could otherwise export the
+artificial lifetime and leave dangling references after its buffer is dropped.
+Borrowed `MessageView` implementations remain extensible. Custom ownership via
+`unsafe from_parts` must keep widened references inside the buffer's lifetime,
+including references exposed through trait callbacks. Keep lifetime erasure in
+`waproto/src/protobuf/owned_view.rs` and retain its Miri gate.
 
 Find the behavior in WhatsApp Web before changing protocol logic. Follow
 [wa_web_reference.md](wa_web_reference.md), change the owning layer, and add a

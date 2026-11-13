@@ -3841,6 +3841,7 @@ impl<'a> ::core::fmt::Debug for ACP2SettingView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ACP2SettingView<'a> {}
 impl crate::protobuf::ViewReborrow for ACP2SettingView<'static> {
     type Reborrowed<'b> = ACP2SettingView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -4396,6 +4397,7 @@ impl<'a> ::core::fmt::Debug for ADVDeviceIdentityView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ADVDeviceIdentityView<'a> {}
 impl crate::protobuf::ViewReborrow for ADVDeviceIdentityView<'static> {
     type Reborrowed<'b> = ADVDeviceIdentityView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -5015,6 +5017,7 @@ impl<'a> ::core::fmt::Debug for ADVKeyIndexListView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ADVKeyIndexListView<'a> {}
 impl crate::protobuf::ViewReborrow for ADVKeyIndexListView<'static> {
     type Reborrowed<'b> = ADVKeyIndexListView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -5591,6 +5594,7 @@ impl<'a> ::core::fmt::Debug for ADVSignedDeviceIdentityView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ADVSignedDeviceIdentityView<'a> {}
 impl crate::protobuf::ViewReborrow for ADVSignedDeviceIdentityView<'static> {
     type Reborrowed<'b> = ADVSignedDeviceIdentityView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -6070,6 +6074,8 @@ impl<'a> ::core::fmt::Debug for ADVSignedDeviceIdentityHMACView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for ADVSignedDeviceIdentityHMACView<'a> {}
 impl crate::protobuf::ViewReborrow for ADVSignedDeviceIdentityHMACView<'static> {
     type Reborrowed<'b> = ADVSignedDeviceIdentityHMACView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -6514,6 +6520,7 @@ impl<'a> ::core::fmt::Debug for ADVSignedKeyIndexListView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ADVSignedKeyIndexListView<'a> {}
 impl crate::protobuf::ViewReborrow for ADVSignedKeyIndexListView<'static> {
     type Reborrowed<'b> = ADVSignedKeyIndexListView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -6970,6 +6977,7 @@ impl<'a> ::core::fmt::Debug for AIHomeStateView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIHomeStateView<'a> {}
 impl crate::protobuf::ViewReborrow for AIHomeStateView<'static> {
     type Reborrowed<'b> = AIHomeStateView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -7446,6 +7454,7 @@ impl<'a> ::core::fmt::Debug for AIMediaCollectionMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIMediaCollectionMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for AIMediaCollectionMessageView<'static> {
     type Reborrowed<'b> = AIMediaCollectionMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -7828,6 +7837,8 @@ impl<'a> ::core::fmt::Debug for AIMediaCollectionMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIMediaCollectionMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIMediaCollectionMetadataView<'static> {
     type Reborrowed<'b> = AIMediaCollectionMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -8190,6 +8201,7 @@ impl<'a> ::core::fmt::Debug for AIMetadataOperationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIMetadataOperationView<'a> {}
 impl crate::protobuf::ViewReborrow for AIMetadataOperationView<'static> {
     type Reborrowed<'b> = AIMetadataOperationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -8616,6 +8628,7 @@ impl<'a> ::core::fmt::Debug for AIProvenanceView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIProvenanceView<'a> {}
 impl crate::protobuf::ViewReborrow for AIProvenanceView<'static> {
     type Reborrowed<'b> = AIProvenanceView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -9077,6 +9090,7 @@ impl<'a> ::core::fmt::Debug for AIQueryFanoutView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIQueryFanoutView<'a> {}
 impl crate::protobuf::ViewReborrow for AIQueryFanoutView<'static> {
     type Reborrowed<'b> = AIQueryFanoutView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -9523,6 +9537,7 @@ impl<'a> ::core::fmt::Debug for AIRegenerateMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIRegenerateMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRegenerateMetadataView<'static> {
     type Reborrowed<'b> = AIRegenerateMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -9923,6 +9938,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseCodeMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseCodeMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseCodeMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseCodeMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -10341,6 +10358,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseContentItemsMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseContentItemsMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseContentItemsMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseContentItemsMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -10836,6 +10855,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseDynamicMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseDynamicMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseDynamicMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseDynamicMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -11274,6 +11295,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseGridImageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseGridImageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseGridImageMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseGridImageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -11741,6 +11764,7 @@ impl<'a> ::core::fmt::Debug for AIRichResponseImageURLView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIRichResponseImageURLView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseImageURLView<'static> {
     type Reborrowed<'b> = AIRichResponseImageURLView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -12236,6 +12260,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseInlineImageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseInlineImageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseInlineImageMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseInlineImageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -12710,6 +12736,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseLatexMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseLatexMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseLatexMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseLatexMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -13282,6 +13310,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseMapMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseMapMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseMapMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseMapMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -13962,6 +13992,7 @@ impl<'a> ::core::fmt::Debug for AIRichResponseMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIRichResponseMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseMessageView<'static> {
     type Reborrowed<'b> = AIRichResponseMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -14923,6 +14954,7 @@ impl<'a> ::core::fmt::Debug for AIRichResponseSubMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIRichResponseSubMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseSubMessageView<'static> {
     type Reborrowed<'b> = AIRichResponseSubMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -15801,6 +15833,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseTableMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseTableMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseTableMetadataView<'static> {
     type Reborrowed<'b> = AIRichResponseTableMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -16150,6 +16184,8 @@ impl<'a> ::core::fmt::Debug for AIRichResponseUnifiedResponseView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AIRichResponseUnifiedResponseView<'a> {}
 impl crate::protobuf::ViewReborrow for AIRichResponseUnifiedResponseView<'static> {
     type Reborrowed<'b> = AIRichResponseUnifiedResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -16448,6 +16484,8 @@ impl<'a> ::core::fmt::Debug for AISubscriptionUpsellMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for AISubscriptionUpsellMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for AISubscriptionUpsellMetadataView<'static> {
     type Reborrowed<'b> = AISubscriptionUpsellMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -16792,6 +16830,7 @@ impl<'a> ::core::fmt::Debug for AIThreadInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AIThreadInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for AIThreadInfoView<'static> {
     type Reborrowed<'b> = AIThreadInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -17292,6 +17331,7 @@ impl<'a> ::core::fmt::Debug for AccountView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AccountView<'a> {}
 impl crate::protobuf::ViewReborrow for AccountView<'static> {
     type Reborrowed<'b> = AccountView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -17785,6 +17825,7 @@ impl<'a> ::core::fmt::Debug for AccountLinkingOpaqueDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AccountLinkingOpaqueDataView<'a> {}
 impl crate::protobuf::ViewReborrow for AccountLinkingOpaqueDataView<'static> {
     type Reborrowed<'b> = AccountLinkingOpaqueDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -18206,6 +18247,7 @@ impl<'a> ::core::fmt::Debug for ActionLinkView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ActionLinkView<'a> {}
 impl crate::protobuf::ViewReborrow for ActionLinkView<'static> {
     type Reborrowed<'b> = ActionLinkView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -18622,6 +18664,7 @@ impl<'a> ::core::fmt::Debug for AutoDownloadSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AutoDownloadSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for AutoDownloadSettingsView<'static> {
     type Reborrowed<'b> = AutoDownloadSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -19030,6 +19073,7 @@ impl<'a> ::core::fmt::Debug for AvatarUserSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for AvatarUserSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for AvatarUserSettingsView<'static> {
     type Reborrowed<'b> = AvatarUserSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -19368,6 +19412,7 @@ impl<'a> ::core::fmt::Debug for BizAIMetadataSyncView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BizAIMetadataSyncView<'a> {}
 impl crate::protobuf::ViewReborrow for BizAIMetadataSyncView<'static> {
     type Reborrowed<'b> = BizAIMetadataSyncView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -19943,6 +19988,7 @@ impl<'a> ::core::fmt::Debug for BizAccountLinkInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BizAccountLinkInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for BizAccountLinkInfoView<'static> {
     type Reborrowed<'b> = BizAccountLinkInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -20444,6 +20490,7 @@ impl<'a> ::core::fmt::Debug for BizAccountPayloadView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BizAccountPayloadView<'a> {}
 impl crate::protobuf::ViewReborrow for BizAccountPayloadView<'static> {
     type Reborrowed<'b> = BizAccountPayloadView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -21109,6 +21156,7 @@ impl<'a> ::core::fmt::Debug for BizIdentityInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BizIdentityInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for BizIdentityInfoView<'static> {
     type Reborrowed<'b> = BizIdentityInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -21748,6 +21796,7 @@ impl<'a> ::core::fmt::Debug for BotAgeCollectionMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotAgeCollectionMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotAgeCollectionMetadataView<'static> {
     type Reborrowed<'b> = BotAgeCollectionMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -22150,6 +22199,7 @@ impl<'a> ::core::fmt::Debug for BotAgentDeepLinkMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotAgentDeepLinkMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotAgentDeepLinkMetadataView<'static> {
     type Reborrowed<'b> = BotAgentDeepLinkMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -22469,6 +22519,7 @@ impl<'a> ::core::fmt::Debug for BotAgentMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotAgentMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotAgentMetadataView<'static> {
     type Reborrowed<'b> = BotAgentMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -22803,6 +22854,7 @@ impl<'a> ::core::fmt::Debug for BotCapabilityMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotCapabilityMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotCapabilityMetadataView<'static> {
     type Reborrowed<'b> = BotCapabilityMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -23201,6 +23253,7 @@ impl<'a> ::core::fmt::Debug for BotCommandMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotCommandMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotCommandMetadataView<'static> {
     type Reborrowed<'b> = BotCommandMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -23558,6 +23611,8 @@ impl<'a> ::core::fmt::Debug for BotDocumentMessageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotDocumentMessageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotDocumentMessageMetadataView<'static> {
     type Reborrowed<'b> = BotDocumentMessageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -24134,6 +24189,7 @@ impl<'a> ::core::fmt::Debug for BotFeedbackMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotFeedbackMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for BotFeedbackMessageView<'static> {
     type Reborrowed<'b> = BotFeedbackMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -24695,6 +24751,7 @@ impl<'a> ::core::fmt::Debug for BotGroupMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotGroupMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotGroupMetadataView<'static> {
     type Reborrowed<'b> = BotGroupMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -25008,6 +25065,8 @@ impl<'a> ::core::fmt::Debug for BotGroupParticipantMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotGroupParticipantMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotGroupParticipantMetadataView<'static> {
     type Reborrowed<'b> = BotGroupParticipantMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -25308,6 +25367,7 @@ impl<'a> ::core::fmt::Debug for BotHistoryShareMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotHistoryShareMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotHistoryShareMetadataView<'static> {
     type Reborrowed<'b> = BotHistoryShareMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -25682,6 +25742,7 @@ impl<'a> ::core::fmt::Debug for BotImagineMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotImagineMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotImagineMetadataView<'static> {
     type Reborrowed<'b> = BotImagineMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -26094,6 +26155,8 @@ impl<'a> ::core::fmt::Debug for BotInfrastructureDiagnosticsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotInfrastructureDiagnosticsView<'a> {}
 impl crate::protobuf::ViewReborrow for BotInfrastructureDiagnosticsView<'static> {
     type Reborrowed<'b> = BotInfrastructureDiagnosticsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -26497,6 +26560,7 @@ impl<'a> ::core::fmt::Debug for BotInterjectionMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotInterjectionMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotInterjectionMetadataView<'static> {
     type Reborrowed<'b> = BotInterjectionMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -26833,6 +26897,7 @@ impl<'a> ::core::fmt::Debug for BotLinkedAccountView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotLinkedAccountView<'a> {}
 impl crate::protobuf::ViewReborrow for BotLinkedAccountView<'static> {
     type Reborrowed<'b> = BotLinkedAccountView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -27217,6 +27282,8 @@ impl<'a> ::core::fmt::Debug for BotLinkedAccountsMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotLinkedAccountsMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotLinkedAccountsMetadataView<'static> {
     type Reborrowed<'b> = BotLinkedAccountsMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -27859,6 +27926,7 @@ impl<'a> ::core::fmt::Debug for BotMediaMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMediaMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMediaMetadataView<'static> {
     type Reborrowed<'b> = BotMediaMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -28371,6 +28439,7 @@ impl<'a> ::core::fmt::Debug for BotMemoryFactView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMemoryFactView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMemoryFactView<'static> {
     type Reborrowed<'b> = BotMemoryFactView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -28789,6 +28858,7 @@ impl<'a> ::core::fmt::Debug for BotMemoryMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMemoryMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMemoryMetadataView<'static> {
     type Reborrowed<'b> = BotMemoryMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -29199,6 +29269,7 @@ impl<'a> ::core::fmt::Debug for BotMemuMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMemuMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMemuMetadataView<'static> {
     type Reborrowed<'b> = BotMemuMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -29569,6 +29640,7 @@ impl<'a> ::core::fmt::Debug for BotMessageOriginView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMessageOriginView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMessageOriginView<'static> {
     type Reborrowed<'b> = BotMessageOriginView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -29902,6 +29974,7 @@ impl<'a> ::core::fmt::Debug for BotMessageOriginMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMessageOriginMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMessageOriginMetadataView<'static> {
     type Reborrowed<'b> = BotMessageOriginMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -30271,6 +30344,7 @@ impl<'a> ::core::fmt::Debug for BotMessageSharingInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMessageSharingInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMessageSharingInfoView<'static> {
     type Reborrowed<'b> = BotMessageSharingInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -32554,6 +32628,7 @@ impl<'a> ::core::fmt::Debug for BotMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMetadataView<'static> {
     type Reborrowed<'b> = BotMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -35466,6 +35541,7 @@ impl<'a> ::core::fmt::Debug for BotMetricsMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotMetricsMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotMetricsMetadataView<'static> {
     type Reborrowed<'b> = BotMetricsMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -35896,6 +35972,7 @@ impl<'a> ::core::fmt::Debug for BotModeSelectionMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotModeSelectionMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotModeSelectionMetadataView<'static> {
     type Reborrowed<'b> = BotModeSelectionMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -36362,6 +36439,7 @@ impl<'a> ::core::fmt::Debug for BotModelMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotModelMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotModelMetadataView<'static> {
     type Reborrowed<'b> = BotModelMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -37242,6 +37320,7 @@ impl<'a> ::core::fmt::Debug for BotPluginMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotPluginMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotPluginMetadataView<'static> {
     type Reborrowed<'b> = BotPluginMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -38022,6 +38101,8 @@ impl<'a> ::core::fmt::Debug for BotProgressIndicatorMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotProgressIndicatorMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotProgressIndicatorMetadataView<'static> {
     type Reborrowed<'b> = BotProgressIndicatorMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -38462,6 +38543,8 @@ impl<'a> ::core::fmt::Debug for BotPromotionMessageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotPromotionMessageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotPromotionMessageMetadataView<'static> {
     type Reborrowed<'b> = BotPromotionMessageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -38833,6 +38916,7 @@ impl<'a> ::core::fmt::Debug for BotPromptSuggestionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotPromptSuggestionView<'a> {}
 impl crate::protobuf::ViewReborrow for BotPromptSuggestionView<'static> {
     type Reborrowed<'b> = BotPromptSuggestionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -39157,6 +39241,7 @@ impl<'a> ::core::fmt::Debug for BotPromptSuggestionsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotPromptSuggestionsView<'a> {}
 impl crate::protobuf::ViewReborrow for BotPromptSuggestionsView<'static> {
     type Reborrowed<'b> = BotPromptSuggestionsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -39472,6 +39557,7 @@ impl<'a> ::core::fmt::Debug for BotPttPromptMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotPttPromptMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotPttPromptMetadataView<'static> {
     type Reborrowed<'b> = BotPttPromptMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -39772,6 +39858,7 @@ impl<'a> ::core::fmt::Debug for BotQuotaMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotQuotaMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotQuotaMetadataView<'static> {
     type Reborrowed<'b> = BotQuotaMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -40282,6 +40369,7 @@ impl<'a> ::core::fmt::Debug for BotReminderMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotReminderMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotReminderMetadataView<'static> {
     type Reborrowed<'b> = BotReminderMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -40781,6 +40869,8 @@ impl<'a> ::core::fmt::Debug for BotRenderingConfigMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotRenderingConfigMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotRenderingConfigMetadataView<'static> {
     type Reborrowed<'b> = BotRenderingConfigMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -41113,6 +41203,7 @@ impl<'a> ::core::fmt::Debug for BotRenderingMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotRenderingMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotRenderingMetadataView<'static> {
     type Reborrowed<'b> = BotRenderingMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -41473,6 +41564,8 @@ impl<'a> ::core::fmt::Debug for BotResolvedToolCallMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotResolvedToolCallMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotResolvedToolCallMetadataView<'static> {
     type Reborrowed<'b> = BotResolvedToolCallMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -41849,6 +41942,7 @@ impl<'a> ::core::fmt::Debug for BotSessionMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotSessionMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotSessionMetadataView<'static> {
     type Reborrowed<'b> = BotSessionMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -42182,6 +42276,8 @@ impl<'a> ::core::fmt::Debug for BotSignatureVerificationMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotSignatureVerificationMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotSignatureVerificationMetadataView<'static> {
     type Reborrowed<'b> = BotSignatureVerificationMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -42697,6 +42793,8 @@ impl<'a> ::core::fmt::Debug for BotSignatureVerificationUseCaseProofView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotSignatureVerificationUseCaseProofView<'a> {}
 impl crate::protobuf::ViewReborrow
 for BotSignatureVerificationUseCaseProofView<'static> {
     type Reborrowed<'b> = BotSignatureVerificationUseCaseProofView<'b>;
@@ -43164,6 +43262,7 @@ impl<'a> ::core::fmt::Debug for BotSourcesMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BotSourcesMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotSourcesMetadataView<'static> {
     type Reborrowed<'b> = BotSourcesMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -43604,6 +43703,8 @@ impl<'a> ::core::fmt::Debug for BotSuggestedPromptMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotSuggestedPromptMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for BotSuggestedPromptMetadataView<'static> {
     type Reborrowed<'b> = BotSuggestedPromptMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -44078,6 +44179,8 @@ impl<'a> ::core::fmt::Debug for BotUnifiedResponseMutationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for BotUnifiedResponseMutationView<'a> {}
 impl crate::protobuf::ViewReborrow for BotUnifiedResponseMutationView<'static> {
     type Reborrowed<'b> = BotUnifiedResponseMutationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -45080,6 +45183,7 @@ impl<'a> ::core::fmt::Debug for CallLogRecordView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CallLogRecordView<'a> {}
 impl crate::protobuf::ViewReborrow for CallLogRecordView<'static> {
     type Reborrowed<'b> = CallLogRecordView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -45879,6 +45983,7 @@ impl<'a> ::core::fmt::Debug for CertChainView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CertChainView<'a> {}
 impl crate::protobuf::ViewReborrow for CertChainView<'static> {
     type Reborrowed<'b> = CertChainView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -46290,6 +46395,7 @@ impl<'a> ::core::fmt::Debug for ChatLockSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ChatLockSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for ChatLockSettingsView<'static> {
     type Reborrowed<'b> = ChatLockSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -46635,6 +46741,7 @@ impl<'a> ::core::fmt::Debug for ChatRowOpaqueDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ChatRowOpaqueDataView<'a> {}
 impl crate::protobuf::ViewReborrow for ChatRowOpaqueDataView<'static> {
     type Reborrowed<'b> = ChatRowOpaqueDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -47051,6 +47158,7 @@ impl<'a> ::core::fmt::Debug for CitationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CitationView<'a> {}
 impl crate::protobuf::ViewReborrow for CitationView<'static> {
     type Reborrowed<'b> = CitationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -47661,6 +47769,7 @@ impl<'a> ::core::fmt::Debug for ClientPairingPropsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ClientPairingPropsView<'a> {}
 impl crate::protobuf::ViewReborrow for ClientPairingPropsView<'static> {
     type Reborrowed<'b> = ClientPairingPropsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -49682,6 +49791,7 @@ impl<'a> ::core::fmt::Debug for ClientPayloadView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ClientPayloadView<'a> {}
 impl crate::protobuf::ViewReborrow for ClientPayloadView<'static> {
     type Reborrowed<'b> = ClientPayloadView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -51269,6 +51379,7 @@ impl<'a> ::core::fmt::Debug for CoexStateSyncView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CoexStateSyncView<'a> {}
 impl crate::protobuf::ViewReborrow for CoexStateSyncView<'static> {
     type Reborrowed<'b> = CoexStateSyncView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -51671,6 +51782,7 @@ impl<'a> ::core::fmt::Debug for CombinedFingerprintView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CombinedFingerprintView<'a> {}
 impl crate::protobuf::ViewReborrow for CombinedFingerprintView<'static> {
     type Reborrowed<'b> = CombinedFingerprintView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -52119,6 +52231,7 @@ impl<'a> ::core::fmt::Debug for CommentMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CommentMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for CommentMetadataView<'static> {
     type Reborrowed<'b> = CommentMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -52459,6 +52572,7 @@ impl<'a> ::core::fmt::Debug for CompanionCommitmentView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CompanionCommitmentView<'a> {}
 impl crate::protobuf::ViewReborrow for CompanionCommitmentView<'static> {
     type Reborrowed<'b> = CompanionCommitmentView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -52843,6 +52957,8 @@ impl<'a> ::core::fmt::Debug for CompanionEphemeralIdentityView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for CompanionEphemeralIdentityView<'a> {}
 impl crate::protobuf::ViewReborrow for CompanionEphemeralIdentityView<'static> {
     type Reborrowed<'b> = CompanionEphemeralIdentityView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -53301,6 +53417,7 @@ impl<'a> ::core::fmt::Debug for ConfigView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ConfigView<'a> {}
 impl crate::protobuf::ViewReborrow for ConfigView<'static> {
     type Reborrowed<'b> = ConfigView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -56705,6 +56822,7 @@ impl<'a> ::core::fmt::Debug for ContextInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ContextInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for ContextInfoView<'static> {
     type Reborrowed<'b> = ContextInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -62585,6 +62703,7 @@ impl<'a> ::core::fmt::Debug for ConversationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ConversationView<'a> {}
 impl crate::protobuf::ViewReborrow for ConversationView<'static> {
     type Reborrowed<'b> = ConversationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -65559,6 +65678,7 @@ impl<'a> ::core::fmt::Debug for DeviceCapabilitiesView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DeviceCapabilitiesView<'a> {}
 impl crate::protobuf::ViewReborrow for DeviceCapabilitiesView<'static> {
     type Reborrowed<'b> = DeviceCapabilitiesView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -66634,6 +66754,8 @@ impl<'a> ::core::fmt::Debug for DeviceConsistencyCodeMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeviceConsistencyCodeMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for DeviceConsistencyCodeMessageView<'static> {
     type Reborrowed<'b> = DeviceConsistencyCodeMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -67337,6 +67459,7 @@ impl<'a> ::core::fmt::Debug for DeviceListMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DeviceListMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for DeviceListMetadataView<'static> {
     type Reborrowed<'b> = DeviceListMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -68108,6 +68231,7 @@ impl<'a> ::core::fmt::Debug for DevicePropsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DevicePropsView<'a> {}
 impl crate::protobuf::ViewReborrow for DevicePropsView<'static> {
     type Reborrowed<'b> = DevicePropsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -68728,6 +68852,7 @@ impl<'a> ::core::fmt::Debug for DisappearingModeView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DisappearingModeView<'a> {}
 impl crate::protobuf::ViewReborrow for DisappearingModeView<'static> {
     type Reborrowed<'b> = DisappearingModeView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -69203,6 +69328,7 @@ impl<'a> ::core::fmt::Debug for EmbeddedContentView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EmbeddedContentView<'a> {}
 impl crate::protobuf::ViewReborrow for EmbeddedContentView<'static> {
     type Reborrowed<'b> = EmbeddedContentView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -69676,6 +69802,7 @@ impl<'a> ::core::fmt::Debug for EmbeddedMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EmbeddedMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for EmbeddedMessageView<'static> {
     type Reborrowed<'b> = EmbeddedMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -70564,6 +70691,7 @@ impl<'a> ::core::fmt::Debug for EmbeddedMusicView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EmbeddedMusicView<'a> {}
 impl crate::protobuf::ViewReborrow for EmbeddedMusicView<'static> {
     type Reborrowed<'b> = EmbeddedMusicView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -71288,6 +71416,7 @@ impl<'a> ::core::fmt::Debug for EncryptedPairingRequestView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EncryptedPairingRequestView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptedPairingRequestView<'static> {
     type Reborrowed<'b> = EncryptedPairingRequestView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -71645,6 +71774,7 @@ impl<'a> ::core::fmt::Debug for EphemeralSettingView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EphemeralSettingView<'a> {}
 impl crate::protobuf::ViewReborrow for EphemeralSettingView<'static> {
     type Reborrowed<'b> = EphemeralSettingView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -71954,6 +72084,7 @@ impl<'a> ::core::fmt::Debug for EventAdditionalMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EventAdditionalMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for EventAdditionalMetadataView<'static> {
     type Reborrowed<'b> = EventAdditionalMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -72233,6 +72364,8 @@ impl<'a> ::core::fmt::Debug for EventInviteAdditionalMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EventInviteAdditionalMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for EventInviteAdditionalMetadataView<'static> {
     type Reborrowed<'b> = EventInviteAdditionalMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -72642,6 +72775,7 @@ impl<'a> ::core::fmt::Debug for EventResponseView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EventResponseView<'a> {}
 impl crate::protobuf::ViewReborrow for EventResponseView<'static> {
     type Reborrowed<'b> = EventResponseView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -73109,6 +73243,7 @@ impl<'a> ::core::fmt::Debug for ExitCodeView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ExitCodeView<'a> {}
 impl crate::protobuf::ViewReborrow for ExitCodeView<'static> {
     type Reborrowed<'b> = ExitCodeView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -73623,6 +73758,7 @@ impl<'a> ::core::fmt::Debug for ExternalBlobReferenceView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ExternalBlobReferenceView<'a> {}
 impl crate::protobuf::ViewReborrow for ExternalBlobReferenceView<'static> {
     type Reborrowed<'b> = ExternalBlobReferenceView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -74268,6 +74404,7 @@ impl<'a> ::core::fmt::Debug for FieldView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for FieldView<'a> {}
 impl crate::protobuf::ViewReborrow for FieldView<'static> {
     type Reborrowed<'b> = FieldView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -74958,6 +75095,7 @@ impl<'a> ::core::fmt::Debug for FingerprintDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for FingerprintDataView<'a> {}
 impl crate::protobuf::ViewReborrow for FingerprintDataView<'static> {
     type Reborrowed<'b> = FingerprintDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -75491,6 +75629,8 @@ impl<'a> ::core::fmt::Debug for ForwardedAIBotMessageInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for ForwardedAIBotMessageInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for ForwardedAIBotMessageInfoView<'static> {
     type Reborrowed<'b> = ForwardedAIBotMessageInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -76648,6 +76788,7 @@ impl<'a> ::core::fmt::Debug for GlobalSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GlobalSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for GlobalSettingsView<'static> {
     type Reborrowed<'b> = GlobalSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -78017,6 +78158,7 @@ impl<'a> ::core::fmt::Debug for GroupHistoryView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupHistoryView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupHistoryView<'static> {
     type Reborrowed<'b> = GroupHistoryView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -78629,6 +78771,7 @@ impl<'a> ::core::fmt::Debug for GroupHistoryBundleInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupHistoryBundleInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupHistoryBundleInfoView<'static> {
     type Reborrowed<'b> = GroupHistoryBundleInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -79036,6 +79179,8 @@ impl<'a> ::core::fmt::Debug for GroupHistoryIndividualMessageInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for GroupHistoryIndividualMessageInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupHistoryIndividualMessageInfoView<'static> {
     type Reborrowed<'b> = GroupHistoryIndividualMessageInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -79609,6 +79754,8 @@ impl<'a> ::core::fmt::Debug for GroupHistoryWithMessageBytesView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for GroupHistoryWithMessageBytesView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupHistoryWithMessageBytesView<'static> {
     type Reborrowed<'b> = GroupHistoryWithMessageBytesView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -80218,6 +80365,7 @@ impl<'a> ::core::fmt::Debug for GroupMentionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupMentionView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupMentionView<'static> {
     type Reborrowed<'b> = GroupMentionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -80623,6 +80771,7 @@ impl<'a> ::core::fmt::Debug for GroupParticipantView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupParticipantView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupParticipantView<'static> {
     type Reborrowed<'b> = GroupParticipantView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -81019,6 +81168,7 @@ impl<'a> ::core::fmt::Debug for GroupRootKeyShareView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupRootKeyShareView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupRootKeyShareView<'static> {
     type Reborrowed<'b> = GroupRootKeyShareView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -81453,6 +81603,7 @@ impl<'a> ::core::fmt::Debug for GroupRootKeyShareEntryView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GroupRootKeyShareEntryView<'a> {}
 impl crate::protobuf::ViewReborrow for GroupRootKeyShareEntryView<'static> {
     type Reborrowed<'b> = GroupRootKeyShareEntryView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -81918,6 +82069,7 @@ impl<'a> ::core::fmt::Debug for HandshakeMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for HandshakeMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for HandshakeMessageView<'static> {
     type Reborrowed<'b> = HandshakeMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -82439,6 +82591,7 @@ impl<'a> ::core::fmt::Debug for HatchMetadataSyncView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for HatchMetadataSyncView<'a> {}
 impl crate::protobuf::ViewReborrow for HatchMetadataSyncView<'static> {
     type Reborrowed<'b> = HatchMetadataSyncView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -83834,6 +83987,7 @@ impl<'a> ::core::fmt::Debug for HistorySyncView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for HistorySyncView<'a> {}
 impl crate::protobuf::ViewReborrow for HistorySyncView<'static> {
     type Reborrowed<'b> = HistorySyncView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -85206,6 +85360,7 @@ impl<'a> ::core::fmt::Debug for HistorySyncMsgView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for HistorySyncMsgView<'a> {}
 impl crate::protobuf::ViewReborrow for HistorySyncMsgView<'static> {
     type Reborrowed<'b> = HistorySyncMsgView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -85733,6 +85888,7 @@ impl<'a> ::core::fmt::Debug for HydratedTemplateButtonView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for HydratedTemplateButtonView<'a> {}
 impl crate::protobuf::ViewReborrow for HydratedTemplateButtonView<'static> {
     type Reborrowed<'b> = HydratedTemplateButtonView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -86320,6 +86476,7 @@ impl<'a> ::core::fmt::Debug for IdentityKeyPairStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for IdentityKeyPairStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for IdentityKeyPairStructureView<'static> {
     type Reborrowed<'b> = IdentityKeyPairStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -86671,6 +86828,8 @@ impl<'a> ::core::fmt::Debug for IdentityVerificationStateView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for IdentityVerificationStateView<'a> {}
 impl crate::protobuf::ViewReborrow for IdentityVerificationStateView<'static> {
     type Reborrowed<'b> = IdentityVerificationStateView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -87737,6 +87896,7 @@ impl<'a> ::core::fmt::Debug for InThreadSurveyMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for InThreadSurveyMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for InThreadSurveyMetadataView<'static> {
     type Reborrowed<'b> = InThreadSurveyMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -88795,6 +88955,7 @@ impl<'a> ::core::fmt::Debug for InlineContactView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for InlineContactView<'a> {}
 impl crate::protobuf::ViewReborrow for InlineContactView<'static> {
     type Reborrowed<'b> = InlineContactView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -89568,6 +89729,7 @@ impl<'a> ::core::fmt::Debug for InteractiveAnnotationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for InteractiveAnnotationView<'a> {}
 impl crate::protobuf::ViewReborrow for InteractiveAnnotationView<'static> {
     type Reborrowed<'b> = InteractiveAnnotationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -90314,6 +90476,8 @@ impl<'a> ::core::fmt::Debug for InteractiveMessageAdditionalMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for InteractiveMessageAdditionalMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow
 for InteractiveMessageAdditionalMetadataView<'static> {
     type Reborrowed<'b> = InteractiveMessageAdditionalMetadataView<'b>;
@@ -90815,6 +90979,7 @@ impl<'a> ::core::fmt::Debug for KeepInChatView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for KeepInChatView<'a> {}
 impl crate::protobuf::ViewReborrow for KeepInChatView<'static> {
     type Reborrowed<'b> = KeepInChatView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -91443,6 +91608,7 @@ impl<'a> ::core::fmt::Debug for KeyExchangeMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for KeyExchangeMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for KeyExchangeMessageView<'static> {
     type Reborrowed<'b> = KeyExchangeMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -91841,6 +92007,7 @@ impl<'a> ::core::fmt::Debug for KeyIdView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for KeyIdView<'a> {}
 impl crate::protobuf::ViewReborrow for KeyIdView<'static> {
     type Reborrowed<'b> = KeyIdView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -92118,6 +92285,8 @@ impl<'a> ::core::fmt::Debug for LIDMigrationMappingSyncMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for LIDMigrationMappingSyncMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for LIDMigrationMappingSyncMessageView<'static> {
     type Reborrowed<'b> = LIDMigrationMappingSyncMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -92472,6 +92641,7 @@ impl<'a> ::core::fmt::Debug for LIDMigrationMappingView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LIDMigrationMappingView<'a> {}
 impl crate::protobuf::ViewReborrow for LIDMigrationMappingView<'static> {
     type Reborrowed<'b> = LIDMigrationMappingView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -92868,6 +93038,8 @@ impl<'a> ::core::fmt::Debug for LIDMigrationMappingSyncPayloadView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for LIDMigrationMappingSyncPayloadView<'a> {}
 impl crate::protobuf::ViewReborrow for LIDMigrationMappingSyncPayloadView<'static> {
     type Reborrowed<'b> = LIDMigrationMappingSyncPayloadView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -93264,6 +93436,7 @@ impl<'a> ::core::fmt::Debug for LegacyMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LegacyMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for LegacyMessageView<'static> {
     type Reborrowed<'b> = LegacyMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -93771,6 +93944,7 @@ impl<'a> ::core::fmt::Debug for LimitSharingView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LimitSharingView<'a> {}
 impl crate::protobuf::ViewReborrow for LimitSharingView<'static> {
     type Reborrowed<'b> = LimitSharingView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -94236,6 +94410,7 @@ impl<'a> ::core::fmt::Debug for LocalizedNameView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LocalizedNameView<'a> {}
 impl crate::protobuf::ViewReborrow for LocalizedNameView<'static> {
     type Reborrowed<'b> = LocalizedNameView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -94666,6 +94841,7 @@ impl<'a> ::core::fmt::Debug for LocationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LocationView<'a> {}
 impl crate::protobuf::ViewReborrow for LocationView<'static> {
     type Reborrowed<'b> = LocationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -95004,6 +95180,7 @@ impl<'a> ::core::fmt::Debug for MediaDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MediaDataView<'a> {}
 impl crate::protobuf::ViewReborrow for MediaDataView<'static> {
     type Reborrowed<'b> = MediaDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -95336,6 +95513,7 @@ impl<'a> ::core::fmt::Debug for MediaDomainInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MediaDomainInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for MediaDomainInfoView<'static> {
     type Reborrowed<'b> = MediaDomainInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -96338,6 +96516,7 @@ impl<'a> ::core::fmt::Debug for MediaEntryView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MediaEntryView<'a> {}
 impl crate::protobuf::ViewReborrow for MediaEntryView<'static> {
     type Reborrowed<'b> = MediaEntryView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -97240,6 +97419,7 @@ impl<'a> ::core::fmt::Debug for MediaNotifyMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MediaNotifyMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for MediaNotifyMessageView<'static> {
     type Reborrowed<'b> = MediaNotifyMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -97723,6 +97903,7 @@ impl<'a> ::core::fmt::Debug for MediaRetryNotificationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MediaRetryNotificationView<'a> {}
 impl crate::protobuf::ViewReborrow for MediaRetryNotificationView<'static> {
     type Reborrowed<'b> = MediaRetryNotificationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -98149,6 +98330,7 @@ impl<'a> ::core::fmt::Debug for MemberLabelView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MemberLabelView<'a> {}
 impl crate::protobuf::ViewReborrow for MemberLabelView<'static> {
     type Reborrowed<'b> = MemberLabelView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -104073,6 +104255,7 @@ impl<'a> ::core::fmt::Debug for MessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageView<'static> {
     type Reborrowed<'b> = MessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -112056,6 +112239,7 @@ impl<'a> ::core::fmt::Debug for MessageAddOnView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageAddOnView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageAddOnView<'static> {
     type Reborrowed<'b> = MessageAddOnView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -112745,6 +112929,7 @@ impl<'a> ::core::fmt::Debug for MessageAddOnContextInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageAddOnContextInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageAddOnContextInfoView<'static> {
     type Reborrowed<'b> = MessageAddOnContextInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -113172,6 +113357,7 @@ impl<'a> ::core::fmt::Debug for MessageAssociationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageAssociationView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageAssociationView<'static> {
     type Reborrowed<'b> = MessageAssociationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -114485,6 +114671,7 @@ impl<'a> ::core::fmt::Debug for MessageContextInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageContextInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageContextInfoView<'static> {
     type Reborrowed<'b> = MessageContextInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -115804,6 +115991,7 @@ impl<'a> ::core::fmt::Debug for MessageKeyView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageKeyView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageKeyView<'static> {
     type Reborrowed<'b> = MessageKeyView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -116253,6 +116441,7 @@ impl<'a> ::core::fmt::Debug for MessageSecretMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageSecretMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageSecretMessageView<'static> {
     type Reborrowed<'b> = MessageSecretMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -116676,6 +116865,7 @@ impl<'a> ::core::fmt::Debug for MoneyView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MoneyView<'a> {}
 impl crate::protobuf::ViewReborrow for MoneyView<'static> {
     type Reborrowed<'b> = MoneyView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -119475,6 +119665,7 @@ impl<'a> ::core::fmt::Debug for MsgOpaqueDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MsgOpaqueDataView<'a> {}
 impl crate::protobuf::ViewReborrow for MsgOpaqueDataView<'static> {
     type Reborrowed<'b> = MsgOpaqueDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -121764,6 +121955,7 @@ impl<'a> ::core::fmt::Debug for MsgRowOpaqueDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MsgRowOpaqueDataView<'a> {}
 impl crate::protobuf::ViewReborrow for MsgRowOpaqueDataView<'static> {
     type Reborrowed<'b> = MsgRowOpaqueDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -122185,6 +122377,7 @@ impl<'a> ::core::fmt::Debug for NoiseCertificateView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for NoiseCertificateView<'a> {}
 impl crate::protobuf::ViewReborrow for NoiseCertificateView<'static> {
     type Reborrowed<'b> = NoiseCertificateView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -122509,6 +122702,7 @@ impl<'a> ::core::fmt::Debug for NonE2EEAttestationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for NonE2EEAttestationView<'a> {}
 impl crate::protobuf::ViewReborrow for NonE2EEAttestationView<'static> {
     type Reborrowed<'b> = NonE2EEAttestationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -122929,6 +123123,7 @@ impl<'a> ::core::fmt::Debug for NotificationMessageInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for NotificationMessageInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for NotificationMessageInfoView<'static> {
     type Reborrowed<'b> = NotificationMessageInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -123574,6 +123769,7 @@ impl<'a> ::core::fmt::Debug for NotificationSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for NotificationSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for NotificationSettingsView<'static> {
     type Reborrowed<'b> = NotificationSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -124213,6 +124409,8 @@ impl<'a> ::core::fmt::Debug for OmittedConversationMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for OmittedConversationMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for OmittedConversationMetadataView<'static> {
     type Reborrowed<'b> = OmittedConversationMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -124758,6 +124956,7 @@ impl<'a> ::core::fmt::Debug for PairingRequestView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PairingRequestView<'a> {}
 impl crate::protobuf::ViewReborrow for PairingRequestView<'static> {
     type Reborrowed<'b> = PairingRequestView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -125201,6 +125400,7 @@ impl<'a> ::core::fmt::Debug for PastParticipantView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PastParticipantView<'a> {}
 impl crate::protobuf::ViewReborrow for PastParticipantView<'static> {
     type Reborrowed<'b> = PastParticipantView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -125609,6 +125809,7 @@ impl<'a> ::core::fmt::Debug for PastParticipantsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PastParticipantsView<'a> {}
 impl crate::protobuf::ViewReborrow for PastParticipantsView<'static> {
     type Reborrowed<'b> = PastParticipantsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -126381,6 +126582,7 @@ impl<'a> ::core::fmt::Debug for PatchDebugDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PatchDebugDataView<'a> {}
 impl crate::protobuf::ViewReborrow for PatchDebugDataView<'static> {
     type Reborrowed<'b> = PatchDebugDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -127355,6 +127557,7 @@ impl<'a> ::core::fmt::Debug for PaymentBackgroundView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PaymentBackgroundView<'a> {}
 impl crate::protobuf::ViewReborrow for PaymentBackgroundView<'static> {
     type Reborrowed<'b> = PaymentBackgroundView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -128481,6 +128684,7 @@ impl<'a> ::core::fmt::Debug for PaymentInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PaymentInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for PaymentInfoView<'static> {
     type Reborrowed<'b> = PaymentInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -129280,6 +129484,7 @@ impl<'a> ::core::fmt::Debug for PhoneNumberToLIDMappingView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PhoneNumberToLIDMappingView<'a> {}
 impl crate::protobuf::ViewReborrow for PhoneNumberToLIDMappingView<'static> {
     type Reborrowed<'b> = PhoneNumberToLIDMappingView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -129679,6 +129884,7 @@ impl<'a> ::core::fmt::Debug for PhotoChangeView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PhotoChangeView<'a> {}
 impl crate::protobuf::ViewReborrow for PhotoChangeView<'static> {
     type Reborrowed<'b> = PhotoChangeView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -130193,6 +130399,7 @@ impl<'a> ::core::fmt::Debug for PinInChatView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PinInChatView<'a> {}
 impl crate::protobuf::ViewReborrow for PinInChatView<'static> {
     type Reborrowed<'b> = PinInChatView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -130782,6 +130989,7 @@ impl<'a> ::core::fmt::Debug for PointView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PointView<'a> {}
 impl crate::protobuf::ViewReborrow for PointView<'static> {
     type Reborrowed<'b> = PointView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -131257,6 +131465,7 @@ impl<'a> ::core::fmt::Debug for PollAdditionalMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PollAdditionalMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for PollAdditionalMetadataView<'static> {
     type Reborrowed<'b> = PollAdditionalMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -131712,6 +131921,7 @@ impl<'a> ::core::fmt::Debug for PollEncValueView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PollEncValueView<'a> {}
 impl crate::protobuf::ViewReborrow for PollEncValueView<'static> {
     type Reborrowed<'b> = PollEncValueView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -132230,6 +132440,7 @@ impl<'a> ::core::fmt::Debug for PollUpdateView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PollUpdateView<'a> {}
 impl crate::protobuf::ViewReborrow for PollUpdateView<'static> {
     type Reborrowed<'b> = PollUpdateView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -132828,6 +133039,7 @@ impl<'a> ::core::fmt::Debug for PreKeyRecordStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PreKeyRecordStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for PreKeyRecordStructureView<'static> {
     type Reborrowed<'b> = PreKeyRecordStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -133453,6 +133665,7 @@ impl<'a> ::core::fmt::Debug for PreKeySignalMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PreKeySignalMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for PreKeySignalMessageView<'static> {
     type Reborrowed<'b> = PreKeySignalMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -133939,6 +134152,7 @@ impl<'a> ::core::fmt::Debug for PremiumMessageInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PremiumMessageInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for PremiumMessageInfoView<'static> {
     type Reborrowed<'b> = PremiumMessageInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -134266,6 +134480,7 @@ impl<'a> ::core::fmt::Debug for PrimaryEphemeralIdentityView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PrimaryEphemeralIdentityView<'a> {}
 impl crate::protobuf::ViewReborrow for PrimaryEphemeralIdentityView<'static> {
     type Reborrowed<'b> = PrimaryEphemeralIdentityView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -134872,6 +135087,7 @@ impl<'a> ::core::fmt::Debug for ProcessedVideoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ProcessedVideoView<'a> {}
 impl crate::protobuf::ViewReborrow for ProcessedVideoView<'static> {
     type Reborrowed<'b> = ProcessedVideoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -135418,6 +135634,7 @@ impl<'a> ::core::fmt::Debug for ProloguePayloadView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ProloguePayloadView<'a> {}
 impl crate::protobuf::ViewReborrow for ProloguePayloadView<'static> {
     type Reborrowed<'b> = ProloguePayloadView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -135807,6 +136024,7 @@ impl<'a> ::core::fmt::Debug for PushnameView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for PushnameView<'a> {}
 impl crate::protobuf::ViewReborrow for PushnameView<'static> {
     type Reborrowed<'b> = PushnameView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -136063,6 +136281,7 @@ impl<'a> ::core::fmt::Debug for QPView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for QPView<'a> {}
 impl crate::protobuf::ViewReborrow for QPView<'static> {
     type Reborrowed<'b> = QPView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -136354,6 +136573,7 @@ impl<'a> ::core::fmt::Debug for QuarantinedMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for QuarantinedMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for QuarantinedMessageView<'static> {
     type Reborrowed<'b> = QuarantinedMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -136830,6 +137050,7 @@ impl<'a> ::core::fmt::Debug for ReactionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ReactionView<'a> {}
 impl crate::protobuf::ViewReborrow for ReactionView<'static> {
     type Reborrowed<'b> = ReactionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -137294,6 +137515,7 @@ impl<'a> ::core::fmt::Debug for RecentEmojiWeightView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RecentEmojiWeightView<'a> {}
 impl crate::protobuf::ViewReborrow for RecentEmojiWeightView<'static> {
     type Reborrowed<'b> = RecentEmojiWeightView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -137668,6 +137890,7 @@ impl<'a> ::core::fmt::Debug for RecordStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RecordStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for RecordStructureView<'static> {
     type Reborrowed<'b> = RecordStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -138154,6 +138377,7 @@ impl<'a> ::core::fmt::Debug for ReportableView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ReportableView<'a> {}
 impl crate::protobuf::ViewReborrow for ReportableView<'static> {
     type Reborrowed<'b> = ReportableView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -138554,6 +138778,7 @@ impl<'a> ::core::fmt::Debug for ReportingTokenInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ReportingTokenInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for ReportingTokenInfoView<'static> {
     type Reborrowed<'b> = ReportingTokenInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -139071,6 +139296,7 @@ impl<'a> ::core::fmt::Debug for RoutingInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RoutingInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for RoutingInfoView<'static> {
     type Reborrowed<'b> = RoutingInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -139598,6 +139824,7 @@ impl<'a> ::core::fmt::Debug for ScheduledMessageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ScheduledMessageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for ScheduledMessageMetadataView<'static> {
     type Reborrowed<'b> = ScheduledMessageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -140063,6 +140290,8 @@ impl<'a> ::core::fmt::Debug for SenderKeyDistributionMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for SenderKeyDistributionMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for SenderKeyDistributionMessageView<'static> {
     type Reborrowed<'b> = SenderKeyDistributionMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -140513,6 +140742,7 @@ impl<'a> ::core::fmt::Debug for SenderKeyMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SenderKeyMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for SenderKeyMessageView<'static> {
     type Reborrowed<'b> = SenderKeyMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -140865,6 +141095,7 @@ impl<'a> ::core::fmt::Debug for SenderKeyRecordStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SenderKeyRecordStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for SenderKeyRecordStructureView<'static> {
     type Reborrowed<'b> = SenderKeyRecordStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -141331,6 +141562,7 @@ impl<'a> ::core::fmt::Debug for SenderKeyStateStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SenderKeyStateStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for SenderKeyStateStructureView<'static> {
     type Reborrowed<'b> = SenderKeyStateStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -141806,6 +142038,7 @@ impl<'a> ::core::fmt::Debug for ServerErrorReceiptView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ServerErrorReceiptView<'a> {}
 impl crate::protobuf::ViewReborrow for ServerErrorReceiptView<'static> {
     type Reborrowed<'b> = ServerErrorReceiptView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -142598,6 +142831,7 @@ impl<'a> ::core::fmt::Debug for SessionStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SessionStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for SessionStructureView<'static> {
     type Reborrowed<'b> = SessionStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -143465,6 +143699,8 @@ impl<'a> ::core::fmt::Debug for SessionTransparencyMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for SessionTransparencyMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for SessionTransparencyMetadataView<'static> {
     type Reborrowed<'b> = SessionTransparencyMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -143945,6 +144181,7 @@ impl<'a> ::core::fmt::Debug for SignalMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SignalMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for SignalMessageView<'static> {
     type Reborrowed<'b> = SignalMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -144480,6 +144717,8 @@ impl<'a> ::core::fmt::Debug for SignedPreKeyRecordStructureView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for SignedPreKeyRecordStructureView<'a> {}
 impl crate::protobuf::ViewReborrow for SignedPreKeyRecordStructureView<'static> {
     type Reborrowed<'b> = SignedPreKeyRecordStructureView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -145302,6 +145541,7 @@ impl<'a> ::core::fmt::Debug for StatusAttributionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for StatusAttributionView<'a> {}
 impl crate::protobuf::ViewReborrow for StatusAttributionView<'static> {
     type Reborrowed<'b> = StatusAttributionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -146131,6 +146371,7 @@ impl<'a> ::core::fmt::Debug for StatusMentionMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for StatusMentionMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for StatusMentionMessageView<'static> {
     type Reborrowed<'b> = StatusMentionMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -146478,6 +146719,7 @@ impl<'a> ::core::fmt::Debug for StatusPSAView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for StatusPSAView<'a> {}
 impl crate::protobuf::ViewReborrow for StatusPSAView<'static> {
     type Reborrowed<'b> = StatusPSAView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -147315,6 +147557,7 @@ impl<'a> ::core::fmt::Debug for StickerMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for StickerMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for StickerMetadataView<'static> {
     type Reborrowed<'b> = StickerMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -148106,6 +148349,7 @@ impl<'a> ::core::fmt::Debug for SyncActionDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncActionDataView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncActionDataView<'static> {
     type Reborrowed<'b> = SyncActionDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -152795,6 +153039,7 @@ impl<'a> ::core::fmt::Debug for SyncActionValueView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncActionValueView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncActionValueView<'static> {
     type Reborrowed<'b> = SyncActionValueView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -158969,6 +159214,7 @@ impl<'a> ::core::fmt::Debug for SyncdIndexView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdIndexView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdIndexView<'static> {
     type Reborrowed<'b> = SyncdIndexView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -159308,6 +159554,7 @@ impl<'a> ::core::fmt::Debug for SyncdMutationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdMutationView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdMutationView<'static> {
     type Reborrowed<'b> = SyncdMutationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -159666,6 +159913,7 @@ impl<'a> ::core::fmt::Debug for SyncdMutationsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdMutationsView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdMutationsView<'static> {
     type Reborrowed<'b> = SyncdMutationsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -160333,6 +160581,7 @@ impl<'a> ::core::fmt::Debug for SyncdPatchView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdPatchView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdPatchView<'static> {
     type Reborrowed<'b> = SyncdPatchView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -161093,6 +161342,7 @@ impl<'a> ::core::fmt::Debug for SyncdPlainTextRecordView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdPlainTextRecordView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdPlainTextRecordView<'static> {
     type Reborrowed<'b> = SyncdPlainTextRecordView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -161562,6 +161812,7 @@ impl<'a> ::core::fmt::Debug for SyncdRecordView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdRecordView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdRecordView<'static> {
     type Reborrowed<'b> = SyncdRecordView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -162138,6 +162389,7 @@ impl<'a> ::core::fmt::Debug for SyncdSnapshotView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdSnapshotView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdSnapshotView<'static> {
     type Reborrowed<'b> = SyncdSnapshotView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -162745,6 +162997,7 @@ impl<'a> ::core::fmt::Debug for SyncdSnapshotRecoveryView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdSnapshotRecoveryView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdSnapshotRecoveryView<'static> {
     type Reborrowed<'b> = SyncdSnapshotRecoveryView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -163180,6 +163433,7 @@ impl<'a> ::core::fmt::Debug for SyncdValueView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdValueView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdValueView<'static> {
     type Reborrowed<'b> = SyncdValueView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -163448,6 +163702,7 @@ impl<'a> ::core::fmt::Debug for SyncdVersionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SyncdVersionView<'a> {}
 impl crate::protobuf::ViewReborrow for SyncdVersionView<'static> {
     type Reborrowed<'b> = SyncdVersionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -163768,6 +164023,7 @@ impl<'a> ::core::fmt::Debug for TapLinkActionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for TapLinkActionView<'a> {}
 impl crate::protobuf::ViewReborrow for TapLinkActionView<'static> {
     type Reborrowed<'b> = TapLinkActionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -164252,6 +164508,7 @@ impl<'a> ::core::fmt::Debug for TemplateButtonView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for TemplateButtonView<'a> {}
 impl crate::protobuf::ViewReborrow for TemplateButtonView<'static> {
     type Reborrowed<'b> = TemplateButtonView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -164847,6 +165104,7 @@ impl<'a> ::core::fmt::Debug for ThreadIDView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ThreadIDView<'a> {}
 impl crate::protobuf::ViewReborrow for ThreadIDView<'static> {
     type Reborrowed<'b> = ThreadIDView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -165303,6 +165561,8 @@ impl<'a> ::core::fmt::Debug for UnCountedAssociatedMessageListView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for UnCountedAssociatedMessageListView<'a> {}
 impl crate::protobuf::ViewReborrow for UnCountedAssociatedMessageListView<'static> {
     type Reborrowed<'b> = UnCountedAssociatedMessageListView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -165778,6 +166038,8 @@ impl<'a> ::core::fmt::Debug for UnCountedAssociatedMessageListWithMessageBytesVi
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for UnCountedAssociatedMessageListWithMessageBytesView<'a> {}
 impl crate::protobuf::ViewReborrow
 for UnCountedAssociatedMessageListWithMessageBytesView<'static> {
     type Reborrowed<'b> = UnCountedAssociatedMessageListWithMessageBytesView<'b>;
@@ -166191,6 +166453,7 @@ impl<'a> ::core::fmt::Debug for UrlTrackingMapView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for UrlTrackingMapView<'a> {}
 impl crate::protobuf::ViewReborrow for UrlTrackingMapView<'static> {
     type Reborrowed<'b> = UrlTrackingMapView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -166670,6 +166933,7 @@ impl<'a> ::core::fmt::Debug for UserPasswordView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for UserPasswordView<'a> {}
 impl crate::protobuf::ViewReborrow for UserPasswordView<'static> {
     type Reborrowed<'b> = UserPasswordView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -167284,6 +167548,7 @@ impl<'a> ::core::fmt::Debug for UserReceiptView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for UserReceiptView<'a> {}
 impl crate::protobuf::ViewReborrow for UserReceiptView<'static> {
     type Reborrowed<'b> = UserReceiptView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -167806,6 +168071,7 @@ impl<'a> ::core::fmt::Debug for VerifiedNameCertificateView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for VerifiedNameCertificateView<'a> {}
 impl crate::protobuf::ViewReborrow for VerifiedNameCertificateView<'static> {
     type Reborrowed<'b> = VerifiedNameCertificateView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -168230,6 +168496,7 @@ impl<'a> ::core::fmt::Debug for WallpaperSettingsView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for WallpaperSettingsView<'a> {}
 impl crate::protobuf::ViewReborrow for WallpaperSettingsView<'static> {
     type Reborrowed<'b> = WallpaperSettingsView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -171005,6 +171272,7 @@ impl<'a> ::core::fmt::Debug for WebFeaturesView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for WebFeaturesView<'a> {}
 impl crate::protobuf::ViewReborrow for WebFeaturesView<'static> {
     type Reborrowed<'b> = WebFeaturesView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -176196,6 +176464,7 @@ impl<'a> ::core::fmt::Debug for WebMessageInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for WebMessageInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for WebMessageInfoView<'static> {
     type Reborrowed<'b> = WebMessageInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -179673,6 +179942,8 @@ impl<'a> ::core::fmt::Debug for WebMessageInfoWithMessageBytesView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for WebMessageInfoWithMessageBytesView<'a> {}
 impl crate::protobuf::ViewReborrow for WebMessageInfoWithMessageBytesView<'static> {
     type Reborrowed<'b> = WebMessageInfoWithMessageBytesView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -180146,6 +180417,7 @@ impl<'a> ::core::fmt::Debug for WebNotificationsInfoView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for WebNotificationsInfoView<'a> {}
 impl crate::protobuf::ViewReborrow for WebNotificationsInfoView<'static> {
     type Reborrowed<'b> = WebNotificationsInfoView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -180634,6 +180906,7 @@ impl<'a> ::core::fmt::Debug for BackwardEdgeView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for BackwardEdgeView<'a> {}
 impl crate::protobuf::ViewReborrow for BackwardEdgeView<'static> {
     type Reborrowed<'b> = BackwardEdgeView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -181116,6 +181389,7 @@ impl<'a> ::core::fmt::Debug for CommandView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CommandView<'a> {}
 impl crate::protobuf::ViewReborrow for CommandView<'static> {
     type Reborrowed<'b> = CommandView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -181534,6 +181808,7 @@ impl<'a> ::core::fmt::Debug for ConsumerApplicationView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ConsumerApplicationView<'a> {}
 impl crate::protobuf::ViewReborrow for ConsumerApplicationView<'static> {
     type Reborrowed<'b> = ConsumerApplicationView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -181940,6 +182215,7 @@ impl<'a> ::core::fmt::Debug for CreateBackupInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CreateBackupInputView<'a> {}
 impl crate::protobuf::ViewReborrow for CreateBackupInputView<'static> {
     type Reborrowed<'b> = CreateBackupInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -182434,6 +182710,7 @@ impl<'a> ::core::fmt::Debug for CreateBackupOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for CreateBackupOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for CreateBackupOutputView<'static> {
     type Reborrowed<'b> = CreateBackupOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -183131,6 +183408,8 @@ for DecryptMekForDistributionFromTransportSenderInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionFromTransportSenderInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DecryptMekForDistributionFromTransportSenderInputView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionFromTransportSenderInputView<'b>;
@@ -183733,6 +184012,8 @@ for DecryptMekForDistributionFromTransportSenderResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionFromTransportSenderResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DecryptMekForDistributionFromTransportSenderResultView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionFromTransportSenderResultView<'b>;
@@ -184154,6 +184435,8 @@ for DecryptMekForDistributionFromTransportSenderSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionFromTransportSenderSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DecryptMekForDistributionFromTransportSenderSuccessView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionFromTransportSenderSuccessView<'b>;
@@ -184764,6 +185047,8 @@ impl<'a> ::core::fmt::Debug for DecryptMekForDistributionInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptMekForDistributionInputView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -185401,6 +185686,8 @@ impl<'a> ::core::fmt::Debug for DecryptMekForDistributionResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionResultView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptMekForDistributionResultView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -185797,6 +186084,8 @@ impl<'a> ::core::fmt::Debug for DecryptMekForDistributionSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptMekForDistributionSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptMekForDistributionSuccessView<'static> {
     type Reborrowed<'b> = DecryptMekForDistributionSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -186221,6 +186510,7 @@ impl<'a> ::core::fmt::Debug for DecryptMessageInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DecryptMessageInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptMessageInputView<'static> {
     type Reborrowed<'b> = DecryptMessageInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -186678,6 +186968,7 @@ impl<'a> ::core::fmt::Debug for DecryptMessageOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DecryptMessageOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptMessageOutputView<'static> {
     type Reborrowed<'b> = DecryptMessageOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -187059,6 +187350,8 @@ impl<'a> ::core::fmt::Debug for DecryptSelfMmkDistributionInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptSelfMmkDistributionInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptSelfMmkDistributionInputView<'static> {
     type Reborrowed<'b> = DecryptSelfMmkDistributionInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -187480,6 +187773,8 @@ impl<'a> ::core::fmt::Debug for DecryptSelfMmkDistributionResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptSelfMmkDistributionResultView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptSelfMmkDistributionResultView<'static> {
     type Reborrowed<'b> = DecryptSelfMmkDistributionResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -187876,6 +188171,8 @@ impl<'a> ::core::fmt::Debug for DecryptSelfMmkDistributionSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DecryptSelfMmkDistributionSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for DecryptSelfMmkDistributionSuccessView<'static> {
     type Reborrowed<'b> = DecryptSelfMmkDistributionSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -188159,6 +188456,8 @@ impl<'a> ::core::fmt::Debug for DeriveAttachmentAccessTokenSecretInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveAttachmentAccessTokenSecretInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveAttachmentAccessTokenSecretInputView<'static> {
     type Reborrowed<'b> = DeriveAttachmentAccessTokenSecretInputView<'b>;
@@ -188452,6 +188751,8 @@ impl<'a> ::core::fmt::Debug for DeriveAttachmentAccessTokenSecretResultView<'a> 
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveAttachmentAccessTokenSecretResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveAttachmentAccessTokenSecretResultView<'static> {
     type Reborrowed<'b> = DeriveAttachmentAccessTokenSecretResultView<'b>;
@@ -188746,6 +189047,8 @@ impl<'a> ::core::fmt::Debug for DeriveAttachmentPrimaryKeySecretInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveAttachmentPrimaryKeySecretInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveAttachmentPrimaryKeySecretInputView<'static> {
     type Reborrowed<'b> = DeriveAttachmentPrimaryKeySecretInputView<'b>;
@@ -189037,6 +189340,8 @@ impl<'a> ::core::fmt::Debug for DeriveAttachmentPrimaryKeySecretResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveAttachmentPrimaryKeySecretResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveAttachmentPrimaryKeySecretResultView<'static> {
     type Reborrowed<'b> = DeriveAttachmentPrimaryKeySecretResultView<'b>;
@@ -189363,6 +189668,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxAuthKeypairInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxAuthKeypairInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxAuthKeypairInputView<'static> {
     type Reborrowed<'b> = DeriveMailboxAuthKeypairInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -189712,6 +190019,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxAuthKeypairResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxAuthKeypairResultView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxAuthKeypairResultView<'static> {
     type Reborrowed<'b> = DeriveMailboxAuthKeypairResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -190061,6 +190370,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxEncryptionKeypairInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxEncryptionKeypairInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxEncryptionKeypairInputView<'static> {
     type Reborrowed<'b> = DeriveMailboxEncryptionKeypairInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -190414,6 +190725,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxEncryptionKeypairResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxEncryptionKeypairResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveMailboxEncryptionKeypairResultView<'static> {
     type Reborrowed<'b> = DeriveMailboxEncryptionKeypairResultView<'b>;
@@ -190769,6 +191082,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxSigningKeypairInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxSigningKeypairInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxSigningKeypairInputView<'static> {
     type Reborrowed<'b> = DeriveMailboxSigningKeypairInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -191156,6 +191471,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxSigningKeypairResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxSigningKeypairResultView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxSigningKeypairResultView<'static> {
     type Reborrowed<'b> = DeriveMailboxSigningKeypairResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -191588,6 +191905,8 @@ impl<'a> ::core::fmt::Debug for DeriveMailboxSigningKeypairSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMailboxSigningKeypairSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMailboxSigningKeypairSuccessView<'static> {
     type Reborrowed<'b> = DeriveMailboxSigningKeypairSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -191977,6 +192296,7 @@ impl<'a> ::core::fmt::Debug for DeriveMessageKeyInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DeriveMessageKeyInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMessageKeyInputView<'static> {
     type Reborrowed<'b> = DeriveMessageKeyInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -192372,6 +192692,7 @@ impl<'a> ::core::fmt::Debug for DeriveMessageKeyOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DeriveMessageKeyOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMessageKeyOutputView<'static> {
     type Reborrowed<'b> = DeriveMessageKeyOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -192683,6 +193004,8 @@ impl<'a> ::core::fmt::Debug for DeriveMessagingMailboxKeypairsInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMessagingMailboxKeypairsInputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeriveMessagingMailboxKeypairsInputView<'static> {
     type Reborrowed<'b> = DeriveMessagingMailboxKeypairsInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -193044,6 +193367,8 @@ impl<'a> ::core::fmt::Debug for DeriveMessagingMailboxKeypairsResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMessagingMailboxKeypairsResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveMessagingMailboxKeypairsResultView<'static> {
     type Reborrowed<'b> = DeriveMessagingMailboxKeypairsResultView<'b>;
@@ -193568,6 +193893,8 @@ impl<'a> ::core::fmt::Debug for DeriveMessagingMailboxKeypairsSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for DeriveMessagingMailboxKeypairsSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow
 for DeriveMessagingMailboxKeypairsSuccessView<'static> {
     type Reborrowed<'b> = DeriveMessagingMailboxKeypairsSuccessView<'b>;
@@ -194128,6 +194455,7 @@ impl<'a> ::core::fmt::Debug for DetachedDevicePublicDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DetachedDevicePublicDataView<'a> {}
 impl crate::protobuf::ViewReborrow for DetachedDevicePublicDataView<'static> {
     type Reborrowed<'b> = DetachedDevicePublicDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -194906,6 +195234,7 @@ impl<'a> ::core::fmt::Debug for DeviceOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for DeviceOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for DeviceOutputView<'static> {
     type Reborrowed<'b> = DeviceOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -195696,6 +196025,8 @@ impl<'a> ::core::fmt::Debug for EncryptMekForDistributionInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EncryptMekForDistributionInputView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptMekForDistributionInputView<'static> {
     type Reborrowed<'b> = EncryptMekForDistributionInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -196263,6 +196594,8 @@ impl<'a> ::core::fmt::Debug for EncryptMekForDistributionResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EncryptMekForDistributionResultView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptMekForDistributionResultView<'static> {
     type Reborrowed<'b> = EncryptMekForDistributionResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -196769,6 +197102,8 @@ for EncryptMeksForDistributionFromTransportSenderInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EncryptMeksForDistributionFromTransportSenderInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for EncryptMeksForDistributionFromTransportSenderInputView<'static> {
     type Reborrowed<'b> = EncryptMeksForDistributionFromTransportSenderInputView<'b>;
@@ -197449,6 +197784,8 @@ for EncryptMeksForDistributionFromTransportSenderResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EncryptMeksForDistributionFromTransportSenderResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for EncryptMeksForDistributionFromTransportSenderResultView<'static> {
     type Reborrowed<'b> = EncryptMeksForDistributionFromTransportSenderResultView<'b>;
@@ -198232,6 +198569,7 @@ impl<'a> ::core::fmt::Debug for EncryptMessageInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EncryptMessageInputView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptMessageInputView<'static> {
     type Reborrowed<'b> = EncryptMessageInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -199037,6 +199375,7 @@ impl<'a> ::core::fmt::Debug for EncryptMessageOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EncryptMessageOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptMessageOutputView<'static> {
     type Reborrowed<'b> = EncryptMessageOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -199730,6 +200069,8 @@ impl<'a> ::core::fmt::Debug for EncryptedSecretValuesOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for EncryptedSecretValuesOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for EncryptedSecretValuesOutputView<'static> {
     type Reborrowed<'b> = EncryptedSecretValuesOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -200464,6 +200805,7 @@ impl<'a> ::core::fmt::Debug for Epoch0OutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for Epoch0OutputView<'a> {}
 impl crate::protobuf::ViewReborrow for Epoch0OutputView<'static> {
     type Reborrowed<'b> = Epoch0OutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -201114,6 +201456,7 @@ impl<'a> ::core::fmt::Debug for EpochPublicDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EpochPublicDataView<'a> {}
 impl crate::protobuf::ViewReborrow for EpochPublicDataView<'static> {
     type Reborrowed<'b> = EpochPublicDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -201592,6 +201935,7 @@ impl<'a> ::core::fmt::Debug for EpochSignaturesView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for EpochSignaturesView<'a> {}
 impl crate::protobuf::ViewReborrow for EpochSignaturesView<'static> {
     type Reborrowed<'b> = EpochSignaturesView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -203179,6 +203523,7 @@ impl<'a> ::core::fmt::Debug for ExtendedContentMessageView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for ExtendedContentMessageView<'a> {}
 impl crate::protobuf::ViewReborrow for ExtendedContentMessageView<'static> {
     type Reborrowed<'b> = ExtendedContentMessageView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -204569,6 +204914,7 @@ impl<'a> ::core::fmt::Debug for GenerateMekInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GenerateMekInputView<'a> {}
 impl crate::protobuf::ViewReborrow for GenerateMekInputView<'static> {
     type Reborrowed<'b> = GenerateMekInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -204857,6 +205203,7 @@ impl<'a> ::core::fmt::Debug for GenerateMekResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for GenerateMekResultView<'a> {}
 impl crate::protobuf::ViewReborrow for GenerateMekResultView<'static> {
     type Reborrowed<'b> = GenerateMekResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -205167,6 +205514,8 @@ impl<'a> ::core::fmt::Debug for GenerateMekRosterHashInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for GenerateMekRosterHashInputView<'a> {}
 impl crate::protobuf::ViewReborrow for GenerateMekRosterHashInputView<'static> {
     type Reborrowed<'b> = GenerateMekRosterHashInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -205452,6 +205801,8 @@ impl<'a> ::core::fmt::Debug for GenerateMekRosterHashResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for GenerateMekRosterHashResultView<'a> {}
 impl crate::protobuf::ViewReborrow for GenerateMekRosterHashResultView<'static> {
     type Reborrowed<'b> = GenerateMekRosterHashResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -206056,6 +206407,7 @@ impl<'a> ::core::fmt::Debug for LabyrinthWaCommandView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for LabyrinthWaCommandView<'a> {}
 impl crate::protobuf::ViewReborrow for LabyrinthWaCommandView<'static> {
     type Reborrowed<'b> = LabyrinthWaCommandView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -207281,6 +207633,7 @@ impl<'a> ::core::fmt::Debug for MandrakeDecryptMekInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeDecryptMekInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeDecryptMekInputView<'static> {
     type Reborrowed<'b> = MandrakeDecryptMekInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -208202,6 +208555,7 @@ impl<'a> ::core::fmt::Debug for MandrakeDecryptMekResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeDecryptMekResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeDecryptMekResultView<'static> {
     type Reborrowed<'b> = MandrakeDecryptMekResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -208597,6 +208951,8 @@ impl<'a> ::core::fmt::Debug for MandrakeDecryptMekSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeDecryptMekSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeDecryptMekSuccessView<'static> {
     type Reborrowed<'b> = MandrakeDecryptMekSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -209169,6 +209525,7 @@ impl<'a> ::core::fmt::Debug for MandrakeEncryptMekInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeEncryptMekInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeEncryptMekInputView<'static> {
     type Reborrowed<'b> = MandrakeEncryptMekInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -209932,6 +210289,7 @@ impl<'a> ::core::fmt::Debug for MandrakeEncryptMekResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeEncryptMekResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeEncryptMekResultView<'static> {
     type Reborrowed<'b> = MandrakeEncryptMekResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -210415,6 +210773,8 @@ impl<'a> ::core::fmt::Debug for MandrakeEncryptMekSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeEncryptMekSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeEncryptMekSuccessView<'static> {
     type Reborrowed<'b> = MandrakeEncryptMekSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -210862,6 +211222,7 @@ impl<'a> ::core::fmt::Debug for MandrakeMekBundleView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeMekBundleView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeMekBundleView<'static> {
     type Reborrowed<'b> = MandrakeMekBundleView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -211477,6 +211838,7 @@ impl<'a> ::core::fmt::Debug for MandrakeOpenEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeOpenEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeOpenEpochInputView<'static> {
     type Reborrowed<'b> = MandrakeOpenEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -212110,6 +212472,7 @@ impl<'a> ::core::fmt::Debug for MandrakeOpenEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeOpenEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeOpenEpochResultView<'static> {
     type Reborrowed<'b> = MandrakeOpenEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -212557,6 +212920,7 @@ impl<'a> ::core::fmt::Debug for MandrakeOpenEpochSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MandrakeOpenEpochSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeOpenEpochSuccessView<'static> {
     type Reborrowed<'b> = MandrakeOpenEpochSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -213053,6 +213417,8 @@ impl<'a> ::core::fmt::Debug for MandrakeOpenInitialEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeOpenInitialEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeOpenInitialEpochInputView<'static> {
     type Reborrowed<'b> = MandrakeOpenInitialEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -213533,6 +213899,8 @@ impl<'a> ::core::fmt::Debug for MandrakeOpenInitialEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeOpenInitialEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeOpenInitialEpochResultView<'static> {
     type Reborrowed<'b> = MandrakeOpenInitialEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -214020,6 +214388,8 @@ impl<'a> ::core::fmt::Debug for MandrakeValidateNewMmkFromDetachedDeviceInputVie
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeValidateNewMmkFromDetachedDeviceInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for MandrakeValidateNewMmkFromDetachedDeviceInputView<'static> {
     type Reborrowed<'b> = MandrakeValidateNewMmkFromDetachedDeviceInputView<'b>;
@@ -214580,6 +214950,8 @@ impl<'a> ::core::fmt::Debug for MandrakeValidateNewMmkFromMailboxInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeValidateNewMmkFromMailboxInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for MandrakeValidateNewMmkFromMailboxInputView<'static> {
     type Reborrowed<'b> = MandrakeValidateNewMmkFromMailboxInputView<'b>;
@@ -215112,6 +215484,8 @@ impl<'a> ::core::fmt::Debug for MandrakeValidateNewMmkResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MandrakeValidateNewMmkResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MandrakeValidateNewMmkResultView<'static> {
     type Reborrowed<'b> = MandrakeValidateNewMmkResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -215546,6 +215920,7 @@ impl<'a> ::core::fmt::Debug for MekBundleView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MekBundleView<'a> {}
 impl crate::protobuf::ViewReborrow for MekBundleView<'static> {
     type Reborrowed<'b> = MekBundleView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -216020,6 +216395,7 @@ impl<'a> ::core::fmt::Debug for MentionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MentionView<'a> {}
 impl crate::protobuf::ViewReborrow for MentionView<'static> {
     type Reborrowed<'b> = MentionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -216488,6 +216864,7 @@ impl<'a> ::core::fmt::Debug for MerkleMembershipProofView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MerkleMembershipProofView<'a> {}
 impl crate::protobuf::ViewReborrow for MerkleMembershipProofView<'static> {
     type Reborrowed<'b> = MerkleMembershipProofView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -217006,6 +217383,7 @@ impl<'a> ::core::fmt::Debug for MessageTextView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MessageTextView<'a> {}
 impl crate::protobuf::ViewReborrow for MessageTextView<'static> {
     type Reborrowed<'b> = MessageTextView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -217609,6 +217987,8 @@ impl<'a> ::core::fmt::Debug for MessagingMailboxPublicDataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MessagingMailboxPublicDataView<'a> {}
 impl crate::protobuf::ViewReborrow for MessagingMailboxPublicDataView<'static> {
     type Reborrowed<'b> = MessagingMailboxPublicDataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -218087,6 +218467,7 @@ impl<'a> ::core::fmt::Debug for MinosClientConfigView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosClientConfigView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosClientConfigView<'static> {
     type Reborrowed<'b> = MinosClientConfigView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -220050,6 +220431,7 @@ impl<'a> ::core::fmt::Debug for MinosCommandView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosCommandView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosCommandView<'static> {
     type Reborrowed<'b> = MinosCommandView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -222920,6 +223302,8 @@ impl<'a> ::core::fmt::Debug for MinosDecryptAndVerifyMessageInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosDecryptAndVerifyMessageInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosDecryptAndVerifyMessageInputView<'static> {
     type Reborrowed<'b> = MinosDecryptAndVerifyMessageInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -223528,6 +223912,8 @@ impl<'a> ::core::fmt::Debug for MinosDecryptAndVerifyMessageResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosDecryptAndVerifyMessageResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosDecryptAndVerifyMessageResultView<'static> {
     type Reborrowed<'b> = MinosDecryptAndVerifyMessageResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -223927,6 +224313,8 @@ impl<'a> ::core::fmt::Debug for MinosDecryptAndVerifyMessageSuccessView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosDecryptAndVerifyMessageSuccessView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosDecryptAndVerifyMessageSuccessView<'static> {
     type Reborrowed<'b> = MinosDecryptAndVerifyMessageSuccessView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -224420,6 +224808,8 @@ impl<'a> ::core::fmt::Debug for MinosEncryptAndSignMessageInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosEncryptAndSignMessageInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosEncryptAndSignMessageInputView<'static> {
     type Reborrowed<'b> = MinosEncryptAndSignMessageInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -224994,6 +225384,8 @@ impl<'a> ::core::fmt::Debug for MinosEncryptAndSignMessageResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosEncryptAndSignMessageResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosEncryptAndSignMessageResultView<'static> {
     type Reborrowed<'b> = MinosEncryptAndSignMessageResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -225444,6 +225836,7 @@ impl<'a> ::core::fmt::Debug for MinosMessageMetadataView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosMessageMetadataView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosMessageMetadataView<'static> {
     type Reborrowed<'b> = MinosMessageMetadataView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -225994,6 +226387,7 @@ impl<'a> ::core::fmt::Debug for MinosOpenEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosOpenEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosOpenEpochInputView<'static> {
     type Reborrowed<'b> = MinosOpenEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -226439,6 +226833,7 @@ impl<'a> ::core::fmt::Debug for MinosOpenEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosOpenEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosOpenEpochResultView<'static> {
     type Reborrowed<'b> = MinosOpenEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -226819,6 +227214,8 @@ impl<'a> ::core::fmt::Debug for MinosOpenInitialEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosOpenInitialEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosOpenInitialEpochInputView<'static> {
     type Reborrowed<'b> = MinosOpenInitialEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -227172,6 +227569,8 @@ impl<'a> ::core::fmt::Debug for MinosOpenInitialEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosOpenInitialEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosOpenInitialEpochResultView<'static> {
     type Reborrowed<'b> = MinosOpenInitialEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -227574,6 +227973,7 @@ impl<'a> ::core::fmt::Debug for MinosSignedEpochView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosSignedEpochView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosSignedEpochView<'static> {
     type Reborrowed<'b> = MinosSignedEpochView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -227977,6 +228377,8 @@ impl<'a> ::core::fmt::Debug for MinosThreadIdFromActThreadIdInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosThreadIdFromActThreadIdInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosThreadIdFromActThreadIdInputView<'static> {
     type Reborrowed<'b> = MinosThreadIdFromActThreadIdInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -228260,6 +228662,8 @@ impl<'a> ::core::fmt::Debug for MinosThreadIdFromActThreadIdResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosThreadIdFromActThreadIdResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosThreadIdFromActThreadIdResultView<'static> {
     type Reborrowed<'b> = MinosThreadIdFromActThreadIdResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -228582,6 +228986,8 @@ impl<'a> ::core::fmt::Debug for MinosThreadIdFromOneToOneThreadInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosThreadIdFromOneToOneThreadInputView<'a> {}
 impl crate::protobuf::ViewReborrow
 for MinosThreadIdFromOneToOneThreadInputView<'static> {
     type Reborrowed<'b> = MinosThreadIdFromOneToOneThreadInputView<'b>;
@@ -228902,6 +229308,8 @@ impl<'a> ::core::fmt::Debug for MinosThreadIdFromOneToOneThreadResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosThreadIdFromOneToOneThreadResultView<'a> {}
 impl crate::protobuf::ViewReborrow
 for MinosThreadIdFromOneToOneThreadResultView<'static> {
     type Reborrowed<'b> = MinosThreadIdFromOneToOneThreadResultView<'b>;
@@ -229291,6 +229699,7 @@ impl<'a> ::core::fmt::Debug for MinosValidateEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosValidateEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosValidateEpochInputView<'static> {
     type Reborrowed<'b> = MinosValidateEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -229780,6 +230189,7 @@ impl<'a> ::core::fmt::Debug for MinosValidateEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MinosValidateEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosValidateEpochResultView<'static> {
     type Reborrowed<'b> = MinosValidateEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -230187,6 +230597,8 @@ impl<'a> ::core::fmt::Debug for MinosVerifySingleEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosVerifySingleEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosVerifySingleEpochInputView<'static> {
     type Reborrowed<'b> = MinosVerifySingleEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -230527,6 +230939,8 @@ impl<'a> ::core::fmt::Debug for MinosVerifySingleEpochResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MinosVerifySingleEpochResultView<'a> {}
 impl crate::protobuf::ViewReborrow for MinosVerifySingleEpochResultView<'static> {
     type Reborrowed<'b> = MinosVerifySingleEpochResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -230906,6 +231320,7 @@ impl<'a> ::core::fmt::Debug for MmkDistributionView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MmkDistributionView<'a> {}
 impl crate::protobuf::ViewReborrow for MmkDistributionView<'static> {
     type Reborrowed<'b> = MmkDistributionView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -231342,6 +231757,8 @@ impl<'a> ::core::fmt::Debug for MmkDistributionToDetachedDeviceView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for MmkDistributionToDetachedDeviceView<'a> {}
 impl crate::protobuf::ViewReborrow for MmkDistributionToDetachedDeviceView<'static> {
     type Reborrowed<'b> = MmkDistributionToDetachedDeviceView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -231692,6 +232109,7 @@ impl<'a> ::core::fmt::Debug for MmkDistributionToMailboxView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MmkDistributionToMailboxView<'a> {}
 impl crate::protobuf::ViewReborrow for MmkDistributionToMailboxView<'static> {
     type Reborrowed<'b> = MmkDistributionToMailboxView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -232103,6 +232521,7 @@ impl<'a> ::core::fmt::Debug for MmkFromDetachedDeviceView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for MmkFromDetachedDeviceView<'a> {}
 impl crate::protobuf::ViewReborrow for MmkFromDetachedDeviceView<'static> {
     type Reborrowed<'b> = MmkFromDetachedDeviceView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -232573,6 +232992,7 @@ impl<'a> ::core::fmt::Debug for OrfThreadIdInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for OrfThreadIdInputView<'a> {}
 impl crate::protobuf::ViewReborrow for OrfThreadIdInputView<'static> {
     type Reborrowed<'b> = OrfThreadIdInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -232934,6 +233354,7 @@ impl<'a> ::core::fmt::Debug for OrfThreadIdOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for OrfThreadIdOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for OrfThreadIdOutputView<'static> {
     type Reborrowed<'b> = OrfThreadIdOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -233398,6 +233819,7 @@ impl<'a> ::core::fmt::Debug for RotateEpochInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RotateEpochInputView<'a> {}
 impl crate::protobuf::ViewReborrow for RotateEpochInputView<'static> {
     type Reborrowed<'b> = RotateEpochInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -233920,6 +234342,7 @@ impl<'a> ::core::fmt::Debug for RotateEpochMemberEdgeView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RotateEpochMemberEdgeView<'a> {}
 impl crate::protobuf::ViewReborrow for RotateEpochMemberEdgeView<'static> {
     type Reborrowed<'b> = RotateEpochMemberEdgeView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -234329,6 +234752,7 @@ impl<'a> ::core::fmt::Debug for RotateEpochMemberInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RotateEpochMemberInputView<'a> {}
 impl crate::protobuf::ViewReborrow for RotateEpochMemberInputView<'static> {
     type Reborrowed<'b> = RotateEpochMemberInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -234983,6 +235407,7 @@ impl<'a> ::core::fmt::Debug for RotateEpochOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for RotateEpochOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for RotateEpochOutputView<'static> {
     type Reborrowed<'b> = RotateEpochOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -235622,6 +236047,8 @@ impl<'a> ::core::fmt::Debug for SignedMmkDistributionFromMailboxView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for SignedMmkDistributionFromMailboxView<'a> {}
 impl crate::protobuf::ViewReborrow for SignedMmkDistributionFromMailboxView<'static> {
     type Reborrowed<'b> = SignedMmkDistributionFromMailboxView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -236074,6 +236501,7 @@ impl<'a> ::core::fmt::Debug for SubProtocolView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for SubProtocolView<'a> {}
 impl crate::protobuf::ViewReborrow for SubProtocolView<'static> {
     type Reborrowed<'b> = SubProtocolView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -236602,6 +237030,7 @@ impl<'a> ::core::fmt::Debug for VirtualDeviceOutputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View for VirtualDeviceOutputView<'a> {}
 impl crate::protobuf::ViewReborrow for VirtualDeviceOutputView<'static> {
     type Reborrowed<'b> = VirtualDeviceOutputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -237106,6 +237535,8 @@ impl<'a> ::core::fmt::Debug for WrapTransportSigningPublicKeyInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for WrapTransportSigningPublicKeyInputView<'a> {}
 impl crate::protobuf::ViewReborrow for WrapTransportSigningPublicKeyInputView<'static> {
     type Reborrowed<'b> = WrapTransportSigningPublicKeyInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -237392,6 +237823,8 @@ impl<'a> ::core::fmt::Debug for WrapTransportSigningPublicKeyResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for WrapTransportSigningPublicKeyResultView<'a> {}
 impl crate::protobuf::ViewReborrow for WrapTransportSigningPublicKeyResultView<'static> {
     type Reborrowed<'b> = WrapTransportSigningPublicKeyResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -237679,6 +238112,8 @@ impl<'a> ::core::fmt::Debug for WrapTransportSigningSecretKeyInputView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for WrapTransportSigningSecretKeyInputView<'a> {}
 impl crate::protobuf::ViewReborrow for WrapTransportSigningSecretKeyInputView<'static> {
     type Reborrowed<'b> = WrapTransportSigningSecretKeyInputView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -237965,6 +238400,8 @@ impl<'a> ::core::fmt::Debug for WrapTransportSigningSecretKeyResultView<'a> {
         d.finish()
     }
 }
+impl<'a> crate::protobuf::owned_view::sealed::View
+for WrapTransportSigningSecretKeyResultView<'a> {}
 impl crate::protobuf::ViewReborrow for WrapTransportSigningSecretKeyResultView<'static> {
     type Reborrowed<'b> = WrapTransportSigningSecretKeyResultView<'b>;
     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -238587,6 +239024,7 @@ pub mod ai_home_state {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AIHomeOptionView<'a> {}
     impl crate::protobuf::ViewReborrow for AIHomeOptionView<'static> {
         type Reborrowed<'b> = AIHomeOptionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -239260,6 +239698,7 @@ pub mod ai_provenance {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for MetadataView<'static> {
         type Reborrowed<'b> = MetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -239765,6 +240204,8 @@ pub mod ai_rich_response_code_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseCodeBlockView<'a> {}
     impl crate::protobuf::ViewReborrow for AIRichResponseCodeBlockView<'static> {
         type Reborrowed<'b> = AIRichResponseCodeBlockView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -240215,6 +240656,8 @@ pub mod ai_rich_response_content_items_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseContentItemMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow
     for AIRichResponseContentItemMetadataView<'static> {
         type Reborrowed<'b> = AIRichResponseContentItemMetadataView<'b>;
@@ -240723,6 +241166,8 @@ pub mod ai_rich_response_content_items_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseReelItemView<'a> {}
     impl crate::protobuf::ViewReborrow for AIRichResponseReelItemView<'static> {
         type Reborrowed<'b> = AIRichResponseReelItemView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -241688,6 +242133,8 @@ pub mod ai_rich_response_latex_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseLatexExpressionView<'a> {}
     impl crate::protobuf::ViewReborrow for AIRichResponseLatexExpressionView<'static> {
         type Reborrowed<'b> = AIRichResponseLatexExpressionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -242432,6 +242879,8 @@ pub mod ai_rich_response_map_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseMapAnnotationView<'a> {}
     impl crate::protobuf::ViewReborrow for AIRichResponseMapAnnotationView<'static> {
         type Reborrowed<'b> = AIRichResponseMapAnnotationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -242901,6 +243350,8 @@ pub mod ai_rich_response_table_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AIRichResponseTableRowView<'a> {}
     impl crate::protobuf::ViewReborrow for AIRichResponseTableRowView<'static> {
         type Reborrowed<'b> = AIRichResponseTableRowView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -243301,6 +243752,7 @@ pub mod ai_thread_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AIThreadClientInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for AIThreadClientInfoView<'static> {
         type Reborrowed<'b> = AIThreadClientInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -243643,6 +244095,7 @@ pub mod ai_thread_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AIThreadServerInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for AIThreadServerInfoView<'static> {
         type Reborrowed<'b> = AIThreadServerInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -244272,6 +244725,7 @@ pub mod biz_ai_metadata_sync {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ServerEventView<'a> {}
     impl crate::protobuf::ViewReborrow for ServerEventView<'static> {
         type Reborrowed<'b> = ServerEventView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -244793,6 +245247,8 @@ pub mod biz_ai_metadata_sync {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for AgentOnboardingStartedView<'a> {}
         impl crate::protobuf::ViewReborrow for AgentOnboardingStartedView<'static> {
             type Reborrowed<'b> = AgentOnboardingStartedView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -247122,6 +247578,8 @@ pub mod bot_feedback_message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SideBySideSurveyMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for SideBySideSurveyMetadataView<'static> {
         type Reborrowed<'b> = SideBySideSurveyMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -247845,6 +248303,8 @@ pub mod bot_feedback_message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for SideBySideSurveyAnalyticsDataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for SideBySideSurveyAnalyticsDataView<'static> {
             type Reborrowed<'b> = SideBySideSurveyAnalyticsDataView<'b>;
@@ -248595,6 +249055,8 @@ pub mod bot_feedback_message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for SidebySideSurveyMetaAiAnalyticsDataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for SidebySideSurveyMetaAiAnalyticsDataView<'static> {
             type Reborrowed<'b> = SidebySideSurveyMetaAiAnalyticsDataView<'b>;
@@ -249366,6 +249828,8 @@ pub mod bot_feedback_message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SideBySideSurveyAbandonEventDataView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SideBySideSurveyAbandonEventDataView<'static> {
                 type Reborrowed<'b> = SideBySideSurveyAbandonEventDataView<'b>;
@@ -249750,6 +250214,8 @@ pub mod bot_feedback_message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SideBySideSurveyCTAClickEventDataView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SideBySideSurveyCTAClickEventDataView<'static> {
                 type Reborrowed<'b> = SideBySideSurveyCTAClickEventDataView<'b>;
@@ -250126,6 +250592,8 @@ pub mod bot_feedback_message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SideBySideSurveyCTAImpressionEventDataView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SideBySideSurveyCTAImpressionEventDataView<'static> {
                 type Reborrowed<'b> = SideBySideSurveyCTAImpressionEventDataView<'b>;
@@ -250420,6 +250888,8 @@ pub mod bot_feedback_message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SideBySideSurveyCardImpressionEventDataView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SideBySideSurveyCardImpressionEventDataView<'static> {
                 type Reborrowed<'b> = SideBySideSurveyCardImpressionEventDataView<'b>;
@@ -250775,6 +251245,8 @@ pub mod bot_feedback_message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SideBySideSurveyResponseEventDataView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SideBySideSurveyResponseEventDataView<'static> {
                 type Reborrowed<'b> = SideBySideSurveyResponseEventDataView<'b>;
@@ -252207,6 +252679,8 @@ pub mod bot_progress_indicator_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BotPlanningStepMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for BotPlanningStepMetadataView<'static> {
         type Reborrowed<'b> = BotPlanningStepMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -253074,6 +253548,8 @@ pub mod bot_progress_indicator_metadata {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for BotPlanningSearchSourceMetadataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for BotPlanningSearchSourceMetadataView<'static> {
             type Reborrowed<'b> = BotPlanningSearchSourceMetadataView<'b>;
@@ -253597,6 +254073,8 @@ pub mod bot_progress_indicator_metadata {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for BotPlanningSearchSourcesMetadataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for BotPlanningSearchSourcesMetadataView<'static> {
             type Reborrowed<'b> = BotPlanningSearchSourcesMetadataView<'b>;
@@ -254093,6 +254571,8 @@ pub mod bot_progress_indicator_metadata {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for BotPlanningStepSectionMetadataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for BotPlanningStepSectionMetadataView<'static> {
             type Reborrowed<'b> = BotPlanningStepSectionMetadataView<'b>;
@@ -254771,6 +255251,8 @@ pub mod bot_quota_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BotFeatureQuotaMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for BotFeatureQuotaMetadataView<'static> {
         type Reborrowed<'b> = BotFeatureQuotaMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -255431,6 +255913,7 @@ pub mod bot_rendering_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for KeywordView<'a> {}
     impl crate::protobuf::ViewReborrow for KeywordView<'static> {
         type Reborrowed<'b> = KeywordView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -255918,6 +256401,7 @@ pub mod bot_signature_verification_use_case_proof {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CertificateSKIView<'a> {}
     impl crate::protobuf::ViewReborrow for CertificateSKIView<'static> {
         type Reborrowed<'b> = CertificateSKIView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -256531,6 +257015,7 @@ pub mod bot_sources_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for BotSourceItemView<'a> {}
     impl crate::protobuf::ViewReborrow for BotSourceItemView<'static> {
         type Reborrowed<'b> = BotSourceItemView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -257213,6 +257698,7 @@ pub mod bot_unified_response_mutation {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MediaDetailsMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for MediaDetailsMetadataView<'static> {
         type Reborrowed<'b> = MediaDetailsMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -257687,6 +258173,7 @@ pub mod bot_unified_response_mutation {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SideBySideMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for SideBySideMetadataView<'static> {
         type Reborrowed<'b> = SideBySideMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -258311,6 +258798,7 @@ pub mod call_log_record {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for GuestInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for GuestInfoView<'static> {
         type Reborrowed<'b> = GuestInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -258711,6 +259199,7 @@ pub mod call_log_record {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ParticipantInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for ParticipantInfoView<'static> {
         type Reborrowed<'b> = ParticipantInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -259169,6 +259658,7 @@ pub mod cert_chain {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for NoiseCertificateView<'a> {}
     impl crate::protobuf::ViewReborrow for NoiseCertificateView<'static> {
         type Reborrowed<'b> = NoiseCertificateView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -259662,6 +260152,7 @@ pub mod cert_chain {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for DetailsView<'a> {}
         impl crate::protobuf::ViewReborrow for DetailsView<'static> {
             type Reborrowed<'b> = DetailsView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -260266,6 +260757,7 @@ pub mod chat_row_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DraftMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for DraftMessageView<'static> {
         type Reborrowed<'b> = DraftMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -261247,6 +261739,7 @@ pub mod chat_row_opaque_data {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for CtwaContextDataView<'a> {}
         impl crate::protobuf::ViewReborrow for CtwaContextDataView<'static> {
             type Reborrowed<'b> = CtwaContextDataView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -262036,6 +262529,8 @@ pub mod chat_row_opaque_data {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for CtwaContextLinkDataView<'a> {}
         impl crate::protobuf::ViewReborrow for CtwaContextLinkDataView<'static> {
             type Reborrowed<'b> = CtwaContextLinkDataView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -263137,6 +263632,7 @@ pub mod client_payload {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DNSSourceView<'a> {}
     impl crate::protobuf::ViewReborrow for DNSSourceView<'static> {
         type Reborrowed<'b> = DNSSourceView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -263777,6 +264273,8 @@ pub mod client_payload {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DevicePairingRegistrationDataView<'a> {}
     impl crate::protobuf::ViewReborrow for DevicePairingRegistrationDataView<'static> {
         type Reborrowed<'b> = DevicePairingRegistrationDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -264369,6 +264867,7 @@ pub mod client_payload {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for InteropDataView<'a> {}
     impl crate::protobuf::ViewReborrow for InteropDataView<'static> {
         type Reborrowed<'b> = InteropDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -265472,6 +265971,7 @@ pub mod client_payload {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for UserAgentView<'a> {}
     impl crate::protobuf::ViewReborrow for UserAgentView<'static> {
         type Reborrowed<'b> = UserAgentView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -266569,6 +267069,7 @@ pub mod client_payload {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for WebInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for WebInfoView<'static> {
         type Reborrowed<'b> = WebInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -267942,6 +268443,7 @@ pub mod client_payload {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for AppVersionView<'a> {}
         impl crate::protobuf::ViewReborrow for AppVersionView<'static> {
             type Reborrowed<'b> = AppVersionView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -268873,6 +269375,7 @@ pub mod client_payload {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for WebdPayloadView<'a> {}
         impl crate::protobuf::ViewReborrow for WebdPayloadView<'static> {
             type Reborrowed<'b> = WebdPayloadView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -269562,6 +270065,7 @@ pub mod coex_state_sync {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CollectionMutationsView<'a> {}
     impl crate::protobuf::ViewReborrow for CollectionMutationsView<'static> {
         type Reborrowed<'b> = CollectionMutationsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -270073,6 +270577,7 @@ pub mod coex_state_sync {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MutationView<'a> {}
     impl crate::protobuf::ViewReborrow for MutationView<'static> {
         type Reborrowed<'b> = MutationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -270635,6 +271140,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ApplicationDataView<'a> {}
     impl crate::protobuf::ViewReborrow for ApplicationDataView<'static> {
         type Reborrowed<'b> = ApplicationDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -271043,6 +271549,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AudioMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for AudioMessageView<'static> {
         type Reborrowed<'b> = AudioMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -271409,6 +271916,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactMessageView<'static> {
         type Reborrowed<'b> = ContactMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -271800,6 +272308,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactsArrayMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactsArrayMessageView<'static> {
         type Reborrowed<'b> = ContactsArrayMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -273182,6 +273691,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContentView<'a> {}
     impl crate::protobuf::ViewReborrow for ContentView<'static> {
         type Reborrowed<'b> = ContentView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -274982,6 +275492,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DocumentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for DocumentMessageView<'static> {
         type Reborrowed<'b> = DocumentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -275436,6 +275947,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EditMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EditMessageView<'static> {
         type Reborrowed<'b> = EditMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -276140,6 +276652,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ExtendedTextMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ExtendedTextMessageView<'static> {
         type Reborrowed<'b> = ExtendedTextMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -276918,6 +277431,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for GroupInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for GroupInviteMessageView<'static> {
         type Reborrowed<'b> = GroupInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -277453,6 +277967,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ImageMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ImageMessageView<'static> {
         type Reborrowed<'b> = ImageMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -277939,6 +278454,8 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InteractiveAnnotationView<'a> {}
     impl crate::protobuf::ViewReborrow for InteractiveAnnotationView<'static> {
         type Reborrowed<'b> = InteractiveAnnotationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -278618,6 +279135,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LiveLocationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for LiveLocationMessageView<'static> {
         type Reborrowed<'b> = LiveLocationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -279260,6 +279778,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LocationView<'a> {}
     impl crate::protobuf::ViewReborrow for LocationView<'static> {
         type Reborrowed<'b> = LocationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -279668,6 +280187,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LocationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for LocationMessageView<'static> {
         type Reborrowed<'b> = LocationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -280038,6 +280558,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MediaPayloadView<'a> {}
     impl crate::protobuf::ViewReborrow for MediaPayloadView<'static> {
         type Reborrowed<'b> = MediaPayloadView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -280385,6 +280906,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for MetadataView<'static> {
         type Reborrowed<'b> = MetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -280688,6 +281210,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for OptionView<'a> {}
     impl crate::protobuf::ViewReborrow for OptionView<'static> {
         type Reborrowed<'b> = OptionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -281183,6 +281706,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PayloadView<'a> {}
     impl crate::protobuf::ViewReborrow for PayloadView<'static> {
         type Reborrowed<'b> = PayloadView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -281827,6 +282351,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PointView<'a> {}
     impl crate::protobuf::ViewReborrow for PointView<'static> {
         type Reborrowed<'b> = PointView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -282168,6 +282693,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollAddOptionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollAddOptionMessageView<'static> {
         type Reborrowed<'b> = PollAddOptionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -282641,6 +283167,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollCreationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollCreationMessageView<'static> {
         type Reborrowed<'b> = PollCreationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -283115,6 +283642,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollEncValueView<'a> {}
     impl crate::protobuf::ViewReborrow for PollEncValueView<'static> {
         type Reborrowed<'b> = PollEncValueView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -283542,6 +284070,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollUpdateMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollUpdateMessageView<'static> {
         type Reborrowed<'b> = PollUpdateMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -284055,6 +284584,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollVoteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollVoteMessageView<'static> {
         type Reborrowed<'b> = PollVoteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -284604,6 +285134,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ReactionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ReactionMessageView<'static> {
         type Reborrowed<'b> = ReactionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -285095,6 +285626,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for RevokeMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RevokeMessageView<'static> {
         type Reborrowed<'b> = RevokeMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -285376,6 +285908,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SignalView<'a> {}
     impl crate::protobuf::ViewReborrow for SignalView<'static> {
         type Reborrowed<'b> = SignalView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -285780,6 +286313,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StatusTextMesageView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusTextMesageView<'static> {
         type Reborrowed<'b> = StatusTextMesageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -286224,6 +286758,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StickerMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StickerMessageView<'static> {
         type Reborrowed<'b> = StickerMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -286571,6 +287106,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SubProtocolPayloadView<'a> {}
     impl crate::protobuf::ViewReborrow for SubProtocolPayloadView<'static> {
         type Reborrowed<'b> = SubProtocolPayloadView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -286933,6 +287469,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for VideoMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for VideoMessageView<'static> {
         type Reborrowed<'b> = VideoMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -287419,6 +287956,7 @@ pub mod consumer_application {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ViewOnceMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ViewOnceMessageView<'static> {
         type Reborrowed<'b> = ViewOnceMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -288973,6 +289511,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AdReplyInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for AdReplyInfoView<'static> {
         type Reborrowed<'b> = AdReplyInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -289624,6 +290163,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessInteractionPillsView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessInteractionPillsView<'static> {
         type Reborrowed<'b> = BusinessInteractionPillsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -290203,6 +290744,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessMessageForwardInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessMessageForwardInfoView<'static> {
         type Reborrowed<'b> = BusinessMessageForwardInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -290647,6 +291190,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DataSharingContextView<'a> {}
     impl crate::protobuf::ViewReborrow for DataSharingContextView<'static> {
         type Reborrowed<'b> = DataSharingContextView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -292762,6 +293306,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ExternalAdReplyInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for ExternalAdReplyInfoView<'static> {
         type Reborrowed<'b> = ExternalAdReplyInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -294453,6 +294998,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FeatureEligibilitiesView<'a> {}
     impl crate::protobuf::ViewReborrow for FeatureEligibilitiesView<'static> {
         type Reborrowed<'b> = FeatureEligibilitiesView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -295095,6 +295641,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ForwardedNewsletterMessageInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for ForwardedNewsletterMessageInfoView<'static> {
         type Reborrowed<'b> = ForwardedNewsletterMessageInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -295561,6 +296109,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for InstagramThreadLinkView<'a> {}
     impl crate::protobuf::ViewReborrow for InstagramThreadLinkView<'static> {
         type Reborrowed<'b> = InstagramThreadLinkView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -295865,6 +296414,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PartiallySelectedContentView<'a> {}
     impl crate::protobuf::ViewReborrow for PartiallySelectedContentView<'static> {
         type Reborrowed<'b> = PartiallySelectedContentView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -296257,6 +296808,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for QuestionReplyQuotedMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for QuestionReplyQuotedMessageView<'static> {
         type Reborrowed<'b> = QuestionReplyQuotedMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -296832,6 +297385,8 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusAudienceMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusAudienceMetadataView<'static> {
         type Reborrowed<'b> = StatusAudienceMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -297281,6 +297836,7 @@ pub mod context_info {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for UTMInfoView<'a> {}
     impl crate::protobuf::ViewReborrow for UTMInfoView<'static> {
         type Reborrowed<'b> = UTMInfoView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -297989,6 +298545,7 @@ pub mod context_info {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for PillView<'a> {}
         impl crate::protobuf::ViewReborrow for PillView<'static> {
             type Reborrowed<'b> = PillView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -298388,6 +298945,7 @@ pub mod context_info {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for SignedPayloadView<'a> {}
         impl crate::protobuf::ViewReborrow for SignedPayloadView<'static> {
             type Reborrowed<'b> = SignedPayloadView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -298892,6 +299450,8 @@ pub mod context_info {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for UnauthenticatedBusinessMetadataView<'a> {}
         impl crate::protobuf::ViewReborrow
         for UnauthenticatedBusinessMetadataView<'static> {
             type Reborrowed<'b> = UnauthenticatedBusinessMetadataView<'b>;
@@ -299559,6 +300119,7 @@ pub mod context_info {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ParametersView<'a> {}
         impl crate::protobuf::ViewReborrow for ParametersView<'static> {
             type Reborrowed<'b> = ParametersView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -300686,6 +301247,8 @@ pub mod decrypt_mek_for_distribution_from_transport_sender_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for TransportSenderMEKDistributionSingleRecipientView<'a> {}
     impl crate::protobuf::ViewReborrow
     for TransportSenderMEKDistributionSingleRecipientView<'static> {
         type Reborrowed<'b> = TransportSenderMEKDistributionSingleRecipientView<'b>;
@@ -301469,6 +302032,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AiFbidMigrationView<'a> {}
     impl crate::protobuf::ViewReborrow for AiFbidMigrationView<'static> {
         type Reborrowed<'b> = AiFbidMigrationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -301810,6 +302374,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AiThreadView<'a> {}
     impl crate::protobuf::ViewReborrow for AiThreadView<'static> {
         type Reborrowed<'b> = AiThreadView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -302115,6 +302680,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for BizAiSettingsSyncView<'a> {}
     impl crate::protobuf::ViewReborrow for BizAiSettingsSyncView<'static> {
         type Reborrowed<'b> = BizAiSettingsSyncView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -302413,6 +302979,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for BizAiWebOnboardingView<'a> {}
     impl crate::protobuf::ViewReborrow for BizAiWebOnboardingView<'static> {
         type Reborrowed<'b> = BizAiWebOnboardingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -302905,6 +303472,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for BusinessBroadcastView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessBroadcastView<'static> {
         type Reborrowed<'b> = BusinessBroadcastView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -303346,6 +303914,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactRefreshView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactRefreshView<'static> {
         type Reborrowed<'b> = ContactRefreshView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -303644,6 +304213,8 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HostWriteMutationSupportView<'a> {}
     impl crate::protobuf::ViewReborrow for HostWriteMutationSupportView<'static> {
         type Reborrowed<'b> = HostWriteMutationSupportView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -303950,6 +304521,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LIDMigrationView<'a> {}
     impl crate::protobuf::ViewReborrow for LIDMigrationView<'static> {
         type Reborrowed<'b> = LIDMigrationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -304324,6 +304896,8 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for NewsletterChatsMigrationView<'a> {}
     impl crate::protobuf::ViewReborrow for NewsletterChatsMigrationView<'static> {
         type Reborrowed<'b> = NewsletterChatsMigrationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -304706,6 +305280,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ReverseHistorySyncView<'a> {}
     impl crate::protobuf::ViewReborrow for ReverseHistorySyncView<'static> {
         type Reborrowed<'b> = ReverseHistorySyncView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -305031,6 +305606,7 @@ pub mod device_capabilities {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for UserHasAvatarView<'a> {}
     impl crate::protobuf::ViewReborrow for UserHasAvatarView<'static> {
         type Reborrowed<'b> = UserHasAvatarView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -305906,6 +306482,7 @@ pub mod device_props {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AppVersionView<'a> {}
     impl crate::protobuf::ViewReborrow for AppVersionView<'static> {
         type Reborrowed<'b> = AppVersionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -307336,6 +307913,7 @@ pub mod device_props {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for HistorySyncConfigView<'a> {}
     impl crate::protobuf::ViewReborrow for HistorySyncConfigView<'static> {
         type Reborrowed<'b> = HistorySyncConfigView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -308684,6 +309262,7 @@ pub mod encrypt_mek_for_distribution_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MailboxAuthKPView<'a> {}
     impl crate::protobuf::ViewReborrow for MailboxAuthKPView<'static> {
         type Reborrowed<'b> = MailboxAuthKPView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -309054,6 +309633,7 @@ pub mod encrypt_meks_for_distribution_from_transport_sender_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for TransportSigningKPView<'a> {}
     impl crate::protobuf::ViewReborrow for TransportSigningKPView<'static> {
         type Reborrowed<'b> = TransportSigningKPView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -309752,6 +310332,7 @@ pub mod extended_content_message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CTAView<'a> {}
     impl crate::protobuf::ViewReborrow for CTAView<'static> {
         type Reborrowed<'b> = CTAView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -310763,6 +311344,7 @@ pub mod handshake_message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ClientFinishView<'a> {}
     impl crate::protobuf::ViewReborrow for ClientFinishView<'static> {
         type Reborrowed<'b> = ClientFinishView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -311573,6 +312155,7 @@ pub mod handshake_message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ClientHelloView<'a> {}
     impl crate::protobuf::ViewReborrow for ClientHelloView<'static> {
         type Reborrowed<'b> = ClientHelloView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -312373,6 +312956,7 @@ pub mod handshake_message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ServerHelloView<'a> {}
     impl crate::protobuf::ViewReborrow for ServerHelloView<'static> {
         type Reborrowed<'b> = ServerHelloView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -313107,6 +313691,7 @@ pub mod hydrated_template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for HydratedCallButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for HydratedCallButtonView<'static> {
         type Reborrowed<'b> = HydratedCallButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -313486,6 +314071,8 @@ pub mod hydrated_template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HydratedQuickReplyButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for HydratedQuickReplyButtonView<'static> {
         type Reborrowed<'b> = HydratedQuickReplyButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -313963,6 +314550,7 @@ pub mod hydrated_template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for HydratedURLButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for HydratedURLButtonView<'static> {
         type Reborrowed<'b> = HydratedURLButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -314535,6 +315123,7 @@ pub mod in_thread_survey_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for InThreadSurveyOptionView<'a> {}
     impl crate::protobuf::ViewReborrow for InThreadSurveyOptionView<'static> {
         type Reborrowed<'b> = InThreadSurveyOptionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -314940,6 +315529,8 @@ pub mod in_thread_survey_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InThreadSurveyPrivacyStatementPartView<'a> {}
     impl crate::protobuf::ViewReborrow
     for InThreadSurveyPrivacyStatementPartView<'static> {
         type Reborrowed<'b> = InThreadSurveyPrivacyStatementPartView<'b>;
@@ -315387,6 +315978,8 @@ pub mod in_thread_survey_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InThreadSurveyQuestionView<'a> {}
     impl crate::protobuf::ViewReborrow for InThreadSurveyQuestionView<'static> {
         type Reborrowed<'b> = InThreadSurveyQuestionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -316112,6 +316705,8 @@ pub mod mandrake_decrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for EpochSenderPublicDataView<'a> {}
     impl crate::protobuf::ViewReborrow for EpochSenderPublicDataView<'static> {
         type Reborrowed<'b> = EpochSenderPublicDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -316454,6 +317049,7 @@ pub mod mandrake_decrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MmkSenderPublicDataView<'a> {}
     impl crate::protobuf::ViewReborrow for MmkSenderPublicDataView<'static> {
         type Reborrowed<'b> = MmkSenderPublicDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -316824,6 +317420,8 @@ pub mod mandrake_decrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PrecomputedEpochSenderPublicDataView<'a> {}
     impl crate::protobuf::ViewReborrow
     for PrecomputedEpochSenderPublicDataView<'static> {
         type Reborrowed<'b> = PrecomputedEpochSenderPublicDataView<'b>;
@@ -317320,6 +317918,7 @@ pub mod mandrake_encrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DetachedDeviceSenderView<'a> {}
     impl crate::protobuf::ViewReborrow for DetachedDeviceSenderView<'static> {
         type Reborrowed<'b> = DetachedDeviceSenderView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -317801,6 +318400,7 @@ pub mod mandrake_encrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EpochSenderView<'a> {}
     impl crate::protobuf::ViewReborrow for EpochSenderView<'static> {
         type Reborrowed<'b> = EpochSenderView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -318275,6 +318875,7 @@ pub mod mandrake_encrypt_mek_input {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MmkSenderView<'a> {}
     impl crate::protobuf::ViewReborrow for MmkSenderView<'static> {
         type Reborrowed<'b> = MmkSenderView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -318790,6 +319391,8 @@ pub mod mandrake_encrypt_mek_success {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MekDistributionSingleRecipientView<'a> {}
     impl crate::protobuf::ViewReborrow for MekDistributionSingleRecipientView<'static> {
         type Reborrowed<'b> = MekDistributionSingleRecipientView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -319523,6 +320126,8 @@ pub mod media_entry {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DownloadableThumbnailView<'a> {}
     impl crate::protobuf::ViewReborrow for DownloadableThumbnailView<'static> {
         type Reborrowed<'b> = DownloadableThumbnailView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -320026,6 +320631,8 @@ pub mod media_entry {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ProgressiveJpegDetailsView<'a> {}
     impl crate::protobuf::ViewReborrow for ProgressiveJpegDetailsView<'static> {
         type Reborrowed<'b> = ProgressiveJpegDetailsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -321092,6 +321699,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AlbumMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for AlbumMessageView<'static> {
         type Reborrowed<'b> = AlbumMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -321523,6 +322131,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AppStateFatalExceptionNotificationView<'a> {}
     impl crate::protobuf::ViewReborrow
     for AppStateFatalExceptionNotificationView<'static> {
         type Reborrowed<'b> = AppStateFatalExceptionNotificationView<'b>;
@@ -321918,6 +322528,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AppStateSyncKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -322407,6 +323018,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AppStateSyncKeyDataView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyDataView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -322922,6 +323534,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AppStateSyncKeyFingerprintView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyFingerprintView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyFingerprintView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -323320,6 +323934,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AppStateSyncKeyIdView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyIdView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyIdView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -323632,6 +324247,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AppStateSyncKeyRequestView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyRequestView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyRequestView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -323980,6 +324597,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AppStateSyncKeyShareView<'a> {}
     impl crate::protobuf::ViewReborrow for AppStateSyncKeyShareView<'static> {
         type Reborrowed<'b> = AppStateSyncKeyShareView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -324940,6 +325558,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AudioMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for AudioMessageView<'static> {
         type Reborrowed<'b> = AudioMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -325865,6 +326484,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for BCallMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for BCallMessageView<'static> {
         type Reborrowed<'b> = BCallMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -326367,6 +326987,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BotHistoryShareSyncMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for BotHistoryShareSyncMetadataView<'static> {
         type Reborrowed<'b> = BotHistoryShareSyncMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -327253,6 +327875,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ButtonsMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ButtonsMessageView<'static> {
         type Reborrowed<'b> = ButtonsMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -328301,6 +328924,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ButtonsResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ButtonsResponseMessageView<'static> {
         type Reborrowed<'b> = ButtonsResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -329246,6 +329871,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CallView<'a> {}
     impl crate::protobuf::ViewReborrow for CallView<'static> {
         type Reborrowed<'b> = CallView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -330150,6 +330776,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CallLogMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for CallLogMessageView<'static> {
         type Reborrowed<'b> = CallLogMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -330626,6 +331253,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CancelPaymentRequestMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for CancelPaymentRequestMessageView<'static> {
         type Reborrowed<'b> = CancelPaymentRequestMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -331010,6 +331639,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ChatView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatView<'static> {
         type Reborrowed<'b> = ChatView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -331380,6 +332010,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ChatAnimatedWallpaperView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatAnimatedWallpaperView<'static> {
         type Reborrowed<'b> = ChatAnimatedWallpaperView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -331894,6 +332526,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ChatCustomImageWallpaperView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatCustomImageWallpaperView<'static> {
         type Reborrowed<'b> = ChatCustomImageWallpaperView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -332316,6 +332950,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ChatDefaultWallpaperView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatDefaultWallpaperView<'static> {
         type Reborrowed<'b> = ChatDefaultWallpaperView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -332849,6 +333484,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ChatSolidColorWallpaperView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatSolidColorWallpaperView<'static> {
         type Reborrowed<'b> = ChatSolidColorWallpaperView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -333364,6 +334001,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ChatStockImageWallpaperView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatStockImageWallpaperView<'static> {
         type Reborrowed<'b> = ChatStockImageWallpaperView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -334083,6 +334722,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ChatThemeSettingView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatThemeSettingView<'static> {
         type Reborrowed<'b> = ChatThemeSettingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -335090,6 +335730,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CloudAPIThreadControlNotificationView<'a> {}
     impl crate::protobuf::ViewReborrow
     for CloudAPIThreadControlNotificationView<'static> {
         type Reborrowed<'b> = CloudAPIThreadControlNotificationView<'b>;
@@ -335644,6 +336286,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CoexConnectionDescriptorView<'a> {}
     impl crate::protobuf::ViewReborrow for CoexConnectionDescriptorView<'static> {
         type Reborrowed<'b> = CoexConnectionDescriptorView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -336024,6 +336668,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CommentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for CommentMessageView<'static> {
         type Reborrowed<'b> = CommentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -336570,6 +337215,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ConditionalRevealMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ConditionalRevealMessageView<'static> {
         type Reborrowed<'b> = ConditionalRevealMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -337105,6 +337752,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactMessageView<'static> {
         type Reborrowed<'b> = ContactMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -337627,6 +338275,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactsArrayMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactsArrayMessageView<'static> {
         type Reborrowed<'b> = ContactsArrayMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -338064,6 +338713,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DeclinePaymentRequestMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for DeclinePaymentRequestMessageView<'static> {
         type Reborrowed<'b> = DeclinePaymentRequestMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -338493,6 +339144,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DeviceSentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for DeviceSentMessageView<'static> {
         type Reborrowed<'b> = DeviceSentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -339724,6 +340376,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DocumentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for DocumentMessageView<'static> {
         type Reborrowed<'b> = DocumentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -340748,6 +341401,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EncCommentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EncCommentMessageView<'static> {
         type Reborrowed<'b> = EncCommentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -341235,6 +341889,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for EncEventResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EncEventResponseMessageView<'static> {
         type Reborrowed<'b> = EncEventResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -341727,6 +342383,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EncReactionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EncReactionMessageView<'static> {
         type Reborrowed<'b> = EncReactionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -342638,6 +343295,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EventInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EventInviteMessageView<'static> {
         type Reborrowed<'b> = EventInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -343786,6 +344444,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EventMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EventMessageView<'static> {
         type Reborrowed<'b> = EventMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -344562,6 +345221,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EventResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for EventResponseMessageView<'static> {
         type Reborrowed<'b> = EventResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -346313,6 +346973,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ExtendedTextMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ExtendedTextMessageView<'static> {
         type Reborrowed<'b> = ExtendedTextMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -347882,6 +348543,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for FullHistorySyncOnDemandConfigView<'a> {}
     impl crate::protobuf::ViewReborrow for FullHistorySyncOnDemandConfigView<'static> {
         type Reborrowed<'b> = FullHistorySyncOnDemandConfigView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -348349,6 +349012,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for FullHistorySyncOnDemandRequestMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow
     for FullHistorySyncOnDemandRequestMetadataView<'static> {
         type Reborrowed<'b> = FullHistorySyncOnDemandRequestMetadataView<'b>;
@@ -348799,6 +349464,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FutureProofMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for FutureProofMessageView<'static> {
         type Reborrowed<'b> = FutureProofMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -349450,6 +350116,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for GroupInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for GroupInviteMessageView<'static> {
         type Reborrowed<'b> = GroupInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -350365,6 +351032,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HighlyStructuredMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for HighlyStructuredMessageView<'static> {
         type Reborrowed<'b> = HighlyStructuredMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -351036,6 +351705,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HistoryShareMessageEntryView<'a> {}
     impl crate::protobuf::ViewReborrow for HistoryShareMessageEntryView<'static> {
         type Reborrowed<'b> = HistoryShareMessageEntryView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -351371,6 +352042,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HistorySyncMessageAccessStatusView<'a> {}
     impl crate::protobuf::ViewReborrow for HistorySyncMessageAccessStatusView<'static> {
         type Reborrowed<'b> = HistorySyncMessageAccessStatusView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -352300,6 +352973,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for HistorySyncNotificationView<'a> {}
     impl crate::protobuf::ViewReborrow for HistorySyncNotificationView<'static> {
         type Reborrowed<'b> = HistorySyncNotificationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -354382,6 +355057,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ImageMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ImageMessageView<'static> {
         type Reborrowed<'b> = ImageMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -355684,6 +356360,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InitialSecurityNotificationSettingSyncView<'a> {}
     impl crate::protobuf::ViewReborrow
     for InitialSecurityNotificationSettingSyncView<'static> {
         type Reborrowed<'b> = InitialSecurityNotificationSettingSyncView<'b>;
@@ -356481,6 +357159,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for InteractiveMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for InteractiveMessageView<'static> {
         type Reborrowed<'b> = InteractiveMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -357616,6 +358295,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InteractiveResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for InteractiveResponseMessageView<'static> {
         type Reborrowed<'b> = InteractiveResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -358515,6 +359196,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for InvoiceMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for InvoiceMessageView<'static> {
         type Reborrowed<'b> = InvoiceMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -359211,6 +359893,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for KeepInChatMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for KeepInChatMessageView<'static> {
         type Reborrowed<'b> = KeepInChatMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -359963,6 +360646,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LinkPreviewMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for LinkPreviewMetadataView<'static> {
         type Reborrowed<'b> = LinkPreviewMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -360955,6 +361639,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ListMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ListMessageView<'static> {
         type Reborrowed<'b> = ListMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -361773,6 +362458,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ListResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ListResponseMessageView<'static> {
         type Reborrowed<'b> = ListResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -362653,6 +363339,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LiveLocationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for LiveLocationMessageView<'static> {
         type Reborrowed<'b> = LiveLocationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -363733,6 +364420,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LocationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for LocationMessageView<'static> {
         type Reborrowed<'b> = LocationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -364653,6 +365341,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MMSThumbnailMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for MMSThumbnailMetadataView<'static> {
         type Reborrowed<'b> = MMSThumbnailMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -365258,6 +365947,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MarkAsVerifiedActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MarkAsVerifiedActionView<'static> {
         type Reborrowed<'b> = MarkAsVerifiedActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -365953,6 +366643,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MessageHistoryBundleView<'a> {}
     impl crate::protobuf::ViewReborrow for MessageHistoryBundleView<'static> {
         type Reborrowed<'b> = MessageHistoryBundleView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -366737,6 +367428,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MessageHistoryMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for MessageHistoryMetadataView<'static> {
         type Reborrowed<'b> = MessageHistoryMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -367299,6 +367992,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MessageHistoryNoticeView<'a> {}
     impl crate::protobuf::ViewReborrow for MessageHistoryNoticeView<'static> {
         type Reborrowed<'b> = MessageHistoryNoticeView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -367992,6 +368686,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MusicMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for MusicMessageView<'static> {
         type Reborrowed<'b> = MusicMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -368760,6 +369455,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for NewsletterAdminInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for NewsletterAdminInviteMessageView<'static> {
         type Reborrowed<'b> = NewsletterAdminInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -369424,6 +370121,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for NewsletterFollowerInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for NewsletterFollowerInviteMessageView<'static> {
         type Reborrowed<'b> = NewsletterFollowerInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -370504,6 +371203,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for OrderMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for OrderMessageView<'static> {
         type Reborrowed<'b> = OrderMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -371395,6 +372095,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PaymentExtendedMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentExtendedMetadataView<'static> {
         type Reborrowed<'b> = PaymentExtendedMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -371948,6 +372650,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PaymentInviteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentInviteMessageView<'static> {
         type Reborrowed<'b> = PaymentInviteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -372487,6 +373190,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PaymentLinkMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentLinkMetadataView<'static> {
         type Reborrowed<'b> = PaymentLinkMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -373334,6 +374038,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PaymentReminderMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentReminderMessageView<'static> {
         type Reborrowed<'b> = PaymentReminderMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -374583,6 +375289,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PeerDataOperationRequestMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PeerDataOperationRequestMessageView<'static> {
         type Reborrowed<'b> = PeerDataOperationRequestMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -375875,6 +376583,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PeerDataOperationRequestResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow
     for PeerDataOperationRequestResponseMessageView<'static> {
         type Reborrowed<'b> = PeerDataOperationRequestResponseMessageView<'b>;
@@ -376397,6 +377107,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PinInChatMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PinInChatMessageView<'static> {
         type Reborrowed<'b> = PinInChatMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -376812,6 +377523,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PlaceholderMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PlaceholderMessageView<'static> {
         type Reborrowed<'b> = PlaceholderMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -377223,6 +377935,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollAddOptionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollAddOptionMessageView<'static> {
         type Reborrowed<'b> = PollAddOptionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -378152,6 +378865,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollCreationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollCreationMessageView<'static> {
         type Reborrowed<'b> = PollCreationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -378924,6 +379638,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollEncValueView<'a> {}
     impl crate::protobuf::ViewReborrow for PollEncValueView<'static> {
         type Reborrowed<'b> = PollEncValueView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -379410,6 +380125,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PollResultSnapshotMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollResultSnapshotMessageView<'static> {
         type Reborrowed<'b> = PollResultSnapshotMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -380019,6 +380736,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollUpdateMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollUpdateMessageView<'static> {
         type Reborrowed<'b> = PollUpdateMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -380564,6 +381282,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PollUpdateMessageMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for PollUpdateMessageMetadataView<'static> {
         type Reborrowed<'b> = PollUpdateMessageMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -380901,6 +381621,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollVoteMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for PollVoteMessageView<'static> {
         type Reborrowed<'b> = PollVoteMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -381435,6 +382156,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ProductMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ProductMessageView<'static> {
         type Reborrowed<'b> = ProductMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -383514,6 +384236,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ProtocolMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ProtocolMessageView<'static> {
         type Reborrowed<'b> = ProtocolMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -385860,6 +386583,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for QuestionResponseMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for QuestionResponseMessageView<'static> {
         type Reborrowed<'b> = QuestionResponseMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -386357,6 +387082,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ReactionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ReactionMessageView<'static> {
         type Reborrowed<'b> = ReactionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -386785,6 +387511,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RequestLocationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RequestLocationMessageView<'static> {
         type Reborrowed<'b> = RequestLocationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -387222,6 +387950,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RequestLocationUpdateMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RequestLocationUpdateMessageView<'static> {
         type Reborrowed<'b> = RequestLocationUpdateMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -387885,6 +388615,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RequestPaymentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RequestPaymentMessageView<'static> {
         type Reborrowed<'b> = RequestPaymentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -388476,6 +389208,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RequestPhoneNumberMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RequestPhoneNumberMessageView<'static> {
         type Reborrowed<'b> = RequestPhoneNumberMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -388930,6 +389664,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RequestWelcomeMessageMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for RequestWelcomeMessageMetadataView<'static> {
         type Reborrowed<'b> = RequestWelcomeMessageMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -389350,6 +390086,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RootSecretDistributeMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for RootSecretDistributeMessageView<'static> {
         type Reborrowed<'b> = RootSecretDistributeMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -389750,6 +390488,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ScheduledCallCreationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ScheduledCallCreationMessageView<'static> {
         type Reborrowed<'b> = ScheduledCallCreationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -390181,6 +390921,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ScheduledCallEditMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for ScheduledCallEditMessageView<'static> {
         type Reborrowed<'b> = ScheduledCallEditMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -390748,6 +391490,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SecretEncryptedMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SecretEncryptedMessageView<'static> {
         type Reborrowed<'b> = SecretEncryptedMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -391354,6 +392098,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SendPaymentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SendPaymentMessageView<'static> {
         type Reborrowed<'b> = SendPaymentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -391904,6 +392649,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SenderKeyDistributionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SenderKeyDistributionMessageView<'static> {
         type Reborrowed<'b> = SenderKeyDistributionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -392339,6 +393086,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SharedDeviceContactHashKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for SharedDeviceContactHashKeyView<'static> {
         type Reborrowed<'b> = SharedDeviceContactHashKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -392707,6 +393456,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SharedDeviceContactHashKeyRequestView<'a> {}
     impl crate::protobuf::ViewReborrow
     for SharedDeviceContactHashKeyRequestView<'static> {
         type Reborrowed<'b> = SharedDeviceContactHashKeyRequestView<'b>;
@@ -393030,6 +393781,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SharedDeviceContactHashKeyShareView<'a> {}
     impl crate::protobuf::ViewReborrow for SharedDeviceContactHashKeyShareView<'static> {
         type Reborrowed<'b> = SharedDeviceContactHashKeyShareView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -393644,6 +394397,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SplitPaymentMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SplitPaymentMessageView<'static> {
         type Reborrowed<'b> = SplitPaymentMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -394334,6 +395088,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SplitPaymentParticipantView<'a> {}
     impl crate::protobuf::ViewReborrow for SplitPaymentParticipantView<'static> {
         type Reborrowed<'b> = SplitPaymentParticipantView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -394788,6 +395544,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SplitPaymentUpdateMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SplitPaymentUpdateMessageView<'static> {
         type Reborrowed<'b> = SplitPaymentUpdateMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -395134,6 +395892,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusLinkPreviewMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusLinkPreviewMetadataView<'static> {
         type Reborrowed<'b> = StatusLinkPreviewMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -395552,6 +396312,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusNotificationMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusNotificationMessageView<'static> {
         type Reborrowed<'b> = StatusNotificationMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -396044,6 +396806,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusQuestionAnswerMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusQuestionAnswerMessageView<'static> {
         type Reborrowed<'b> = StatusQuestionAnswerMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -396558,6 +397322,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StatusQuotedMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusQuotedMessageView<'static> {
         type Reborrowed<'b> = StatusQuotedMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -397100,6 +397865,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusStickerInteractionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusStickerInteractionMessageView<'static> {
         type Reborrowed<'b> = StatusStickerInteractionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -398435,6 +399202,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StickerMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StickerMessageView<'static> {
         type Reborrowed<'b> = StickerMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -400383,6 +401151,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StickerPackMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StickerPackMessageView<'static> {
         type Reborrowed<'b> = StickerPackMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -401478,6 +402247,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StickerSyncRMRMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for StickerSyncRMRMessageView<'static> {
         type Reborrowed<'b> = StickerSyncRMRMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -402012,6 +402783,8 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for TemplateButtonReplyMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for TemplateButtonReplyMessageView<'static> {
         type Reborrowed<'b> = TemplateButtonReplyMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -402755,6 +403528,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for TemplateMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for TemplateMessageView<'static> {
         type Reborrowed<'b> = TemplateMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -403442,6 +404216,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for URLMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for URLMetadataView<'static> {
         type Reborrowed<'b> = URLMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -403842,6 +404617,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for VideoEndCardView<'a> {}
     impl crate::protobuf::ViewReborrow for VideoEndCardView<'static> {
         type Reborrowed<'b> = VideoEndCardView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -405595,6 +406371,7 @@ pub mod message {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for VideoMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for VideoMessageView<'static> {
         type Reborrowed<'b> = VideoMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -407378,6 +408155,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ButtonView<'a> {}
         impl crate::protobuf::ViewReborrow for ButtonView<'static> {
             type Reborrowed<'b> = ButtonView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -407936,6 +408714,7 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View for ButtonTextView<'a> {}
             impl crate::protobuf::ViewReborrow for ButtonTextView<'static> {
                 type Reborrowed<'b> = ButtonTextView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -408299,6 +409078,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for NativeFlowInfoView<'a> {}
             impl crate::protobuf::ViewReborrow for NativeFlowInfoView<'static> {
                 type Reborrowed<'b> = NativeFlowInfoView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -408974,6 +409755,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for CallParticipantView<'a> {}
         impl crate::protobuf::ViewReborrow for CallParticipantView<'static> {
             type Reborrowed<'b> = CallParticipantView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -409535,6 +410317,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for CloudAPIThreadControlNotificationContentView<'a> {}
         impl crate::protobuf::ViewReborrow
         for CloudAPIThreadControlNotificationContentView<'static> {
             type Reborrowed<'b> = CloudAPIThreadControlNotificationContentView<'b>;
@@ -410667,6 +411451,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for HSMLocalizableParameterView<'a> {}
         impl crate::protobuf::ViewReborrow for HSMLocalizableParameterView<'static> {
             type Reborrowed<'b> = HSMLocalizableParameterView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -411237,6 +412023,7 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View for HSMCurrencyView<'a> {}
             impl crate::protobuf::ViewReborrow for HSMCurrencyView<'static> {
                 type Reborrowed<'b> = HSMCurrencyView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -411679,6 +412466,7 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View for HSMDateTimeView<'a> {}
             impl crate::protobuf::ViewReborrow for HSMDateTimeView<'static> {
                 type Reborrowed<'b> = HSMDateTimeView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -412455,6 +413243,8 @@ pub mod message {
                         d.finish()
                     }
                 }
+                impl<'a> crate::protobuf::owned_view::sealed::View
+                for HSMDateTimeComponentView<'a> {}
                 impl crate::protobuf::ViewReborrow
                 for HSMDateTimeComponentView<'static> {
                     type Reborrowed<'b> = HSMDateTimeComponentView<'b>;
@@ -412979,6 +413769,8 @@ pub mod message {
                         d.finish()
                     }
                 }
+                impl<'a> crate::protobuf::owned_view::sealed::View
+                for HSMDateTimeUnixEpochView<'a> {}
                 impl crate::protobuf::ViewReborrow
                 for HSMDateTimeUnixEpochView<'static> {
                     type Reborrowed<'b> = HSMDateTimeUnixEpochView<'b>;
@@ -413793,6 +414585,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for BloksWidgetView<'a> {}
         impl crate::protobuf::ViewReborrow for BloksWidgetView<'static> {
             type Reborrowed<'b> = BloksWidgetView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -414191,6 +414984,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for BodyView<'a> {}
         impl crate::protobuf::ViewReborrow for BodyView<'static> {
             type Reborrowed<'b> = BodyView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -414599,6 +415393,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for CarouselMessageView<'a> {}
         impl crate::protobuf::ViewReborrow for CarouselMessageView<'static> {
             type Reborrowed<'b> = CarouselMessageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -415098,6 +415893,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for CollectionMessageView<'a> {}
         impl crate::protobuf::ViewReborrow for CollectionMessageView<'static> {
             type Reborrowed<'b> = CollectionMessageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -415583,6 +416380,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for FooterView<'a> {}
         impl crate::protobuf::ViewReborrow for FooterView<'static> {
             type Reborrowed<'b> = FooterView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -416486,6 +417284,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for HeaderView<'a> {}
         impl crate::protobuf::ViewReborrow for HeaderView<'static> {
             type Reborrowed<'b> = HeaderView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -417484,6 +418283,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for NativeFlowMessageView<'a> {}
         impl crate::protobuf::ViewReborrow for NativeFlowMessageView<'static> {
             type Reborrowed<'b> = NativeFlowMessageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -417990,6 +418791,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ShopMessageView<'a> {}
         impl crate::protobuf::ViewReborrow for ShopMessageView<'static> {
             type Reborrowed<'b> = ShopMessageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -418607,6 +419409,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for NativeFlowButtonView<'a> {}
             impl crate::protobuf::ViewReborrow for NativeFlowButtonView<'static> {
                 type Reborrowed<'b> = NativeFlowButtonView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -419121,6 +419925,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for BodyView<'a> {}
         impl crate::protobuf::ViewReborrow for BodyView<'static> {
             type Reborrowed<'b> = BodyView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -419549,6 +420354,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for NativeFlowResponseMessageView<'a> {}
         impl crate::protobuf::ViewReborrow for NativeFlowResponseMessageView<'static> {
             type Reborrowed<'b> = NativeFlowResponseMessageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -420246,6 +421053,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ProductView<'a> {}
         impl crate::protobuf::ViewReborrow for ProductView<'static> {
             type Reborrowed<'b> = ProductView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -420598,6 +421406,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for ProductListHeaderImageView<'a> {}
         impl crate::protobuf::ViewReborrow for ProductListHeaderImageView<'static> {
             type Reborrowed<'b> = ProductListHeaderImageView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -421047,6 +421857,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ProductListInfoView<'a> {}
         impl crate::protobuf::ViewReborrow for ProductListInfoView<'static> {
             type Reborrowed<'b> = ProductListInfoView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -421551,6 +422362,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ProductSectionView<'a> {}
         impl crate::protobuf::ViewReborrow for ProductSectionView<'static> {
             type Reborrowed<'b> = ProductSectionView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -422017,6 +422829,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for RowView<'a> {}
         impl crate::protobuf::ViewReborrow for RowView<'static> {
             type Reborrowed<'b> = RowView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -422434,6 +423247,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for SectionView<'a> {}
         impl crate::protobuf::ViewReborrow for SectionView<'static> {
             type Reborrowed<'b> = SectionView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -422876,6 +423690,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for SingleSelectReplyView<'a> {}
         impl crate::protobuf::ViewReborrow for SingleSelectReplyView<'static> {
             type Reborrowed<'b> = SingleSelectReplyView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -423287,6 +424103,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for LyricsView<'a> {}
         impl crate::protobuf::ViewReborrow for LyricsView<'static> {
             type Reborrowed<'b> = LyricsView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -423772,6 +424589,7 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View for LineView<'a> {}
             impl crate::protobuf::ViewReborrow for LineView<'static> {
                 type Reborrowed<'b> = LineView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -424328,6 +425146,8 @@ pub mod message {
                         d.finish()
                     }
                 }
+                impl<'a> crate::protobuf::owned_view::sealed::View
+                for WordOffsetView<'a> {}
                 impl crate::protobuf::ViewReborrow for WordOffsetView<'static> {
                     type Reborrowed<'b> = WordOffsetView<'b>;
                     fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -425035,6 +425855,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for PaymentLinkButtonView<'a> {}
         impl crate::protobuf::ViewReborrow for PaymentLinkButtonView<'static> {
             type Reborrowed<'b> = PaymentLinkButtonView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -425359,6 +426181,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for PaymentLinkHeaderView<'a> {}
         impl crate::protobuf::ViewReborrow for PaymentLinkHeaderView<'static> {
             type Reborrowed<'b> = PaymentLinkHeaderView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -425681,6 +426505,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for PaymentLinkProviderView<'a> {}
         impl crate::protobuf::ViewReborrow for PaymentLinkProviderView<'static> {
             type Reborrowed<'b> = PaymentLinkProviderView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -426272,6 +427098,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for BizBroadcastInsightsContactListRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for BizBroadcastInsightsContactListRequestView<'static> {
             type Reborrowed<'b> = BizBroadcastInsightsContactListRequestView<'b>;
@@ -426604,6 +427432,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for BizBroadcastInsightsRefreshRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for BizBroadcastInsightsRefreshRequestView<'static> {
             type Reborrowed<'b> = BizBroadcastInsightsRefreshRequestView<'b>;
@@ -426932,6 +427762,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for CompanionCanonicalUserNonceFetchRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for CompanionCanonicalUserNonceFetchRequestView<'static> {
             type Reborrowed<'b> = CompanionCanonicalUserNonceFetchRequestView<'b>;
@@ -427368,6 +428200,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for FullHistorySyncOnDemandRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for FullHistorySyncOnDemandRequestView<'static> {
             type Reborrowed<'b> = FullHistorySyncOnDemandRequestView<'b>;
@@ -428058,6 +428892,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for GalaxyFlowActionView<'a> {}
         impl crate::protobuf::ViewReborrow for GalaxyFlowActionView<'static> {
             type Reborrowed<'b> = GalaxyFlowActionView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -428642,6 +429477,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for HistorySyncChunkRetryRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for HistorySyncChunkRetryRequestView<'static> {
             type Reborrowed<'b> = HistorySyncChunkRetryRequestView<'b>;
@@ -429363,6 +430200,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for HistorySyncOnDemandRequestView<'a> {}
         impl crate::protobuf::ViewReborrow for HistorySyncOnDemandRequestView<'static> {
             type Reborrowed<'b> = HistorySyncOnDemandRequestView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -429906,6 +430745,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for PlaceholderMessageResendRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for PlaceholderMessageResendRequestView<'static> {
             type Reborrowed<'b> = PlaceholderMessageResendRequestView<'b>;
@@ -430302,6 +431143,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for RecentConversationsOnDemandRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for RecentConversationsOnDemandRequestView<'static> {
             type Reborrowed<'b> = RecentConversationsOnDemandRequestView<'b>;
@@ -430656,6 +431499,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for RequestStickerReuploadView<'a> {}
         impl crate::protobuf::ViewReborrow for RequestStickerReuploadView<'static> {
             type Reborrowed<'b> = RequestStickerReuploadView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -431010,6 +431855,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for RequestUrlPreviewView<'a> {}
         impl crate::protobuf::ViewReborrow for RequestUrlPreviewView<'static> {
             type Reborrowed<'b> = RequestUrlPreviewView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -431395,6 +432242,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for SyncDCollectionFatalRecoveryRequestView<'a> {}
         impl crate::protobuf::ViewReborrow
         for SyncDCollectionFatalRecoveryRequestView<'static> {
             type Reborrowed<'b> = SyncDCollectionFatalRecoveryRequestView<'b>;
@@ -432534,6 +433383,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for PeerDataOperationResultView<'a> {}
         impl crate::protobuf::ViewReborrow for PeerDataOperationResultView<'static> {
             type Reborrowed<'b> = PeerDataOperationResultView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -434085,6 +434936,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for BizBroadcastInsightsContactListResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for BizBroadcastInsightsContactListResponseView<'static> {
                 type Reborrowed<'b> = BizBroadcastInsightsContactListResponseView<'b>;
@@ -434577,6 +435430,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for BizBroadcastInsightsContactStateView<'a> {}
             impl crate::protobuf::ViewReborrow
             for BizBroadcastInsightsContactStateView<'static> {
                 type Reborrowed<'b> = BizBroadcastInsightsContactStateView<'b>;
@@ -435040,6 +435895,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for CompanionCanonicalUserNonceFetchResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for CompanionCanonicalUserNonceFetchResponseView<'static> {
                 type Reborrowed<'b> = CompanionCanonicalUserNonceFetchResponseView<'b>;
@@ -435440,6 +436297,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for CompanionMetaNonceFetchResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for CompanionMetaNonceFetchResponseView<'static> {
                 type Reborrowed<'b> = CompanionMetaNonceFetchResponseView<'b>;
@@ -435888,6 +436747,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for ContactRefreshResponseView<'a> {}
             impl crate::protobuf::ViewReborrow for ContactRefreshResponseView<'static> {
                 type Reborrowed<'b> = ContactRefreshResponseView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -436695,6 +437556,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for FlowResponsesCsvBundleView<'a> {}
             impl crate::protobuf::ViewReborrow for FlowResponsesCsvBundleView<'static> {
                 type Reborrowed<'b> = FlowResponsesCsvBundleView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -437363,6 +438226,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for FullHistorySyncOnDemandRequestResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for FullHistorySyncOnDemandRequestResponseView<'static> {
                 type Reborrowed<'b> = FullHistorySyncOnDemandRequestResponseView<'b>;
@@ -437968,6 +438833,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for HistorySyncChunkRetryResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for HistorySyncChunkRetryResponseView<'static> {
                 type Reborrowed<'b> = HistorySyncChunkRetryResponseView<'b>;
@@ -438747,6 +439614,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for LinkPreviewResponseView<'a> {}
             impl crate::protobuf::ViewReborrow for LinkPreviewResponseView<'static> {
                 type Reborrowed<'b> = LinkPreviewResponseView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -439356,6 +440225,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for PlaceholderMessageResendResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for PlaceholderMessageResendResponseView<'static> {
                 type Reborrowed<'b> = PlaceholderMessageResendResponseView<'b>;
@@ -439736,6 +440607,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for SyncDSnapshotFatalRecoveryResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for SyncDSnapshotFatalRecoveryResponseView<'static> {
                 type Reborrowed<'b> = SyncDSnapshotFatalRecoveryResponseView<'b>;
@@ -440151,6 +441024,8 @@ pub mod message {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View
+            for WaffleNonceFetchResponseView<'a> {}
             impl crate::protobuf::ViewReborrow
             for WaffleNonceFetchResponseView<'static> {
                 type Reborrowed<'b> = WaffleNonceFetchResponseView<'b>;
@@ -440788,6 +441663,8 @@ pub mod message {
                         d.finish()
                     }
                 }
+                impl<'a> crate::protobuf::owned_view::sealed::View
+                for LinkPreviewHighQualityThumbnailView<'a> {}
                 impl crate::protobuf::ViewReborrow
                 for LinkPreviewHighQualityThumbnailView<'static> {
                     type Reborrowed<'b> = LinkPreviewHighQualityThumbnailView<'b>;
@@ -441543,6 +442420,8 @@ pub mod message {
                         d.finish()
                     }
                 }
+                impl<'a> crate::protobuf::owned_view::sealed::View
+                for PaymentLinkPreviewMetadataView<'a> {}
                 impl crate::protobuf::ViewReborrow
                 for PaymentLinkPreviewMetadataView<'static> {
                     type Reborrowed<'b> = PaymentLinkPreviewMetadataView<'b>;
@@ -442219,6 +443098,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for OptionView<'a> {}
         impl crate::protobuf::ViewReborrow for OptionView<'static> {
             type Reborrowed<'b> = OptionView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -442599,6 +443479,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for PollVoteView<'a> {}
         impl crate::protobuf::ViewReborrow for PollVoteView<'static> {
             type Reborrowed<'b> = PollVoteView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -443030,6 +443911,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for CatalogSnapshotView<'a> {}
         impl crate::protobuf::ViewReborrow for CatalogSnapshotView<'static> {
             type Reborrowed<'b> = CatalogSnapshotView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -443902,6 +444784,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ProductSnapshotView<'a> {}
         impl crate::protobuf::ViewReborrow for ProductSnapshotView<'static> {
             type Reborrowed<'b> = ProductSnapshotView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -446207,6 +447090,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for StickerView<'a> {}
         impl crate::protobuf::ViewReborrow for StickerView<'static> {
             type Reborrowed<'b> = StickerView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -447160,6 +448044,7 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for FourRowTemplateView<'a> {}
         impl crate::protobuf::ViewReborrow for FourRowTemplateView<'static> {
             type Reborrowed<'b> = FourRowTemplateView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -448531,6 +449416,8 @@ pub mod message {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View
+        for HydratedFourRowTemplateView<'a> {}
         impl crate::protobuf::ViewReborrow for HydratedFourRowTemplateView<'static> {
             type Reborrowed<'b> = HydratedFourRowTemplateView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -450834,6 +451721,7 @@ pub mod msg_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for EventLocationView<'a> {}
     impl crate::protobuf::ViewReborrow for EventLocationView<'static> {
         type Reborrowed<'b> = EventLocationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -452085,6 +452973,7 @@ pub mod msg_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MusicDataView<'a> {}
     impl crate::protobuf::ViewReborrow for MusicDataView<'static> {
         type Reborrowed<'b> = MusicDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -453163,6 +454052,7 @@ pub mod msg_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollOptionView<'a> {}
     impl crate::protobuf::ViewReborrow for PollOptionView<'static> {
         type Reborrowed<'b> = PollOptionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -453622,6 +454512,7 @@ pub mod msg_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollVoteSnapshotView<'a> {}
     impl crate::protobuf::ViewReborrow for PollVoteSnapshotView<'static> {
         type Reborrowed<'b> = PollVoteSnapshotView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -453999,6 +454890,7 @@ pub mod msg_opaque_data {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PollVotesSnapshotView<'a> {}
     impl crate::protobuf::ViewReborrow for PollVotesSnapshotView<'static> {
         type Reborrowed<'b> = PollVotesSnapshotView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -454480,6 +455372,7 @@ pub mod msg_opaque_data {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for LyricsLineView<'a> {}
         impl crate::protobuf::ViewReborrow for LyricsLineView<'static> {
             type Reborrowed<'b> = LyricsLineView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -455035,6 +455928,7 @@ pub mod msg_opaque_data {
                     d.finish()
                 }
             }
+            impl<'a> crate::protobuf::owned_view::sealed::View for WordOffsetView<'a> {}
             impl crate::protobuf::ViewReborrow for WordOffsetView<'static> {
                 type Reborrowed<'b> = WordOffsetView<'b>;
                 fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -455608,6 +456502,7 @@ pub mod noise_certificate {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DetailsView<'a> {}
     impl crate::protobuf::ViewReborrow for DetailsView<'static> {
         type Reborrowed<'b> = DetailsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -456555,6 +457450,7 @@ pub mod payment_background {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MediaDataView<'a> {}
     impl crate::protobuf::ViewReborrow for MediaDataView<'static> {
         type Reborrowed<'b> = MediaDataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -457592,6 +458488,8 @@ pub mod poll_additional_metadata {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PollNameHashHistoryEntryView<'a> {}
     impl crate::protobuf::ViewReborrow for PollNameHashHistoryEntryView<'static> {
         type Reborrowed<'b> = PollNameHashHistoryEntryView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -458370,6 +459268,7 @@ pub mod qp {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FilterView<'a> {}
     impl crate::protobuf::ViewReborrow for FilterView<'static> {
         type Reborrowed<'b> = FilterView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -458913,6 +459812,7 @@ pub mod qp {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FilterClauseView<'a> {}
     impl crate::protobuf::ViewReborrow for FilterClauseView<'static> {
         type Reborrowed<'b> = FilterClauseView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -459391,6 +460291,7 @@ pub mod qp {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FilterParametersView<'a> {}
     impl crate::protobuf::ViewReborrow for FilterParametersView<'static> {
         type Reborrowed<'b> = FilterParametersView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -459770,6 +460671,7 @@ pub mod sender_key_state_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SenderChainKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for SenderChainKeyView<'static> {
         type Reborrowed<'b> = SenderChainKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -460142,6 +461044,7 @@ pub mod sender_key_state_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SenderMessageKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for SenderMessageKeyView<'static> {
         type Reborrowed<'b> = SenderMessageKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -460522,6 +461425,7 @@ pub mod sender_key_state_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SenderSigningKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for SenderSigningKeyView<'static> {
         type Reborrowed<'b> = SenderSigningKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -461050,6 +461954,7 @@ pub mod session_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ChainView<'a> {}
     impl crate::protobuf::ViewReborrow for ChainView<'static> {
         type Reborrowed<'b> = ChainView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -461797,6 +462702,7 @@ pub mod session_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PendingKeyExchangeView<'a> {}
     impl crate::protobuf::ViewReborrow for PendingKeyExchangeView<'static> {
         type Reborrowed<'b> = PendingKeyExchangeView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -462453,6 +463359,7 @@ pub mod session_structure {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PendingPreKeyView<'a> {}
     impl crate::protobuf::ViewReborrow for PendingPreKeyView<'static> {
         type Reborrowed<'b> = PendingPreKeyView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -462908,6 +463815,7 @@ pub mod session_structure {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ChainKeyView<'a> {}
         impl crate::protobuf::ViewReborrow for ChainKeyView<'static> {
             type Reborrowed<'b> = ChainKeyView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -463420,6 +464328,7 @@ pub mod session_structure {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for MessageKeyView<'a> {}
         impl crate::protobuf::ViewReborrow for MessageKeyView<'static> {
             type Reborrowed<'b> = MessageKeyView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -464103,6 +465012,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AiCreatedAttributionView<'a> {}
     impl crate::protobuf::ViewReborrow for AiCreatedAttributionView<'static> {
         type Reborrowed<'b> = AiCreatedAttributionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -464555,6 +465465,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ExternalShareView<'a> {}
     impl crate::protobuf::ViewReborrow for ExternalShareView<'static> {
         type Reborrowed<'b> = ExternalShareView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -464954,6 +465865,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for GroupStatusView<'a> {}
     impl crate::protobuf::ViewReborrow for GroupStatusView<'static> {
         type Reborrowed<'b> = GroupStatusView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -465466,6 +466378,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MusicView<'a> {}
     impl crate::protobuf::ViewReborrow for MusicView<'static> {
         type Reborrowed<'b> = MusicView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -465922,6 +466835,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for RLAttributionView<'a> {}
     impl crate::protobuf::ViewReborrow for RLAttributionView<'static> {
         type Reborrowed<'b> = RLAttributionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -466293,6 +467207,7 @@ pub mod status_attribution {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StatusReshareView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusReshareView<'static> {
         type Reborrowed<'b> = StatusReshareView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -467205,6 +468120,7 @@ pub mod status_attribution {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for MetadataView<'a> {}
         impl crate::protobuf::ViewReborrow for MetadataView<'static> {
             type Reborrowed<'b> = MetadataView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -467896,6 +468812,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AgentActionView<'a> {}
     impl crate::protobuf::ViewReborrow for AgentActionView<'static> {
         type Reborrowed<'b> = AgentActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -468252,6 +469169,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AiThreadRenameActionView<'a> {}
     impl crate::protobuf::ViewReborrow for AiThreadRenameActionView<'static> {
         type Reborrowed<'b> = AiThreadRenameActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -468551,6 +469469,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AndroidUnsupportedActionsView<'a> {}
     impl crate::protobuf::ViewReborrow for AndroidUnsupportedActionsView<'static> {
         type Reborrowed<'b> = AndroidUnsupportedActionsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -468897,6 +469817,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ArchiveChatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ArchiveChatActionView<'static> {
         type Reborrowed<'b> = ArchiveChatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -469260,6 +470181,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for AutoOrganizeBusinessChatSettingView<'a> {}
     impl crate::protobuf::ViewReborrow for AutoOrganizeBusinessChatSettingView<'static> {
         type Reborrowed<'b> = AutoOrganizeBusinessChatSettingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -469638,6 +470561,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for AvatarUpdatedActionView<'a> {}
     impl crate::protobuf::ViewReborrow for AvatarUpdatedActionView<'static> {
         type Reborrowed<'b> = AvatarUpdatedActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -470014,6 +470938,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BBProPendingCustomerBaseActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BBProPendingCustomerBaseActionView<'static> {
         type Reborrowed<'b> = BBProPendingCustomerBaseActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -470409,6 +471335,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BizAISettingsNudgeActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BizAISettingsNudgeActionView<'static> {
         type Reborrowed<'b> = BizAISettingsNudgeActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -470774,6 +471702,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BotWelcomeRequestActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BotWelcomeRequestActionView<'static> {
         type Reborrowed<'b> = BotWelcomeRequestActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -471114,6 +472044,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BroadcastListParticipantView<'a> {}
     impl crate::protobuf::ViewReborrow for BroadcastListParticipantView<'static> {
         type Reborrowed<'b> = BroadcastListParticipantView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -471445,6 +472377,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BubbleLockMessageActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BubbleLockMessageActionView<'static> {
         type Reborrowed<'b> = BubbleLockMessageActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -471743,6 +472677,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessBroadcastAssociationActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for BusinessBroadcastAssociationActionView<'static> {
         type Reborrowed<'b> = BusinessBroadcastAssociationActionView<'b>;
@@ -472492,6 +473428,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessBroadcastCampaignActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessBroadcastCampaignActionView<'static> {
         type Reborrowed<'b> = BusinessBroadcastCampaignActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -473265,6 +474203,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessBroadcastInsightsActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessBroadcastInsightsActionView<'static> {
         type Reborrowed<'b> = BusinessBroadcastInsightsActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -473902,6 +474842,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessBroadcastListActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessBroadcastListActionView<'static> {
         type Reborrowed<'b> = BusinessBroadcastListActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -474397,6 +475339,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for BusinessFolderActivationActionView<'a> {}
     impl crate::protobuf::ViewReborrow for BusinessFolderActivationActionView<'static> {
         type Reborrowed<'b> = BusinessFolderActivationActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -474705,6 +475649,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CallLogActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CallLogActionView<'static> {
         type Reborrowed<'b> = CallLogActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -475040,6 +475985,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ChatAssignmentActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ChatAssignmentActionView<'static> {
         type Reborrowed<'b> = ChatAssignmentActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -475340,6 +476286,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ChatAssignmentOpenedStatusActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for ChatAssignmentOpenedStatusActionView<'static> {
         type Reborrowed<'b> = ChatAssignmentOpenedStatusActionView<'b>;
@@ -475652,6 +476600,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ClearChatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ClearChatActionView<'static> {
         type Reborrowed<'b> = ClearChatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -475986,6 +476935,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CoexV2VersionActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CoexV2VersionActionView<'static> {
         type Reborrowed<'b> = CoexV2VersionActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -476301,6 +477251,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CommunityNestingStateActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CommunityNestingStateActionView<'static> {
         type Reborrowed<'b> = CommunityNestingStateActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -476870,6 +477822,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ContactActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactActionView<'static> {
         type Reborrowed<'b> = ContactActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -477347,6 +478300,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ContactManagerMetadataActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ContactManagerMetadataActionView<'static> {
         type Reborrowed<'b> = ContactManagerMetadataActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -477646,6 +478601,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CtwaMessageReceivedActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CtwaMessageReceivedActionView<'static> {
         type Reborrowed<'b> = CtwaMessageReceivedActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -477955,6 +478912,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CtwaPerCustomerDataSharingActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for CtwaPerCustomerDataSharingActionView<'static> {
         type Reborrowed<'b> = CtwaPerCustomerDataSharingActionView<'b>;
@@ -478387,6 +479346,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CustomPaymentMethodView<'a> {}
     impl crate::protobuf::ViewReborrow for CustomPaymentMethodView<'static> {
         type Reborrowed<'b> = CustomPaymentMethodView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -478854,6 +479814,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CustomPaymentMethodMetadataView<'a> {}
     impl crate::protobuf::ViewReborrow for CustomPaymentMethodMetadataView<'static> {
         type Reborrowed<'b> = CustomPaymentMethodMetadataView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -479209,6 +480171,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for CustomPaymentMethodsActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CustomPaymentMethodsActionView<'static> {
         type Reborrowed<'b> = CustomPaymentMethodsActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -479946,6 +480910,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CustomerDataActionView<'a> {}
     impl crate::protobuf::ViewReborrow for CustomerDataActionView<'static> {
         type Reborrowed<'b> = CustomerDataActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -480544,6 +481509,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DeleteChatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for DeleteChatActionView<'static> {
         type Reborrowed<'b> = DeleteChatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -480924,6 +481890,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DeleteIndividualCallLogActionView<'a> {}
     impl crate::protobuf::ViewReborrow for DeleteIndividualCallLogActionView<'static> {
         type Reborrowed<'b> = DeleteIndividualCallLogActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -481291,6 +482259,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DeleteMessageForMeActionView<'a> {}
     impl crate::protobuf::ViewReborrow for DeleteMessageForMeActionView<'static> {
         type Reborrowed<'b> = DeleteMessageForMeActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -481617,6 +482587,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for DetectedOutcomesStatusActionView<'a> {}
     impl crate::protobuf::ViewReborrow for DetectedOutcomesStatusActionView<'static> {
         type Reborrowed<'b> = DetectedOutcomesStatusActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -481914,6 +482886,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for ExternalWebBetaActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ExternalWebBetaActionView<'static> {
         type Reborrowed<'b> = ExternalWebBetaActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -482228,6 +483202,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for FavoritesActionView<'a> {}
     impl crate::protobuf::ViewReborrow for FavoritesActionView<'static> {
         type Reborrowed<'b> = FavoritesActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -482580,6 +483555,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for GroupHistoryToggleActionView<'a> {}
     impl crate::protobuf::ViewReborrow for GroupHistoryToggleActionView<'static> {
         type Reborrowed<'b> = GroupHistoryToggleActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -482937,6 +483914,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for HatchCVMSecretActionView<'a> {}
     impl crate::protobuf::ViewReborrow for HatchCVMSecretActionView<'static> {
         type Reborrowed<'b> = HatchCVMSecretActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -483313,6 +484291,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for InteractiveMessageActionView<'a> {}
     impl crate::protobuf::ViewReborrow for InteractiveMessageActionView<'static> {
         type Reborrowed<'b> = InteractiveMessageActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -483652,6 +484632,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for KeyExpirationView<'a> {}
     impl crate::protobuf::ViewReborrow for KeyExpirationView<'static> {
         type Reborrowed<'b> = KeyExpirationView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -483990,6 +484971,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for LabelAssociationActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LabelAssociationActionView<'static> {
         type Reborrowed<'b> = LabelAssociationActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -484645,6 +485628,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LabelEditActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LabelEditActionView<'static> {
         type Reborrowed<'b> = LabelEditActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -485194,6 +486178,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for LabelReorderingActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LabelReorderingActionView<'static> {
         type Reborrowed<'b> = LabelReorderingActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -485506,6 +486492,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LabelSublistActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LabelSublistActionView<'static> {
         type Reborrowed<'b> = LabelSublistActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -485939,6 +486926,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LidContactActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LidContactActionView<'static> {
         type Reborrowed<'b> = LidContactActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -486329,6 +487317,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LocaleSettingView<'a> {}
     impl crate::protobuf::ViewReborrow for LocaleSettingView<'static> {
         type Reborrowed<'b> = LocaleSettingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -486622,6 +487611,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for LockChatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for LockChatActionView<'static> {
         type Reborrowed<'b> = LockChatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -486990,6 +487980,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MaibaAIFeaturesControlActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MaibaAIFeaturesControlActionView<'static> {
         type Reborrowed<'b> = MaibaAIFeaturesControlActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -487388,6 +488380,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MarkChatAsReadActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MarkChatAsReadActionView<'static> {
         type Reborrowed<'b> = MarkChatAsReadActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -488014,6 +489007,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MarketingMessageActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MarketingMessageActionView<'static> {
         type Reborrowed<'b> = MarketingMessageActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -488498,6 +489493,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MarketingMessageBroadcastActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MarketingMessageBroadcastActionView<'static> {
         type Reborrowed<'b> = MarketingMessageBroadcastActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -488928,6 +489925,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for MerchantPaymentPartnerActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MerchantPaymentPartnerActionView<'static> {
         type Reborrowed<'b> = MerchantPaymentPartnerActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -489431,6 +490430,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MusicUserIdActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MusicUserIdActionView<'static> {
         type Reborrowed<'b> = MusicUserIdActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -489930,6 +490930,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for MuteActionView<'a> {}
     impl crate::protobuf::ViewReborrow for MuteActionView<'static> {
         type Reborrowed<'b> = MuteActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -490313,6 +491314,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for NctSaltSyncActionView<'a> {}
     impl crate::protobuf::ViewReborrow for NctSaltSyncActionView<'static> {
         type Reborrowed<'b> = NctSaltSyncActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -490618,6 +491620,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for NewsletterSavedInterestsActionView<'a> {}
     impl crate::protobuf::ViewReborrow for NewsletterSavedInterestsActionView<'static> {
         type Reborrowed<'b> = NewsletterSavedInterestsActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -491104,6 +492108,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for NoteEditActionView<'a> {}
     impl crate::protobuf::ViewReborrow for NoteEditActionView<'static> {
         type Reborrowed<'b> = NoteEditActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -491551,6 +492556,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for NotificationActivitySettingActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for NotificationActivitySettingActionView<'static> {
         type Reborrowed<'b> = NotificationActivitySettingActionView<'b>;
@@ -491869,6 +492876,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for NuxActionView<'a> {}
     impl crate::protobuf::ViewReborrow for NuxActionView<'static> {
         type Reborrowed<'b> = NuxActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -492210,6 +493218,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for OutContactActionView<'a> {}
     impl crate::protobuf::ViewReborrow for OutContactActionView<'static> {
         type Reborrowed<'b> = OutContactActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -492540,6 +493549,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PaymentInfoActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentInfoActionView<'static> {
         type Reborrowed<'b> = PaymentInfoActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -492876,6 +493886,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PaymentTosActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PaymentTosActionView<'static> {
         type Reborrowed<'b> = PaymentTosActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -493211,6 +494222,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PinActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PinActionView<'static> {
         type Reborrowed<'b> = PinActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -493505,6 +494517,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PnForLidChatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PnForLidChatActionView<'static> {
         type Reborrowed<'b> = PnForLidChatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -493805,6 +494818,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PrimaryFeatureView<'a> {}
     impl crate::protobuf::ViewReborrow for PrimaryFeatureView<'static> {
         type Reborrowed<'b> = PrimaryFeatureView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -494110,6 +495124,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PrimaryVersionActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PrimaryVersionActionView<'static> {
         type Reborrowed<'b> = PrimaryVersionActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -494421,6 +495436,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PrivacySettingChannelsPersonalisedRecommendationActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for PrivacySettingChannelsPersonalisedRecommendationActionView<'static> {
         type Reborrowed<'b> = PrivacySettingChannelsPersonalisedRecommendationActionView<
@@ -494744,6 +495761,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PrivacySettingDisableLinkPreviewsActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for PrivacySettingDisableLinkPreviewsActionView<'static> {
         type Reborrowed<'b> = PrivacySettingDisableLinkPreviewsActionView<'b>;
@@ -495054,6 +496073,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PrivacySettingRelayAllCallsView<'a> {}
     impl crate::protobuf::ViewReborrow for PrivacySettingRelayAllCallsView<'static> {
         type Reborrowed<'b> = PrivacySettingRelayAllCallsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -495371,6 +496392,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for PrivateProcessingSettingActionView<'a> {}
     impl crate::protobuf::ViewReborrow for PrivateProcessingSettingActionView<'static> {
         type Reborrowed<'b> = PrivateProcessingSettingActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -495689,6 +496712,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for PushNameSettingView<'a> {}
     impl crate::protobuf::ViewReborrow for PushNameSettingView<'static> {
         type Reborrowed<'b> = PushNameSettingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -496192,6 +497216,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for QuickReplyActionView<'a> {}
     impl crate::protobuf::ViewReborrow for QuickReplyActionView<'static> {
         type Reborrowed<'b> = QuickReplyActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -496662,6 +497687,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RecentEmojiWeightsActionView<'a> {}
     impl crate::protobuf::ViewReborrow for RecentEmojiWeightsActionView<'static> {
         type Reborrowed<'b> = RecentEmojiWeightsActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -496995,6 +498022,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for RemoveRecentStickerActionView<'a> {}
     impl crate::protobuf::ViewReborrow for RemoveRecentStickerActionView<'static> {
         type Reborrowed<'b> = RemoveRecentStickerActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -498737,6 +499766,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SettingsSyncActionView<'a> {}
     impl crate::protobuf::ViewReborrow for SettingsSyncActionView<'static> {
         type Reborrowed<'b> = SettingsSyncActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -500122,6 +501152,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SharedDeviceAllowlistActionView<'a> {}
     impl crate::protobuf::ViewReborrow for SharedDeviceAllowlistActionView<'static> {
         type Reborrowed<'b> = SharedDeviceAllowlistActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -500461,6 +501493,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SharedDeviceSecretActionView<'a> {}
     impl crate::protobuf::ViewReborrow for SharedDeviceSecretActionView<'static> {
         type Reborrowed<'b> = SharedDeviceSecretActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -500786,6 +501820,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StarActionView<'a> {}
     impl crate::protobuf::ViewReborrow for StarActionView<'static> {
         type Reborrowed<'b> = StarActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -501082,6 +502117,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for StatusPostOptInNotificationPreferencesActionView<'a> {}
     impl crate::protobuf::ViewReborrow
     for StatusPostOptInNotificationPreferencesActionView<'static> {
         type Reborrowed<'b> = StatusPostOptInNotificationPreferencesActionView<'b>;
@@ -501662,6 +502699,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StatusPrivacyActionView<'a> {}
     impl crate::protobuf::ViewReborrow for StatusPrivacyActionView<'static> {
         type Reborrowed<'b> = StatusPrivacyActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -502670,6 +503708,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for StickerActionView<'a> {}
     impl crate::protobuf::ViewReborrow for StickerActionView<'static> {
         type Reborrowed<'b> = StickerActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -503389,6 +504428,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SubscriptionActionView<'a> {}
     impl crate::protobuf::ViewReborrow for SubscriptionActionView<'static> {
         type Reborrowed<'b> = SubscriptionActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -503817,6 +504857,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SubscriptionsSyncV2ActionView<'a> {}
     impl crate::protobuf::ViewReborrow for SubscriptionsSyncV2ActionView<'static> {
         type Reborrowed<'b> = SubscriptionsSyncV2ActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -504265,6 +505307,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for SyncActionMessageView<'a> {}
     impl crate::protobuf::ViewReborrow for SyncActionMessageView<'static> {
         type Reborrowed<'b> = SyncActionMessageView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -504722,6 +505765,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for SyncActionMessageRangeView<'a> {}
     impl crate::protobuf::ViewReborrow for SyncActionMessageRangeView<'static> {
         type Reborrowed<'b> = SyncActionMessageRangeView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -505114,6 +506159,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for ThreadPinActionView<'a> {}
     impl crate::protobuf::ViewReborrow for ThreadPinActionView<'static> {
         type Reborrowed<'b> = ThreadPinActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -505414,6 +506460,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for TimeFormatActionView<'a> {}
     impl crate::protobuf::ViewReborrow for TimeFormatActionView<'static> {
         type Reborrowed<'b> = TimeFormatActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -505717,6 +506764,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for UGCBotView<'a> {}
     impl crate::protobuf::ViewReborrow for UGCBotView<'static> {
         type Reborrowed<'b> = UGCBotView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -506007,6 +507055,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for UnarchiveChatsSettingView<'a> {}
     impl crate::protobuf::ViewReborrow for UnarchiveChatsSettingView<'static> {
         type Reborrowed<'b> = UnarchiveChatsSettingView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -506304,6 +507354,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for UserStatusMuteActionView<'a> {}
     impl crate::protobuf::ViewReborrow for UserStatusMuteActionView<'static> {
         type Reborrowed<'b> = UserStatusMuteActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -506619,6 +507670,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for UsernameChatStartModeActionView<'a> {}
     impl crate::protobuf::ViewReborrow for UsernameChatStartModeActionView<'static> {
         type Reborrowed<'b> = UsernameChatStartModeActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -506945,6 +507998,7 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for WASARootSecretActionView<'a> {}
     impl crate::protobuf::ViewReborrow for WASARootSecretActionView<'static> {
         type Reborrowed<'b> = WASARootSecretActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -507298,6 +508352,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for WaffleAccountLinkStateActionView<'a> {}
     impl crate::protobuf::ViewReborrow for WaffleAccountLinkStateActionView<'static> {
         type Reborrowed<'b> = WaffleAccountLinkStateActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -507612,6 +508668,8 @@ pub mod sync_action_value {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for WamoUserIdentifierActionView<'a> {}
     impl crate::protobuf::ViewReborrow for WamoUserIdentifierActionView<'static> {
         type Reborrowed<'b> = WamoUserIdentifierActionView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -508185,6 +509243,7 @@ pub mod sync_action_value {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for FavoriteView<'a> {}
         impl crate::protobuf::ViewReborrow for FavoriteView<'static> {
             type Reborrowed<'b> = FavoriteView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -510435,6 +511494,7 @@ pub mod sync_action_value {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for CustomListView<'a> {}
         impl crate::protobuf::ViewReborrow for CustomListView<'static> {
             type Reborrowed<'b> = CustomListView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -510995,6 +512055,7 @@ pub mod sync_action_value {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for PaidFeatureView<'a> {}
         impl crate::protobuf::ViewReborrow for PaidFeatureView<'static> {
             type Reborrowed<'b> = PaidFeatureView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -511677,6 +512738,7 @@ pub mod sync_action_value {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for SubscriptionInfoView<'a> {}
         impl crate::protobuf::ViewReborrow for SubscriptionInfoView<'static> {
             type Reborrowed<'b> = SubscriptionInfoView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -512490,6 +513552,7 @@ pub mod sync_action_value {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for RootSecretEntryView<'a> {}
         impl crate::protobuf::ViewReborrow for RootSecretEntryView<'static> {
             type Reborrowed<'b> = RootSecretEntryView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -513148,6 +514211,7 @@ pub mod template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for CallButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for CallButtonView<'static> {
         type Reborrowed<'b> = CallButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -513599,6 +514663,7 @@ pub mod template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for QuickReplyButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for QuickReplyButtonView<'static> {
         type Reborrowed<'b> = QuickReplyButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -514020,6 +515085,7 @@ pub mod template_button {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for URLButtonView<'a> {}
     impl crate::protobuf::ViewReborrow for URLButtonView<'static> {
         type Reborrowed<'b> = URLButtonView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -514632,6 +515698,8 @@ pub mod url_tracking_map {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View
+    for UrlTrackingMapElementView<'a> {}
     impl crate::protobuf::ViewReborrow for UrlTrackingMapElementView<'static> {
         type Reborrowed<'b> = UrlTrackingMapElementView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -515223,6 +516291,7 @@ pub mod user_password {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for TransformerArgView<'a> {}
     impl crate::protobuf::ViewReborrow for TransformerArgView<'static> {
         type Reborrowed<'b> = TransformerArgView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -515642,6 +516711,7 @@ pub mod user_password {
                 d.finish()
             }
         }
+        impl<'a> crate::protobuf::owned_view::sealed::View for ValueView<'a> {}
         impl crate::protobuf::ViewReborrow for ValueView<'static> {
             type Reborrowed<'b> = ValueView<'b>;
             fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {
@@ -516231,6 +517301,7 @@ pub mod verified_name_certificate {
             d.finish()
         }
     }
+    impl<'a> crate::protobuf::owned_view::sealed::View for DetailsView<'a> {}
     impl crate::protobuf::ViewReborrow for DetailsView<'static> {
         type Reborrowed<'b> = DetailsView<'b>;
         fn reborrow<'b>(this: &'b Self) -> &'b Self::Reborrowed<'b> {

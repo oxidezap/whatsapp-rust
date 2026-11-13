@@ -44,7 +44,7 @@ jobs:
           # decoded borrows valid through moves, clones and destructor unwind.
           - name: waproto (owned views)
             cache-key: proto-owned-view
-            args: -p waproto --features protobuf-experiment --lib protobuf::owned_view::tests
+            args: -p waproto --lib protobuf::owned_view::tests
           # wacore-binary owns load-bearing `unsafe`: the
           # `Yokeable` derive and `StableDeref` impl behind `OwnedNodeRef`
           # (lifetime erasure over borrowed decode output) and the `set_len` over
