@@ -17,7 +17,6 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
-signal-operations = []
 # Runtime- and I/O-independent experimental mobile configuration/workflow.
 mobile = []
 instance-clock = []
@@ -113,7 +112,6 @@ buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-aes-gcm = { workspace = true }
 # Differential oracle only; IDNA/ICU must not enter the media runtime.
 url = { version = "2.5.8", default-features = false }
 # Compact oracle fixtures; pure Rust, test-only, including on wasm targets.
@@ -126,7 +124,7 @@ flate2 = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 # `rt-multi-thread` is test-only: the wire-gate race test needs two threads to
 # actually interleave a lease insert with the lock-free gate query.
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Keep this path-only: package normalization must omit the local self edge.
@@ -214,11 +212,3 @@ required-features = ["voip-mlow"]
 
 [lints]
 workspace = true
-
-[[test]]
-name = "signal_store"
-required-features = ["signal-operations"]
-
-[[test]]
-name = "signal_operations"
-required-features = ["signal-operations", "test-util"]

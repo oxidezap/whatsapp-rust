@@ -72,6 +72,3 @@ pub mod webp;
 pub mod version;
 pub mod xml;
 mod zip;
-
-#[cfg(feature = "signal-operations")]
-pub mod signal;
