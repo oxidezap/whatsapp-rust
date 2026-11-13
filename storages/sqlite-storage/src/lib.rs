@@ -11,7 +11,7 @@
 //! # SQLite version
 //!
 //! SQLite 3.54.0 or newer is required for RUSTSEC-2026-0459. Native bundled
-//! builds use the patched SQLite from `libsqlite3-sys` 0.39.1, and WASM uses
+//! builds use the patched SQLite from `libsqlite3-sys` 0.40, and WASM uses
 //! `sqlite-wasm-rs` 0.6.3. Builds using system SQLite must also satisfy this
 //! minimum; the storage integration test checks the library actually linked.
 //!
