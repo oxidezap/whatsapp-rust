@@ -314,6 +314,34 @@ async fn connect_admission_legacy_constant_delay_still_dials_once() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn immediate_reconnect_during_backoff_still_obeys_host_admission() {
+    let f = Fixture::new(
+        Some(vec![Duration::ZERO, Duration::from_secs(60)]),
+        Duration::ZERO,
+    )
+    .await;
+    let run = f.run();
+    f.admitted.recv().await.unwrap();
+    f.entered.recv().await.unwrap();
+    f.release.send(()).await.unwrap();
+    scheduled().await;
+    assert_eq!(f.client.stats().reconnect_errors, 1);
+
+    f.client.reconnect_immediately().await;
+    scheduled().await;
+    assert_eq!(f.decisions.load(Ordering::SeqCst), 2);
+    assert_eq!(f.client.stats().reconnect_errors, 0);
+    assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(59)).await;
+    scheduled().await;
+    assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    scheduled().await;
+    assert_eq!(f.dials.load(Ordering::SeqCst), 2);
+    f.stop(run).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn connect_admission_rechecks_normal_and_forced_reconnects() {
     for forced in [false, true] {
         let policy = CooldownPolicy::new(Duration::ZERO);
