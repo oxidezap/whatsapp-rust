@@ -65,8 +65,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 gloo-timers = { version = "0.4", features = ["futures"] }
 
 # Diesel 2.3.14 accepts the 0.6 ABI; `js` selects the browser host hooks.
+# 0.6.3 bundles SQLite 3.54.1, fixing RUSTSEC-2026-0459 for browser builds.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-sqlite-wasm-rs = { version = "0.6.1", default-features = false, features = ["wasm-bindgen"], optional = true }
+sqlite-wasm-rs = { version = "0.6.3", default-features = false, features = ["wasm-bindgen"], optional = true }
 
 [[bench]]
 name = "signal_flush"

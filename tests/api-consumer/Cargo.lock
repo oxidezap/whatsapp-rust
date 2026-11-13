@@ -50,6 +50,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "diesel",
  "futures",
  "getrandom 0.4.3",
  "js-sys",
@@ -1509,9 +1510,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "717e14271e332de37b8f7793913d53e2f952b3d21f96efd5880aea42a3c32d18"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "js-sys",
