@@ -13,6 +13,8 @@ use wacore_binary::{Jid, JidExt as _};
 mod hosted_recovery_tests;
 
 #[cfg(test)]
+mod group_cache_progress_tests;
+#[cfg(test)]
 mod ordinary_recovery_tests;
 
 /// An authoritative refresh retries when a newer registry mutation wins while
@@ -536,7 +538,11 @@ impl Client {
             );
             let requested = jids_to_fetch.len();
             let fetched = if group {
-                self.refresh_group_user_devices(jids_to_fetch).await?
+                self.fetch_group_user_devices(
+                    jids_to_fetch,
+                    crate::cache::Freshness::CachePreferred,
+                )
+                .await?
             } else {
                 self.fetch_user_devices(jids_to_fetch).await?
             };
@@ -572,7 +578,16 @@ impl Client {
     /// An omitted or invalid user keeps its previous registry record.
     pub(crate) async fn refresh_group_user_devices(
         &self,
+        jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.fetch_group_user_devices(jids, crate::cache::Freshness::Refresh)
+            .await
+    }
+
+    async fn fetch_group_user_devices(
+        &self,
         mut jids: Vec<Jid>,
+        freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         for jid in &mut jids {
             jid.agent = 0;
@@ -586,12 +601,13 @@ impl Client {
             remaining: GROUP_ADV_RECOVERY_LIMIT,
             attempted: std::collections::HashSet::new(),
         };
+        let mut pending = None;
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let generation = self.device_topology.current();
             let authentication_epoch = self.signal_cache.identity_continuity.primary_snapshot();
             let response = self
                 .execute_streaming(DeviceListSpec::new(
-                    jids.clone(),
+                    pending.take().unwrap_or_else(|| jids.clone()),
                     self.generate_request_id(),
                 ))
                 .await?;
@@ -607,6 +623,15 @@ impl Client {
                 .await?
             {
                 return Ok(devices);
+            }
+            if freshness == crate::cache::Freshness::CachePreferred {
+                // A concurrent publication can satisfy the original cache miss.
+                // Keep its current records and query only the unresolved accounts.
+                let (devices, missing) = self.get_devices_from_registry_batch(jids.clone()).await;
+                if missing.is_empty() {
+                    return Ok(devices);
+                }
+                pending = Some(missing);
             }
         }
         anyhow::bail!("device registry kept changing while a group refresh was in flight")
