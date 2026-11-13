@@ -3818,7 +3818,10 @@ async fn group_send_skips_a_cold_contact_with_conflicting_primaries() {
                 if group {
                     client.get_group_user_devices_owned(users).await
                 } else {
-                    client.get_user_devices_owned(users).await
+                    client
+                        .get_user_devices_owned(users)
+                        .await
+                        .map(|devices| (devices, true))
                 }
             })
         };
@@ -3830,7 +3833,8 @@ async fn group_send_skips_a_cold_contact_with_conflicting_primaries() {
             .unwrap()
             .unwrap();
         if group {
-            let devices = result.unwrap();
+            let (devices, complete) = result.unwrap();
+            assert!(!complete, "a partial fanout must not be memoized");
             assert!(devices.contains(&good.with_device(2)));
             assert!(!devices.iter().any(|device| device.user == bad.user));
         } else {
