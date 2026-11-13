@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
-use buffa::Message as _;
-use buffa_descriptor::generated::descriptor::FileDescriptorSet;
+use descriptor::FileDescriptorSet;
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
+
+#[path = "../codegen/descriptor.rs"]
+pub mod descriptor;
+#[path = "../codegen/features.rs"]
+pub mod features;
 
 #[allow(dead_code)]
 #[path = "../codegen/emit_owned.rs"]

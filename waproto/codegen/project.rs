@@ -3,13 +3,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use buffa_descriptor::features::{
-    self, EnumType, FieldPresence, RepeatedFieldEncoding, ResolvedFeatures,
-};
-use buffa_descriptor::generated::descriptor::{
+use super::descriptor::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet,
     field_descriptor_proto::{Label, Type},
 };
+use super::features::{self, EnumType, FieldPresence, RepeatedFieldEncoding, ResolvedFeatures};
 
 use super::schema::*;
 
@@ -22,7 +20,6 @@ pub enum ProjectionError {
     InvalidNumber(String, i32),
     InvalidOneof(String, i32),
     InvalidMap(String),
-    UnsupportedPresence(String),
 }
 
 impl fmt::Display for ProjectionError {
@@ -135,7 +132,7 @@ impl<'a> Builder<'a> {
                 oneofs: Vec::new(),
                 map_entry: declaration
                     .options
-                    .as_option()
+                    .as_ref()
                     .and_then(|options| options.map_entry)
                     == Some(true),
             });
@@ -301,7 +298,7 @@ impl<'a> Builder<'a> {
                         packed: value.is_packable()
                             && field
                                 .options
-                                .as_option()
+                                .as_ref()
                                 .and_then(|options| options.packed)
                                 .unwrap_or(
                                     resolved.repeated_field_encoding
@@ -331,7 +328,6 @@ impl<'a> Builder<'a> {
                             Presence::Explicit
                         }
                         FieldPresence::Implicit => Presence::Implicit,
-                        _ => return Err(ProjectionError::UnsupportedPresence(full_name.clone())),
                     }
                 };
                 FieldShape::Singular { value, presence }
@@ -389,7 +385,7 @@ pub fn project(descriptors: &FileDescriptorSet) -> Result<Schema, ProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa_descriptor::generated::descriptor::{
+    use crate::descriptor::{
         Edition, FeatureSet, FileDescriptorProto, FileOptions, MessageOptions,
         OneofDescriptorProto, feature_set,
     };
@@ -414,7 +410,6 @@ mod tests {
                 message_type: messages,
                 ..Default::default()
             }],
-            ..Default::default()
         }
     }
 
@@ -501,7 +496,7 @@ mod tests {
                 field: vec![entries],
                 nested_type: vec![DescriptorProto {
                     name: Some("EntriesEntry".into()),
-                    options: buffa::MessageField::some(MessageOptions {
+                    options: Some(MessageOptions {
                         map_entry: Some(true),
                         ..Default::default()
                     }),
@@ -520,12 +515,11 @@ mod tests {
         ]);
         descriptors.file[0].syntax = Some("editions".into());
         descriptors.file[0].edition = Some(Edition::EDITION_2023);
-        descriptors.file[0].options = buffa::MessageField::some(FileOptions {
-            features: buffa::MessageField::some(FeatureSet {
+        descriptors.file[0].options = Some(FileOptions {
+            features: Some(FeatureSet {
                 message_encoding: Some(feature_set::MessageEncoding::DELIMITED),
                 ..Default::default()
             }),
-            ..Default::default()
         });
         let schema = project(&descriptors).unwrap();
         let FieldShape::Map {

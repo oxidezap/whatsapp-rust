@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::disallowed_methods)]
 
+#[path = "../codegen/descriptor.rs"]
+pub mod descriptor;
+#[path = "../codegen/features.rs"]
+pub mod features;
+
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;
 #[path = "../codegen/policy.rs"]
@@ -10,8 +15,7 @@ pub mod project;
 #[path = "../codegen/schema.rs"]
 pub mod schema;
 
-use buffa::Message as _;
-use buffa_descriptor::generated::descriptor::FileDescriptorSet;
+use descriptor::FileDescriptorSet;
 
 #[test]
 fn private_codecs_are_current_and_deterministic() {

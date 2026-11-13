@@ -4,12 +4,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
 use buffa::{Enumeration as _, Message as _};
-use buffa_descriptor::features::{self, FieldPresence, RepeatedFieldEncoding, ResolvedFeatures};
+use buffa_descriptor::features::{
+    self as reference_features, FieldPresence, RepeatedFieldEncoding, ResolvedFeatures,
+};
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, EnumDescriptorProto, FileDescriptorSet,
     field_descriptor_proto::{Label, Type},
 };
 use serde::Serialize;
+
+#[path = "../codegen/descriptor.rs"]
+pub mod descriptor;
+#[path = "../codegen/features.rs"]
+pub mod features;
 
 #[path = "../codegen/policy.rs"]
 pub mod policy;
@@ -86,7 +93,10 @@ fn messages(
             inventory.public_messages += 1;
         }
         enums(&message.enum_type, inventory);
-        let resolved = features::resolve_child(inherited, features::message_features(message));
+        let resolved = reference_features::resolve_child(
+            inherited,
+            reference_features::message_features(message),
+        );
         let mut numbers: BTreeMap<i32, Vec<String>> = BTreeMap::new();
         let synthetic_oneofs: BTreeSet<_> = message
             .field
@@ -109,7 +119,10 @@ fn messages(
                 .entry(field.number.expect("field number"))
                 .or_default()
                 .push(format!("{name}:{}", kind.proto_name()));
-            let resolved = features::resolve_child(&resolved, features::field_features(field));
+            let resolved = reference_features::resolve_child(
+                &resolved,
+                reference_features::field_features(field),
+            );
             let repeated = field.label == Some(Label::LABEL_REPEATED);
             let presence = if repeated {
                 "repeated"
@@ -170,7 +183,10 @@ fn messages(
         messages(
             &message.nested_type,
             &path,
-            &features::resolve_child(inherited, features::message_features(message)),
+            &reference_features::resolve_child(
+                inherited,
+                reference_features::message_features(message),
+            ),
             map_names,
             inventory,
         );
@@ -180,7 +196,8 @@ fn messages(
 #[allow(clippy::disallowed_methods)]
 fn inspect(bytes: &[u8]) -> Inventory {
     let descriptors = FileDescriptorSet::decode_from_slice(bytes).expect("locked descriptor");
-    let projected = project::project(&descriptors).expect("complete schema projection");
+    let input = descriptor::FileDescriptorSet::decode_from_slice(bytes).expect("locked descriptor");
+    let projected = project::project(&input).expect("complete schema projection");
     let mut inventory = Inventory {
         files: descriptors.file.len(),
         ..Inventory::default()
@@ -198,7 +215,7 @@ fn inspect(bytes: &[u8]) -> Inventory {
         messages(
             &file.message_type,
             &format!(".{}", file.package.as_deref().unwrap_or_default()),
-            &features::for_file(file),
+            &reference_features::for_file(file),
             &map_names,
             &mut inventory,
         );

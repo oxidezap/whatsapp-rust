@@ -31,7 +31,12 @@ use buffa_descriptor::generated::descriptor::{
 };
 
 #[path = "build/descriptor.rs"]
-mod descriptor;
+mod descriptor_file;
+
+#[path = "codegen/descriptor.rs"]
+pub mod descriptor;
+#[path = "codegen/features.rs"]
+pub mod features;
 
 #[path = "build/pin_clone.rs"]
 mod pin_clone;
@@ -133,11 +138,14 @@ fn main() -> std::io::Result<()> {
     apply_local_fields(&mut fds)?;
     emission::retain_wallpaper_fields(&mut fds)?;
     signal_storage::check(&names::wire_api(&fds))?;
+    #[allow(clippy::disallowed_methods)]
+    let encoded = fds.encode_to_vec();
 
     {
         #[cfg(feature = "protobuf-experiment")]
         experiment::generate(&fds, &out_path)?;
-        let projected = project::project(&fds).map_err(std::io::Error::other)?;
+        let input = descriptor::FileDescriptorSet::decode_from_slice(&encoded)?;
+        let projected = project::project(&input).map_err(std::io::Error::other)?;
         let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")
             .map_err(|error| {
                 let _ = std::fs::write(
@@ -163,9 +171,7 @@ fn main() -> std::io::Result<()> {
     // changes, and dated like the descriptor it derives from: a file stamped
     // with the current time would rerun the script on the next build.
     let descriptor = out_path.join("whatsapp.local.desc");
-    #[allow(clippy::disallowed_methods)]
-    let encoded = fds.encode_to_vec();
-    descriptor::write(
+    descriptor_file::write(
         &descriptor,
         &encoded,
         std::path::Path::new("src/whatsapp.desc"),
