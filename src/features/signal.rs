@@ -340,6 +340,7 @@ impl<'a> Signal<'a> {
             .await?
             .unwrap_or_else(wacore::libsignal::protocol::SenderKeyRecord::new_empty);
         if sender_jid.device != 0
+            && !record.legacy_receiver_recovery_disabled()
             && !record.has_sender_key_state(distribution.id(), distribution.signing_key())
         {
             // Old receive rows discarded the companion device. Only an
@@ -415,10 +416,12 @@ impl<'a> Signal<'a> {
             .signal_cache
             .get_sender_key(&sender_key_name, &*device.backend)
             .await?
-            .is_some())
+            .is_some_and(|record| !record.is_empty()))
     }
 
     /// Delete one sender-key chain and make the removal durable before returning.
+    /// Companion resets retain an empty recovery fence so stale legacy rows
+    /// cannot recreate the deleted receive position.
     pub async fn delete_sender_key(
         &self,
         group_jid: &Jid,
@@ -427,10 +430,17 @@ impl<'a> Signal<'a> {
         let sender_address = sender_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
         let backend = self.client.persistence_manager.backend();
-        self.client
-            .signal_cache
-            .delete_sender_key_durable(&sender_key_name, backend.as_ref())
-            .await?;
+        if sender_jid.device == 0 {
+            self.client
+                .signal_cache
+                .delete_sender_key_durable(&sender_key_name, backend.as_ref())
+                .await?;
+        } else {
+            self.client
+                .signal_cache
+                .clear_sender_key_durable(&sender_key_name, backend.as_ref())
+                .await?;
+        }
         Ok(())
     }
 
@@ -608,7 +618,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .get_sender_key(&sender_key_name, &*device_snapshot.backend)
             .await?
-            .is_some();
+            .is_some_and(|record| !record.is_empty());
 
         let mut store = self.client.sender_key_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -1403,6 +1413,171 @@ mod tests {
                 .await
                 .unwrap(),
             b"new"
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_deletion_does_not_restore_stale_legacy_counters() {
+        for restart in [false, true] {
+            let group = Jid::new("120363000000000001", Server::Group);
+            let author = Jid::pn_device("15550001000", 33);
+            let (sender, distribution) = companion_group_sender(&group, &author).await;
+            let (mut receiver, backend) = memory_client().await;
+            receiver
+                .signal()
+                .process_sender_key_distribution(&group, &author.to_non_ad(), &distribution)
+                .await
+                .unwrap();
+            let (_, first) = sender
+                .signal()
+                .encrypt_group_message(&group, b"before upgrade")
+                .await
+                .unwrap();
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author.to_non_ad(), &first)
+                .await
+                .unwrap();
+            receiver
+                .signal()
+                .process_sender_key_distribution(&group, &author, &distribution)
+                .await
+                .unwrap();
+            let (_, second) = sender
+                .signal()
+                .encrypt_group_message(&group, b"after upgrade")
+                .await
+                .unwrap();
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author, &second)
+                .await
+                .unwrap();
+            let current_distribution = sender
+                .signal()
+                .sender_key_distribution(&group, &author)
+                .await
+                .unwrap();
+            receiver
+                .signal()
+                .delete_sender_key(&group, &author)
+                .await
+                .unwrap();
+            if restart {
+                receiver.signal_shutdown_sync();
+                receiver = crate::test_utils::create_test_client_with_backend(backend).await;
+            }
+            assert!(
+                !receiver
+                    .signal()
+                    .has_sender_key(&group, &author)
+                    .await
+                    .unwrap()
+            );
+            let (_, replacement_distribution) = companion_group_sender(&group, &author).await;
+            receiver
+                .signal()
+                .process_sender_key_distribution(&group, &author, &replacement_distribution)
+                .await
+                .unwrap();
+            receiver
+                .signal()
+                .process_sender_key_distribution(&group, &author, &current_distribution)
+                .await
+                .unwrap();
+            assert!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &author, &second)
+                    .await
+                    .is_err(),
+                "a current redistribution must not resurrect an already consumed ciphertext; restart={restart}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn companion_sender_can_encrypt_after_a_durable_clear() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let author = Jid::pn_device("15550001000", 33);
+        let (sender, _) = companion_group_sender(&group, &author).await;
+        sender
+            .signal()
+            .delete_sender_key(&group, &author)
+            .await
+            .unwrap();
+        assert!(
+            !sender
+                .signal()
+                .has_sender_key(&group, &author)
+                .await
+                .unwrap()
+        );
+        let (distribution, ciphertext) = sender
+            .signal()
+            .encrypt_group_message(&group, b"fresh chain")
+            .await
+            .unwrap();
+        let (receiver, _) = memory_client().await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(
+                &group,
+                &author,
+                &distribution.expect("fresh distribution"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author, &ciphertext)
+                .await
+                .unwrap(),
+            b"fresh chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_clear_reports_write_failure_and_retains_its_fence() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let author = Jid::pn_device("15550001000", 33);
+        let (_, distribution) = companion_group_sender(&group, &author).await;
+        let (receiver, backend) = memory_client().await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &author, &distribution)
+            .await
+            .unwrap();
+        backend.set_fail_sender_key_writes(true);
+        assert!(
+            receiver
+                .signal()
+                .delete_sender_key(&group, &author)
+                .await
+                .is_err()
+        );
+        assert!(
+            !receiver
+                .signal()
+                .has_sender_key(&group, &author)
+                .await
+                .unwrap()
+        );
+        backend.set_fail_sender_key_writes(false);
+        receiver
+            .signal()
+            .delete_sender_key(&group, &author)
+            .await
+            .unwrap();
+        receiver.signal_shutdown_sync();
+        let restarted = crate::test_utils::create_test_client_with_backend(backend).await;
+        assert!(
+            !restarted
+                .signal()
+                .has_sender_key(&group, &author)
+                .await
+                .unwrap()
         );
     }
 

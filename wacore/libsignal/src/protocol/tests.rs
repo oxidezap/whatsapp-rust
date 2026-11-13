@@ -14,6 +14,51 @@ fn receiver_state_inheritance_never_copies_a_signing_secret() {
     assert!(destination.is_empty());
     assert_eq!(previous.serialize().unwrap(), before);
 }
+#[test]
+fn sender_key_recovery_fence_survives_record_projections() {
+    let mut record = SenderKeyRecord::new_empty();
+    assert!(!record.legacy_receiver_recovery_disabled());
+    record.disable_legacy_receiver_recovery();
+    let pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let mut previous = SenderKeyRecord::new_empty();
+    previous
+        .add_sender_key_state(3, 17, 0, &[7; 32], pair.public_key, None)
+        .unwrap();
+    assert!(!record.inherit_receiver_state(&previous, 17, &pair.public_key));
+    let bytes = record.serialize().unwrap();
+    assert!(
+        SenderKeyRecord::deserialize(&bytes)
+            .unwrap()
+            .legacy_receiver_recovery_disabled()
+    );
+    let stored = record.serialize_for_store(&[7; 16]).unwrap();
+    for incarnation in [[7; 16], [8; 16]] {
+        assert!(
+            SenderKeyRecord::deserialize_for_store(&stored, &incarnation)
+                .unwrap()
+                .legacy_receiver_recovery_disabled()
+        );
+    }
+    let components = record.into_components().unwrap();
+    assert!(
+        SenderKeyRecord::from_components(components)
+            .unwrap()
+            .legacy_receiver_recovery_disabled()
+    );
+}
+
+#[test]
+fn sender_key_recovery_policy_rejects_ambiguous_storage_fields() {
+    for fields in [vec![0xb0, 0x06, 2], vec![0xb0, 0x06, 1, 0xb0, 0x06, 0]] {
+        assert!(SenderKeyRecord::deserialize(&fields).is_err());
+    }
+    assert!(
+        !SenderKeyRecord::deserialize(&[])
+            .unwrap()
+            .legacy_receiver_recovery_disabled()
+    );
+}
+
 use async_trait::async_trait;
 use rand::SeedableRng;
 use std::{

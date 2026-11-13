@@ -1830,7 +1830,7 @@ impl Client {
                 .signal_cache
                 .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                 .await?
-                .is_some();
+                .is_some_and(|record| !record.is_empty());
 
             if !key_exists {
                 self.reset_sender_key_device_tracking(&to_str).await?;
@@ -3348,7 +3348,7 @@ impl Client {
                     .signal_cache
                     .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                     .await?;
-                let key_exists = record.is_some();
+                let key_exists = record.as_ref().is_some_and(|record| !record.is_empty());
                 // Read the chain iteration through the shared `Arc` without cloning
                 // the record: borrow the current state instead of `*_mut().cloned()`.
                 let needs_rotation = record
@@ -5042,6 +5042,39 @@ mod tests {
         /// measured in.
         fn frame_len(&self, index: usize) -> usize {
             self.transport.sent()[index].len()
+        }
+    }
+
+    #[tokio::test]
+    async fn cleared_sender_key_recreates_distribution_on_normal_group_send() {
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        for fixture in [
+            GroupSendFixture::new().await,
+            GroupSendFixture::new_lid(2).await,
+        ] {
+            fixture.send_text("before clear").await;
+            let key = SenderKeyName::from_parts(
+                &fixture.group.to_string(),
+                fixture.own_sending.to_protocol_address().as_str(),
+            );
+            let backend = fixture.client.persistence_manager.backend();
+            fixture
+                .client
+                .signal_cache
+                .clear_sender_key_durable(&key, backend.as_ref())
+                .await
+                .unwrap();
+            let index = fixture.transport.sent_count();
+            fixture.send_text("after clear").await;
+            let owned = fixture.stanza(index).await;
+            let node = owned.get();
+            let participants = node
+                .get_optional_child("participants")
+                .expect("fresh key distribution");
+            assert_eq!(
+                participants.children().unwrap().len(),
+                fixture.recipient_devices
+            );
         }
     }
 
