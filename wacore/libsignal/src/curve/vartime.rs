@@ -1,0 +1,71 @@
+// Portions derived from curve25519-dalek 5.0.0. See LICENSE.
+// -*- mode: rust; -*-
+//
+// This file is part of curve25519-dalek.
+// Copyright (c) 2016-2021 isis lovecruft
+// Copyright (c) 2016-2019 Henry de Valence
+// See LICENSE for licensing information.
+//
+// Authors:
+// - isis agora lovecruft <isis@patternsinthevoid.net>
+// - Henry de Valence <hdevalence@hdevalence.ca>
+#![allow(non_snake_case)]
+
+use core::cmp::Ordering;
+
+use super::constants;
+use super::edwards::EdwardsPoint;
+use super::models::{ProjectiveNielsPoint, ProjectivePoint};
+use super::scalar::Scalar;
+use super::traits::Identity;
+use super::window::NafLookupTable5;
+
+pub fn mul(a: &Scalar, A: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    if let Some(result) = super::avx2::mul(a, A, b) {
+        return result;
+    }
+    mul_serial(a, A, b)
+}
+
+pub(super) fn mul_serial(a: &Scalar, A: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
+    let a_naf = a.non_adjacent_form(5);
+
+    let b_naf = b.non_adjacent_form(8);
+    // Find starting index
+    let mut i: usize = 255;
+    for j in (0..256).rev() {
+        i = j;
+        if a_naf[i] != 0 || b_naf[i] != 0 {
+            break;
+        }
+    }
+
+    let table_A = NafLookupTable5::<ProjectiveNielsPoint>::from(A);
+    let table_B = &constants::BASEPOINT_ODD_MULTIPLES;
+    let mut r = ProjectivePoint::identity();
+    loop {
+        let mut t = r.double();
+
+        match a_naf[i].cmp(&0) {
+            Ordering::Greater => t = &t.as_extended() + &table_A.select(a_naf[i] as usize),
+            Ordering::Less => t = &t.as_extended() - &table_A.select(-a_naf[i] as usize),
+            Ordering::Equal => {}
+        }
+
+        match b_naf[i].cmp(&0) {
+            Ordering::Greater => t = &t.as_extended() + &table_B.select(b_naf[i] as usize),
+            Ordering::Less => t = &t.as_extended() - &table_B.select(-b_naf[i] as usize),
+            Ordering::Equal => {}
+        }
+
+        r = t.as_projective();
+
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+
+    r.as_extended()
+}

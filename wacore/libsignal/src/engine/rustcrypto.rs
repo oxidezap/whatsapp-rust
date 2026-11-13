@@ -2,12 +2,12 @@
 //! RustCrypto implementation using RFC 7748, RFC 5869 and the public XEdDSA
 //! specification, <https://signal.org/docs/specifications/xeddsa/> sections 2–5.
 //! Verification also accepts an Edwards sign bit transported in signature bit 511.
+use crate::curve::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
 use crate::engine::{CryptoProvider, Error, RandomSource, Result};
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
-use curve25519_dalek::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::digest::{block_api::CoreProxy, common::hazmat::SerializableState};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
@@ -48,17 +48,6 @@ impl RustCrypto {
     }
 }
 
-fn scalar_hash(hash: Sha512) -> Scalar {
-    let digest = Zeroizing::new(<[u8; 64]>::from(hash.finalize()));
-    Scalar::from_bytes_mod_order_wide(&digest)
-}
-fn challenge(r: &[u8], public: &[u8], message: &[u8]) -> Scalar {
-    let mut hash = Sha512::new();
-    hash.update(r);
-    hash.update(public);
-    hash.update(message);
-    scalar_hash(hash)
-}
 fn canonical_montgomery(public: &[u8; 32]) -> bool {
     // p = 2^255 - 19, encoded little endian. Comparison concerns public data.
     let mut p = [255; 32];
@@ -93,22 +82,9 @@ impl CryptoProvider for RustCrypto {
         let sign = Choice::from(public[31] >> 7);
         let a = Zeroizing::new(Scalar::conditional_select(&scalar, &-*scalar, sign));
         public[31] &= 127;
-        let mut domain = [255; 32];
-        domain[0] = 254;
-        let mut hash = Sha512::new();
-        hash.update(domain);
-        hash.update(a.as_bytes());
-        hash.update(message);
-        hash.update(randomness.as_slice());
-        let nonce = Zeroizing::new(scalar_hash(hash));
-        let r = EdwardsPoint::mul_base(&nonce).compress().to_bytes();
-        let h = challenge(&r, &public, message);
-        let s = *nonce + h * *a;
-        let mut signature = [0; 64];
-        signature[..32].copy_from_slice(&r);
-        signature[32..].copy_from_slice(s.as_bytes());
-        Ok(signature)
+        Ok(crate::curve::sign(&a, &public, message, &randomness))
     }
+
     fn verify(&self, public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<()> {
         if !canonical_montgomery(public) {
             return Err(Error::Authentication);
@@ -119,22 +95,16 @@ impl CryptoProvider for RustCrypto {
         if point.is_small_order() {
             return Err(Error::Authentication);
         }
-        let mut encoded_s = [0; 32];
-        encoded_s.copy_from_slice(&signature[32..]);
-        encoded_s[31] &= 127;
-        // XEdDSA permits an unreduced s below 2^253, see specification section 5.
-        if encoded_s[31] & 224 != 0 {
-            return Err(Error::Authentication);
-        }
-        let s = Scalar::from_bytes_mod_order(encoded_s);
-        let h = challenge(&signature[..32], point.compress().as_bytes(), message);
-        let check = EdwardsPoint::vartime_double_scalar_mul_basepoint(&-h, &point, &s).compress();
-        if bool::from(check.as_bytes().ct_eq(&signature[..32])) {
+        let signature =
+            crate::curve::ParsedSignature::parse(signature).ok_or(Error::Authentication)?;
+        let encoding = point.compress().to_bytes();
+        if crate::curve::verify(&point, &encoding, message, &signature) {
             Ok(())
         } else {
             Err(Error::Authentication)
         }
     }
+
     fn sha256(&self, data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
     }
@@ -295,7 +265,7 @@ mod tests {
         one[0] = 1;
         let mut low_order = vec![[0; 32], one, minus_one, p, p_plus_one];
         low_order.extend(
-            curve25519_dalek::constants::EIGHT_TORSION
+            crate::curve::EIGHT_TORSION
                 .iter()
                 .map(|point| point.to_montgomery().to_bytes()),
         );
@@ -383,7 +353,7 @@ mod tests {
     fn rfc8032_signature_with_montgomery_public_key() {
         // RFC 8032 section 7.1, test 1. XEdDSA uses the same verification equation.
         let ed = hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
-        let public = curve25519_dalek::edwards::CompressedEdwardsY(ed)
+        let public = crate::curve::edwards::CompressedEdwardsY(ed)
             .decompress()
             .unwrap()
             .to_montgomery()
