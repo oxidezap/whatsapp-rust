@@ -403,7 +403,7 @@ impl Client {
 
         let mut devices = match freshness {
             crate::cache::Freshness::CachePreferred => {
-                self.get_user_devices_owned(jids_to_resolve).await?
+                self.get_group_user_devices_owned(jids_to_resolve).await?
             }
             crate::cache::Freshness::Refresh => {
                 self.refresh_group_user_devices(jids_to_resolve).await?

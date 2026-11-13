@@ -495,6 +495,24 @@ impl Client {
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.get_user_devices_cached_first(jids, false).await
+    }
+
+    /// Group fanout: a contact whose PN and LID carry conflicting primaries is
+    /// rejected alone (keeping its old record) instead of failing the send
+    /// for every other participant.
+    pub(crate) async fn get_group_user_devices_owned(
+        &self,
+        jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.get_user_devices_cached_first(jids, true).await
+    }
+
+    async fn get_user_devices_cached_first(
+        &self,
+        jids: Vec<Jid>,
+        group: bool,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
         // One batched registry pass: the cache answers per user, and every
         // user it cannot answer goes to the backend in ONE read. The
         // previous per-user fan-out (16 concurrent `get_devices`) bought
@@ -513,7 +531,11 @@ impl Client {
                 "get_user_devices: Cache miss, fetching from network for {} unique users",
                 jids_to_fetch.len()
             );
-            let fetched = self.fetch_user_devices(jids_to_fetch).await?;
+            let fetched = if group {
+                self.refresh_group_user_devices(jids_to_fetch).await?
+            } else {
+                self.fetch_user_devices(jids_to_fetch).await?
+            };
             self.remove_superseded_cached_devices(&mut all_devices, &fetched)
                 .await;
             all_devices.extend(fetched);
