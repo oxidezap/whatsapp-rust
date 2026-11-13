@@ -2524,7 +2524,9 @@ mod tests {
             adv_secret_key: [7; 32],
         };
         let qr = CompanionQr::parse(&PairUtils::make_qr_data(
-            &companion,
+            &companion.noise_key.public_key,
+            &companion.identity_key.public_key,
+            &companion.adv_secret_key,
             "synthetic-reference",
             wacore::companion_reg::CompanionWebClientType::Chrome,
         ))
@@ -3038,7 +3040,9 @@ mod tests {
                 adv_secret_key: [7; 32],
             };
             let qr_text = PairUtils::make_qr_data(
-                &peer,
+                &peer.noise_key.public_key,
+                &peer.identity_key.public_key,
+                &peer.adv_secret_key,
                 "abandoned-reference",
                 wacore::companion_reg::CompanionWebClientType::Chrome,
             );
@@ -3515,7 +3519,9 @@ mod tests {
             adv_secret_key: [6; 32],
         };
         let qr = CompanionQr::parse(&PairUtils::make_qr_data(
-            &companion,
+            &companion.noise_key.public_key,
+            &companion.identity_key.public_key,
+            &companion.adv_secret_key,
             "replacement-reference",
             wacore::companion_reg::CompanionWebClientType::Chrome,
         ))

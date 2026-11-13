@@ -132,7 +132,9 @@ mod tests {
             adv_secret_key: [7; 32],
         };
         let raw = PairUtils::make_qr_data(
-            &state,
+            &state.noise_key.public_key,
+            &state.identity_key.public_key,
+            &state.adv_secret_key,
             "synthetic,reference",
             CompanionWebClientType::Chrome,
         );

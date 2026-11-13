@@ -26,12 +26,13 @@ pub fn make_qr_data_with_client_type(
     ref_str: &str,
     client_type: CompanionWebClientType,
 ) -> String {
-    let device_state = DeviceState {
-        identity_key: store.identity_key.clone(),
-        noise_key: store.noise_key.clone(),
-        adv_secret_key: store.adv_secret_key,
-    };
-    PairUtils::make_qr_data(&device_state, ref_str, client_type)
+    PairUtils::make_qr_data(
+        &store.noise_key.public_key,
+        &store.identity_key.public_key,
+        &store.adv_secret_key,
+        ref_str,
+        client_type,
+    )
 }
 
 impl Client {
@@ -169,15 +170,7 @@ pub(crate) async fn handle_iq_scoped(
                                     }
                                     let snapshot =
                                         client_clone.persistence_manager.get_device_snapshot();
-                                    let code = PairUtils::make_qr_data(
-                                        &DeviceState {
-                                            identity_key: snapshot.identity_key.clone(),
-                                            noise_key: snapshot.noise_key.clone(),
-                                            adv_secret_key: snapshot.adv_secret_key,
-                                        },
-                                        &pairing_ref,
-                                        companion_web_client_type_for_props(&snapshot.device_props),
-                                    );
+                                    let code = make_qr_data(&snapshot, &pairing_ref);
                                     client_clone.core.event_bus.dispatch(Event::PairingQrCode(
                                         crate::types::events::PairingQrCode::builder()
                                             .code(code)
