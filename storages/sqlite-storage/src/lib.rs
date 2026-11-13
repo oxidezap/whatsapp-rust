@@ -10,17 +10,10 @@
 //!
 //! # SQLite version
 //!
-//! SQLite before 3.54.0 can return stale page-cache bytes after it opens a
-//! WAL database whose `-wal` file has a different page size
-//! (RUSTSEC-2026-0459). The default `bundled-sqlite` feature compiles the
-//! SQLite that `libsqlite3-sys` 0.38 bundles, which is affected; Diesel 2.3
-//! does not yet accept `libsqlite3-sys` 0.39, which bundles 3.54.1. To link a
-//! fixed SQLite you built yourself, set `LIBSQLITE3_SYS_USE_PKG_CONFIG=1`
-//! (this overrides `bundled`) and point `libsqlite3-sys` at the library with
-//! `SQLITE3_LIB_DIR` and `SQLITE3_STATIC=1`, or with pkg-config. In this
-//! repository, `cargo xt fixed-sqlite` builds 3.54.1 from the official release
-//! and prints those variables. The wasm backend links `sqlite-wasm-rs` 0.6.3,
-//! which bundles 3.54.1.
+//! SQLite 3.54.0 or newer is required for RUSTSEC-2026-0459. Native bundled
+//! builds use the patched SQLite from `libsqlite3-sys` 0.39.1, and WASM uses
+//! `sqlite-wasm-rs` 0.6.3. Builds using system SQLite must also satisfy this
+//! minimum; the storage integration test checks the library actually linked.
 //!
 //! The pre-1.0 constructor/configuration aliases are deliberately removed:
 //! ```compile_fail

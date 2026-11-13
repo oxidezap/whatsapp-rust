@@ -36,7 +36,7 @@ buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
-libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
+libsqlite3-sys = { version = "0.39.1", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
@@ -64,7 +64,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # target does not provide. This future wraps the platform's real setTimeout.
 gloo-timers = { version = "0.4", features = ["futures"] }
 
-# Diesel 2.3.14 accepts the 0.6 ABI; `js` selects the browser host hooks.
+# `js` selects the browser host hooks.
 # 0.6.3 bundles SQLite 3.54.1, the first line fixed for RUSTSEC-2026-0459.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 sqlite-wasm-rs = { version = "0.6.3", default-features = false, features = ["wasm-bindgen"], optional = true }

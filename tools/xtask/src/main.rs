@@ -3,7 +3,6 @@
 mod ci;
 mod compatibility;
 mod consumers;
-mod fixed_sqlite;
 mod mobile_apk;
 mod package_consumers;
 mod session_retention;
@@ -55,16 +54,6 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
-    /// Build SQLite 3.54.1 from the official release for native builds to link
-    /// (RUSTSEC-2026-0459), and print the libsqlite3-sys variables that select it.
-    FixedSqlite {
-        /// Output directory for libsqlite3.a and its headers.
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Also append the variables to $GITHUB_ENV.
-        #[arg(long)]
-        github_env: bool,
-    },
     /// CI metadata, timed tests, image pins, binary measurements and reporting.
     Ci {
         #[command(subcommand)]
@@ -97,11 +86,6 @@ fn main() -> Result<std::process::ExitCode> {
         Task::Mlow { args } => worker(&root, "mlow", &args)?,
         Task::Oracle { args } => worker(&root, "oracle", &args)?,
         Task::Ci { task } => ci::run(&root, task)?,
-        Task::FixedSqlite { out, github_env } => {
-            let out = out.unwrap_or_else(|| fixed_sqlite::default_out(&root));
-            fixed_sqlite::run(&out, github_env)?;
-            0
-        }
     };
     Ok(std::process::ExitCode::from(status))
 }

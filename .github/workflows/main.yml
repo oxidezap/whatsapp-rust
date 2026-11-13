@@ -194,31 +194,6 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --exclude e2e-tests --doc --verbose
 
-  # RUSTSEC-2026-0459: the SQLite bundled with libsqlite3-sys 0.38 is affected,
-  # and Diesel 2.3 cannot take 0.39 yet. This job links SQLite 3.54.1 built
-  # from the official release, and the storage tests, including the version
-  # check in tests/sqlite_version.rs, run against it.
-  fixed-sqlite:
-    name: Storage on a fixed SQLite (RUSTSEC-2026-0459)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-      - name: Cache Rust build (registry + target)
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: "true"
-      - name: Build SQLite 3.54.1 and select it for libsqlite3-sys
-        run: cargo xt fixed-sqlite --out "$RUNNER_TEMP/fixed-sqlite" --github-env
-      - name: Test the storage crate against it
-        run: cargo test --locked -p whatsapp-rust-sqlite-storage -- --nocapture
-
   waproto-serde:
     name: waproto serde representations
     runs-on: ubuntu-latest
