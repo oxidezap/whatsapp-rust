@@ -24,15 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Verify pinned app-state programs and native output
         env:
           RUSTFLAGS: ''
-        run: cargo +stable run -p whatspec-codegen --bin appstate-validation -- --check
+        run: cargo run -p whatspec-codegen --bin appstate-validation -- --check
       - name: Compare generated validators with the official isolated-method fixtures
         env:
           RUSTFLAGS: ''
-        run: cargo +stable test -p wacore-appstate --lib validation
+        run: cargo test -p wacore-appstate --lib validation

@@ -248,8 +248,10 @@ fn read_type_ids(state: &HostState, ptr: u32, count: u32) -> Result<Vec<u32>> {
     let len = count.checked_mul(4).context("type array length overflow")?;
     let bytes = state.read(ptr, len)?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte type id")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect())
 }
 

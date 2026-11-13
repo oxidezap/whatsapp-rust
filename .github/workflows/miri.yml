@@ -22,8 +22,8 @@ env:
   PROTOC_VERSION: '3.25.3'
   CARGO_INCREMENTAL: "0"
   # Miri interprets MIR and never links, so the workspace's lld/ICF and
-  # -Zshare-generics rustflags buy nothing here; a set-but-empty RUSTFLAGS takes
-  # precedence over .cargo/config.toml (same lever main.yml's stable job pulls).
+  # rustflags buy nothing here; a set-but-empty RUSTFLAGS takes
+  # precedence over .cargo/config.toml.
   RUSTFLAGS: ""
 
 jobs:
@@ -82,6 +82,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
+          # Miri and its interpreted sysroot require nightly; keep every UB leg.
           toolchain: nightly-2026-06-16
           # rust-src is what `cargo miri setup` compiles the interpreter's
           # sysroot from; installing `miri` does not pull it in.

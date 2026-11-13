@@ -10,10 +10,10 @@ on:
   workflow_dispatch:
     inputs:
       toolchain:
-        description: Dated nightly for a main baseline; alternate compilers do not publish graphs
+        description: Pinned Rust version for a main baseline; alternate compilers do not publish graphs
         required: false
         type: string
-        default: nightly-2026-06-16
+        default: 1.100.0
 
 concurrency:
   # head_ref alone could collide across forks; the PR number is unique.
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTUP_TOOLCHAIN: nightly-2026-06-16
+  RUSTUP_TOOLCHAIN: 1.100.0
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: "3.25.3"
   SCCACHE_GHA_ENABLED: "true"

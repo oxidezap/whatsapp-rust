@@ -6299,7 +6299,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
- "portable-atomic",
  "rand 0.10.3",
  "thiserror 2.0.21",
  "tokio",

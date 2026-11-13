@@ -172,7 +172,7 @@ struct PdoAttemptGuard(Arc<PdoRequestMemo>);
 
 impl Drop for PdoAttemptGuard {
     fn drop(&mut self) {
-        let _ = self.0.outcome.fetch_update(
+        let _ = self.0.outcome.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |state| (state != PDO_SENT).then_some(PDO_FAILED),
@@ -2077,7 +2077,7 @@ mod tests {
         id: &str,
         participant: Option<&str>,
     ) -> waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse
-    {
+{
         use buffa::Message as _;
         let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
         web_msg.message = buffa::MessageField::some({

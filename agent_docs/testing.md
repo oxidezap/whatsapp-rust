@@ -1,6 +1,6 @@
 # Verify a change
 
-Use the pinned toolchain from `rust-toolchain.toml`. The workflows and Rust
+Use stable Rust 1.100.0, pinned in `rust-toolchain.toml`. The workflows and Rust
 `cargo xt` tasks are the authoritative command definitions.
 
 ```sh
@@ -19,6 +19,13 @@ dev-dependency graph so feature unification cannot hide missing requirements.
 For storage adapters, reuse the app-state/token helpers in `wacore/tests/support`
 and their SQLite runners. Builder probes do not certify backend correctness;
 add backend-specific cancellation and crash tests.
+
+The published MSRV remains Rust 1.95. Miri retains `nightly-2026-06-16`
+because its interpreter and sysroot are nightly-only. The isolated
+`wacore/binary/fuzz` workspace also requires nightly for libFuzzer and sanitizer
+instrumentation. Keep both safety checks; neither is replaced by native tests.
+Normal builds and the Docker image use stable without `-Zshare-generics` or
+`-Zbuild-std`. The image uses rustup's prebuilt musl standard library.
 
 ## Runtime and E2E tests
 
@@ -75,7 +82,7 @@ supplements the shipping demo gate and does not measure runtime memory.
 ## Unsafe and capture-backed checks
 
 Changes to `Yokeable`/`StableDeref` or zlib `set_len` require the Miri gate.
-Locally use `cargo miri test -p wacore-binary --lib`; large fixtures need a small
+Locally use `cargo +nightly-2026-06-16 miri test -p wacore-binary --lib`; large fixtures need a small
 Miri twin rather than removing coverage.
 
 Use `cargo xt oracle conformance`, adding `--slow` for serialized signaling.

@@ -102,12 +102,16 @@ impl PitchSeed {
 
         let blocksegs_ix: Vec<[usize; 2]> = self
             .blocksegs_ix
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| [p[0] as usize, p[1] as usize])
             .collect();
         let firstblock_range: Vec<[usize; 2]> = self
             .firstblock_range
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| [p[0] as usize, p[1] as usize])
             .collect();
 
@@ -117,13 +121,17 @@ impl PitchSeed {
         let blockseg_idx_cmf = dcmf_to_cmf(&self.blockseg_idx_dcmf);
         let delta_lag_cmfs: Vec<Vec<u32>> = self
             .delta_lag_dcmfs
-            .chunks_exact(319)
-            .map(dcmf_to_cmf)
+            .as_chunks::<319>()
+            .0
+            .iter()
+            .map(|chunk| dcmf_to_cmf(chunk))
             .collect();
         let block_transition_cmf: Vec<Vec<u32>> = self
             .block_transition_dcmf
-            .chunks_exact(PITCH_NUM_BLOCKS)
-            .map(dcmf_to_cmf)
+            .as_chunks::<PITCH_NUM_BLOCKS>()
+            .0
+            .iter()
+            .map(|chunk| dcmf_to_cmf(chunk))
             .collect();
 
         debug_assert_eq!(block_transition_cmf.len(), PITCH_NUM_BLOCKS);
@@ -171,7 +179,9 @@ impl PitchSeed {
         }
         let firstblock_range = self
             .firstblock_range
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| [p[0] as usize, p[1] as usize])
             .collect();
         ContourWindowParts {
@@ -181,13 +191,17 @@ impl PitchSeed {
             lag_cdf: dcmf_to_cmf(&self.blockseg_idx_dcmf),
             frac_cmfs: self
                 .delta_lag_dcmfs
-                .chunks_exact(319)
-                .map(dcmf_to_cmf)
+                .as_chunks::<319>()
+                .0
+                .iter()
+                .map(|chunk| dcmf_to_cmf(chunk))
                 .collect(),
             delta_cmfs: self
                 .block_transition_dcmf
-                .chunks_exact(PITCH_NUM_BLOCKS)
-                .map(dcmf_to_cmf)
+                .as_chunks::<PITCH_NUM_BLOCKS>()
+                .0
+                .iter()
+                .map(|chunk| dcmf_to_cmf(chunk))
                 .collect(),
         }
     }

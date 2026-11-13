@@ -518,7 +518,7 @@ where
                         / parsed) as usize;
                     let reserve_cap = record_sink
                         .retained_item_size()
-                        .map(|item_size| RECORD_RESERVE_BYTE_CAP / item_size.get())
+                        .map(|item_size| RECORD_RESERVE_BYTE_CAP / item_size)
                         .unwrap_or(0);
                     let estimated = projected
                         .saturating_add(projected / RESERVE_HEADROOM_DIVISOR)

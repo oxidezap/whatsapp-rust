@@ -10,7 +10,6 @@ description = "WhatsApp Metrics (WAM) telemetry plugin for whatsapp-rust"
 [dependencies]
 anyhow = { workspace = true }
 log = { workspace = true }
-portable-atomic = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 whatsapp-rust = { path = "../..", default-features = false, features = ["plugins"] }

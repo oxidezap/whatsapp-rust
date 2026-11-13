@@ -86,7 +86,7 @@ impl FlushScope {
         // the same way as a closed scope.
         if self
             .state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                 if state & CLOSED != 0 {
                     return None;
                 }

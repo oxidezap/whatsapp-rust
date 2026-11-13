@@ -512,8 +512,8 @@ pub(crate) fn synth_internal_frame(
         let gain_frac = smpl_ltp_frac_gain(pitch.norm_gain);
         let mut pred_out = vec![0f32; SMPL_SUBFR_LEN];
         st.gst = SmplExcGainState::default();
-        for sf in 0..SMPL_SUBFR_COUNT {
-            let lag_f = pitch.lag_subfr[sf] as f32;
+        for (sf, &lag) in pitch.lag_subfr.iter().enumerate().take(SMPL_SUBFR_COUNT) {
+            let lag_f = lag as f32;
             let int_lag = lag_f as i32;
             if int_lag <= 0 {
                 let from = sf * SMPL_SUBFR_LEN;

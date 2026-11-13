@@ -35,9 +35,9 @@ pub(crate) fn decode_smpl_gains(
     // (gain_delta up to 98); the WASM reads adjacent rodata, which the seed carries verbatim.
     let off6 = p3 * gain_delta;
     let base7 = gain_main * cc.nrg_step(cfg_sel) - 0x154000;
-    for sf in 0..(p3 as usize).min(4) {
+    for (sf, gain) in res.gain_q.iter_mut().enumerate().take((p3 as usize).min(4)) {
         let cbv = cc.gain_recon(p3 == 4, sf as i32 + off6);
-        res.gain_q[sf] = base7 + (cbv << 4);
+        *gain = base7 + (cbv << 4);
     }
 
     // nrgres: per-subframe bucketed CDF (n=92) with a gain-derived slice shift.

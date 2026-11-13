@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           targets: wasm32-unknown-unknown
       - name: Install wasm-bindgen test runner
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
@@ -72,7 +72,7 @@ jobs:
         run: |
           # The hosted image supplies a matching Chrome/ChromeDriver pair.
           export CHROMEDRIVER="${CHROMEWEBDRIVER}/chromedriver"
-          cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16
+          cargo xt ci consumers run --lane wasm --toolchain 1.100.0
       # The SQLite store reaches wasm through `storages/sqlite-storage/src/pool.rs`,
       # which swaps r2d2 and tokio's blocking pool for a single connection behind a
       # lock. Both of those type-check on wasm and only fail when a thread is actually

@@ -16,7 +16,7 @@ on:
         type: string
         default: ''
 
-# Native per-arch runners instead of QEMU: build-std + fat LTO is far too slow
+# Native per-arch runners instead of QEMU: fat LTO is far too slow
 # under emulation. Each arch builds in parallel, pushed by digest, then merged
 # into one multi-arch manifest.
 # event_name keys the group so a main push can't cancel a release's build.
