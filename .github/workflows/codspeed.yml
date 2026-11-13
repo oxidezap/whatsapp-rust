@@ -39,6 +39,10 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # Apply one stable compiler and flags to both checked-out revisions.
+      RUSTUP_TOOLCHAIN: 1.100.0
+      RUSTFLAGS: "-Clink-arg=-Wl,--icf=all"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,7 +51,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - uses: taiki-e/install-action@v2
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
@@ -157,7 +161,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
 
       # The CodSpeed runner installs its patched valgrind with a bare
       # `apt-get update && apt-get install`, and it buffers that command's
@@ -307,7 +311,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
 
       # The CodSpeed runner installs its patched valgrind with a bare
       # `apt-get update && apt-get install`, and it buffers that command's

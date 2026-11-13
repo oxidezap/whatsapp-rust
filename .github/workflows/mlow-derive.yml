@@ -26,7 +26,7 @@ jobs:
         run: git rev-parse HEAD
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - uses: taiki-e/install-action@v2
         with:
           tool: protoc@3.25.3,cargo-nextest
@@ -59,7 +59,7 @@ jobs:
         run: git rev-parse HEAD
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - uses: taiki-e/install-action@v2
         with:
           tool: protoc@3.25.3,cargo-nextest

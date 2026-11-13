@@ -2011,7 +2011,7 @@ mod tests {
         }
         let entries = collector.into_entries();
         assert_eq!(entries.len(), cases.len() * 2);
-        for (burst, (_, expected)) in entries.chunks_exact(2).zip(&cases) {
+        for (burst, (_, expected)) in entries.as_chunks::<2>().0.iter().zip(&cases) {
             for entry in burst {
                 assert_eq!(entry.chat.as_ref(), expected);
                 assert_eq!(entry.sender.as_ref(), expected);

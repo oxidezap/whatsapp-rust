@@ -30,7 +30,9 @@ fn decode_capture() -> Vec<f32> {
 /// Load the decoder reference (s16le @ 16 kHz) as float [-1,1].
 fn load_ref() -> Vec<f32> {
     let raw = include_bytes!("testdata/ref_usesmpl_expected.raw");
-    raw.chunks_exact(2)
+    raw.as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
         .collect()
 }

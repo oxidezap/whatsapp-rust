@@ -411,7 +411,7 @@ impl SharedHost {
         // matching entry, and an underflow here would read as a huge count.
         let _ = self
             .in_wasm
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
                 Some(now.saturating_sub(1))
             });
     }

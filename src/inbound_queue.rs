@@ -236,7 +236,7 @@ pub(crate) fn reserve(budget: &Arc<ByteBudget>, bytes: usize) -> Option<ByteLeas
     let charge = bytes.max(1024);
     budget
         .available
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
             available.checked_sub(charge)
         })
         .ok()?;

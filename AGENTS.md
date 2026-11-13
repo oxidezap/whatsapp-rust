@@ -40,7 +40,7 @@ CI runs tests through [cargo-nextest](https://nexte.st) (`--profile ci`, config 
 
 Workspace clippy takes minutes — pushing and letting CI parallelize the matrix is usually faster. E2E tests (`cargo nextest run --profile e2e -p e2e-tests`) need the mock server running; see `agent_docs/testing.md`.
 
-Touching `unsafe` — the `Yokeable`/`StableDeref` impls in `wacore-binary`'s `node.rs`, the `set_len` in `zlib_pool.rs` — means CI's Miri gate (`.github/workflows/miri.yml`) is what proves it, since neither clippy nor a native test observes an aliasing violation or an uninit read. Locally: `rustup component add miri rust-src && cargo miri test -p wacore-binary --lib`. Interpretation is ~100× native, so a fixture that only makes sense at hundreds of KB (zlib window refill, buffer growth) belongs behind `#[cfg_attr(miri, ignore)]` with a small twin that keeps the `unsafe` covered.
+Touching `unsafe` — the `Yokeable`/`StableDeref` impls in `wacore-binary`'s `node.rs`, the `set_len` in `zlib_pool.rs` — means CI's Miri gate (`.github/workflows/miri.yml`) is what proves it, since neither clippy nor a native test observes an aliasing violation or an uninit read. Locally: `rustup component add --toolchain nightly-2026-06-16 miri rust-src && cargo +nightly-2026-06-16 miri test -p wacore-binary --lib`. Interpretation is ~100× native, so a fixture that only makes sense at hundreds of KB (zlib window refill, buffer growth) belongs behind `#[cfg_attr(miri, ignore)]` with a small twin that keeps the `unsafe` covered.
 
 ## Gotchas
 

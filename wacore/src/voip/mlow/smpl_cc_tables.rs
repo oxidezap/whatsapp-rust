@@ -235,18 +235,24 @@ impl CcSeed {
         let nrgres_shape4 = dcmf_to_cmf(&self.nrgres_shape4_dcmf);
         let fcbg_offset: Vec<Vec<u16>> = self
             .fcbg_offset_dcmf
-            .chunks_exact(FCBG_OFFSET_STEPS)
-            .map(dcmf_to_cmf)
+            .as_chunks::<FCBG_OFFSET_STEPS>()
+            .0
+            .iter()
+            .map(|chunk| dcmf_to_cmf(chunk))
             .collect();
         let acbgains_hr: Vec<u16> = self
             .acbgains_hr_dcmf
-            .chunks_exact(ACBG_N)
-            .flat_map(dcmf_to_cmf)
+            .as_chunks::<ACBG_N>()
+            .0
+            .iter()
+            .flat_map(|chunk| dcmf_to_cmf(chunk))
             .collect();
         // LR (p6!=0) variant: same expansion from the LR DCMF const (no seed bytes).
         let acbgains_lr: Vec<u16> = SMPL_ACBGAINS_DCMF_LR
-            .chunks_exact(ACBG_N)
-            .flat_map(dcmf_to_cmf)
+            .as_chunks::<ACBG_N>()
+            .0
+            .iter()
+            .flat_map(|chunk| dcmf_to_cmf(chunk))
             .collect();
         let fcbgains_v = dcmf_to_cmf(&self.fcbgains_v_dcmf);
         let fcbgains_v_delta = dcmf_to_cmf(&self.fcbgains_v_delta_dcmf);
@@ -255,7 +261,9 @@ impl CcSeed {
         let acbgains_cb_lr_q14: Vec<i16> = SMPL_CB_ACBGAINS_LR_Q14.to_vec();
         let gain_recon: Vec<i16> = self
             .gain_recon
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
 

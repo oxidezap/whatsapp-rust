@@ -48,7 +48,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - name: Install protoc
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
         with:

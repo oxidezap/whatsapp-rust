@@ -6,24 +6,10 @@ xt = "run --quiet -p whatsapp-xtask --"
 # across package boundaries).
 
 [target.x86_64-unknown-linux-gnu]
-# -Zshare-generics=y: downstream crates reuse upstream monomorphic
-#   instantiations instead of stamping per-crate copies with distinct symbol
-#   hashes that fat LTO cannot merge (measured -335 KiB on the stripped demo;
-#   the Docker image build already ran with this flag). Nightly-only, and the
-#   toolchain is pinned by rust-toolchain.toml.
-# lld + ICF: lld lays out the fat-LTO object tighter than BFD ld and folds
-#   byte-identical sections (measured -73 KiB on the stripped demo). Scoped to
-#   this target so wasm and non-Linux builds keep their default linkers.
-#   -Clinker-features=+lld selects the rust-lld bundled with the pinned
-#   toolchain, so contributors need no system lld package. Still
-#   unstable-gated on this nightly, hence -Zunstable-options (the block is
-#   nightly-only anyway; CI's stable job opts out via RUSTFLAGS="").
-rustflags = [
-    "-Zshare-generics=y",
-    "-Zunstable-options",
-    "-Clinker-features=+lld",
-    "-Clink-arg=-Wl,--icf=all",
-]
+# Rust 1.100 uses bundled rust-lld by default on this target. Retain ICF
+# without nightly flags. MSRV and interpreted Miri jobs may clear RUSTFLAGS.
+# -Zshare-generics is deliberately absent so normal builds use stable Rust.
+rustflags = ["-Clink-arg=-Wl,--icf=all"]
 
 [env]
 # Trim bundled-SQLite subsystems the workspace never touches. FTS5 stays:

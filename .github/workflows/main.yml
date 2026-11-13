@@ -47,7 +47,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           components: rustfmt
       - name: Check Bartender image pins
         env:
@@ -76,7 +76,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           components: rustfmt
       # RUSTC_WRAPPER is set workspace-wide, so cargo needs sccache on PATH even
       # in a job this small.
@@ -94,7 +94,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           components: clippy
       # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
       - name: Install ALSA dev headers
@@ -134,7 +134,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -209,7 +209,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -261,7 +261,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       # The voip example (built under --all-features --all-targets) links cpal,
       # which needs ALSA on Linux.
       - name: Install ALSA dev headers
@@ -328,7 +328,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       # The voip-cli member links cpal, which needs ALSA headers.
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -365,7 +365,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - id: crates
         run: cargo xt ci feature-matrix-crates --github-output
 
@@ -398,11 +398,9 @@ jobs:
       # when this was a single job, and splitting it per crate multiplied it by
       # the number of published crates. The `df` closing the check step below is
       # what keeps this claim answerable rather than asserted.
-      # Pinned toolchain: .cargo/config.toml carries nightly-only rustflags
-      # (-Zshare-generics) for this target, and this job does not clear them.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - name: Install protoc
         uses: taiki-e/install-action@v2
         with:
@@ -434,9 +432,7 @@ jobs:
   test-stable:
     name: Test Stable (MSRV)
     runs-on: ubuntu-latest
-    # .cargo/config.toml sets nightly-only rustflags (-Zshare-generics) for the
-    # x86_64-linux target; a set-but-empty RUSTFLAGS takes precedence over
-    # config rustflags, keeping this stable-toolchain job buildable.
+    # Check the published compiler floor independently of the build toolchain.
     env:
       RUSTFLAGS: ""
       NEXTEST_PROFILE: ci
@@ -452,12 +448,12 @@ jobs:
       # release of the action, so the updater bumps it by comparing numbers and
       # has no way to know the toolchain has to exist and has to match the
       # declared floor. It once moved this to 1.100.0 — numerically the largest
-      # ref, a Rust release that does not exist — and every pull request in the
+      # ref, then an unreleased Rust version — and every pull request in the
       # repository failed at `rustup`, before a line was compiled. The
       # `dependabot.yml` entry beside this one is what keeps the pin ours.
       - uses: dtolnay/rust-toolchain@1.95.0
       # The pre-built nextest binary is toolchain-independent — it drives this
-      # MSRV cargo the same way it drives the nightly one.
+      # MSRV cargo the same way it drives the pinned stable compiler.
       - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -491,7 +487,7 @@ jobs:
           -p whatsapp-rust-ureq-http-client
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
       # Standalone API hosts run in consumers.yml through the central xtask
-      # registry; its driver uses nightly while each MSRV host uses 1.95.0.
+      # registry; its driver uses Rust 1.100.0 while each MSRV host uses 1.95.0.
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

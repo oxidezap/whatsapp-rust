@@ -208,7 +208,7 @@ pub fn summarize_rtcp(data: &[u8]) -> Option<RtcpSummary> {
             }
             // FIR commonly leaves the media-source field zero and names targets in 8-byte FCI rows.
             if packet_type == RTCP_PT_PSFB && fmt == 4 {
-                for fci in packet[12..].chunks_exact(8) {
+                for fci in packet[12..].as_chunks::<8>().0.iter() {
                     referenced_ssrcs.push(u32::from_be_bytes(fci[..4].try_into().ok()?));
                 }
             }

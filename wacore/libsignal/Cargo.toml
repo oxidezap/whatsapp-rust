@@ -9,7 +9,7 @@ repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Storage-compatible Signal protocol with a sans-I/O state engine"
 
 [features]
-legacy-session-interop = []
+legacy-session-interop = ["dep:wacore-derive"]
 bench-internals = []
 
 [dependencies]
@@ -35,7 +35,8 @@ chrono = { workspace = true, features = ["now"] }
 hex.workspace = true
 itoa.workspace = true
 wacore-binary.workspace = true
-wacore-derive.workspace = true
+# Only the opt-in legacy wire enums use the derive macro.
+wacore-derive = { workspace = true, optional = true }
 waproto.workspace = true
 buffa.workspace = true
 log.workspace = true

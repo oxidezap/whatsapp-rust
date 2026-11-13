@@ -606,9 +606,7 @@ mod tests {
             };
             // subfr_counts > 0 so the filt_idx path fires (as in the real voiced encode).
             let subfr = [1i32; 4];
-            for sf in 0..4 {
-                pp.filt_idx[sf] = 0;
-            }
+            pp.filt_idx[..4].fill(0);
             let mut enc = RangeEncoder::new(64);
             let mut est = SmplLsfState {
                 prev_lag: -1,
@@ -982,7 +980,9 @@ mod tests {
         let out = std::env::var("MLOW_OUT").expect("MLOW_OUT path");
         let bytes = std::fs::read(&mic).expect("read mic");
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut enc = MlowEncoder::new();
@@ -1012,7 +1012,9 @@ mod tests {
         let out = std::env::var("MLOW_SELFDEC_OUT").expect("MLOW_SELFDEC_OUT path");
         let bytes = std::fs::read(&mic).expect("read mic");
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut enc = MlowEncoder::new();
