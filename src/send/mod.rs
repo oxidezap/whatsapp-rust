@@ -458,9 +458,9 @@ pub struct SendOptions {
     /// Useful for resending a failed message with the same ID or idempotency.
     pub message_id: Option<crate::MessageId>,
     /// Extra XML child nodes on the message stanza. A node the send already
-    /// derives from the message content — `<biz>`, and `<bot>` on a DM — is
-    /// refused with [`SendError::InvalidRequest`] rather than stacked next to
-    /// the derived one, which the receiving client renders as nothing.
+    /// derives from the message content — `<biz>`, and `<bot>` on a DM payment
+    /// flow — is refused with [`SendError::InvalidRequest`] rather than stacked
+    /// next to the derived one, which the receiving client renders as nothing.
     pub extra_stanza_nodes: Vec<Node>,
     /// Ephemeral duration in seconds. Sets `contextInfo.expiration` on the
     /// message (WA Web `EProtoGenerator.js:183` parity).
@@ -1256,7 +1256,7 @@ fn classify_interactive(im: &wa::message::InteractiveMessage) -> Option<BizCateg
 /// announces nothing (a storefront, or a payload with neither buttons nor any
 /// renderable envelope). Otherwise returns the assembled `<biz>` node. The
 /// caller is responsible for prepending `<bot biz_bot="1"/>` for DM-bound
-/// sends (see `build_extra_stanza_nodes`).
+/// payment flows (see `build_extra_stanza_nodes`).
 ///
 /// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
 /// as a parameter keeps the function pure and lets tests pin the resulting
@@ -1337,7 +1337,8 @@ fn reject_duplicate_extra_stanza_node(tag: &str, user_nodes: &[Node]) -> Result<
 
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
 ///
-/// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
+/// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (payment flow in a
+/// DM only), `<biz>`,
 /// then any user-provided extra nodes. Pure so the caller stays trivial and
 /// the assembly logic is unit-testable.
 ///
@@ -1353,7 +1354,14 @@ fn build_extra_stanza_nodes(
     if inferred_meta.is_none() && biz.is_none() {
         return Ok(user_nodes);
     }
-    let bot_emitted = biz.is_some() && !to.is_group();
+    // Only the flat payment `<biz>` keeps the `<bot>`: since 2026-11 the phone
+    // silently drops a DM native-flow message (buttons, lists) that carries it,
+    // while the same stanza without it renders (oxidezap/whatsapp-rust#1881).
+    // WA Web's fanout builder never emits it either.
+    let bot_emitted = !to.is_group()
+        && biz
+            .as_ref()
+            .is_some_and(|node| node.attrs().optional_string("native_flow_name").is_some());
     if biz.is_some() {
         reject_duplicate_extra_stanza_node("biz", &user_nodes)?;
         if bot_emitted {
@@ -8302,14 +8310,14 @@ mod tests {
                 .expect("no caller node conflicts here")
         }
 
-        /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
-        /// order matters because it is part of the wire shape.
+        /// DM payment flow: `<bot biz_bot="1"/>` is prepended before the
+        /// `<biz>`. The order matters because it is part of the wire shape.
         #[test]
-        fn dm_emits_bot_before_biz() {
+        fn dm_payment_emits_bot_before_biz() {
             let nodes = assemble(
                 &jid("5511999999999@s.whatsapp.net"),
                 None,
-                Some(quick_reply_biz()),
+                Some(payment_biz()),
                 vec![],
             );
             assert_eq!(nodes.len(), 2, "expected [<bot>, <biz>]");
@@ -8325,6 +8333,21 @@ mod tests {
             assert_eq!(nodes[1].tag, "biz");
         }
 
+        /// DM buttons and lists: no `<bot>`. With it the phone drops the
+        /// whole message (#1881); groups never needed it.
+        #[test]
+        fn dm_buttons_omit_bot() {
+            for to in ["5511999999999@s.whatsapp.net", "100000000000001@lid"] {
+                for button in ["quick_reply", "single_select", "cta_url"] {
+                    let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
+                        .expect("native flow produces biz");
+                    let nodes = assemble(&jid(to), None, Some(biz), vec![]);
+                    assert_eq!(nodes.len(), 1, "{to} {button}");
+                    assert_eq!(nodes[0].tag, "biz", "{to} {button}");
+                }
+            }
+        }
+
         /// Group: `<bot>` is NOT emitted; only `<biz>`.
         #[test]
         fn group_omits_bot() {
@@ -8338,7 +8361,7 @@ mod tests {
             assert_eq!(nodes[0].tag, "biz");
         }
 
-        /// LID DM (non-group): `<bot>` is still emitted.
+        /// LID DM payment flow (non-group): `<bot>` is still emitted.
         #[test]
         fn lid_dm_emits_bot() {
             let nodes = assemble(
@@ -8369,7 +8392,7 @@ mod tests {
             let nodes = assemble(
                 &jid("X@s.whatsapp.net"),
                 Some(meta),
-                Some(quick_reply_biz()),
+                Some(payment_biz()),
                 vec![user_a, user_b],
             );
             assert_eq!(nodes.len(), 5);
