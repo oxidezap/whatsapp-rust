@@ -6,6 +6,11 @@ use whatsapp_rust::store::traits::DeviceStore;
 #[cfg_attr(not(target_family = "wasm"), tokio::test)]
 #[cfg_attr(target_family = "wasm", wasm_bindgen_test::wasm_bindgen_test)]
 async fn session_store_and_archive_work_in_one_process() {
+    assert!(
+        rusqlite::version_number() >= 3_054_000,
+        "linked SQLite {} predates the RUSTSEC-2026-0459 fix",
+        rusqlite::version(),
+    );
     let archive = rusqlite::Connection::open_in_memory().unwrap();
     archive
         .execute_batch("CREATE TABLE archive (body TEXT NOT NULL);")
