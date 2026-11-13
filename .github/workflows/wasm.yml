@@ -66,6 +66,13 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features
+      - name: Build optional Signal operations for wasm32
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build --locked -p wacore --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features "signal-operations,js"
       - name: Build and execute isolated API consumers for wasm32
         env:
           CARGO_BUILD_JOBS: "1"
@@ -91,22 +98,6 @@ jobs:
       # the store once the shim exists.
       - name: Guard sqlite-storage's platform shim
         run: cargo xt ci workflow guard-sqlite-shim
-      # The fenced, sealed record store backs a browser-held Signal store, so
-      # it must keep building for the page as well as the server.
-      - name: Build wacore-recordstore for wasm32 (release)
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: >
-          cargo build -p wacore-recordstore --lib --release
-          --target wasm32-unknown-unknown
-          --features wacore/js
-      - name: Build wacore-signal-ops for wasm32 (release)
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: >
-          cargo build -p wacore-signal-ops --lib --release
-          --target wasm32-unknown-unknown
-          --features wacore/js
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so a browser front end can drive 1:1 calls.
@@ -137,44 +128,3 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features voip-mlow,instance-clock
-
-  signal-wasm:
-    name: Signal bindings (wasm32, Node)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-          targets: wasm32-unknown-unknown
-      # The CLI must match the wasm-bindgen crate in this workspace's
-      # Cargo.lock, which can differ from the isolated consumers' version the
-      # wasm job installs.
-      - name: Read the locked wasm-bindgen version
-        id: wasm-bindgen
-        run: >
-          awk '/^name = "wasm-bindgen"$/ { getline; split($0, v, "\""); print "version=" v[2]; exit }'
-          Cargo.lock >> "$GITHUB_OUTPUT"
-      - name: Install wasm-bindgen CLI
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
-        with:
-          tool: wasm-bindgen-cli@${{ steps.wasm-bindgen.outputs.version }}
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-      - name: Cache Rust build (registry + target)
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: "true"
-      # The bindings are proven by running them: wasm-bindgen-test-runner
-      # (from the CLI above) loads the test module in the runner's Node and
-      # drives two devices end to end through the exported JS surface.
-      - name: Test wacore-signal-wasm bindings
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: >
-          cargo test --locked -p wacore-signal-wasm
-          --target wasm32-unknown-unknown

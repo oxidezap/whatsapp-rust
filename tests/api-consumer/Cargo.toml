@@ -12,6 +12,8 @@ autobins = false
 resolver = "3"
 
 [features]
+signal-backend = ["wacore/signal-backend", "dep:async-trait", "dep:waproto"]
+signal-execution = ["signal-backend", "js", "dep:wasm-bindgen-test"]
 default = []
 core = ["dep:anyhow"]
 contracts = []
@@ -78,6 +80,7 @@ group-action-exact-pattern = []
 group-action-exhaustive = []
 
 [dependencies]
+waproto = { path = "../../waproto", optional = true }
 anyhow = { version = "1", default-features = false, optional = true }
 async-trait = { version = "0.1.91", optional = true }
 rand = { version = "0.10", optional = true }
@@ -185,3 +188,8 @@ required-features = ["mobile-core"]
 name = "mobile_workflow"
 path = "tests/mobile_workflow.rs"
 required-features = ["mobile-execution"]
+
+[[test]]
+name = "signal_backend"
+path = "tests/signal_backend.rs"
+required-features = ["signal-backend"]

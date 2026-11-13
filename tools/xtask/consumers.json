@@ -4,6 +4,19 @@
     "locked": true,
     "commands": [
       {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["signal-backend"],
+        "test": "signal_backend"
+      },
+      {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["signal-execution"],
+        "test": "signal_backend",
+        "wasm_test": true
+      },
+      {
         "lanes": [
           "native",
           "msrv"
