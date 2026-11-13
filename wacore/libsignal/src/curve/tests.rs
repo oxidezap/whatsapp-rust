@@ -140,7 +140,7 @@ fn radix51_constants_match_byte_decoding() {
                 limbs[index] = value;
                 let packed = pack_radix51(limbs);
                 let mut bytes = [0; 32];
-                for (word, chunk) in packed.iter().zip(bytes.chunks_exact_mut(8)) {
+                for (word, chunk) in packed.iter().zip(bytes.as_chunks_mut::<8>().0) {
                     chunk.copy_from_slice(&word.to_le_bytes());
                 }
                 assert_eq!(

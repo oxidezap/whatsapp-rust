@@ -17,6 +17,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Override the repository's stable toolchain when invoking the interpreter.
+  RUSTUP_TOOLCHAIN: nightly-2026-06-16
   # Keep in sync with PROTOC_VERSION in main.yml — env is per-workflow, so the
   # value cannot be shared across files without a repo-level Actions variable.
   PROTOC_VERSION: '3.25.3'
@@ -83,7 +85,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           # Miri and its interpreted sysroot require nightly; keep every UB leg.
-          toolchain: nightly-2026-06-16
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           # rust-src is what `cargo miri setup` compiles the interpreter's
           # sysroot from; installing `miri` does not pull it in.
           components: miri, rust-src
