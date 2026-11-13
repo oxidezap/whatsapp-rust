@@ -1208,9 +1208,9 @@ impl Client {
                 // `wait_for_unpenalized_immediate_reconnect`). Forgiven the same
                 // way the expected-disconnect branch above forgives it; the top
                 // of the loop still honours a pause and any installed admission
-                // policy before dialling.
+                // policy before dialling. The reset itself happened in that
+                // future, under the same lock as its penalty check.
                 _ = immediate_reconnect.fuse() => {
-                    self.clear_connection_backoff_state();
                     client_log!(self, info, "Immediate reconnect requested during reconnect backoff, reconnecting now.");
                 }
             }
@@ -1226,7 +1226,8 @@ impl Client {
         }
     }
 
-    /// Completes on a `reconnect_immediately()` the backoff may honour.
+    /// Completes on a `reconnect_immediately()` the backoff may honour, having
+    /// reset that backoff.
     ///
     /// Not while a backoff penalty is pending: that delay is one the server
     /// asked for (a 429 adds five Fibonacci steps) or a manual `reconnect()`
@@ -1242,7 +1243,9 @@ impl Client {
     ) {
         loop {
             listener.await;
-            if !self.backoff_penalty_pending(Ordering::Acquire) {
+            // Checks the penalty and resets the backoff under one lock; see
+            // `release_unpenalized_backoff`.
+            if self.release_unpenalized_backoff() {
                 return;
             }
             client_log!(
@@ -5863,6 +5866,27 @@ mod tests {
             .await
             .expect("run() must still return on a terminal shutdown")
             .expect("the run task must not panic");
+    }
+
+    /// The penalty check and the reset are one transition: a penalty, whether
+    /// from a 429 or from a manual `reconnect()` racing the request, keeps its
+    /// attempt instead of being zeroed between a separate check and reset.
+    #[tokio::test]
+    async fn the_immediate_release_checks_the_penalty_and_resets_under_one_lock() {
+        let client = crate::test_utils::create_test_client().await;
+
+        client.set_reconnect_errors_for_test(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
+        client.set_backoff_penalty_for_test(true, Ordering::Relaxed);
+        assert!(!client.release_unpenalized_backoff());
+        assert_eq!(
+            client.reconnect_errors(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS,
+            "a penalised backoff keeps its attempt"
+        );
+
+        client.set_backoff_penalty_for_test(false, Ordering::Relaxed);
+        assert!(client.release_unpenalized_backoff());
+        assert_eq!(client.reconnect_errors(Ordering::Relaxed), 0);
     }
 
     /// The counterpart guard for the arm above: it must answer only

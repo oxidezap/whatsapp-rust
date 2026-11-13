@@ -155,6 +155,21 @@ impl Client {
         self.session_state.reconnect_errors.load(ordering)
     }
 
+    /// Resets the backoff for a `reconnect_immediately()` unless a penalty is
+    /// pending, and says whether it did. One transition, so a manual
+    /// `reconnect()` cannot set its penalty and `MANUAL_RECONNECT_ATTEMPT`
+    /// between the check and the reset and have the reset erase the attempt.
+    pub(super) fn release_unpenalized_backoff(&self) -> bool {
+        self.session_state.transition(Ordering::SeqCst, |state| {
+            if state.snapshot().penalty_pending() {
+                return false;
+            }
+            state.reset_backoff();
+            true
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn backoff_penalty_pending(&self, ordering: Ordering) -> bool {
         self.session_state.status.load(ordering) & SessionState::PENALTY != 0
     }
