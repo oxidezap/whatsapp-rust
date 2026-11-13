@@ -16,5 +16,5 @@ sqlcipher = ["rusqlite/bundled-sqlcipher"]
 
 [dependencies]
 whatsapp-rust = { path = "../..", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client"] }
-rusqlite = "=0.40.2"
+rusqlite = "=0.42.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
