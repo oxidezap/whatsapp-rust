@@ -19,3 +19,6 @@ pub use device::{CachedNoiseCert, CachedServerCertChain, Device, DevicePropsOver
 pub use in_memory::InMemoryBackend;
 pub use persistence::PersistenceManager;
 pub use signal_cache::SignalStoreCache;
+
+#[cfg(feature = "signal-operations")]
+pub mod transaction;
