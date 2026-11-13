@@ -94,7 +94,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "time"], optional = tr
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["bundled-sqlite"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-diesel = { version = "2.3.14", default-features = false, features = ["sqlite"], optional = true }
+diesel = { version = "2.4.0", default-features = false, features = ["sqlite"], optional = true }
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["wasm-test"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"], optional = true }
