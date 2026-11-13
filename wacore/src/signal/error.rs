@@ -18,6 +18,7 @@ fn state_is_refused(error: &StoreError) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OpsError {
     #[error("signal protocol error")]
     Signal(#[from] SignalProtocolError),

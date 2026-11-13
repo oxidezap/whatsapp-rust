@@ -59,6 +59,7 @@ pub trait SignalResolver: SendContextResolver {
 
 /// Why a bundle was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BundleRejection {
     #[error("the account's primary identity changed and was not accepted")]
     IdentityChanged,
