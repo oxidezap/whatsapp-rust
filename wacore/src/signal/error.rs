@@ -21,6 +21,7 @@ fn state_is_refused(error: &StoreError) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OpsError {
     #[error("Signal write authority is no longer valid")]
     AuthorityLost,
@@ -67,6 +68,7 @@ impl OpsError {
 
 /// Why a bundle was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BundleRejection {
     #[error("the account's primary identity changed and was not accepted")]
     IdentityChanged,
