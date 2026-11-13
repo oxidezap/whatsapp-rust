@@ -28,7 +28,7 @@ fn bundle(valid: bool) -> PreKeyBundle {
 }
 
 #[test]
-fn each_cold_primary_signature_is_verified_once_before_returning_anchors() {
+fn each_cold_primary_signature_is_verified_once_before_publication() {
     for devices in [1, 3] {
         let primary = Jid::pn("12025550124");
         let companions: Vec<_> = (1..=devices).map(|id| primary.with_device(id)).collect();
@@ -44,10 +44,10 @@ fn each_cold_primary_signature_is_verified_once_before_returning_anchors() {
                 .insert(companion.clone(), primary_bundle.clone());
         }
         let mut checks = 0;
-        let anchors = authenticate_cold_primary_bundles(
+        authenticate_cold_primary_bundles(
             &mut outcome,
             &companions,
-            vec![primary.clone()],
+            std::slice::from_ref(&primary),
             |bundle| {
                 checks += 1;
                 authenticated_primary_identity(bundle)
@@ -55,7 +55,7 @@ fn each_cold_primary_signature_is_verified_once_before_returning_anchors() {
         )
         .unwrap();
         assert_eq!(checks, 1);
-        assert_eq!(anchors, [(primary, expected)]);
+        assert_eq!(*outcome.bundles[&primary].identity_key().unwrap(), expected);
         for companion in &companions {
             assert!(outcome.bundles.contains_key(companion));
         }
@@ -77,22 +77,19 @@ fn different_accounts_each_require_their_own_valid_signature() {
         outcome.bundles.insert(primary.clone(), bundle);
     }
     let mut checks = 0;
-    let anchors = authenticate_cold_primary_bundles(
-        &mut outcome,
-        &companions,
-        primaries.to_vec(),
-        |bundle| {
-            checks += 1;
-            authenticated_primary_identity(bundle)
-        },
-    )
+    authenticate_cold_primary_bundles(&mut outcome, &companions, &primaries, |bundle| {
+        checks += 1;
+        authenticated_primary_identity(bundle)
+    })
     .unwrap();
     assert_eq!(checks, 2);
-    assert_eq!(anchors, expected);
+    for (primary, identity) in expected {
+        assert_eq!(*outcome.bundles[&primary].identity_key().unwrap(), identity);
+    }
 }
 
 #[test]
-fn an_invalid_later_primary_prevents_returning_any_publishable_anchors() {
+fn an_invalid_later_primary_aborts_validation_before_publication() {
     let primaries = [Jid::pn("12025550124"), Jid::lid("100000000000125")];
     let companions: Vec<_> = primaries
         .iter()
@@ -102,15 +99,11 @@ fn an_invalid_later_primary_prevents_returning_any_publishable_anchors() {
     outcome.bundles.insert(primaries[0].clone(), bundle(true));
     outcome.bundles.insert(primaries[1].clone(), bundle(false));
     let mut checks = 0;
-    let result = authenticate_cold_primary_bundles(
-        &mut outcome,
-        &companions,
-        primaries.to_vec(),
-        |bundle| {
+    let result =
+        authenticate_cold_primary_bundles(&mut outcome, &companions, &primaries, |bundle| {
             checks += 1;
             authenticated_primary_identity(bundle)
-        },
-    );
+        });
     assert_eq!(checks, 2);
     assert!(
         result
@@ -128,12 +121,13 @@ fn missing_primaries_remove_every_unanchored_companion_without_trusting_its_bund
     for companion in &companions {
         outcome.bundles.insert(companion.clone(), bundle(true));
     }
-    let anchors =
-        authenticate_cold_primary_bundles(&mut outcome, &companions, vec![primary], |_| {
-            panic!("a companion must never authenticate its own missing primary")
-        })
-        .unwrap();
-    assert!(anchors.is_empty());
+    authenticate_cold_primary_bundles(
+        &mut outcome,
+        &companions,
+        std::slice::from_ref(&primary),
+        |_| panic!("a companion must never authenticate its own missing primary"),
+    )
+    .unwrap();
     assert!(outcome.bundles.is_empty());
 }
 
@@ -142,10 +136,9 @@ fn unrelated_bundles_are_not_authenticated_when_no_account_is_cold() {
     let primary = Jid::pn("12025550124");
     let mut outcome = PreKeyFetchOutcome::default();
     outcome.bundles.insert(primary.clone(), bundle(false));
-    let anchors = authenticate_cold_primary_bundles(&mut outcome, &[], vec![], |_| {
+    authenticate_cold_primary_bundles(&mut outcome, &[], &[], |_| {
         panic!("no cold account requested validation")
     })
     .unwrap();
-    assert!(anchors.is_empty());
     assert!(outcome.bundles.contains_key(&primary));
 }

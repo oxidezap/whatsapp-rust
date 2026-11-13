@@ -298,15 +298,14 @@ fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<Ident
 fn authenticate_cold_primary_bundles(
     outcome: &mut wacore::prekeys::PreKeyFetchOutcome,
     companions: &[Jid],
-    primaries: Vec<Jid>,
+    primaries: &[Jid],
     mut authenticate: impl FnMut(&PreKeyBundle) -> anyhow::Result<IdentityKey>,
-) -> anyhow::Result<Vec<(Jid, IdentityKey)>> {
-    // Retain verified anchors until every signature has passed, so a later
-    // signature failure cannot partially publish account trust.
-    let mut authenticated = Vec::with_capacity(primaries.len());
+) -> anyhow::Result<()> {
+    // Validate every primary before publication. The fetch owns its immutable
+    // bundles, so publishing can read their keys without repeating crypto.
     for primary in primaries {
-        if let Some(bundle) = outcome.bundles.get(&primary) {
-            authenticated.push((primary, authenticate(bundle)?));
+        if let Some(bundle) = outcome.bundles.get(primary) {
+            authenticate(bundle)?;
         }
     }
     // Do not let a companion certificate replace an omitted primary bundle.
@@ -316,7 +315,7 @@ fn authenticate_cold_primary_bundles(
             outcome.bundles.remove(companion);
         }
     }
-    Ok(authenticated)
+    Ok(())
 }
 
 impl Client {
@@ -397,10 +396,10 @@ impl Client {
         let spec = spec.with_account_identities(account_identities);
 
         let mut outcome = self.execute(spec).await?;
-        let authenticated = authenticate_cold_primary_bundles(
+        authenticate_cold_primary_bundles(
             &mut outcome,
             &cold_companions,
-            bootstrap_primaries,
+            &bootstrap_primaries,
             authenticated_primary_identity,
         )?;
         // Remember every cold account anchor before returning companions, even
@@ -408,16 +407,19 @@ impl Client {
         // before installing any primary session. The caller may already own
         // session locks: the bootstrap fence excludes ADV publication without
         // reacquiring sessions, and checks known reciprocal account aliases.
-        for (jid, identity) in authenticated {
-            if !self
-                .persist_adv_bootstrap_identity_in_epoch(
-                    &jid,
-                    identity.public_key().public_key_bytes(),
-                    bootstrap_epoch,
-                )
-                .await?
-            {
-                anyhow::bail!("primary identity changed during companion bootstrap");
+        for jid in &bootstrap_primaries {
+            if let Some(bundle) = outcome.bundles.get(jid) {
+                let identity = bundle.identity_key()?;
+                if !self
+                    .persist_adv_bootstrap_identity_in_epoch(
+                        jid,
+                        identity.public_key().public_key_bytes(),
+                        bootstrap_epoch,
+                    )
+                    .await?
+                {
+                    anyhow::bail!("primary identity changed during companion bootstrap");
+                }
             }
         }
         // Keep the public fetch outcome scoped to the caller's requested devices.
