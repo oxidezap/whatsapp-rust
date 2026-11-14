@@ -2209,21 +2209,21 @@ impl CallEngine {
     /// is no picture to have lost -- and, for [`KeyframeUrgency::Coalesced`], a
     /// request made too soon after the last about the same stream.
     ///
-    /// **A group call is always `false`.** Group video is routed through the
-    /// participant registry, and a group PLI has to name *which* participant's
-    /// stream was lost -- so it is a different request, not this one aimed
-    /// elsewhere. The per-participant SSRC is on hand; what is not settled is
-    /// whether an SFU-bound PLI travels hop-by-hop rather than end-to-end, which
-    /// this engine has no send path for. Refused explicitly rather than left to
-    /// fall out of an unset SSRC, because promotion breaks that accident: a call
-    /// that authenticated video and *then* received a group update keeps this
-    /// plane, so its depacketizer still names the direct stream while `on_rtp`
-    /// has moved to the registry.
+    /// **A group call asks every routed participant stream** (see
+    /// [`Self::request_group_keyframes`]), never the plane's own depacketizer
+    /// stream: a call that authenticated video and *then* received a group
+    /// update keeps that plane naming the direct stream while `on_rtp` has
+    /// moved to the registry. The PLIs go out end-to-end under our group SRTCP
+    /// keys, the same path our reception reports take; whether the SFU relays
+    /// them rather than answering hop-by-hop is not settled.
     /// A coalesced request suppressed by the interval is retained for its next deadline.
     /// The return value says whether a request was emitted now.
     pub fn request_peer_keyframe(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
-        if self.terminated || self.group.is_some() {
+        if self.terminated {
             return false;
+        }
+        if self.group.is_some() {
+            return self.request_group_keyframes(now, urgency);
         }
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
             return false;
@@ -2257,6 +2257,44 @@ impl CallEngine {
         video.peer_keyframe_asked_at = Some((inbound, now));
         video.peer_keyframe_pending = None;
         self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
+        self.media_stats.peer_keyframe_requests =
+            self.media_stats.peer_keyframe_requests.saturating_add(1);
+        true
+    }
+
+    /// In a group call, a PLI to every participant whose video is coming in.
+    ///
+    /// Without it a lost packet froze a participant's picture until their
+    /// sender chose to send a keyframe on its own, which could be never.
+    /// The application does not say whose picture broke, so all are asked,
+    /// under one throttle (the `0` stream key stands for the group).
+    fn request_group_keyframes(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
+        if !self.group_epoch_ready() {
+            return false;
+        }
+        let Some(ssrcs) = self.group.as_ref().map(|g| g.registry.video_ssrcs()) else {
+            return false;
+        };
+        let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
+            return false;
+        };
+        if ssrcs.is_empty() {
+            return false;
+        }
+        let interval = match urgency {
+            KeyframeUrgency::Coalesced => MIN_PEER_KEYFRAME_INTERVAL_MS,
+            KeyframeUrgency::Immediate => MIN_IMMEDIATE_PEER_KEYFRAME_INTERVAL_MS,
+        };
+        if let Some((0, asked)) = video.peer_keyframe_asked_at
+            && now.saturating_sub(asked) < interval
+        {
+            return false;
+        }
+        video.peer_keyframe_asked_at = Some((0, now));
+        for ssrc in ssrcs {
+            let pli = video.pipe.picture_loss_indication_for(ssrc);
+            self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
+        }
         self.media_stats.peer_keyframe_requests =
             self.media_stats.peer_keyframe_requests.saturating_add(1);
         true
@@ -10071,6 +10109,35 @@ mod tests {
     }
 
     #[test]
+    fn a_group_call_asks_the_participants_it_receives_video_from_for_a_keyframe() {
+        let (mut eng, epoch) = group_engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let mut peer = group_peer_video(&epoch);
+        let packet = peer
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video");
+        eng.handle_input(2, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+        assert!(eng.request_peer_keyframe(3, KeyframeUrgency::Immediate));
+        let (outputs, _) = drain(&mut eng);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Transmit(_)))
+                .count(),
+            1,
+            "one PLI, for the one participant sending video"
+        );
+        assert!(
+            !eng.request_peer_keyframe(4, KeyframeUrgency::Immediate),
+            "throttled"
+        );
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+    }
+
+    #[test]
     fn group_video_orientation_keeps_sibling_devices_distinct() {
         let (mut eng, _epoch) = group_engine(true);
         let first = Jid::new("222222222222222", Server::Lid).with_device(2);
@@ -10813,11 +10880,14 @@ mod tests {
                 .is_some()
         );
 
-        // Far past the interval, so only the group guard can explain the refusal.
-        const _: () = assert!(1_000_000 - 200 > MIN_PEER_KEYFRAME_INTERVAL_MS);
-        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Coalesced));
-        // Nor by the urgency that shortens the interval.
-        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Immediate));
+        // A group call asks the streams its registry routes, not the plane's
+        // own depacketizer stream: nothing is asked for when no participant
+        // is routed.
+        let group = eng.group.as_ref().expect("group").registry.video_ssrcs();
+        assert_eq!(
+            eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Coalesced),
+            !group.is_empty()
+        );
     }
 
     /// A plane coming back on has no inbound stream to complain about: the
