@@ -459,16 +459,20 @@ impl GroupMediaRegistry {
         })
     }
 
-    /// The SSRCs whose video is being received, for asking their senders for a keyframe.
-    pub fn video_ssrcs(&self) -> Vec<u32> {
-        let mut ssrcs: Vec<u32> = self
+    /// Only authenticated RTP establishes a video source; roster mode and sender reports do not.
+    pub(crate) fn video_streams(&self) -> Vec<(String, u32)> {
+        let mut streams: Vec<_> = self
             .video_routes
             .iter()
-            .filter(|(_, id)| self.receivers.get(*id).is_some_and(|r| r.video_enabled))
-            .map(|(ssrc, _)| *ssrc)
+            .filter(|(_, id)| {
+                self.receivers.get(*id).is_some_and(|r| {
+                    r.video_enabled && r.video.as_ref().is_some_and(|v| v.inbound_ssrc().is_some())
+                })
+            })
+            .map(|(ssrc, id)| (id.clone(), *ssrc))
             .collect();
-        ssrcs.sort_unstable();
-        ssrcs
+        streams.sort_unstable_by_key(|(_, ssrc)| *ssrc);
+        streams
     }
 
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<ParticipantVideo> {

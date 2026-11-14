@@ -4576,8 +4576,8 @@ impl CallHandle {
     /// removing it.
     ///
     /// Fire-and-forget: the engine decides whether a request goes out, and the
-    /// outcome is not reported back. In a group call every participant whose
-    /// video comes in is asked -- see
+    /// outcome is not reported back. In a group call each participant whose
+    /// video authenticated in the current session is asked. See
     /// [`wacore::voip::CallEngine::request_peer_keyframe`].
     pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
         self.video
