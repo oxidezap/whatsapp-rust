@@ -15046,7 +15046,7 @@ async fn extra_frame_appears(
 
 /// Production regression: the server delivers E2EE status updates as a
 /// top-level `<status>` stanza (WA Web `handleMessagingStanza` rewrites the tag
-/// to `message` under the `status_e2ee_recv_over_status_stanza` abprop). With
+/// to `message` for non-newsletter senders). With
 /// the tag unhandled the client never acks, so the server redelivers the same
 /// id on every reconnect and then closes the stream with
 /// `<stream:error><ack class="status"/></stream:error>`.
@@ -15168,6 +15168,142 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
         "the message must keep its status@broadcast routing"
     );
     assert_eq!(undecryptable.info.id, "ACSTATUSSTANZA2");
+}
+
+/// Exercise the ACK-only experiment across addressing and fixture flag values.
+/// This does not establish Web compliance or a server-side retention invariant.
+#[tokio::test]
+async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message() {
+    use wacore::iq::abprops::web::STATUS_E2EE_RECV_OVER_STATUS_STANZA;
+
+    for (from, offline, encrypted, flag) in [
+        ("15550000002@s.whatsapp.net", false, false, false),
+        ("100000000000002@lid", true, false, true),
+        ("15550000002@s.whatsapp.net", true, true, false),
+        ("100000000000002@lid", false, true, true),
+        ("120363000000000001@g.us", true, true, true),
+    ] {
+        let (client, transport) = capturing_client("contact_status_plain_ack").await;
+        client
+            .ab_props()
+            .watch(STATUS_E2EE_RECV_OVER_STATUS_STANZA)
+            .await;
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                [(
+                    STATUS_E2EE_RECV_OVER_STATUS_STANZA.code,
+                    if flag { "1" } else { "0" }.into(),
+                )]
+                .into_iter(),
+            )
+            .await;
+        // Inspect the explicitly watched fixture's applied snapshot, rather
+        // than making this test assertion look like a production cache gate.
+        assert_eq!(
+            client
+                .ab_props()
+                .snapshot()
+                .await
+                .get_bool(STATUS_E2EE_RECV_OVER_STATUS_STANZA),
+            Some(flag)
+        );
+        let recorder = Arc::new(EventRecorder::default());
+        client
+            .core
+            .event_bus
+            .subscribe_handler(recorder.clone())
+            .detach();
+        let mut status = NodeBuilder::new("status")
+            .attr("from", from)
+            .attr("id", "CONTACT-STATUS-1")
+            .attr("type", "media")
+            .attr("t", wacore::time::now_secs().to_string());
+        if offline {
+            status = status.attr("offline", "true");
+        }
+        if from.ends_with("@g.us") {
+            status = status.attr("participant", "100000000000002@lid");
+        }
+        if encrypted {
+            status = status.children([NodeBuilder::new("enc")
+                .attr("v", "2")
+                .attr("type", "msg")
+                .bytes(vec![1, 2, 3])
+                .build()]);
+        }
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(&status.build()))
+            .await;
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1, "exactly one acknowledgement");
+        let frame = &frames[0];
+        let bytes = decode_frame(0, frame).expect("ack frame should decrypt");
+        let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(ack.tag.as_ref(), "ack");
+        assert_eq!(
+            ack.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            ack.attrs().optional_string("id").as_deref(),
+            Some("CONTACT-STATUS-1")
+        );
+        assert_eq!(ack.attrs().optional_string("to").as_deref(), Some(from));
+        assert_eq!(
+            ack.attrs().optional_string("type").as_deref(),
+            Some("media")
+        );
+        assert_eq!(
+            ack.attrs().optional_string("participant").as_deref(),
+            from.ends_with("@g.us").then_some("100000000000002@lid")
+        );
+        assert!(
+            ack.get_attr("error").is_none(),
+            "status acknowledgement must not be a NACK"
+        );
+        assert_eq!(
+            client.chat_lanes.entry_count(),
+            0,
+            "opaque statuses must not enter a DM lane"
+        );
+        assert!(
+            recorder
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    &**event,
+                    Event::Messages(_) | Event::UndecryptableMessage(_)
+                ))
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_stanza_without_addressing_is_not_acked() {
+    let (client, transport) = capturing_client("status_missing_address").await;
+    for node in [
+        NodeBuilder::new("status")
+            .attr("from", "15550000002@s.whatsapp.net")
+            .build(),
+        NodeBuilder::new("status")
+            .attr("id", "STATUS-MISSING-FROM")
+            .build(),
+    ] {
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(&node))
+            .await;
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        0,
+        "status ACKs need both id and from"
+    );
 }
 
 /// WA Web nacks every stanza it does not recognize

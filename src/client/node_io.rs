@@ -80,8 +80,6 @@ fn from_jid_matches(
     }
 }
 
-/// The wire shape the server uses for E2EE status updates, carrying the same
-/// payload as `<message from="status@broadcast">`.
 /// Stanzas that carry connection state, which an interceptor may not claim.
 ///
 /// `success` and `failure` settle authentication, `stream:error` drives
@@ -114,6 +112,10 @@ fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
 
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
+}
+
+fn is_non_newsletter_status_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
+    from_jid_matches(node, |jid| !jid.is_newsletter())
 }
 
 /// Whether dispatch hands this stanza to the message handler, which queues it
@@ -994,6 +996,12 @@ impl Client {
                 )
                 .await;
             }
+            Some(StanzaTag::Status) if is_non_newsletter_status_stanza(nr) => {
+                // ACK-only experiment prompted by Baileys #2858/#2883.
+                // Server retention and equivalent Rust incidents are unproven;
+                // this branch does not implement the Web's status processing.
+                // The deferred gate below sends the single plain status ACK.
+            }
             _ => {
                 let handled = self
                     .stanza_router
@@ -1058,7 +1066,8 @@ impl Client {
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
     /// arrives. message and status@broadcast only enqueue here, and a spawned
     /// enqueue could put a group message ahead of the pkmsg that establishes its
-    /// session. Acks and receipts qualify only while nothing observes them.
+    /// session. Other non-newsletter statuses only queue an ACK, also in arrival
+    /// order. Acks and receipts qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(
@@ -1068,7 +1077,7 @@ impl Client {
                 | StanzaTag::Message
                 | StanzaTag::InfoBanner,
             ) => true,
-            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Status) => is_non_newsletter_status_stanza(node),
             Ok(StanzaTag::Notification) => self.queues_group_notification(node),
             Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
@@ -1125,7 +1134,7 @@ impl Client {
             Ok(StanzaTag::Message) => {
                 from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
             }
-            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Status) => is_non_newsletter_status_stanza(node),
             _ => false,
         }
     }
