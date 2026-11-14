@@ -228,13 +228,14 @@ pub fn parse_relay_data(relay_node: &NodeRef<'_>) -> Option<RelayData> {
             .optional_string("relay_name")
             .map(|s| s.into_owned())
             .unwrap_or_default();
-        // A cross-region relay (one sent with `xrtt_ms`) names its token `xtoken_id` instead.
-        // Defaulting it to 0 pairs that relay with another relay's token, and its allocate is
-        // refused with 452 "Xor Relayed Address Mismatch".
+        // A cross-region (xpop) relay names its token `xtoken_id` instead. Defaulting it to 0
+        // pairs that relay with another relay's token, and its allocate is refused with 452
+        // "Xor Relayed Address Mismatch". A valid `token_id` still wins; a missing or malformed
+        // one falls back to a valid `xtoken_id`. (Narrow: the xpop candidate isn't modelled.)
         let token_id = a
             .optional_string("token_id")
-            .or_else(|| a.optional_string("xtoken_id"))
             .and_then(|s| s.parse().ok())
+            .or_else(|| a.optional_string("xtoken_id").and_then(|s| s.parse().ok()))
             .unwrap_or(0);
         let auth_token_id = a
             .optional_string("auth_token_id")
@@ -853,6 +854,39 @@ mod tests {
         assert_eq!(picked.relay_name, "bom5c01");
         assert_eq!(picked.token_id, 2);
         assert_eq!(rd.relay_tokens[picked.token_id as usize], vec![0x02; 4]);
+    }
+
+    #[test]
+    fn token_id_precedence_over_xtoken_id() {
+        // (token_id, xtoken_id) as sent -> the token index the endpoint gets
+        let cases: [(Option<&str>, Option<&str>, u32); 6] = [
+            (Some("1"), Some("2"), 1),   // a valid ordinary token wins
+            (None, Some("2"), 2),        // xtoken-only: the cross-region relay's own
+            (Some("abc"), Some("2"), 2), // malformed ordinary: falls back to the xtoken
+            (Some("-1"), Some("2"), 2),  // negative ordinary: likewise
+            (None, Some("abc"), 0),      // malformed xtoken alone: the old default
+            (None, None, 0),             // neither: the old default
+        ];
+        for (token_id, xtoken_id, expected) in cases {
+            let mut te2 = NodeBuilder::new("te2")
+                .attr("relay_id", "2")
+                .attr("relay_name", "bom5c01")
+                .attr("auth_token_id", "1");
+            if let Some(id) = token_id {
+                te2 = te2.attr("token_id", id);
+            }
+            if let Some(id) = xtoken_id {
+                te2 = te2.attr("xtoken_id", id);
+            }
+            let node = NodeBuilder::new("relay")
+                .children([te2.bytes(vec![57, 144, 43, 57, 0x0d, 0x96]).build()])
+                .build();
+            let rd = parse_relay_data(&as_ref(&node)).unwrap();
+            assert_eq!(
+                rd.endpoints[0].token_id, expected,
+                "token_id={token_id:?} xtoken_id={xtoken_id:?}"
+            );
+        }
     }
 
     #[test]
