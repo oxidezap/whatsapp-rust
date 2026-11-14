@@ -99,6 +99,13 @@
       "sha256": "e55e43babf85e2c0fc76ec65dcb8d47beba0f58b03b135b37a5aaaff7fe70e2f",
       "size": 10856103,
       "what": "VoIP MLOW migration oracle; whatspec 3110bdab^ generated/wasm.lock.json"
+    },
+    {
+      "fileName": "u-Bw8hwXJGE.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yd/r/u-Bw8hwXJGE.wasm",
+      "sha256": "c73edd705435d0d22b19fd3817c9bed536d8bc6a5fbe8a927cbd277fa26fff4f",
+      "size": 11492008,
+      "what": "VoIP relay/xpop oracle; whatspec ae3880925bacd23863cc30ec480c9f82bfd869f1, WA 2.3000.1052559453"
     }
   ]
 }
