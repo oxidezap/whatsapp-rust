@@ -88,6 +88,11 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
                 .and_then(|video| parse_video_orientation(video))
         })
         .flatten();
+    let relay_latency = (action_tag == CallActionTag::RelayLatency)
+        .then(|| super::relay_latency::parse_relay_latency_entries(child))
+        .filter(|entries| !entries.is_empty())
+        .map(crate::types::relay_latency::RelayLatencyReport::new)
+        .map(Box::new);
     let action = parse_action(child, action_tag)?;
     let group = if is_offer {
         super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
@@ -111,6 +116,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .maybe_timestamp(timestamp)
         .offline(offline)
         .action(action)
+        .maybe_relay_latency(relay_latency)
         .maybe_caller_username(caller_username)
         .maybe_video_orientation(video_orientation)
         .maybe_group(group);
@@ -1066,6 +1072,48 @@ pub fn build_relay_latency(p: &RelayLatencyParams<'_>) -> Node {
         None,
         offer_action("relaylatency", p.call_id, p.call_creator, children),
     )
+}
+
+/// A report preserves packed values and normal/xpop attributes verbatim.
+pub struct RelayLatencyReportParams<'a> {
+    pub call_id: &'a str,
+    pub to: &'a Jid,
+    pub call_creator: &'a Jid,
+    pub entries: &'a [crate::types::relay_latency::RelayLatencyEntry],
+    pub devices: &'a [Jid],
+}
+
+/// Serialize measurement metadata; this does not select or connect a relay.
+pub fn build_relay_latency_report(p: &RelayLatencyReportParams<'_>) -> Result<Node> {
+    use crate::types::relay_latency::RelayLatencyKind;
+    if p.entries.len() > super::relay_latency::MAX_RELAY_LATENCY_ENTRIES {
+        return Err(anyhow!("too many relay latency entries"));
+    }
+    let mut children = Vec::with_capacity(p.entries.len() + 1);
+    for entry in p.entries {
+        if !matches!(entry.address.len(), 6 | 18) {
+            return Err(anyhow!("invalid relay latency address length"));
+        }
+        let attr = match entry.kind {
+            RelayLatencyKind::Normal => "latency",
+            RelayLatencyKind::Xpop => "xlatency",
+        };
+        children.push(
+            NodeBuilder::new("te")
+                .attr(attr, (entry.latency.raw() as i32).to_string())
+                .attr("relay_name", entry.relay_name.clone())
+                .bytes(entry.address.clone())
+                .build(),
+        );
+    }
+    if !p.devices.is_empty() {
+        children.push(destination_to(p.devices));
+    }
+    Ok(call_wrap(
+        p.to,
+        None,
+        offer_action("relaylatency", p.call_id, p.call_creator, children),
+    ))
 }
 
 /// `<call to={call_id}@call id=…><heartbeat call-id call-creator/></call>`.
@@ -2192,6 +2240,131 @@ mod tests {
             .build();
         let call = parse_call_stanza(&as_ref(&relaylatency)).unwrap().unwrap();
         assert!(matches!(call.action, CallAction::RelayLatency { .. }));
+    }
+
+    #[test]
+    fn relay_latency_report_survives_dispatch_and_typed_serialization() {
+        use crate::types::relay_latency::{
+            PackedRelayLatency, RelayLatencyEntry, RelayLatencyKind,
+        };
+        let mut entries = Vec::new();
+        let mut children = Vec::new();
+        for (name, kind, raw) in [
+            ("normal-a", RelayLatencyKind::Normal, 33_554_468u32),
+            ("normal-b", RelayLatencyKind::Normal, 33_554_485),
+            ("peer-only", RelayLatencyKind::Xpop, 33_554_688),
+        ] {
+            for address in [vec![192, 0, 2, 1, 13, 150], vec![0; 18]] {
+                let attr = if kind == RelayLatencyKind::Normal {
+                    "latency"
+                } else {
+                    "xlatency"
+                };
+                children.push(
+                    NodeBuilder::new("te")
+                        .attr("relay_name", name)
+                        .attr(attr, raw.to_string())
+                        .bytes(address.clone())
+                        .build(),
+                );
+                entries.push(
+                    RelayLatencyEntry::new(
+                        kind,
+                        PackedRelayLatency::new(raw),
+                        name.into(),
+                        address,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let node = base_call_builder()
+            .children([NodeBuilder::new("relaylatency")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .children(children)
+                .build()])
+            .build();
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        assert!(matches!(call.action, CallAction::RelayLatency { .. }));
+        assert_eq!(call.relay_latency.as_ref().unwrap().entries, entries);
+        let serialized = serde_json::to_value(&call).unwrap();
+        assert_eq!(serialized["relay_latency"]["entries"][4]["kind"], "xpop");
+        let peer = Jid::lid("2");
+        let creator = Jid::lid("1");
+        let report = build_relay_latency_report(&RelayLatencyReportParams {
+            call_id: "CID",
+            to: &peer,
+            call_creator: &creator,
+            entries: &entries,
+            devices: &[],
+        })
+        .unwrap();
+        let nr = report.as_node_ref();
+        let action = nr.get_optional_child("relaylatency").unwrap();
+        assert_eq!(
+            super::super::relay_latency::parse_relay_latency_entries(action),
+            entries
+        );
+        let mut invalid = entries[0].clone();
+        invalid.address = vec![0; 7];
+        assert!(
+            build_relay_latency_report(&RelayLatencyReportParams {
+                call_id: "CID",
+                to: &peer,
+                call_creator: &creator,
+                entries: &[invalid],
+                devices: &[],
+            })
+            .is_err()
+        );
+        let too_many = vec![entries[0].clone(); 9];
+        assert!(
+            build_relay_latency_report(&RelayLatencyReportParams {
+                call_id: "CID",
+                to: &peer,
+                call_creator: &creator,
+                entries: &too_many,
+                devices: &[],
+            })
+            .is_err()
+        );
+        let signed = RelayLatencyEntry::new(
+            RelayLatencyKind::Xpop,
+            PackedRelayLatency::new(u32::MAX),
+            "synthetic".into(),
+            vec![0; 6],
+        )
+        .unwrap();
+        let signed_report = build_relay_latency_report(&RelayLatencyReportParams {
+            call_id: "CID",
+            to: &peer,
+            call_creator: &creator,
+            entries: std::slice::from_ref(&signed),
+            devices: &[],
+        })
+        .unwrap();
+        let signed_nr = signed_report.as_node_ref();
+        assert_eq!(
+            super::super::relay_latency::parse_relay_latency_entries(
+                signed_nr.get_optional_child("relaylatency").unwrap()
+            ),
+            [signed]
+        );
+        let empty = base_call_builder()
+            .children([NodeBuilder::new("relaylatency")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .build()])
+            .build();
+        let empty_call = parse_call_stanza(&as_ref(&empty)).unwrap().unwrap();
+        assert!(empty_call.relay_latency.is_none());
+        assert!(
+            serde_json::to_value(empty_call)
+                .unwrap()
+                .get("relay_latency")
+                .is_none()
+        );
     }
 
     #[test]

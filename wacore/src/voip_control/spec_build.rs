@@ -322,6 +322,102 @@ mod tests {
     }
 
     #[test]
+    fn captured_xpop_token_permutations_keep_credentials_with_both_address_families() {
+        use crate::voip_control::relay_parse::{
+            RelayCandidateKind, parse_relay_candidates, parse_relay_data,
+        };
+        use wacore_binary::builder::NodeBuilder;
+        for x_token in 0..3u32 {
+            let mut children = vec![
+                NodeBuilder::new("key")
+                    .bytes(b"synthetic-key".to_vec())
+                    .build(),
+            ];
+            for token in 0..3u32 {
+                children.push(
+                    NodeBuilder::new("token")
+                        .attr("id", token.to_string())
+                        .bytes(vec![0x10 + token as u8; 12])
+                        .build(),
+                );
+            }
+            for auth in 0..2u32 {
+                children.push(
+                    NodeBuilder::new("auth_token")
+                        .attr("id", auth.to_string())
+                        .bytes(vec![0xa0 + auth as u8; 8])
+                        .build(),
+                );
+            }
+            for relay_id in 0..3u32 {
+                let (attr, token, auth) = if relay_id == 2 {
+                    ("xtoken_id", x_token, "1")
+                } else {
+                    ("token_id", (x_token + relay_id + 1) % 3, "0")
+                };
+                let mut v6 = vec![0x20, 0x01, 0x0d, 0xb8];
+                v6.extend([0; 11]);
+                v6.extend([relay_id as u8 + 1, 13, 150]);
+                for address in [vec![192, 0, 2, relay_id as u8 + 1, 13, 150], v6] {
+                    children.push(
+                        NodeBuilder::new("te2")
+                            .attr("relay_id", relay_id.to_string())
+                            .attr("relay_name", format!("synthetic-{relay_id}"))
+                            .attr(attr, token.to_string())
+                            .attr("auth_token_id", auth)
+                            .attr("xrtt_ms", "52")
+                            .attr("c2r_rtt", "7")
+                            .bytes(address)
+                            .build(),
+                    );
+                }
+            }
+            let node = NodeBuilder::new("relay").children(children).build();
+            let nr = node.as_node_ref();
+            let data = parse_relay_data(&nr).unwrap();
+            let candidates = parse_relay_candidates(&nr).unwrap();
+            assert_eq!(candidates.len(), 3);
+            assert_eq!(candidates[2].kind, RelayCandidateKind::Xpop);
+            assert_eq!(candidates[2].xrtt_ms, Some(52));
+            assert!(data.endpoints.iter().all(|e| e.addresses.len() == 2));
+            let spec = MediaSessionSpec::from_relay(
+                CallDirection::Outgoing,
+                key(),
+                "1:0@lid",
+                "2:0@lid",
+                vec![0; 32],
+                &data,
+            )
+            .unwrap();
+            assert_eq!(spec.relay_token, vec![0x10 + x_token as u8; 12]);
+            assert_eq!(spec.auth_token, vec![0xa1; 8]);
+            assert_eq!(spec.relay_ip, "192.0.2.3");
+            assert_eq!(spec.relay_port, 3478);
+            #[cfg(feature = "voip")]
+            {
+                use crate::voip::engine::{CallEngine, Output, SequentialTxIds};
+                let mut parts =
+                    crate::voip_control::engine_bridge::into_engine_parts(spec).unwrap();
+                parts.config.enable_media = false;
+                let mut engine =
+                    CallEngine::new(parts.config, Box::new(SequentialTxIds::new())).unwrap();
+                engine.start(0, 0);
+                let Output::Transmit(packet) = engine.poll_output() else {
+                    panic!("missing Allocate")
+                };
+                assert_eq!(
+                    crate::voip::stun::parse_stun_attributes(&packet)
+                        .iter()
+                        .find(|attr| attr.attr_type == 0x4000)
+                        .unwrap()
+                        .value,
+                    vec![0x10 + x_token as u8; 12]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_short_call_key_is_refused() {
         let error = MediaSessionSpec::from_relay(
             CallDirection::Outgoing,
