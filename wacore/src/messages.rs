@@ -1502,6 +1502,14 @@ pub fn parse_message_info(
     } else {
         let sender_alt = if from.server == Server::Lid {
             attrs.optional_jid(MessageAttr::SenderPn)
+        } else if matches!(from.server, Server::Hosted | Server::HostedLid) {
+            // Hosted API senders can carry their phone-number identity in
+            // `sender_pn`. The ordinary PN/LID branch below looks only for
+            // `sender_lid`, which leaves these direct chats addressed by an
+            // opaque hosted id and separates replies into a second chat.
+            attrs
+                .optional_jid(MessageAttr::SenderPn)
+                .or_else(|| attrs.optional_jid(MessageAttr::SenderLid))
         } else {
             attrs.optional_jid(MessageAttr::SenderLid)
         };
