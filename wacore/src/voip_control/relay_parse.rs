@@ -267,8 +267,8 @@ pub fn parse_relay_data(relay_node: &NodeRef<'_>) -> Option<RelayData> {
 ///
 /// Conflicting tokens for the same identity reject the relay block instead of pairing
 /// an address with a token from another entry. Address updates replace the same family
-/// and protocol while preserving other families/protocols. See `agent_docs/voip_xpop.md`
-/// for the pinned native evidence and the limits of this projection.
+/// and protocol while preserving other families/protocols. See PR #1913 for the
+/// pinned native evidence and the limits of this projection.
 pub fn parse_relay_candidates(relay_node: &NodeRef<'_>) -> Option<Vec<RelayCandidate>> {
     let mut candidates: Vec<RelayCandidate> = Vec::new();
     let mut index_by_key = HashMap::new();

@@ -301,7 +301,11 @@ mod tests {
             {
                 use crate::voip::engine::{CallEngine, Output, SequentialTxIds};
                 use crate::voip::stun::parse_stun_attributes;
-                let parts = crate::voip_control::engine_bridge::into_engine_parts(spec).unwrap();
+                let mut parts =
+                    crate::voip_control::engine_bridge::into_engine_parts(spec).unwrap();
+                // Allocate is control-plane traffic: credential binding must also be
+                // checked with `voip` alone, without requiring a PCM/MLOW decoder.
+                parts.config.enable_media = false;
                 let mut engine =
                     CallEngine::new(parts.config, Box::new(SequentialTxIds::new())).unwrap();
                 engine.start(0, 0);
