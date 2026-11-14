@@ -91,7 +91,11 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     let relay_latency = (action_tag == CallActionTag::RelayLatency)
         .then(|| super::relay_latency::parse_relay_latency_entries(child))
         .filter(|entries| !entries.is_empty())
-        .map(crate::types::relay_latency::RelayLatencyReport::new)
+        .map(|entries| {
+            crate::types::relay_latency::RelayLatencyReport::builder()
+                .entries(entries)
+                .build()
+        })
         .map(Box::new);
     let action = parse_action(child, action_tag)?;
     let group = if is_offer {
@@ -1085,7 +1089,6 @@ pub struct RelayLatencyReportParams<'a> {
 
 /// Serialize measurement metadata; this does not select or connect a relay.
 pub fn build_relay_latency_report(p: &RelayLatencyReportParams<'_>) -> Result<Node> {
-    use crate::types::relay_latency::RelayLatencyKind;
     if p.entries.len() > super::relay_latency::MAX_RELAY_LATENCY_ENTRIES {
         return Err(anyhow!("too many relay latency entries"));
     }
@@ -1094,17 +1097,16 @@ pub fn build_relay_latency_report(p: &RelayLatencyReportParams<'_>) -> Result<No
         if !matches!(entry.address.len(), 6 | 18) {
             return Err(anyhow!("invalid relay latency address length"));
         }
-        let attr = match entry.kind {
-            RelayLatencyKind::Normal => "latency",
-            RelayLatencyKind::Xpop => "xlatency",
-        };
-        children.push(
-            NodeBuilder::new("te")
-                .attr(attr, (entry.latency.raw() as i32).to_string())
-                .attr("relay_name", entry.relay_name.clone())
-                .bytes(entry.address.clone())
-                .build(),
-        );
+        let mut te = NodeBuilder::new("te")
+            .attr(
+                entry.kind.as_str(),
+                (entry.latency.raw() as i32).to_string(),
+            )
+            .bytes(entry.address.clone());
+        if let Some(name) = &entry.relay_name {
+            te = te.attr("relay_name", name.clone());
+        }
+        children.push(te.build());
     }
     if !p.devices.is_empty() {
         children.push(destination_to(p.devices));
@@ -2268,13 +2270,12 @@ mod tests {
                         .build(),
                 );
                 entries.push(
-                    RelayLatencyEntry::new(
-                        kind,
-                        PackedRelayLatency::new(raw),
-                        name.into(),
-                        address,
-                    )
-                    .unwrap(),
+                    RelayLatencyEntry::builder()
+                        .kind(kind)
+                        .latency(PackedRelayLatency::new(raw))
+                        .relay_name(name.into())
+                        .address(address)
+                        .build(),
                 );
             }
         }
@@ -2289,7 +2290,10 @@ mod tests {
         assert!(matches!(call.action, CallAction::RelayLatency { .. }));
         assert_eq!(call.relay_latency.as_ref().unwrap().entries, entries);
         let serialized = serde_json::to_value(&call).unwrap();
-        assert_eq!(serialized["relay_latency"]["entries"][4]["kind"], "xpop");
+        assert_eq!(
+            serialized["relay_latency"]["entries"][4]["kind"],
+            "xlatency"
+        );
         let peer = Jid::lid("2");
         let creator = Jid::lid("1");
         let report = build_relay_latency_report(&RelayLatencyReportParams {
@@ -2329,13 +2333,12 @@ mod tests {
             })
             .is_err()
         );
-        let signed = RelayLatencyEntry::new(
-            RelayLatencyKind::Xpop,
-            PackedRelayLatency::new(u32::MAX),
-            "synthetic".into(),
-            vec![0; 6],
-        )
-        .unwrap();
+        let signed = RelayLatencyEntry::builder()
+            .kind(RelayLatencyKind::Xpop)
+            .latency(PackedRelayLatency::new(u32::MAX))
+            .relay_name("synthetic".into())
+            .address(vec![0; 6])
+            .build();
         let signed_report = build_relay_latency_report(&RelayLatencyReportParams {
             call_id: "CID",
             to: &peer,

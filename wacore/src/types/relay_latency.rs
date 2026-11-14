@@ -1,10 +1,11 @@
 //! Peer relay measurements. These are signaling metadata, never dial instructions.
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, crate::WireEnum)]
 pub enum RelayLatencyKind {
+    #[wire = "latency"]
     Normal,
+    #[wire = "xlatency"]
     Xpop,
 }
 
@@ -34,39 +35,19 @@ impl PackedRelayLatency {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct RelayLatencyEntry {
     pub kind: RelayLatencyKind,
     pub latency: PackedRelayLatency,
-    pub relay_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_name: Option<String>,
     /// Original IPv4/port (6 bytes) or IPv6/port (18 bytes); untrusted peer metadata.
     pub address: Vec<u8>,
 }
 
-impl RelayLatencyEntry {
-    pub fn new(
-        kind: RelayLatencyKind,
-        latency: PackedRelayLatency,
-        relay_name: String,
-        address: Vec<u8>,
-    ) -> Option<Self> {
-        matches!(address.len(), 6 | 18).then_some(Self {
-            kind,
-            latency,
-            relay_name,
-            address,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct RelayLatencyReport {
     pub entries: Vec<RelayLatencyEntry>,
-}
-impl RelayLatencyReport {
-    pub fn new(entries: Vec<RelayLatencyEntry>) -> Self {
-        Self { entries }
-    }
 }

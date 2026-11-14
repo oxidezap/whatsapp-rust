@@ -14,29 +14,26 @@ pub fn parse_relay_latency_entries(node: &NodeRef<'_>) -> Vec<RelayLatencyEntry>
         .filter(|child| child.tag == "te")
         .filter_map(|child| {
             let mut attrs = child.attrs();
-            let value = attrs
-                .optional_string("latency")
-                .and_then(|s| s.parse::<i32>().ok().map(|value| value as u32))
-                .map(|n| (RelayLatencyKind::Normal, n))
-                .or_else(|| {
+            let (kind, value) = [RelayLatencyKind::Normal, RelayLatencyKind::Xpop]
+                .into_iter()
+                .find_map(|kind| {
                     attrs
-                        .optional_string("xlatency")
-                        .and_then(|s| s.parse::<i32>().ok().map(|value| value as u32))
-                        .map(|n| (RelayLatencyKind::Xpop, n))
+                        .optional_string(kind.as_str())
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .map(|value| (kind, value as u32))
                 })?;
             let bytes = child.content_bytes()?;
             if !matches!(bytes.len(), 6 | 18) {
                 return None;
             }
-            let name = attrs
-                .optional_string("relay_name")
-                .map(|s| s.into_owned())
-                .unwrap_or_default();
-            RelayLatencyEntry::new(
-                value.0,
-                PackedRelayLatency::new(value.1),
-                name,
-                bytes.to_vec(),
+            let name = attrs.optional_string("relay_name").map(|s| s.into_owned());
+            Some(
+                RelayLatencyEntry::builder()
+                    .kind(kind)
+                    .latency(PackedRelayLatency::new(value))
+                    .maybe_relay_name(name)
+                    .address(bytes.to_vec())
+                    .build(),
             )
         })
         .take(MAX_RELAY_LATENCY_ENTRIES)
@@ -77,7 +74,7 @@ mod tests {
             [Some(36), Some(36), Some(53), Some(53), Some(256), Some(256)]
         );
         assert_eq!(entries[4].kind, RelayLatencyKind::Xpop);
-        assert_eq!(entries[4].relay_name, "peer-only");
+        assert_eq!(entries[4].relay_name.as_deref(), Some("peer-only"));
         assert!(entries.iter().all(|e| e.latency.round() == 1));
         assert_eq!(entries[4].latency.raw(), 33_554_688);
     }
