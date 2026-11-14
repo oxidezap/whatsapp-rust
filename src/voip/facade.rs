@@ -9025,7 +9025,9 @@ mod tests {
         // Media-plane keepalive: no public call-control method claims to send it today, and what
         // the official client emits for it is not established here. See the audit notes.
         // (`transport` and `relay_latency` are sent by the caller since #1098.)
-        const UNWIRED: &[&str] = &["heartbeat"];
+        // Typed peer-report serialization is a public API. Runtime sending remains unwired
+        // until outbound reporting/election policy is established; never echo peer endpoints.
+        const UNWIRED: &[&str] = &["heartbeat", "relay_latency_report"];
         const CALLERS: &[&str] = &[
             "src/voip/facade.rs",
             "src/client/voip.rs",
