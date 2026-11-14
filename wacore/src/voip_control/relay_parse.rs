@@ -29,10 +29,31 @@ pub struct RelayEndpoint {
     pub token_id: u32,
     pub auth_token_id: u32,
     pub is_fna: bool,
-    /// Raw 6-byte IPv4:port from the first matching te2; used verbatim in relaylatency.
+    /// Raw 6-byte IPv4:port from the latest matching te2; used verbatim in relaylatency.
     pub ipv4_te2_bytes: Option<[u8; 6]>,
     pub addresses: Vec<RelayAddress>,
     pub c2r_rtt_ms: Option<u32>,
+}
+
+/// The two independently keyed entries carried by a relay's `te2` attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RelayCandidateKind {
+    /// Candidate using `token_id`.
+    Normal,
+    /// Independent cross-region candidate using `xtoken_id`.
+    Xpop,
+}
+
+/// A relay entry before projection into the legacy [`RelayData`] API.
+///
+/// Xpop RTT is metadata, not a priority: the native engine combines it with measured
+/// connectivity and gated RTT weighting. The current Rust transport elects one endpoint.
+#[derive(Clone, Debug)]
+pub struct RelayCandidate {
+    pub kind: RelayCandidateKind,
+    pub endpoint: RelayEndpoint,
+    pub xrtt_ms: Option<u32>,
+    pub max_peer_c2r_rtt_ms: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -192,7 +213,7 @@ fn parse_te2_address(bytes: &[u8], protocol: u8) -> Option<RelayAddress> {
     }
 }
 
-/// Parse a `<relay>` node into [`RelayData`].
+/// Parse a `<relay>` node into [`RelayData`], rejecting conflicting candidate token bindings.
 pub fn parse_relay_data(relay_node: &NodeRef<'_>) -> Option<RelayData> {
     let children = relay_node.children().unwrap_or_default();
     let find_bytes = |tag: &str| {
@@ -212,73 +233,10 @@ pub fn parse_relay_data(relay_node: &NodeRef<'_>) -> Option<RelayData> {
     let relay_tokens = parse_indexed_tokens(children, "token");
     let auth_tokens = parse_indexed_tokens(children, "auth_token");
 
-    let mut endpoints: Vec<RelayEndpoint> = Vec::new();
-    let mut index_by_key: HashMap<String, usize> = HashMap::new();
-
-    for te2 in children.iter().filter(|c| c.tag.as_ref() == "te2") {
-        let Some(addr_bytes) = node_content_bytes(te2) else {
-            continue;
-        };
-        let mut a = te2.attrs();
-        let relay_id = a
-            .optional_string("relay_id")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let relay_name = a
-            .optional_string("relay_name")
-            .map(|s| s.into_owned())
-            .unwrap_or_default();
-        // A cross-region (xpop) relay names its token `xtoken_id` instead. Defaulting it to 0
-        // pairs that relay with another relay's token, and its allocate is refused with 452
-        // "Xor Relayed Address Mismatch". A valid `token_id` still wins; a missing or malformed
-        // one falls back to a valid `xtoken_id`. (Narrow: the xpop candidate isn't modelled.)
-        let token_id = a
-            .optional_string("token_id")
-            .and_then(|s| s.parse().ok())
-            .or_else(|| a.optional_string("xtoken_id").and_then(|s| s.parse().ok()))
-            .unwrap_or(0);
-        let auth_token_id = a
-            .optional_string("auth_token_id")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let is_fna = a.optional_string("is_fna").as_deref() == Some("1");
-        let protocol = a
-            .optional_string("protocol")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let c2r_rtt_ms = a
-            .optional_string("c2r_rtt")
-            .and_then(|s| s.parse::<u32>().ok());
-
-        let Some(address) = parse_te2_address(&addr_bytes, protocol) else {
-            continue;
-        };
-
-        let key = format!("{relay_id}:{relay_name}");
-        let idx = *index_by_key.entry(key).or_insert_with(|| {
-            endpoints.push(RelayEndpoint {
-                relay_id,
-                relay_name: relay_name.clone(),
-                token_id,
-                auth_token_id,
-                is_fna,
-                ipv4_te2_bytes: None,
-                addresses: Vec::new(),
-                c2r_rtt_ms,
-            });
-            endpoints.len() - 1
-        });
-        let endpoint = &mut endpoints[idx];
-        endpoint.addresses.push(address);
-        if let Some(rtt) = c2r_rtt_ms {
-            endpoint.c2r_rtt_ms = Some(rtt);
-        }
-        if addr_bytes.len() == 6 && endpoint.ipv4_te2_bytes.is_none() {
-            let mut six = [0u8; 6];
-            six.copy_from_slice(&addr_bytes);
-            endpoint.ipv4_te2_bytes = Some(six);
-        }
-    }
+    let endpoints = parse_relay_candidates(relay_node)?
+        .into_iter()
+        .map(|candidate| candidate.endpoint)
+        .collect();
 
     let mut attrs = relay_node.attrs();
     Some(RelayData {
@@ -298,6 +256,130 @@ pub fn parse_relay_data(relay_node: &NodeRef<'_>) -> Option<RelayData> {
         auth_tokens,
         endpoints,
     })
+}
+
+/// Parse normal and xpop entries independently, keyed by `(relay_id, kind)`.
+///
+/// A valid normal token retains the existing Rust selection preference; an xpop token
+/// is an additional candidate, including when both attributes are present. Without
+/// either valid attribute, normal token 0 preserves the legacy default. Candidate
+/// metadata is available here without adding fields to public legacy struct literals.
+///
+/// Conflicting tokens for the same identity reject the relay block instead of pairing
+/// an address with a token from another entry. Address updates replace the same family
+/// and protocol while preserving other families/protocols. See PR #1913 for the
+/// pinned native evidence and the limits of this projection.
+pub fn parse_relay_candidates(relay_node: &NodeRef<'_>) -> Option<Vec<RelayCandidate>> {
+    let mut candidates: Vec<RelayCandidate> = Vec::new();
+    let mut index_by_key = HashMap::new();
+    for te2 in relay_node
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c.tag.as_ref() == "te2")
+    {
+        let Some(bytes) = node_content_bytes(te2) else {
+            continue;
+        };
+        let mut attrs = te2.attrs();
+        let relay_id = attrs
+            .optional_string("relay_id")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let relay_name = attrs
+            .optional_string("relay_name")
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        let normal = attrs
+            .optional_string("token_id")
+            .and_then(|s| s.parse::<u32>().ok());
+        let xpop = attrs
+            .optional_string("xtoken_id")
+            .and_then(|s| s.parse::<u32>().ok());
+        let auth_token_id = attrs
+            .optional_string("auth_token_id")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let protocol = attrs
+            .optional_string("protocol")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        // Native relay entries support UDP (0) and TCP (1), never arbitrary transports.
+        if !(0..=1).contains(&protocol) {
+            continue;
+        }
+        let protocol = protocol as u8;
+        let is_fna = attrs.optional_string("is_fna").as_deref() == Some("1");
+        let c2r_rtt_ms = attrs
+            .optional_string("c2r_rtt")
+            .and_then(|s| s.parse().ok());
+        let max_peer_c2r_rtt_ms = attrs
+            .optional_string("max_peer_c2r_rtt")
+            .and_then(|s| s.parse().ok());
+        let xrtt_ms = attrs
+            .optional_string("xrtt_ms")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let Some(address) = parse_te2_address(&bytes, protocol) else {
+            continue;
+        };
+        let normal = normal.or_else(|| xpop.is_none().then_some(0));
+        let ipv4 = address.ipv4.is_some();
+        let mut address = Some(address);
+        for (kind, token_id) in [
+            (RelayCandidateKind::Normal, normal),
+            (RelayCandidateKind::Xpop, xpop),
+        ] {
+            let Some(token_id) = token_id else { continue };
+            let idx = *index_by_key.entry((relay_id, kind)).or_insert_with(|| {
+                candidates.push(RelayCandidate {
+                    kind,
+                    endpoint: RelayEndpoint {
+                        relay_id,
+                        relay_name: relay_name.clone(),
+                        token_id,
+                        auth_token_id,
+                        is_fna,
+                        ipv4_te2_bytes: None,
+                        addresses: Vec::new(),
+                        c2r_rtt_ms,
+                    },
+                    xrtt_ms: (kind == RelayCandidateKind::Xpop).then_some(xrtt_ms),
+                    max_peer_c2r_rtt_ms,
+                });
+                candidates.len() - 1
+            });
+            let candidate = &mut candidates[idx];
+            let endpoint = &mut candidate.endpoint;
+            if endpoint.token_id != token_id {
+                return None;
+            }
+            endpoint.relay_name.clone_from(&relay_name);
+            endpoint.auth_token_id = auth_token_id;
+            endpoint.is_fna = is_fna;
+            endpoint.c2r_rtt_ms = c2r_rtt_ms;
+            candidate.max_peer_c2r_rtt_ms = max_peer_c2r_rtt_ms;
+            candidate.xrtt_ms = (kind == RelayCandidateKind::Xpop).then_some(xrtt_ms);
+            // The native entry has one address slot per family and protocol.
+            endpoint
+                .addresses
+                .retain(|old| old.protocol != protocol || old.ipv4.is_some() != ipv4);
+            // Move the common single-candidate address; only dual entries need a clone.
+            endpoint
+                .addresses
+                .push(if kind == RelayCandidateKind::Normal && xpop.is_some() {
+                    address.as_ref()?.clone()
+                } else {
+                    address.take()?
+                });
+            if bytes.len() == 6 && protocol == 0 {
+                let mut six = [0; 6];
+                six.copy_from_slice(&bytes);
+                endpoint.ipv4_te2_bytes = Some(six);
+            }
+        }
+    }
+    Some(candidates)
 }
 
 /// Find and parse the `<relay>` child of an ack node.
@@ -354,14 +436,12 @@ pub fn is_outbound_relay_candidate(endpoint: &RelayEndpoint) -> bool {
     !endpoint.is_fna && endpoint.auth_token_id != 0
 }
 
-/// Outbound relay endpoints, deduped by name and sorted by relay_id.
+/// Outbound relay entries sorted by relay_id, retaining normal and xpop token bindings.
 pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint> {
-    let mut seen = std::collections::HashSet::new();
     let mut out: Vec<RelayEndpoint> = relay_data
         .endpoints
         .iter()
         .filter(|ep| is_outbound_relay_candidate(ep))
-        .filter(|ep| seen.insert(ep.relay_name.clone()))
         .cloned()
         .collect();
     out.sort_by_key(|ep| ep.relay_id);
@@ -431,6 +511,9 @@ pub fn get_ipv4_address_bytes(endpoint: &RelayEndpoint) -> Option<[u8; 6]> {
         return Some(bytes);
     }
     for addr in &endpoint.addresses {
+        if addr.protocol != 0 {
+            continue;
+        }
         let Some(ipv4) = &addr.ipv4 else { continue };
         let octets: Vec<u8> = ipv4.split('.').filter_map(|n| n.parse().ok()).collect();
         if octets.len() != 4 {
@@ -445,10 +528,12 @@ pub fn get_ipv4_address_bytes(endpoint: &RelayEndpoint) -> Option<[u8; 6]> {
     None
 }
 
+/// The UDP IPv4 address supported by the current media transport.
 pub fn get_primary_ipv4_address(endpoint: &RelayEndpoint) -> Option<(String, u16)> {
     endpoint
         .addresses
         .iter()
+        .filter(|a| a.protocol == 0)
         .find_map(|a| a.ipv4.clone().map(|ip| (ip, a.port)))
 }
 
@@ -887,6 +972,214 @@ mod tests {
                 "token_id={token_id:?} xtoken_id={xtoken_id:?}"
             );
         }
+    }
+
+    fn dual_relay(normal: &str, xpop: &str, tokens: Vec<Node>) -> Node {
+        let mut children = tokens;
+        children.push(
+            NodeBuilder::new("te2")
+                .attr("relay_id", "2")
+                .attr("relay_name", "synthetic")
+                .attr("token_id", normal)
+                .attr("xtoken_id", xpop)
+                .attr("auth_token_id", "1")
+                .bytes(vec![192, 0, 2, 1, 0x0d, 0x96])
+                .build(),
+        );
+        NodeBuilder::new("relay").children(children).build()
+    }
+
+    #[test]
+    fn both_token_attributes_preserve_two_candidates_and_rtt_defaults() {
+        let node = dual_relay("1", "2", vec![]);
+        let candidates = parse_relay_candidates(&as_ref(&node)).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].kind, RelayCandidateKind::Normal);
+        assert_eq!(candidates[0].endpoint.token_id, 1);
+        assert_eq!(candidates[0].xrtt_ms, None);
+        assert_eq!(candidates[1].kind, RelayCandidateKind::Xpop);
+        assert_eq!(candidates[1].endpoint.token_id, 2);
+        assert_eq!(candidates[1].xrtt_ms, Some(100));
+        let data = parse_relay_data(&as_ref(&node)).unwrap();
+        assert_eq!(data.endpoints.len(), 2);
+        assert_eq!(get_outbound_relay_endpoints(&data).len(), 2);
+    }
+
+    #[test]
+    fn invalid_attributes_do_not_create_phantom_normal_candidates() {
+        let cases = [
+            ("abc", "2", RelayCandidateKind::Xpop, 2),
+            ("-1", "2", RelayCandidateKind::Xpop, 2),
+            ("4294967296", "2", RelayCandidateKind::Xpop, 2),
+            ("1", "abc", RelayCandidateKind::Normal, 1),
+            ("1", "-1", RelayCandidateKind::Normal, 1),
+            ("1", "4294967296", RelayCandidateKind::Normal, 1),
+            ("abc", "abc", RelayCandidateKind::Normal, 0),
+        ];
+        for (normal, xpop, kind, token) in cases {
+            let node = dual_relay(normal, xpop, vec![]);
+            let candidates = parse_relay_candidates(&as_ref(&node)).unwrap();
+            assert_eq!(candidates.len(), 1, "normal={normal} xpop={xpop}");
+            assert_eq!(candidates[0].kind, kind);
+            assert_eq!(candidates[0].endpoint.token_id, token);
+        }
+    }
+
+    #[test]
+    fn normal_and_xpop_with_the_same_token_are_still_distinct() {
+        let node = dual_relay("1", "1", vec![]);
+        assert_eq!(parse_relay_candidates(&as_ref(&node)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn missing_empty_or_out_of_range_normal_token_can_use_xpop() {
+        for normal in ["1", "63", "64", "4294967295"] {
+            let node = dual_relay(
+                normal,
+                "2",
+                vec![
+                    NodeBuilder::new("token")
+                        .attr("id", "2")
+                        .bytes(vec![0x22; 4])
+                        .build(),
+                ],
+            );
+            let data = parse_relay_data(&as_ref(&node)).unwrap();
+            let selected = get_media_relay_endpoint(&data).unwrap();
+            assert_eq!(selected.token_id, 2, "normal={normal}");
+            assert_eq!(data.relay_tokens[selected.token_id as usize], vec![0x22; 4]);
+            assert_eq!(
+                get_primary_ipv4_address(selected),
+                Some(("192.0.2.1".into(), 3478))
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_empty_token_does_not_mask_the_other_candidate() {
+        for normal_empty in [false, true] {
+            let node = dual_relay(
+                "1",
+                "2",
+                vec![
+                    NodeBuilder::new("token")
+                        .attr("id", "1")
+                        .bytes(if normal_empty { vec![] } else { vec![0x11] })
+                        .build(),
+                    NodeBuilder::new("token")
+                        .attr("id", "2")
+                        .bytes(if normal_empty { vec![0x22] } else { vec![] })
+                        .build(),
+                ],
+            );
+            let data = parse_relay_data(&as_ref(&node)).unwrap();
+            assert_eq!(
+                get_media_relay_endpoint(&data).unwrap().token_id,
+                if normal_empty { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn usable_normal_token_retains_selection_preference() {
+        let node = dual_relay(
+            "1",
+            "2",
+            vec![
+                NodeBuilder::new("token")
+                    .attr("id", "1")
+                    .bytes(vec![0x11])
+                    .build(),
+                NodeBuilder::new("token")
+                    .attr("id", "2")
+                    .bytes(vec![0x22])
+                    .build(),
+            ],
+        );
+        let data = parse_relay_data(&as_ref(&node)).unwrap();
+        assert_eq!(get_media_relay_endpoint(&data).unwrap().token_id, 1);
+    }
+
+    #[test]
+    fn candidate_updates_replace_address_and_preserve_other_family() {
+        let te2 = |ip: Vec<u8>, name: &'static str| {
+            NodeBuilder::new("te2")
+                .attr("relay_id", "2")
+                .attr("relay_name", name)
+                .attr("token_id", "1")
+                .attr("xtoken_id", "2")
+                .attr("xrtt_ms", "52")
+                .attr("max_peer_c2r_rtt", "31")
+                .bytes(ip)
+                .build()
+        };
+        let node = NodeBuilder::new("relay")
+            .children([
+                te2(vec![192, 0, 2, 1, 0x0d, 0x96], "first"),
+                te2(vec![0; 18], "ipv6"),
+                te2(vec![192, 0, 2, 2, 0x0d, 0x98], "latest"),
+            ])
+            .build();
+        let candidates = parse_relay_candidates(&as_ref(&node)).unwrap();
+        assert_eq!(candidates.len(), 2);
+        for candidate in &candidates {
+            assert_eq!(candidate.endpoint.addresses.len(), 2);
+            assert_eq!(candidate.endpoint.relay_name, "latest");
+            assert_eq!(
+                get_primary_ipv4_address(&candidate.endpoint),
+                Some(("192.0.2.2".into(), 3480))
+            );
+            assert_eq!(
+                get_ipv4_address_bytes(&candidate.endpoint),
+                Some([192, 0, 2, 2, 0x0d, 0x98])
+            );
+            assert_eq!(candidate.max_peer_c2r_rtt_ms, Some(31));
+        }
+        assert_eq!(candidates[1].xrtt_ms, Some(52));
+    }
+
+    #[test]
+    fn tcp_and_unknown_protocols_are_not_dialed_as_udp() {
+        for protocol in ["1", "2", "255", "256", "-1"] {
+            let node = NodeBuilder::new("relay")
+                .children([
+                    NodeBuilder::new("token").bytes(vec![0x22]).build(),
+                    NodeBuilder::new("te2")
+                        .attr("relay_id", "2")
+                        .attr("protocol", protocol)
+                        .bytes(vec![192, 0, 2, 1, 0x0d, 0x98])
+                        .build(),
+                ])
+                .build();
+            let data = parse_relay_data(&as_ref(&node)).unwrap();
+            if protocol == "1" {
+                assert_eq!(data.endpoints.len(), 1, "retain TCP metadata");
+                assert!(get_primary_ipv4_address(&data.endpoints[0]).is_none());
+                assert!(get_ipv4_address_bytes(&data.endpoints[0]).is_none());
+            } else {
+                assert!(data.endpoints.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_tokens_for_one_candidate_reject_the_block() {
+        let node = NodeBuilder::new("relay")
+            .children([
+                NodeBuilder::new("te2")
+                    .attr("relay_id", "2")
+                    .attr("token_id", "1")
+                    .bytes(vec![192, 0, 2, 1, 0x0d, 0x96])
+                    .build(),
+                NodeBuilder::new("te2")
+                    .attr("relay_id", "2")
+                    .attr("token_id", "2")
+                    .bytes(vec![192, 0, 2, 2, 0x0d, 0x96])
+                    .build(),
+            ])
+            .build();
+        assert!(parse_relay_candidates(&as_ref(&node)).is_none());
+        assert!(parse_relay_data(&as_ref(&node)).is_none());
     }
 
     #[test]

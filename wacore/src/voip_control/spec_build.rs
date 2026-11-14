@@ -247,6 +247,81 @@ mod tests {
     }
 
     #[test]
+    fn xpop_selection_keeps_credentials_bound_through_media_setup() {
+        use crate::voip_control::relay_parse::parse_relay_data;
+        use wacore_binary::builder::NodeBuilder;
+        for normal_available in [false, true] {
+            let mut children = vec![
+                NodeBuilder::new("key")
+                    .bytes(b"synthetic-key".to_vec())
+                    .build(),
+                NodeBuilder::new("auth_token")
+                    .attr("id", "0")
+                    .bytes(vec![0x33; 8])
+                    .build(),
+                NodeBuilder::new("token")
+                    .attr("id", "2")
+                    .bytes(vec![0x22; 16])
+                    .build(),
+                NodeBuilder::new("te2")
+                    .attr("relay_id", "2")
+                    .attr("token_id", "1")
+                    .attr("xtoken_id", "2")
+                    .attr("auth_token_id", "0")
+                    .bytes(vec![192, 0, 2, 1, 0x0d, 0x96])
+                    .build(),
+            ];
+            if normal_available {
+                children.push(
+                    NodeBuilder::new("token")
+                        .attr("id", "1")
+                        .bytes(vec![0x11; 16])
+                        .build(),
+                );
+            }
+            let node = NodeBuilder::new("relay").children(children).build();
+            let relay = parse_relay_data(&node.as_node_ref()).unwrap();
+            let spec = MediaSessionSpec::from_relay(
+                CallDirection::Outgoing,
+                key(),
+                "1:0@lid",
+                "2:0@lid",
+                vec![0; 32],
+                &relay,
+            )
+            .unwrap();
+            let expected_token = vec![if normal_available { 0x11 } else { 0x22 }; 16];
+            assert_eq!(spec.relay_token, expected_token);
+            assert_eq!(spec.auth_token, vec![0x33; 8]);
+            assert_eq!(
+                (spec.relay_ip.as_str(), spec.relay_port),
+                ("192.0.2.1", 3478)
+            );
+            #[cfg(feature = "voip")]
+            {
+                use crate::voip::engine::{CallEngine, Output, SequentialTxIds};
+                use crate::voip::stun::parse_stun_attributes;
+                let mut parts =
+                    crate::voip_control::engine_bridge::into_engine_parts(spec).unwrap();
+                // Allocate is control-plane traffic: credential binding must also be
+                // checked with `voip` alone, without requiring a PCM/MLOW decoder.
+                parts.config.enable_media = false;
+                let mut engine =
+                    CallEngine::new(parts.config, Box::new(SequentialTxIds::new())).unwrap();
+                engine.start(0, 0);
+                let Output::Transmit(packet) = engine.poll_output() else {
+                    panic!("missing Allocate")
+                };
+                let attrs = parse_stun_attributes(&packet);
+                assert_eq!(
+                    attrs.iter().find(|a| a.attr_type == 0x4000).unwrap().value,
+                    expected_token
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_short_call_key_is_refused() {
         let error = MediaSessionSpec::from_relay(
             CallDirection::Outgoing,
