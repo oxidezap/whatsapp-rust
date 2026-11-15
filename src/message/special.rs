@@ -155,7 +155,7 @@ impl Client {
         #[cfg(test)]
         if self
             .app_state_key_share_prepare_test_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

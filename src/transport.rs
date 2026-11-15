@@ -200,7 +200,7 @@ pub mod mock {
         async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
             if self
                 .remaining_failures
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |remaining| remaining.checked_sub(1),

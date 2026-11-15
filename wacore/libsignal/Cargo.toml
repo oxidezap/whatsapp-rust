@@ -3,13 +3,13 @@ name = "wacore-libsignal"
 version = "0.7.0"
 edition.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
-license = "MIT"
+license = "MIT AND BSD-3-Clause"
 rust-version.workspace = true
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Storage-compatible Signal protocol with a sans-I/O state engine"
 
 [features]
-legacy-session-interop = []
+legacy-session-interop = ["dep:wacore-derive"]
 bench-internals = []
 
 [dependencies]
@@ -23,7 +23,6 @@ hmac.workspace = true
 hkdf.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
-curve25519-dalek = { version = "5.0.0", features = ["zeroize"] }
 rand.workspace = true
 serde.workspace = true
 bytes.workspace = true
@@ -35,7 +34,8 @@ chrono = { workspace = true, features = ["now"] }
 hex.workspace = true
 itoa.workspace = true
 wacore-binary.workspace = true
-wacore-derive.workspace = true
+# Only the opt-in legacy wire enums use the derive macro.
+wacore-derive = { workspace = true, optional = true }
 waproto.workspace = true
 buffa.workspace = true
 log.workspace = true
@@ -56,4 +56,8 @@ harness = false
 
 [[bench]]
 name = "classic_benchmark"
+harness = false
+
+[[bench]]
+name = "curve_benchmark"
 harness = false

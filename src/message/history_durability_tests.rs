@@ -1002,7 +1002,7 @@ impl wacore::runtime::Runtime for ParkedEncodingRuntime {
     ) -> wacore::runtime::BoxFuture<'static, ()> {
         if self
             .skip
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |skip| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |skip| {
                 skip.checked_sub(1)
             })
             .is_ok()

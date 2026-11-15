@@ -16,7 +16,7 @@ hex = { workspace = true }
 jni = { version = "=0.22.4", default-features = false }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
-zip = { version = "=9.4.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "=9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [lints]
 workspace = true

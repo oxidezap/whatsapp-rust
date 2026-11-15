@@ -13,6 +13,8 @@ use wacore_binary::{Jid, JidExt as _};
 mod hosted_recovery_tests;
 
 #[cfg(test)]
+mod group_cache_progress_tests;
+#[cfg(test)]
 mod ordinary_recovery_tests;
 
 /// An authoritative refresh retries when a newer registry mutation wins while
@@ -495,6 +497,27 @@ impl Client {
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.get_user_devices_cached_first(jids, false)
+            .await
+            .map(|(devices, _)| devices)
+    }
+
+    /// Group fanout: a contact whose PN and LID carry conflicting primaries is
+    /// rejected alone (keeping its old record) instead of failing the send
+    /// for every other participant. The flag is false when a fetched user came
+    /// back without devices, so callers must not memoize that partial view.
+    pub(crate) async fn get_group_user_devices_owned(
+        &self,
+        jids: Vec<Jid>,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+        self.get_user_devices_cached_first(jids, true).await
+    }
+
+    async fn get_user_devices_cached_first(
+        &self,
+        jids: Vec<Jid>,
+        group: bool,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
         // One batched registry pass: the cache answers per user, and every
         // user it cannot answer goes to the backend in ONE read. The
         // previous per-user fan-out (16 concurrent `get_devices`) bought
@@ -513,13 +536,29 @@ impl Client {
                 "get_user_devices: Cache miss, fetching from network for {} unique users",
                 jids_to_fetch.len()
             );
-            let fetched = self.fetch_user_devices(jids_to_fetch).await?;
+            let requested = jids_to_fetch.len();
+            let fetched = if group {
+                self.fetch_group_user_devices(
+                    jids_to_fetch,
+                    crate::cache::Freshness::CachePreferred,
+                )
+                .await?
+            } else {
+                self.fetch_user_devices(jids_to_fetch).await?
+            };
+            // Counting is enough: every resolved user keeps device 0, and an
+            // undercount (e.g. PN and LID collapsing) only costs a memo miss.
+            let mut users: Vec<_> = fetched.iter().map(|device| &device.user).collect();
+            users.sort_unstable();
+            users.dedup();
+            let complete = users.len() == requested;
             self.remove_superseded_cached_devices(&mut all_devices, &fetched)
                 .await;
             all_devices.extend(fetched);
+            return Ok((all_devices, complete));
         }
 
-        Ok(all_devices)
+        Ok((all_devices, true))
     }
 
     pub(crate) async fn refresh_user_devices(
@@ -539,7 +578,16 @@ impl Client {
     /// An omitted or invalid user keeps its previous registry record.
     pub(crate) async fn refresh_group_user_devices(
         &self,
+        jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.fetch_group_user_devices(jids, crate::cache::Freshness::Refresh)
+            .await
+    }
+
+    async fn fetch_group_user_devices(
+        &self,
         mut jids: Vec<Jid>,
+        freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         for jid in &mut jids {
             jid.agent = 0;
@@ -553,12 +601,13 @@ impl Client {
             remaining: GROUP_ADV_RECOVERY_LIMIT,
             attempted: std::collections::HashSet::new(),
         };
+        let mut pending = None;
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let generation = self.device_topology.current();
             let authentication_epoch = self.signal_cache.identity_continuity.primary_snapshot();
             let response = self
                 .execute_streaming(DeviceListSpec::new(
-                    jids.clone(),
+                    pending.take().unwrap_or_else(|| jids.clone()),
                     self.generate_request_id(),
                 ))
                 .await?;
@@ -574,6 +623,15 @@ impl Client {
                 .await?
             {
                 return Ok(devices);
+            }
+            if freshness == crate::cache::Freshness::CachePreferred {
+                // A concurrent publication can satisfy the original cache miss.
+                // Keep its current records and query only the unresolved accounts.
+                let (devices, missing) = self.get_devices_from_registry_batch(jids.clone()).await;
+                if missing.is_empty() {
+                    return Ok(devices);
+                }
+                pending = Some(missing);
             }
         }
         anyhow::bail!("device registry kept changing while a group refresh was in flight")

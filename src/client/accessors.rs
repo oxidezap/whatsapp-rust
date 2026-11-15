@@ -90,7 +90,7 @@ impl Client {
     pub fn acquire_raw_node_forwarding(self: &Arc<Self>) -> RawNodeLease {
         let incremented = self
             .raw_node_forwarding
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
             })
             .is_ok();
@@ -114,7 +114,7 @@ impl Client {
     pub fn acquire_decrypted_payload_forwarding(self: &Arc<Self>) -> DecryptedPayloadLease {
         let incremented = self
             .decrypted_payload_forwarding
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
             })
             .is_ok();
@@ -147,7 +147,7 @@ impl Client {
     pub fn acquire_enc_decrypt_failed_forwarding(self: &Arc<Self>) -> EncDecryptFailedLease {
         let incremented = self
             .enc_decrypt_failed_forwarding
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
             })
             .is_ok();

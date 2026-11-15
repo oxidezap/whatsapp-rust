@@ -26496,7 +26496,9 @@ field whatsapp::SenderKeyMessage::iteration :: core :: option :: Option < u32 >
 field whatsapp::SenderKeyMessageView::ciphertext :: core :: option :: Option < & 'a [u8] >
 field whatsapp::SenderKeyMessageView::id :: core :: option :: Option < u32 >
 field whatsapp::SenderKeyMessageView::iteration :: core :: option :: Option < u32 >
+field whatsapp::SenderKeyRecordStructure::legacy_receiver_recovery_disabled :: core :: option :: Option < bool >
 field whatsapp::SenderKeyRecordStructure::sender_key_states :: buffa :: alloc :: vec :: Vec < SenderKeyStateStructure >
+field whatsapp::SenderKeyRecordStructureView::legacy_receiver_recovery_disabled :: core :: option :: Option < bool >
 field whatsapp::SenderKeyRecordStructureView::sender_key_states :: buffa :: RepeatedView < 'a , whatsapp::SenderKeyStateStructureView < 'a > , >
 field whatsapp::SenderKeyStateStructure::sender_chain_key :: buffa :: MessageField < sender_key_state_structure :: SenderChainKey , >
 field whatsapp::SenderKeyStateStructure::sender_key_id :: core :: option :: Option < u32 >
@@ -33234,6 +33236,7 @@ field-presence .whatsapp.SenderKeyDistributionMessage.signingKey=Explicit
 field-presence .whatsapp.SenderKeyMessage.ciphertext=Explicit
 field-presence .whatsapp.SenderKeyMessage.id=Explicit
 field-presence .whatsapp.SenderKeyMessage.iteration=Explicit
+field-presence .whatsapp.SenderKeyRecordStructure.legacyReceiverRecoveryDisabled=Explicit
 field-presence .whatsapp.SenderKeyStateStructure.SenderChainKey.iteration=Explicit
 field-presence .whatsapp.SenderKeyStateStructure.SenderChainKey.seed=Explicit
 field-presence .whatsapp.SenderKeyStateStructure.SenderMessageKey.iteration=Explicit
@@ -61261,11 +61264,13 @@ method whatsapp::SenderKeyMessageOwnedView fn into_bytes (self) -> :: buffa :: b
 method whatsapp::SenderKeyMessageOwnedView fn iteration (& self) -> :: core :: option :: Option < u32 >
 method whatsapp::SenderKeyMessageOwnedView fn to_owned_message (& self) -> whatsapp::SenderKeyMessage
 method whatsapp::SenderKeyMessageOwnedView fn view (& self) -> & SenderKeyMessageView < '_ >
+method whatsapp::SenderKeyRecordStructure fn with_legacy_receiver_recovery_disabled (mut self , value : bool) -> Self
 method whatsapp::SenderKeyRecordStructureOwnedView fn bytes (& self) -> & :: buffa :: bytes :: Bytes
 method whatsapp::SenderKeyRecordStructureOwnedView fn decode (bytes : :: buffa :: bytes :: Bytes ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::SenderKeyRecordStructureOwnedView fn decode_with_options (bytes : :: buffa :: bytes :: Bytes , opts : & :: buffa :: DecodeOptions ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::SenderKeyRecordStructureOwnedView fn from_owned (msg : & whatsapp::SenderKeyRecordStructure ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::SenderKeyRecordStructureOwnedView fn into_bytes (self) -> :: buffa :: bytes :: Bytes
+method whatsapp::SenderKeyRecordStructureOwnedView fn legacy_receiver_recovery_disabled (& self) -> :: core :: option :: Option < bool >
 method whatsapp::SenderKeyRecordStructureOwnedView fn sender_key_states (& self ,) -> & :: buffa :: RepeatedView < '_ , whatsapp::SenderKeyStateStructureView < '_ > , >
 method whatsapp::SenderKeyRecordStructureOwnedView fn to_owned_message (& self) -> whatsapp::SenderKeyRecordStructure
 method whatsapp::SenderKeyRecordStructureOwnedView fn view (& self) -> & SenderKeyRecordStructureView < '_ >
@@ -77948,6 +77953,7 @@ wire .whatsapp.SenderKeyDistributionMessage.signingKey number=Some(4) type=Some(
 wire .whatsapp.SenderKeyMessage.ciphertext number=Some(3) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SenderKeyMessage.id number=Some(1) type=Some(TYPE_UINT32) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SenderKeyMessage.iteration number=Some(2) type=Some(TYPE_UINT32) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
+wire .whatsapp.SenderKeyRecordStructure.legacyReceiverRecoveryDisabled number=Some(102) type=Some(TYPE_BOOL) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SenderKeyRecordStructure.senderKeyStates number=Some(1) type=Some(TYPE_MESSAGE) label=Some(LABEL_REPEATED) target=Some(".whatsapp.SenderKeyStateStructure") default=None oneof=None
 wire .whatsapp.SenderKeyStateStructure.SenderChainKey.iteration number=Some(1) type=Some(TYPE_UINT32) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SenderKeyStateStructure.SenderChainKey.seed number=Some(2) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None

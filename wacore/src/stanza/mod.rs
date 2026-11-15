@@ -12,6 +12,7 @@ pub mod ib;
 pub mod message;
 pub mod notification;
 pub mod receipt;
+pub mod relay_latency;
 pub mod wire_tags;
 
 pub use business::*;

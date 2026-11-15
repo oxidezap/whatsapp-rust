@@ -1,0 +1,4 @@
+# libFuzzer and sanitizer instrumentation require nightly.
+[toolchain]
+channel = "nightly-2026-06-16"
+profile = "minimal"

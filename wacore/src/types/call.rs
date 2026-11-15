@@ -318,6 +318,9 @@ pub struct IncomingCall {
     pub timestamp: Option<DateTime<Utc>>,
     pub offline: bool,
     pub action: CallAction,
+    /// Peer measurements retained as metadata, never as trusted transport destinations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_latency: Option<Box<super::relay_latency::RelayLatencyReport>>,
     /// The offer's `username` attribute, used to enforce calling phone-number
     /// privacy before learning a LID/PN mapping. Kept on this extensible payload
     /// rather than adding a field to the public `CallAction::Offer` variant.

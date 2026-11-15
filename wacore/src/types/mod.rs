@@ -7,6 +7,7 @@ pub mod message;
 pub mod message_ref;
 pub mod message_secret;
 pub mod presence;
+pub mod relay_latency;
 pub mod spam_report;
 pub mod user;
 pub mod wire_enums;

@@ -36,6 +36,7 @@ fn signal_projection_guard_rejects_additive_known_fields() {
         ("IdentityKeyPairStructure", &[][..]),
         ("SessionStructure", &[][..]),
         ("SessionStructure", &["Chain", "MessageKey"][..]),
+        ("SenderKeyRecordStructure", &[][..]),
         ("SenderKeyStateStructure", &[][..]),
         ("SenderKeyStateStructure", &["SenderChainKey"][..]),
         ("SenderKeyStateStructure", &["SenderMessageKey"][..]),
@@ -87,6 +88,12 @@ fn signal_projection_guard_allows_unrelated_schema_evolution() {
         .collect::<std::collections::BTreeSet<_>>();
     candidate.insert("wire .whatsapp.Message.futureState number=Some(1000)".into());
     signal_storage::check(&candidate).expect("ordinary message evolution remains additive");
+    let mut missing_recovery_policy = candidate.clone();
+    missing_recovery_policy.retain(|line| {
+        !line.starts_with("wire .whatsapp.SenderKeyRecordStructure.legacyReceiverRecoveryDisabled ")
+    });
+    signal_storage::check(&missing_recovery_policy)
+        .expect_err("removing the durable recovery policy must fail");
     candidate.retain(|line| !line.starts_with("wire .whatsapp.SessionStructure.rootKey "));
     signal_storage::check(&candidate).expect_err("removing represented state must also fail");
 }
