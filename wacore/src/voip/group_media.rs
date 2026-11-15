@@ -459,6 +459,22 @@ impl GroupMediaRegistry {
         })
     }
 
+    /// Only authenticated RTP establishes a video source; roster mode and sender reports do not.
+    pub(crate) fn video_streams(&self) -> Vec<(String, u32)> {
+        let mut streams: Vec<_> = self
+            .video_routes
+            .iter()
+            .filter(|(_, id)| {
+                self.receivers.get(*id).is_some_and(|r| {
+                    r.video_enabled && r.video.as_ref().is_some_and(|v| v.inbound_ssrc().is_some())
+                })
+            })
+            .map(|(ssrc, id)| (id.clone(), *ssrc))
+            .collect();
+        streams.sort_unstable_by_key(|(_, ssrc)| *ssrc);
+        streams
+    }
+
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<ParticipantVideo> {
         let ssrc = parse_rtp_header(packet)?.ssrc;
         let participant_id = self.video_routes.get(&ssrc)?.clone();

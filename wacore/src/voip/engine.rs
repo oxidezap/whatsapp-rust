@@ -1157,6 +1157,7 @@ struct GroupEngineState {
     video_orientations: HashMap<Jid, u8>,
     audio_reception: HashMap<String, RtpReceptionStats>,
     video_reception: HashMap<String, RtpReceptionStats>,
+    keyframe_requests: HashMap<String, GroupKeyframeRequest>,
     #[cfg(feature = "voip-mlow")]
     decoders: HashMap<String, mlow::MlowDecoder>,
     /// One injected decoder per participant speaking standard Opus. Separate instances because
@@ -1171,6 +1172,12 @@ struct GroupEngineState {
     /// marker, so nothing about the packet says so -- only the accumulated evidence does, and it
     /// has to be remembered or every packet after the verdict would be classified MLOW again.
     foreign_participants: HashSet<String>,
+}
+
+#[derive(Default)]
+struct GroupKeyframeRequest {
+    asked_at: Option<Millis>,
+    pending: Option<Millis>,
 }
 
 struct ReactionWatermark {
@@ -1583,6 +1590,7 @@ impl CallEngine {
             video_orientations: HashMap::new(),
             audio_reception: HashMap::new(),
             video_reception: HashMap::new(),
+            keyframe_requests: HashMap::new(),
             #[cfg(feature = "voip-mlow")]
             decoders: HashMap::new(),
             foreign_decoders: HashMap::new(),
@@ -1727,7 +1735,17 @@ impl CallEngine {
                 // sequence climbed past the old maximum.
                 group.audio_reception.remove(&participant);
                 group.video_reception.remove(&participant);
+                group.keyframe_requests.remove(&participant);
             }
+            let video_sources: HashSet<_> = group
+                .registry
+                .video_streams()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            group
+                .keyframe_requests
+                .retain(|participant, _| video_sources.contains(participant));
             group.mixer.retain(active.iter().cloned());
             group
                 .audio_reception
@@ -2209,21 +2227,20 @@ impl CallEngine {
     /// is no picture to have lost -- and, for [`KeyframeUrgency::Coalesced`], a
     /// request made too soon after the last about the same stream.
     ///
-    /// **A group call is always `false`.** Group video is routed through the
-    /// participant registry, and a group PLI has to name *which* participant's
-    /// stream was lost -- so it is a different request, not this one aimed
-    /// elsewhere. The per-participant SSRC is on hand; what is not settled is
-    /// whether an SFU-bound PLI travels hop-by-hop rather than end-to-end, which
-    /// this engine has no send path for. Refused explicitly rather than left to
-    /// fall out of an unset SSRC, because promotion breaks that accident: a call
-    /// that authenticated video and *then* received a group update keeps this
-    /// plane, so its depacketizer still names the direct stream while `on_rtp`
-    /// has moved to the registry.
+    /// **A group call asks every authenticated participant stream**, never the plane's depacketizer
+    /// stream: a call that authenticated video and *then* received a group
+    /// update keeps that plane naming the direct stream while `on_rtp` has
+    /// moved to the registry. The PLIs go out end-to-end under our group SRTCP
+    /// keys, the same path our reception reports take; whether the SFU relays
+    /// them rather than answering hop-by-hop is not settled.
     /// A coalesced request suppressed by the interval is retained for its next deadline.
     /// The return value says whether a request was emitted now.
     pub fn request_peer_keyframe(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
-        if self.terminated || self.group.is_some() {
+        if self.terminated {
             return false;
+        }
+        if self.group.is_some() {
+            return self.request_group_keyframes(now, urgency);
         }
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
             return false;
@@ -2260,6 +2277,81 @@ impl CallEngine {
         self.media_stats.peer_keyframe_requests =
             self.media_stats.peer_keyframe_requests.saturating_add(1);
         true
+    }
+
+    /// The application cannot identify the lost picture, so ask each authenticated source.
+    /// Keep recovery and throttling per participant so a new source is never blocked by another.
+    fn request_group_keyframes(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
+        self.emit_group_keyframes(now, urgency, false)
+    }
+
+    fn emit_group_keyframes(
+        &mut self,
+        now: Millis,
+        urgency: KeyframeUrgency,
+        due_only: bool,
+    ) -> bool {
+        if !self.group_epoch_ready() {
+            return false;
+        }
+        let Some(group) = self.group.as_mut() else {
+            return false;
+        };
+        let Some(video) = self
+            .media
+            .as_mut()
+            .and_then(|media| media.video.as_mut())
+            .filter(|v| v.active)
+        else {
+            return false;
+        };
+        let interval = match urgency {
+            KeyframeUrgency::Coalesced => MIN_PEER_KEYFRAME_INTERVAL_MS,
+            KeyframeUrgency::Immediate => MIN_IMMEDIATE_PEER_KEYFRAME_INTERVAL_MS,
+        };
+        let mut emitted = false;
+        for (participant, ssrc) in group.registry.video_streams() {
+            let request = group.keyframe_requests.entry(participant).or_default();
+            if due_only && !request.pending.is_some_and(|deadline| now >= deadline) {
+                continue;
+            }
+            if let Some(asked) = request.asked_at
+                && now.saturating_sub(asked) < interval
+            {
+                if urgency == KeyframeUrgency::Coalesced {
+                    request.pending = Some(asked.saturating_add(interval));
+                }
+                continue;
+            }
+            request.asked_at = Some(now);
+            request.pending = None;
+            let pli = video.pipe.picture_loss_indication_for(ssrc);
+            self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
+            emitted = true;
+        }
+        if emitted {
+            self.media_stats.peer_keyframe_requests =
+                self.media_stats.peer_keyframe_requests.saturating_add(1);
+        }
+        emitted
+    }
+
+    fn group_keyframe_deadline(&self) -> Option<Millis> {
+        if !self.group_epoch_ready()
+            || !self
+                .media
+                .as_ref()
+                .and_then(|m| m.video.as_ref())
+                .is_some_and(|v| v.active)
+        {
+            return None;
+        }
+        let group = self.group.as_ref()?;
+        group
+            .keyframe_requests
+            .values()
+            .filter_map(|r| r.pending)
+            .min()
     }
 
     /// Set the nominal RTP cadence for subsequent video access units. The source must pace access
@@ -2360,6 +2452,9 @@ impl CallEngine {
     /// The pipeline keeps its SRTP send sequence and ROC so enabling video again does not reuse a
     /// packet index. The audio plane is unchanged. Idempotent.
     pub fn disable_video(&mut self) {
+        if let Some(group) = self.group.as_mut() {
+            group.keyframe_requests.clear();
+        }
         if let Some(v) = self.media.as_mut().and_then(|m| m.video.as_mut()) {
             v.active = false;
         }
@@ -2503,6 +2598,9 @@ impl CallEngine {
             return None;
         }
         let mut next = self.keepalive_deadline;
+        if let Some(deadline) = self.group_keyframe_deadline() {
+            next = next.min(deadline);
+        }
         // The allocate timeout only matters while the allocate is still outstanding.
         if self.allocate_pending && self.allocate_deadline != NEVER {
             next = next.min(self.allocate_deadline);
@@ -2638,6 +2736,12 @@ impl CallEngine {
                 });
         if keyframe_due {
             self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
+        }
+        if self
+            .group_keyframe_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.emit_group_keyframes(now, KeyframeUrgency::Coalesced, true);
         }
         self.poll_audio_health(now);
         self.retransmit_group_reactions(now);
@@ -3916,6 +4020,12 @@ impl CallEngine {
                 video.access_units.into_iter().zip(video.orientations)
             {
                 let keyframe = au_is_keyframe(&access_unit);
+                if keyframe
+                    && au_has_idr(&access_unit)
+                    && let Some(request) = group.keyframe_requests.get_mut(&video.participant_id)
+                {
+                    request.pending = None;
+                }
                 self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                     data: access_unit,
                     keyframe,
@@ -10070,6 +10180,278 @@ mod tests {
         }
     }
 
+    fn group_with_video_source() -> (CallEngine, [u8; 32], VideoPipeline) {
+        let (mut eng, epoch) = group_engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let mut peer = group_peer_video(&epoch);
+        for packet in peer.protect_video(&video_au(100)) {
+            eng.handle_input(100, Input::RelayPacket(&packet));
+        }
+        let _ = drain(&mut eng);
+        (eng, epoch, peer)
+    }
+
+    fn group_plis(eng: &mut CallEngine, epoch: &[u8]) -> Vec<Vec<u8>> {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys_from_raw, unprotect_srtcp};
+        let local = eng
+            .media
+            .as_ref()
+            .unwrap()
+            .video
+            .as_ref()
+            .unwrap()
+            .pipe
+            .send_ssrc();
+        let key = derive_srtcp_keys_from_raw(epoch, &eng.self_participant_id).unwrap();
+        let (outs, _) = drain(eng);
+        outs.into_iter()
+            .filter_map(|out| {
+                let Output::Transmit(packet) = out else {
+                    return None;
+                };
+                if classify_relay_packet(&packet) != RelayPacketKind::Rtcp
+                    || parse_rtcp_sender_ssrc(&packet) != Some(local)
+                {
+                    return None;
+                }
+                let (plain, _) = unprotect_srtcp(&key, local, &packet)
+                    .expect("local group epoch decrypts feedback");
+                if plain.len() < 12 || plain[1] != RTCP_PT_PSFB || plain[0] & 0x0f != 1 {
+                    return None;
+                }
+                assert_eq!(plain[0], 0x91, "WhatsApp video-profile PLI");
+                Some(plain)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn group_coalesced_loss_retries_at_deadline() {
+        let (mut eng, epoch, _peer) = group_with_video_source();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        assert_eq!(group_plis(&mut eng, &epoch).len(), 1);
+        assert!(!eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+        eng.keepalive_deadline = NEVER;
+        eng.allocate_deadline = NEVER;
+        eng.rtcp_deadline = NEVER;
+        eng.media.as_mut().unwrap().playout_deadline = NEVER;
+        eng.health = AudioHealthWatch::default();
+        assert_eq!(eng.poll_timeout(), Some(1200));
+        eng.handle_input(1199, Input::Timeout);
+        assert!(group_plis(&mut eng, &epoch).is_empty());
+        eng.handle_input(1200, Input::Timeout);
+        let plis = group_plis(&mut eng, &epoch);
+        assert_eq!(plis.len(), 1);
+        let expected = ssrc::derive_video_participant_ssrc(
+            "CID",
+            &ssrc::format_e2e_srtp_participant_id(PEER_LID),
+        );
+        assert_eq!(
+            u32::from_be_bytes(plis[0][8..12].try_into().unwrap()),
+            expected
+        );
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 2);
+        eng.handle_input(2200, Input::Timeout);
+        assert!(group_plis(&mut eng, &epoch).is_empty());
+        assert_eq!(eng.group_keyframe_deadline(), None);
+        assert_eq!(eng.poll_timeout(), Some(NEVER));
+    }
+
+    #[test]
+    fn group_pending_recovery_needs_a_picture_and_cancels_on_idr() {
+        let (mut eng, epoch, mut peer) = group_with_video_source();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        let _ = drain(&mut eng);
+        assert!(!eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+        let parameter_sets = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1e];
+        for au in [&parameter_sets[..], &video_delta_au(100)[..]] {
+            for packet in peer.protect_video(au) {
+                eng.handle_input(500, Input::RelayPacket(&packet));
+            }
+            assert_eq!(eng.group_keyframe_deadline(), Some(1200));
+        }
+        for packet in peer.protect_video(&video_au(100)) {
+            eng.handle_input(600, Input::RelayPacket(&packet));
+        }
+        assert_eq!(eng.group_keyframe_deadline(), None);
+        let _ = drain(&mut eng);
+        eng.handle_input(1200, Input::Timeout);
+        assert!(group_plis(&mut eng, &epoch).is_empty());
+    }
+
+    #[test]
+    fn group_pending_recovery_is_removed_with_the_participant_session() {
+        for leave in [false, true] {
+            let (mut eng, epoch, _peer) = group_with_video_source();
+            assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+            let _ = drain(&mut eng);
+            assert!(!eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+            let mut update = group_update("video");
+            update.transaction_id += 1;
+            if leave {
+                update.participants.pop();
+            } else {
+                update.participants[1].devices[0].pid = Some(3);
+            }
+            eng.apply_group_update(500, &update).unwrap();
+            assert!(eng.group.as_ref().unwrap().keyframe_requests.is_empty());
+            assert_eq!(eng.group_keyframe_deadline(), None);
+            let _ = drain(&mut eng);
+            eng.handle_input(1200, Input::Timeout);
+            assert!(group_plis(&mut eng, &epoch).is_empty());
+        }
+    }
+
+    #[test]
+    fn group_pli_fanout_and_throttle_are_per_authenticated_participant() {
+        const OTHER: &str = "333333333333333:1@lid";
+        for request_before_join in [false, true] {
+            let (mut eng, epoch, _peer) = group_with_video_source();
+            if request_before_join {
+                assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+                let _ = drain(&mut eng);
+            }
+            let mut update = group_update("video");
+            update.transaction_id += 1;
+            let mut other = update.participants[1].clone();
+            other.jid = "333333333333333@lid".parse().unwrap();
+            other.devices[0].jid = OTHER.parse().unwrap();
+            other.devices[0].pid = Some(3);
+            update.participants.push(other);
+            eng.apply_group_update(300, &update).unwrap();
+            let other_id = ssrc::format_e2e_srtp_participant_id(OTHER);
+            let other_ssrc = ssrc::derive_video_participant_ssrc("CID", &other_id);
+            let mut other = VideoPipeline::new(&VideoPipelineParams {
+                call_key: &epoch,
+                self_lid: OTHER,
+                peer_lid: SELF_LID,
+                ssrc: other_ssrc,
+                ts_stride: VIDEO_TS_STRIDE_15FPS,
+                warp_mi_tag_len: WARP_MI_TAG_LEN,
+            })
+            .unwrap();
+            for packet in other.protect_video(&video_au(100)) {
+                eng.handle_input(310, Input::RelayPacket(&packet));
+            }
+            let _ = drain(&mut eng);
+            assert!(eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+            let plis = group_plis(&mut eng, &epoch);
+            let mut targets: Vec<_> = plis
+                .iter()
+                .map(|plain| {
+                    let expected_sender = ssrc::derive_video_participant_ssrc(
+                        "CID",
+                        &ssrc::format_e2e_srtp_participant_id(SELF_LID),
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(plain[4..8].try_into().unwrap()),
+                        expected_sender
+                    );
+                    u32::from_be_bytes(plain[8..12].try_into().unwrap())
+                })
+                .collect();
+            targets.sort_unstable();
+            let mut expected = vec![other_ssrc];
+            if !request_before_join {
+                expected.push(ssrc::derive_video_participant_ssrc(
+                    "CID",
+                    &ssrc::format_e2e_srtp_participant_id(PEER_LID),
+                ));
+            }
+            expected.sort_unstable();
+            assert_eq!(targets, expected);
+            assert_eq!(
+                eng.media_stats().peer_keyframe_requests,
+                if request_before_join { 2 } else { 1 }
+            );
+            if request_before_join {
+                for packet in other.protect_video(&video_au(100)) {
+                    eng.handle_input(500, Input::RelayPacket(&packet));
+                }
+                assert_eq!(
+                    eng.group_keyframe_deadline(),
+                    Some(1200),
+                    "another participant's IDR cannot repair this source"
+                );
+                let _ = drain(&mut eng);
+                eng.handle_input(1200, Input::Timeout);
+                let retry = group_plis(&mut eng, &epoch);
+                assert_eq!(retry.len(), 1);
+                assert_ne!(
+                    u32::from_be_bytes(retry[0][8..12].try_into().unwrap()),
+                    other_ssrc
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn group_disabling_video_cancels_pending_recovery() {
+        let (mut eng, epoch, _peer) = group_with_video_source();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        let _ = drain(&mut eng);
+        assert!(!eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+        eng.disable_video();
+        assert_eq!(eng.group_keyframe_deadline(), None);
+        assert!(eng.group.as_ref().unwrap().keyframe_requests.is_empty());
+        eng.handle_input(1200, Input::Timeout);
+        assert!(group_plis(&mut eng, &epoch).is_empty());
+    }
+
+    #[test]
+    fn group_pli_requires_authenticated_video_and_a_ready_epoch() {
+        let (mut eng, epoch) = group_engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        assert!(!eng.request_peer_keyframe(100, KeyframeUrgency::Coalesced));
+        assert!(eng.group.as_ref().unwrap().keyframe_requests.is_empty());
+        let mut peer = group_peer_video(&epoch);
+        let mut packets = peer.protect_video(&video_au(100));
+        let mut corrupt = packets[0].clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        eng.handle_input(101, Input::RelayPacket(&corrupt));
+        assert!(!eng.request_peer_keyframe(102, KeyframeUrgency::Coalesced));
+        for packet in packets.drain(..) {
+            eng.handle_input(103, Input::RelayPacket(&packet));
+        }
+        assert!(eng.request_peer_keyframe(104, KeyframeUrgency::Coalesced));
+        let _ = drain(&mut eng);
+        eng.group.as_mut().unwrap().required_epoch_transaction = Some(8);
+        assert!(!eng.request_peer_keyframe(1200, KeyframeUrgency::Immediate));
+        assert!(group_plis(&mut eng, &epoch).is_empty());
+    }
+
+    #[test]
+    fn a_group_call_asks_the_participants_it_receives_video_from_for_a_keyframe() {
+        let (mut eng, epoch) = group_engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let mut peer = group_peer_video(&epoch);
+        let packet = peer
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video");
+        eng.handle_input(2, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+        assert!(eng.request_peer_keyframe(3, KeyframeUrgency::Immediate));
+        let (outputs, _) = drain(&mut eng);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Transmit(_)))
+                .count(),
+            1,
+            "one PLI, for the one participant sending video"
+        );
+        assert!(
+            !eng.request_peer_keyframe(4, KeyframeUrgency::Immediate),
+            "throttled"
+        );
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+    }
+
     #[test]
     fn group_video_orientation_keeps_sibling_devices_distinct() {
         let (mut eng, _epoch) = group_engine(true);
@@ -10813,11 +11195,16 @@ mod tests {
                 .is_some()
         );
 
-        // Far past the interval, so only the group guard can explain the refusal.
-        const _: () = assert!(1_000_000 - 200 > MIN_PEER_KEYFRAME_INTERVAL_MS);
+        assert!(
+            eng.group
+                .as_ref()
+                .unwrap()
+                .registry
+                .video_streams()
+                .is_empty()
+        );
         assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Coalesced));
-        // Nor by the urgency that shortens the interval.
-        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Immediate));
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
     }
 
     /// A plane coming back on has no inbound stream to complain about: the
