@@ -1583,9 +1583,21 @@ pub fn parse_message_info(
     // Built only when one of the children is present, so the common message
     // carries no `MsgMetaInfo` at all.
     let mut meta_info: Option<Box<crate::types::message::MsgMetaInfo>> = None;
+    let is_status_stanza = node.tag.as_ref() == "status" && !source.chat.is_newsletter();
+    if is_status_stanza && source.chat.is_group() {
+        meta_info
+            .get_or_insert_with(Default::default)
+            .is_group_status = true;
+    }
     if let Some(meta) = node.get_optional_child("meta") {
         let meta_info = meta_info.get_or_insert_with(Default::default);
         let mut ma = meta.attrs();
+        meta_info.is_group_status |=
+            ma.optional_string("is_group_status").as_deref() == Some("true");
+        meta_info.session_scope = ma
+            .optional_string("session_scope")
+            .filter(|scope| matches!(scope.as_ref(), "default" | "status" | "pq"))
+            .map(CompactString::from);
         meta_info.content_type = ma.optional_string("content_type").map(CompactString::from);
         meta_info.appdata = ma.optional_string("appdata").map(CompactString::from);
         // msmsg addon path needs the trio (target_id, target_sender_jid,
@@ -1668,6 +1680,7 @@ pub fn parse_message_info(
     drop(attrs.into_errors());
 
     Ok(MessageInfo {
+        is_status_stanza,
         source,
         id,
         server_id,
@@ -1881,6 +1894,62 @@ mod parse_message_info_tests {
     use std::str::FromStr;
     use wacore_binary::Jid;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn status_context_preserves_envelope_and_group_identity() {
+        let own = Jid::pn("15550000001");
+        for (tag, from, group_status) in [
+            ("status", "120363000000000001@g.us", true),
+            ("message", "120363000000000001@g.us", false),
+            ("status", "15550000002@s.whatsapp.net", false),
+        ] {
+            let node = NodeBuilder::new(tag)
+                .attr("id", "STATUS-CONTEXT")
+                .attr("from", from)
+                .attr("participant", "100000000000002@lid")
+                .attr("type", "media")
+                .attr("t", "1700000000")
+                .build();
+            let info = parse_message_info(&node.as_node_ref(), &own, None).unwrap();
+            assert_eq!(info.is_status_stanza, tag == "status");
+            assert_eq!(info.source.chat.to_string(), from);
+            assert_eq!(
+                info.meta_info
+                    .as_ref()
+                    .is_some_and(|meta| meta.is_group_status),
+                group_status
+            );
+        }
+    }
+
+    #[test]
+    fn status_meta_scope_rejects_unknown_values() {
+        let own = Jid::pn("15550000001");
+        for (scope, expected) in [
+            ("status", Some("status")),
+            ("default", Some("default")),
+            ("pq", Some("pq")),
+            ("STATUS", None),
+            ("unknown", None),
+        ] {
+            let node = NodeBuilder::new("message")
+                .attr("id", "STATUS-META")
+                .attr("from", "120363000000000001@g.us")
+                .attr("participant", "100000000000002@lid")
+                .attr("type", "reaction")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("meta")
+                    .attr("is_group_status", "true")
+                    .attr("session_scope", scope)
+                    .build()])
+                .build();
+            let info = parse_message_info(&node.as_node_ref(), &own, None).unwrap();
+            assert!(!info.is_status_stanza);
+            let meta = info.meta_info.unwrap();
+            assert!(meta.is_group_status);
+            assert_eq!(meta.session_scope.as_deref(), expected);
+        }
+    }
 
     #[test]
     fn self_sync_recipient_alias_is_explicit_and_scoped_to_lid_dm() {

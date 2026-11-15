@@ -1174,7 +1174,23 @@ impl Client {
         // multiple messages from the same sender are processed concurrently.
         // Use the full Signal protocol address string as the lock key so it matches
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
-        let signal_address = sender_encryption_jid.to_protocol_address();
+        let default_address = sender_encryption_jid.to_protocol_address();
+        let receiver_state = self
+            .ab_props
+            .get_int(wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT)
+            .await;
+        let signal_address =
+            if info.uses_status_session(receiver_state) && !sender_encryption_jid.is_hosted() {
+                wacore::libsignal::protocol::ProtocolAddress::from_writer(
+                    default_address.device_id(),
+                    |name| {
+                        name.push_str(default_address.name());
+                        name.push_str("_status");
+                    },
+                )
+            } else {
+                default_address
+            };
 
         // `session_guard` is held across the decrypt loop (and released before the
         // plaintext drain below); it's also dropped around calls into
@@ -2718,7 +2734,12 @@ impl Client {
         deferred: &mut Vec<DeferredPlaintext>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> MigrationDecryptResult {
-        if !parsed_message.is_available() || !sender_jid.is_lid() {
+        // Ordinary PN/LID migration has no scoped-session contract. Never use
+        // its default-session ratchet to recover a split status session.
+        if signal_address.name().ends_with("_status")
+            || !parsed_message.is_available()
+            || !sender_jid.is_lid()
+        {
             return MigrationDecryptResult::NotDecrypted(None, None);
         }
 

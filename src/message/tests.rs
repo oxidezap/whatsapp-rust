@@ -735,6 +735,129 @@ struct AlicePeer {
     sender_keys: MemSenderKeyStore,
 }
 
+#[tokio::test]
+async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
+    use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
+    for (state, scope, split) in [
+        (1, Some("status"), true),
+        (0, Some("status"), false),
+        (1, None, false),
+        (3, None, true),
+    ] {
+        let client = crate::test_utils::create_test_client_with_name("status_session_crypto").await;
+        let recorder = Arc::new(EventRecorder::default());
+        client
+            .core
+            .event_bus
+            .subscribe_handler(recorder.clone())
+            .detach();
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                [(
+                    STATUS_INFRA_1_1_SESSION_SPLIT.code,
+                    state.to_string().into(),
+                )]
+                .into_iter(),
+            )
+            .await;
+        let mut peer = AlicePeer::new("15550000002@s.whatsapp.net").await;
+        let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+        let ordinary_receiver = receiver.to_protocol_address();
+        let receiver_address = if split {
+            ProtocolAddress::new(
+                &format!("{}_status", ordinary_receiver.name()),
+                ordinary_receiver.device_id(),
+            )
+        } else {
+            ordinary_receiver
+        };
+        peer.install_bob_session(&receiver_address, &bundle).await;
+        for id in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"] {
+            if id == "STATUS-SESSION-MESSAGE" {
+                peer.sessions
+                    .0
+                    .get_mut(&receiver_address)
+                    .unwrap()
+                    .session_state_mut()
+                    .unwrap()
+                    .clear_unacknowledged_pre_key_message();
+            }
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("synthetic status session".into());
+            let ciphertext = peer
+                .encrypt(&receiver_address, &MessageUtils::encode_and_pad(&proto))
+                .await;
+            let enc = enc_payload_from_ciphertext(&ciphertext);
+            let mut children = vec![
+                NodeBuilder::new("enc")
+                    .attr("type", enc.enc_type.as_wire_str())
+                    .attr("v", "2")
+                    .bytes(enc.ciphertext.to_vec())
+                    .build(),
+            ];
+            if let Some(scope) = scope {
+                children.push(
+                    NodeBuilder::new("meta")
+                        .attr("session_scope", scope)
+                        .build(),
+                );
+            }
+            client
+                .clone()
+                .handle_incoming_message(node_to_arc(
+                    NodeBuilder::new("status")
+                        .attr("from", "status@broadcast")
+                        .attr("participant", peer.jid.clone())
+                        .attr("id", id)
+                        .attr("type", "text")
+                        .attr("t", wacore::time::now_secs().to_string())
+                        .children(children)
+                        .build(),
+                ))
+                .await;
+        }
+        let ordinary = peer.jid.to_protocol_address();
+        assert_eq!(
+            recorder
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(&***event, Event::Messages(_)))
+                .count(),
+            2,
+            "both pkmsg and msg must authenticate and deliver through the selected session"
+        );
+        let scoped =
+            ProtocolAddress::new(&format!("{}_status", ordinary.name()), ordinary.device_id());
+        let backend = client
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
+        assert_eq!(
+            client
+                .signal_cache
+                .get_session(&ordinary, &*backend)
+                .await
+                .unwrap()
+                .is_some(),
+            !split
+        );
+        assert_eq!(
+            client
+                .signal_cache
+                .get_session(&scoped, &*backend)
+                .await
+                .unwrap()
+                .is_some(),
+            split
+        );
+    }
+}
+
 impl AlicePeer {
     async fn new(jid_str: &str) -> Self {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -3724,6 +3847,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
     let sender_jid: Jid = sender.parse().expect("valid sender JID");
 
     MessageInfo {
+        is_status_stanza: false,
         id: msg_id.into(),
         server_id: 0,
         newsletter_server_id: None,

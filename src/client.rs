@@ -2815,9 +2815,18 @@ fn message_ack_source_node(
     } else {
         &info.source.sender
     };
-    let mut builder = NodeBuilder::new("message")
-        .attr("id", &info.id)
-        .attr("from", from);
+    let mut builder = NodeBuilder::new(if info.is_status_stanza {
+        "status"
+    } else {
+        "message"
+    })
+    .attr("id", &info.id)
+    .attr("from", from);
+    if info.is_status_stanza
+        && let Some(kind) = &info.r#type
+    {
+        builder = builder.attr("type", kind.as_str());
+    }
     if let Some(recipient) = recipient.or(info.source.recipient.as_ref()) {
         builder = builder.attr("recipient", recipient);
     }

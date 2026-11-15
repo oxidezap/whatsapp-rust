@@ -361,6 +361,11 @@ pub type ReportingBytes = SmallVec<[u8; 20]>;
 /// nothing for them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
+    /// Group status classification from dispatch or `<meta is_group_status="true">`.
+    pub is_group_status: bool,
+    /// Wire session scope. Unknown values remain absent, as in the Web enum cast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_scope: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +414,9 @@ pub struct MsgMetaInfo {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MessageInfo {
+    /// The original envelope was a top-level non-newsletter `<status>`.
+    /// This does not change the sender or chat into a direct-message address.
+    pub is_status_stanza: bool,
     pub source: MessageSource,
     pub id: MessageId,
     /// Legacy range-filtered server id; zero also represents absence. Prefer
@@ -533,6 +541,7 @@ impl crate::stats::HeapSize for MsgMetaInfo {
                 .map_or(0, |b| b.capacity())
         };
         [
+            &self.session_scope,
             &self.target_id,
             &self.thread_message_id,
             &self.content_type,
@@ -614,6 +623,28 @@ static EMPTY_META: std::sync::LazyLock<MsgMetaInfo> =
     std::sync::LazyLock::new(MsgMetaInfo::default);
 
 impl MessageInfo {
+    /// Delivery receipt class is independent of the transport envelope tag.
+    pub fn has_status_receipt_class(&self) -> bool {
+        self.source.chat.is_status_broadcast()
+            || self
+                .meta_info
+                .as_deref()
+                .is_some_and(|meta| meta.is_group_status)
+    }
+    /// Web `WAWebStatusSessionGatingUtils`: the envelope tag alone does not
+    /// select a split session. Group statuses additionally require scope metadata.
+    pub fn uses_status_session(&self, receiver_state: i64) -> bool {
+        let meta = self.meta_info.as_deref();
+        let explicit_status = meta.and_then(|meta| meta.session_scope.as_deref()) == Some("status");
+        let context = self.source.chat.is_status_broadcast()
+            || meta.is_some_and(|meta| meta.is_group_status) && explicit_status;
+        context
+            && match receiver_state {
+                1 | 2 => explicit_status,
+                3 => true,
+                _ => false,
+            }
+    }
     /// The `<meta>` and `<reporting>` data, or an all-`None` one when the
     /// stanza carried neither. Readers that only look at a field go through
     /// here; [`meta_info`](Self::meta_info) itself is `None` in that case so
@@ -633,6 +664,44 @@ impl MessageInfo {
     pub fn is_expired_status_with(&self, now: impl FnOnce() -> DateTime<Utc>) -> bool {
         self.source.chat.is_status_broadcast()
             && (now() - self.timestamp) > chrono::Duration::hours(24)
+    }
+}
+
+#[cfg(test)]
+mod status_session_tests {
+    use super::*;
+
+    #[test]
+    fn status_session_selection_respects_context_metadata_and_receiver_state() {
+        for chat in [
+            "status@broadcast",
+            "120363000000000001@g.us",
+            "15550000002@s.whatsapp.net",
+        ] {
+            for group_status in [false, true] {
+                for scope in [None, Some("default"), Some("status"), Some("pq")] {
+                    for state in [-1, 0, 1, 2, 3, 4] {
+                        let mut info = MessageInfo::default();
+                        info.source.chat = chat.parse().unwrap();
+                        info.is_status_stanza = true;
+                        info.meta_info = Some(Box::new(MsgMetaInfo {
+                            is_group_status: group_status,
+                            session_scope: scope.map(CompactString::from),
+                            ..Default::default()
+                        }));
+                        let context =
+                            chat == "status@broadcast" || group_status && scope == Some("status");
+                        let expected = context
+                            && (state == 3 || matches!(state, 1 | 2) && scope == Some("status"));
+                        assert_eq!(
+                            info.uses_status_session(state),
+                            expected,
+                            "chat={chat}, group={group_status}, scope={scope:?}, state={state}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
