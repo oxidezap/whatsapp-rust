@@ -2080,6 +2080,8 @@ impl Client {
             .sender_key_lock(&sender_key_name)
             .await;
 
+        let mut expired_status_acked = false;
+
         for payload in payloads {
             let padding_version = payload.padding_version;
             let enc_index = payload.enc_index;
@@ -2191,6 +2193,10 @@ impl Client {
                         EncDecryptFailureReason::NoSenderKey,
                     );
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
+                        if info.is_status_stanza && !expired_status_acked {
+                            self.spawn_message_ack(info);
+                            expired_status_acked = true;
+                        }
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
                             ObservedId::new(info.id.as_str()),
@@ -2244,6 +2250,10 @@ impl Client {
                         },
                     );
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
+                        if info.is_status_stanza && !expired_status_acked {
+                            self.spawn_message_ack(info);
+                            expired_status_acked = true;
+                        }
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
                             ObservedId::new(info.id.as_str()),

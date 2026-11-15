@@ -890,11 +890,17 @@ async fn status_processing_failure_respects_envelope_nack_guard() {
 
 #[tokio::test]
 async fn status_backfill_and_retry_have_distinct_single_responses() {
-    for unavailable in [true, false] {
+    for mode in ["backfill", "retry", "expired"] {
+        let unavailable = mode == "backfill";
+        let expired = mode == "expired";
         let (client, transport) = capturing_client("status_backfill_retry").await;
         let _ = bobs_prekey_bundle(&client).await;
         let mut peer = AlicePeer::new("100000000000002@lid").await;
-        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group: Jid = if expired {
+            Jid::status_broadcast()
+        } else {
+            "120363000000000001@g.us".parse().unwrap()
+        };
         let payload = if unavailable {
             NodeBuilder::new("unavailable")
                 .attr("type", "view_once")
@@ -921,7 +927,15 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
                     .attr("participant", peer.jid)
                     .attr("id", ID)
                     .attr("type", "media")
-                    .attr("t", wacore::time::now_secs().to_string())
+                    .attr(
+                        "t",
+                        if expired {
+                            wacore::time::now_secs() - 25 * 3600
+                        } else {
+                            wacore::time::now_secs()
+                        }
+                        .to_string(),
+                    )
                     .children([payload])
                     .build(),
             ))
@@ -952,7 +966,7 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
             })
             .collect();
         assert_eq!(responses.len(), 1);
-        if unavailable {
+        if unavailable || expired {
             assert_eq!(
                 responses[0],
                 (
@@ -968,6 +982,60 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
                 ("receipt".into(), Some("retry".into()), None, None)
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn terminal_status_outcomes_send_one_final_ack() {
+    for mode in ["own_success", "retry_cap", "retry_suppressed"] {
+        let (client, transport) = capturing_client_configured("status_terminal", |builder| {
+            if mode == "retry_suppressed" {
+                builder.with_decrypt_failure_admission(FixedDecryptFailureAdmission {
+                    verdict: false,
+                    calls: std::sync::Mutex::new(Vec::new()),
+                })
+            } else {
+                builder
+            }
+        })
+        .await;
+        let info = Arc::new(MessageInfo {
+            id: "STATUS-TERMINAL".into(),
+            is_status_stanza: true,
+            r#type: Some(wacore::types::message::StanzaMessageType::Media),
+            source: wacore::types::message::MessageSource {
+                chat: Jid::status_broadcast(),
+                sender: Jid::pn("15550000002"),
+                is_group: true,
+                is_from_me: mode == "own_success",
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        if mode == "own_success" {
+            client.ack_received_message_unscoped(&info);
+        } else {
+            if mode == "retry_cap" {
+                let key = client
+                    .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+                    .await;
+                client.preseed_retry_count(&key, MAX_DECRYPT_RETRIES).await;
+            }
+            client
+                .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+                .await;
+        }
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1, "mode={mode}");
+        let bytes = decode_frame(0, &frames[0]).unwrap();
+        let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(ack.tag.as_ref(), "ack");
+        assert_eq!(
+            ack.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert!(ack.get_attr("error").is_none());
     }
 }
 

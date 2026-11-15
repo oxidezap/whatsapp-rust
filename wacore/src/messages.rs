@@ -1583,7 +1583,10 @@ pub fn parse_message_info(
     // Built only when one of the children is present, so the common message
     // carries no `MsgMetaInfo` at all.
     let mut meta_info: Option<Box<crate::types::message::MsgMetaInfo>> = None;
-    let is_status_stanza = node.tag.as_ref() == "status" && !from.is_newsletter();
+    let is_status_stanza = matches!(
+        crate::stanza::wire_tags::StanzaTag::try_from(node.tag.as_ref()),
+        Ok(crate::stanza::wire_tags::StanzaTag::Status)
+    ) && !from.is_newsletter();
     if is_status_stanza && from.is_group() {
         meta_info
             .get_or_insert_with(Default::default)

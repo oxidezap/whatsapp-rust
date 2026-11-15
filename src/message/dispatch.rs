@@ -492,7 +492,7 @@ impl Client {
         }
         if Self::should_send_delivery_receipt(info) {
             self.spawn_delivery_receipt(info);
-        } else if !info.source.chat.is_status_broadcast() {
+        } else if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
             self.spawn_message_ack(info);
         }
     }
