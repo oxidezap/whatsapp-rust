@@ -17,6 +17,113 @@ use wacore_binary::{Jid, marshal};
 const CAPTURE: &str = "JgwtTQVeWPm";
 const CAPTURE_SHA: &str = "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db";
 
+// J's reader takes a wrapper around a native element. Names and string values
+// are pj_str_t pairs in its intrusive attribute list, not serialized XML bytes.
+fn read_video(runtime: &mut Runtime, attributes: &[(&str, &str)]) -> Result<(i32, Vec<u8>)> {
+    let element = runtime.write_bytes(&[0; 96])?;
+    let wrapper = runtime.write_bytes(&element.to_le_bytes())?;
+    let result = runtime.write_bytes(&[0; 96])?;
+    let sentinel = element + 24;
+    let mut previous = sentinel;
+    for (name, value) in attributes {
+        let attribute = runtime.write_bytes(&[0; 48])?;
+        let mut name_bytes = name.as_bytes().to_vec();
+        name_bytes.push(0);
+        let name_ptr = runtime.write_bytes(&name_bytes)?;
+        runtime.write_bytes_at(attribute, &previous.to_le_bytes())?;
+        runtime.write_bytes_at(previous + 4, &attribute.to_le_bytes())?;
+        runtime.write_bytes_at(attribute + 8, &name_ptr.to_le_bytes())?;
+        runtime.write_bytes_at(attribute + 16, &(name.len() as u64).to_le_bytes())?;
+        let mut value_bytes = value.as_bytes().to_vec();
+        value_bytes.push(0);
+        let value_ptr = runtime.write_bytes(&value_bytes)?;
+        runtime.write_bytes_at(attribute + 24, &value_ptr.to_le_bytes())?;
+        runtime.write_bytes_at(attribute + 32, &(value.len() as u64).to_le_bytes())?;
+        previous = attribute;
+    }
+    runtime.write_bytes_at(previous + 4, &sentinel.to_le_bytes())?;
+    runtime.write_bytes_at(sentinel, &previous.to_le_bytes())?;
+    let returned = runtime
+        .call_table(
+            9050,
+            &[
+                wasmtime::Val::I32(wrapper as i32),
+                wasmtime::Val::I32(result as i32),
+                wasmtime::Val::I32(1),
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "video attributes={attributes:?}; stubs={:?}",
+                runtime.stubs_called()
+            )
+        })?;
+    Ok((
+        returned[0].i32().context("reader result")?,
+        runtime.read(result, 96)?,
+    ))
+}
+
+#[test]
+fn group_video_codec_spellings_match_the_pinned_reader() -> Result<()> {
+    let Some(bytes) = common::capture(CAPTURE)? else {
+        eprintln!("skipping: {CAPTURE} unavailable (set WA_WASM_DIR)");
+        return Ok(());
+    };
+    assert_eq!(hex::encode(Sha256::digest(&bytes)), CAPTURE_SHA);
+    assert_eq!(
+        oracle_core::derive::function_body_sha256(&bytes, 12707)?,
+        "f1e11df4d2b0fe28c0c2132e2a9f9e4b946f2665c8acc93cfc2a07fe5cd452a4"
+    );
+    assert!(oracle_core::abi::table_slots_of(&bytes, 12707)?.contains(&9050));
+    assert!(
+        oracle_core::abi::find_string_refs(&bytes, "fill_video: unknown video encoding %s")?
+            .iter()
+            .any(|entry| entry.referenced_by.contains(&12707))
+    );
+    let _serial = common::threaded_guard();
+    let mut runtime = Runtime::instantiate(&bytes)?;
+    runtime.run_ctors()?;
+    // Unknown encodings log through an engine thread that this reader-only test does not start.
+    runtime.set_engine_log_level(0)?;
+    for (encoder, code) in [("h.264", 1), ("vp8", 2), ("vp8/h.264", 3)] {
+        let (accepted, video) = read_video(&mut runtime, &[("enc", encoder), ("dec", "H264")])?;
+        assert_eq!(accepted, 1, "enc={encoder}");
+        assert_eq!(u32::from_le_bytes(video[4..8].try_into()?), code);
+    }
+    for decoder in ["h264", "H264"] {
+        let attributes = [
+            ("enc", "h.264"),
+            ("dec", decoder),
+            ("screen_width", "0"),
+            ("screen_height", "0"),
+            ("device_orientation", "1"),
+        ];
+        let (accepted, baseline) = read_video(&mut runtime, &attributes)?;
+        assert_eq!(accepted, 1, "dec={decoder}");
+        assert_eq!(u32::from_le_bytes(baseline[4..8].try_into()?), 1);
+        assert_eq!(u32::from_le_bytes(baseline[12..16].try_into()?), 1);
+        assert_eq!(&baseline[28..28 + decoder.len()], decoder.as_bytes());
+        let mut with_orientation = attributes.to_vec();
+        with_orientation.push(("orientation", "3"));
+        assert_eq!(
+            read_video(&mut runtime, &with_orientation)?,
+            (accepted, baseline)
+        );
+    }
+    for encoder in ["h264", "H264"] {
+        let (accepted, _) = read_video(&mut runtime, &[("enc", encoder), ("dec", "H264")])?;
+        assert_eq!(accepted, 0, "enc={encoder}");
+    }
+    assert!(
+        runtime.stubs_called().is_empty(),
+        "reader used a stub: {:?}",
+        runtime.stubs_called()
+    );
+    eprintln!("executed {CAPTURE}: enc spelling, both dec spellings and ignored orientation");
+    Ok(())
+}
+
 #[test]
 #[ignore = "real guest threads and captured JgwtTQVeWPm.wasm; missing captures fail"]
 fn video_offer_matches_the_vendor_engine() -> Result<()> {
