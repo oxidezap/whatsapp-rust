@@ -1082,6 +1082,7 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
                 ordinary_receiver
             };
             peer.install_bob_session(&receiver_address, &bundle).await;
+            let is_reaction = from.ends_with("@g.us") && scope == Some("status");
             for (index, id) in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"]
                 .into_iter()
                 .enumerate()
@@ -1096,7 +1097,19 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
                         .clear_unacknowledged_pre_key_message();
                 }
                 let mut proto = wa::Message::default();
-                proto.conversation = Some("synthetic status session".into());
+                if is_reaction {
+                    let mut key = wa::MessageKey::default();
+                    key.remote_jid = Some(from.into());
+                    key.id = Some("SYNTHETIC-STATUS-POST".into());
+                    key.participant = Some(peer.jid.to_non_ad().to_string());
+                    key.from_me = Some(false);
+                    let mut reaction = wa::message::ReactionMessage::default();
+                    reaction.key = buffa::MessageField::some(key);
+                    reaction.text = Some("\u{1f44d}".into());
+                    proto.reaction_message = buffa::MessageField::some(reaction);
+                } else {
+                    proto.conversation = Some("synthetic status session".into());
+                }
                 let ciphertext = peer
                     .encrypt(&receiver_address, &MessageUtils::encode_and_pad(&proto))
                     .await;
@@ -1116,11 +1129,11 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
                     );
                 }
                 if let Some(scope) = scope {
-                    children.push(
-                        NodeBuilder::new("meta")
-                            .attr("session_scope", scope)
-                            .build(),
-                    );
+                    let mut meta = NodeBuilder::new("meta").attr("session_scope", scope);
+                    if is_reaction {
+                        meta = meta.attr("target_id", "SYNTHETIC-STATUS-POST");
+                    }
+                    children.push(meta.build());
                 }
                 client
                     .clone()
@@ -1129,7 +1142,7 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
                             .attr("from", from_jid.clone())
                             .attr("participant", peer.jid.clone())
                             .attr("id", id)
-                            .attr("type", "text")
+                            .attr("type", if is_reaction { "reaction" } else { "text" })
                             .attr("t", wacore::time::now_secs().to_string())
                             .children(children)
                             .build(),
