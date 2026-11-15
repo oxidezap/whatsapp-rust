@@ -1342,11 +1342,13 @@ fn audio_opus(rate: &str) -> Node {
 
 #[cold]
 #[inline(never)]
+/// Use the same codec names as the direct-call advertisement. The native
+/// `fill_video` reader compares `enc` with `h.264`, while `dec` is a capability
+/// string using `H264`. See `stanza::call` for the codec contract.
 fn video_offer_node(device_orientation: u8) -> Node {
     NodeBuilder::new("video")
-        .attr("enc", "h264")
-        .attr("dec", "h264")
-        .attr("orientation", "0")
+        .attr("enc", "h.264")
+        .attr("dec", "H264")
         .attr("screen_width", "1920")
         .attr("screen_height", "1080")
         .attr("device_orientation", device_orientation.to_string())
@@ -1462,6 +1464,10 @@ mod tests {
         let action_children = action_ref.children().expect("group offer children");
         let audio = &action_children[0];
         assert_eq!(audio.attrs().optional_u64("rate"), Some(16_000));
+        let mut video = action_children[1].attrs();
+        assert_eq!(video.optional_string("enc").as_deref(), Some("h.264"));
+        assert_eq!(video.optional_string("dec").as_deref(), Some("H264"));
+        assert!(video.optional_string("orientation").is_none());
         assert_eq!(
             action
                 .attrs

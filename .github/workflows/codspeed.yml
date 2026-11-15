@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-24.04
     # The SDK shard needs headroom for a full build, measurement and result
     # upload. Keep bounded jobs so infrastructure stalls cannot run indefinitely.
-    timeout-minutes: ${{ matrix.shard.name == 'client' && 35 || 25 }}
+    timeout-minutes: ${{ matrix.shard.name == 'client' && 50 || 25 }}
     strategy:
       # One shard failing must not cancel the other: CodSpeed merges shards
       # into a single run, and a cancelled shard leaves it incomplete.
