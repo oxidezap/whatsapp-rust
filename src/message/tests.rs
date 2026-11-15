@@ -736,15 +736,309 @@ struct AlicePeer {
 }
 
 #[tokio::test]
+async fn group_status_skmsg_reaches_application_with_status_context_and_receipt() {
+    use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
+    let (client, transport) = capturing_client("group_status_skmsg").await;
+    client
+        .ab_props()
+        .apply_props(
+            false,
+            [(STATUS_INFRA_1_1_SESSION_SPLIT.code, "3".into())].into_iter(),
+        )
+        .await;
+    let recorder = Arc::new(EventRecorder::default());
+    client
+        .core
+        .event_bus
+        .subscribe_handler(recorder.clone())
+        .detach();
+    let mut peer = AlicePeer::new("100000000000002@lid").await;
+    let group: Jid = "120363000000000001@g.us".parse().unwrap();
+    let skdm = peer.create_group_skdm(&group).await;
+    let distribution = wacore::libsignal::protocol::SenderKeyDistributionMessage::try_from(
+        skdm.axolotl_sender_key_distribution_message
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    let name = make_sender_key_name(&group, &peer.jid.to_protocol_address());
+    let mut adapter = client.signal_adapter();
+    wacore::libsignal::protocol::process_sender_key_distribution_message(
+        &name,
+        &distribution,
+        &mut adapter.sender_key_store,
+    )
+    .await
+    .unwrap();
+    drop(adapter);
+    let mut proto = wa::Message::default();
+    proto.conversation = Some("synthetic group status".into());
+    let ciphertext = peer
+        .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&proto))
+        .await;
+    const ID: &str = "GROUP-STATUS-SKMSG";
+    client
+        .process_node(node_to_arc(
+            NodeBuilder::new("status")
+                .attr("from", group.clone())
+                .attr("participant", peer.jid.clone())
+                .attr("type", "media")
+                .attr("id", ID)
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(ciphertext)
+                    .build()])
+                .build(),
+        ))
+        .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(event) = recorder
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| matches!(&***event, Event::Messages(_)))
+                .cloned()
+            {
+                break event;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("group status must reach the application");
+    let Event::Messages(batch) = &*event else {
+        unreachable!()
+    };
+    let info = &batch.messages[0].info;
+    assert_eq!(info.source.chat, group);
+    assert_eq!(info.source.sender, peer.jid);
+    assert!(info.is_status_stanza);
+    assert!(info.meta_info.as_deref().unwrap().is_group_status);
+    assert_eq!(
+        batch.messages[0].message.conversation.as_deref(),
+        Some("synthetic group status")
+    );
+    assert_exactly_one_confirmation(&transport, ID).await;
+    assert_eq!(delivery_receipts_for(&transport.sent(), ID), 1);
+    let frames = transport.sent();
+    let receipt = frames
+        .iter()
+        .enumerate()
+        .find_map(|(index, frame)| {
+            let bytes = decode_frame(index, frame)?;
+            let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).ok()?;
+            (node.tag.as_ref() == "receipt"
+                && node.attrs().optional_string("id").as_deref() == Some(ID))
+            .then(|| node.attrs().optional_string("class").map(|v| v.to_string()))
+        })
+        .flatten();
+    assert_eq!(receipt.as_deref(), Some("status"));
+}
+
+#[tokio::test]
+async fn status_processing_failure_respects_envelope_nack_guard() {
+    for (kind, hide, error) in [
+        ("media", false, Some("487")),
+        ("media", true, None),
+        ("reaction", false, None),
+        ("reaction", true, Some("487")),
+    ] {
+        let (client, transport) = capturing_client("status_nack_guard").await;
+        let mut enc = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .attr("v", "2")
+            .bytes(vec![1, 2, 3]);
+        if hide {
+            enc = enc.attr("decrypt-fail", "hide");
+        }
+        client
+            .process_node(node_to_arc(
+                NodeBuilder::new("status")
+                    .attr("from", "120363000000000001@g.us")
+                    .attr("participant", "100000000000002@lid")
+                    .attr("id", "STATUS-NACK-GUARD")
+                    .attr("type", kind)
+                    .attr("t", wacore::time::now_secs().to_string())
+                    .children([enc.build()])
+                    .build(),
+            ))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while transport.sent_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1);
+        let bytes = decode_frame(0, &frames[0]).unwrap();
+        let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(ack.tag.as_ref(), "ack");
+        assert_eq!(
+            ack.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert_eq!(ack.attrs().optional_string("error").as_deref(), error);
+    }
+}
+
+#[tokio::test]
+async fn status_backfill_and_retry_have_distinct_single_responses() {
+    for unavailable in [true, false] {
+        let (client, transport) = capturing_client("status_backfill_retry").await;
+        let _ = bobs_prekey_bundle(&client).await;
+        let mut peer = AlicePeer::new("100000000000002@lid").await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let payload = if unavailable {
+            NodeBuilder::new("unavailable")
+                .attr("type", "view_once")
+                .build()
+        } else {
+            // A real ciphertext with no installed receiver-side sender key.
+            let _ = peer.create_group_skdm(&group).await;
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("synthetic retry status".into());
+            let encrypted = peer
+                .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&proto))
+                .await;
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .attr("v", "2")
+                .bytes(encrypted)
+                .build()
+        };
+        const ID: &str = "STATUS-BACKFILL-RETRY";
+        client
+            .process_node(node_to_arc(
+                NodeBuilder::new("status")
+                    .attr("from", group)
+                    .attr("participant", peer.jid)
+                    .attr("id", ID)
+                    .attr("type", "media")
+                    .attr("t", wacore::time::now_secs().to_string())
+                    .children([payload])
+                    .build(),
+            ))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while transport.sent_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("status result must produce a response");
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        let responses: Vec<_> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                let bytes = decode_frame(index, frame)?;
+                let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).ok()?;
+                (node.attrs().optional_string("id").as_deref() == Some(ID)).then(|| {
+                    (
+                        node.tag.to_string(),
+                        node.attrs().optional_string("type").map(|v| v.to_string()),
+                        node.attrs().optional_string("class").map(|v| v.to_string()),
+                        node.attrs().optional_string("error").map(|v| v.to_string()),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(responses.len(), 1);
+        if unavailable {
+            assert_eq!(
+                responses[0],
+                (
+                    "ack".into(),
+                    Some("media".into()),
+                    Some("status".into()),
+                    None
+                )
+            );
+        } else {
+            assert_eq!(
+                responses[0],
+                ("receipt".into(), Some("retry".into()), None, None)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_parser_rejects_invalid_envelopes_before_decryption() {
+    for (kind, sender, participant, payload, expected) in [
+        ("future", "15550000002@s.whatsapp.net", None, true, "490"),
+        ("media", "15550000002@s.whatsapp.net", None, false, "487"),
+        ("media", "120363000000000001@g.us", None, true, "487"),
+        (
+            "media",
+            "120363000000000001@g.us",
+            Some("120363000000000002@g.us"),
+            true,
+            "487",
+        ),
+        ("media", "s.whatsapp.net", None, true, "487"),
+    ] {
+        let (client, transport) = capturing_client("status_invalid_envelope").await;
+        let mut node = NodeBuilder::new("status")
+            .attr("from", sender)
+            .attr("type", kind)
+            .attr("id", "STATUS-INVALID")
+            .attr("t", wacore::time::now_secs().to_string());
+        if let Some(participant) = participant {
+            node = node.attr("participant", participant);
+        }
+        if payload {
+            node = node.children([NodeBuilder::new("enc")
+                .attr("type", "msg")
+                .attr("v", "2")
+                .bytes(vec![1, 2, 3])
+                .build()]);
+        }
+        client.process_node(node_to_arc(node.build())).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while transport.sent_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1);
+        let bytes = decode_frame(0, &frames[0]).unwrap();
+        let nack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(
+            nack.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            nack.attrs().optional_string("error").as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+#[tokio::test]
 async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
     use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
-    for (state, scope, split) in [
-        (1, Some("status"), true),
-        (0, Some("status"), false),
-        (1, None, false),
-        (3, None, true),
+    for (from, state, scope, split) in [
+        ("status@broadcast", 1, Some("status"), true),
+        ("status@broadcast", 0, Some("status"), false),
+        ("status@broadcast", 1, None, false),
+        ("status@broadcast", 3, None, true),
+        ("120363000000000001@g.us", 1, Some("status"), true),
+        ("120363000000000001@g.us", 3, None, false),
+        ("15550000002@s.whatsapp.net", 3, Some("status"), false),
     ] {
-        let client = crate::test_utils::create_test_client_with_name("status_session_crypto").await;
+        let (client, transport) = capturing_client("status_session_crypto").await;
         let recorder = Arc::new(EventRecorder::default());
         client
             .core
@@ -774,7 +1068,10 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
             ordinary_receiver
         };
         peer.install_bob_session(&receiver_address, &bundle).await;
-        for id in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"] {
+        for (index, id) in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"]
+            .into_iter()
+            .enumerate()
+        {
             if id == "STATUS-SESSION-MESSAGE" {
                 peer.sessions
                     .0
@@ -806,9 +1103,9 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
             }
             client
                 .clone()
-                .handle_incoming_message(node_to_arc(
+                .process_node(node_to_arc(
                     NodeBuilder::new("status")
-                        .attr("from", "status@broadcast")
+                        .attr("from", from)
                         .attr("participant", peer.jid.clone())
                         .attr("id", id)
                         .attr("type", "text")
@@ -817,6 +1114,24 @@ async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
                         .build(),
                 ))
                 .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let count = recorder
+                        .events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| matches!(&***event, Event::Messages(_)))
+                        .count();
+                    if count == index + 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dispatcher must deliver the decrypted status");
+            assert_exactly_one_confirmation(&transport, id).await;
         }
         let ordinary = peer.jid.to_protocol_address();
         assert_eq!(
@@ -14869,14 +15184,9 @@ async fn extra_frame_appears(
     .is_ok()
 }
 
-/// Production regression: the server delivers E2EE status updates as a
-/// top-level `<status>` stanza (WA Web `handleMessagingStanza` rewrites the tag
-/// to `message` for non-newsletter senders). With
-/// the tag unhandled the client never acks, so the server redelivers the same
-/// id on every reconnect and then closes the stream with
-/// `<stream:error><ack class="status"/></stream:error>`.
+/// An unknown encrypted-payload type is rejected by the status parser.
 #[tokio::test]
-async fn status_stanza_gets_transport_ack() {
+async fn unrecognized_status_enc_gets_status_class_nack() {
     let (client, transport) = capturing_client("status_stanza_ack").await;
 
     let status = NodeBuilder::new("status")
@@ -14887,7 +15197,7 @@ async fn status_stanza_gets_transport_ack() {
         .attr("t", wacore::time::now_secs().to_string())
         .children([NodeBuilder::new("enc")
             .attr("v", "2")
-            .attr("type", "skmsg")
+            .attr("type", "unknown")
             .bytes(vec![1, 2, 3])
             .build()])
         .build();
@@ -14911,6 +15221,7 @@ async fn status_stanza_gets_transport_ack() {
     let ack =
         wacore_binary::marshal::unmarshal_packed_ref(&bytes).expect("ack frame should decode");
     assert_eq!(ack.tag.as_ref(), "ack");
+    assert_eq!(ack.attrs().optional_string("error").as_deref(), Some("487"));
     assert!(
         ack.get_attr("class")
             .is_some_and(|v| v.as_str() == "status"),
@@ -14995,10 +15306,10 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
     assert_eq!(undecryptable.info.id, "ACSTATUSSTANZA2");
 }
 
-/// Exercise the ACK-only experiment across addressing and fixture flag values.
-/// This does not establish Web compliance or a server-side retention invariant.
+/// Missing payload and malformed ciphertext are processing failures, not an
+/// opaque payload that can be accepted by an unconditional transport ACK.
 #[tokio::test]
-async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message() {
+async fn non_broadcast_status_failures_are_processed_and_nacked() {
     use wacore::iq::abprops::web::STATUS_E2EE_RECV_OVER_STATUS_STANZA;
 
     for (from, offline, encrypted, flag) in [
@@ -15061,6 +15372,13 @@ async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message()
         client
             .process_node(crate::test_utils::node_to_owned_ref(&status.build()))
             .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while transport.sent_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("status processing must produce a response");
         crate::test_utils::wait_for_outbound_tasks(&client).await;
         let frames = transport.sent();
         assert_eq!(frames.len(), 1, "exactly one acknowledgement");
@@ -15085,25 +15403,24 @@ async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message()
             ack.attrs().optional_string("participant").as_deref(),
             from.ends_with("@g.us").then_some("100000000000002@lid")
         );
-        assert!(
-            ack.get_attr("error").is_none(),
-            "status acknowledgement must not be a NACK"
-        );
-        assert_eq!(
-            client.chat_lanes.entry_count(),
-            0,
-            "opaque statuses must not enter a DM lane"
-        );
+        assert_eq!(ack.attrs().optional_string("error").as_deref(), Some("487"));
+        assert!(client.chat_lanes.entry_count() > 0);
         assert!(
             recorder
                 .events
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|event| !matches!(
-                    &**event,
-                    Event::Messages(_) | Event::UndecryptableMessage(_)
-                ))
+                .all(|event| !matches!(&**event, Event::Messages(_)))
+        );
+        assert_eq!(
+            recorder
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&**event, Event::UndecryptableMessage(_))),
+            encrypted
         );
     }
 }

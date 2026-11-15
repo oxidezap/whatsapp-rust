@@ -2078,7 +2078,7 @@ mod tests {
         id: &str,
         participant: Option<&str>,
     ) -> waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse
-    {
+{
         use buffa::Message as _;
         let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
         web_msg.message = buffa::MessageField::some({

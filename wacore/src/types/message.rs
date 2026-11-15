@@ -361,6 +361,8 @@ pub type ReportingBytes = SmallVec<[u8; 20]>;
 /// nothing for them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
+    /// Whether the parsed status envelope permits a processing-result NACK.
+    pub status_can_nack: bool,
     /// Group status classification from dispatch or `<meta is_group_status="true">`.
     pub is_group_status: bool,
     /// Wire session scope. Unknown values remain absent, as in the Web enum cast.

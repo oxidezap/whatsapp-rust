@@ -262,7 +262,7 @@ impl Client {
             let resend_sent = client
                 .run_retry_receipt(&info, reason, decrypt_fail_mode)
                 .await;
-            if resend_sent {
+            if resend_sent && !info.is_status_stanza {
                 client
                     .send_transport_ack(&info, ack_recipient.as_ref())
                     .await;

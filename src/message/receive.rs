@@ -323,6 +323,24 @@ impl Client {
         let info = match self.parse_message_info(nr).await {
             Ok(mut info) => {
                 info.media_type = media_type;
+                if info.is_status_stanza {
+                    let hide = all_enc_nodes.iter().any(|enc| {
+                        enc.attrs().optional_string("decrypt-fail").as_deref() == Some("hide")
+                    });
+                    let mode = if hide {
+                        crate::types::events::DecryptFailMode::Hide
+                    } else {
+                        crate::types::events::DecryptFailMode::Show
+                    };
+                    let can_nack = wacore::types::message::envelope_is_coherent(
+                        info.r#type.as_ref(),
+                        info.meta_info.as_deref().and_then(|meta| meta.poll_type),
+                        mode,
+                    );
+                    info.meta_info
+                        .get_or_insert_with(Default::default)
+                        .status_can_nack = can_nack;
+                }
                 Arc::new(info)
             }
             Err(error) => {
@@ -337,6 +355,55 @@ impl Client {
                 return None;
             }
         };
+
+        if info.is_status_stanza {
+            let is_user = |jid: &Jid| {
+                !jid.user.is_empty()
+                    && (jid.server.is_pn_family() || jid.server.is_lid_family() || jid.is_bot())
+            };
+            let from = nr.attrs().optional_jid("from");
+            let recipient = nr.attrs().optional_jid("recipient");
+            let invalid_address = !is_user(&info.source.sender)
+                || from.as_ref().is_none_or(|from| {
+                    from.user.is_empty()
+                        || (!is_user(from)
+                            && !from.is_group()
+                            && from.server != wacore_binary::Server::Broadcast)
+                })
+                || (nr.get_attr("recipient").is_some()
+                    && (!info.source.is_from_me
+                        || recipient
+                            .as_ref()
+                            .is_none_or(|recipient| !is_user(recipient))))
+                || (info.source.is_group && info.source.sender.is_hosted());
+            let malformed_payload = nr.get_optional_child("plaintext").is_some()
+                || (all_enc_nodes.is_empty() && nr.get_optional_child("unavailable").is_none())
+                || all_enc_nodes.iter().any(|enc| {
+                    !matches!(
+                        enc.attrs().optional_string("type").as_deref(),
+                        Some("msg" | "pkmsg" | "skmsg" | "msmsg")
+                    ) || enc.content_bytes().is_none()
+                });
+            let reason = if malformed_payload || invalid_address {
+                Some(NackReason::ParsingError)
+            } else if info.r#type.as_ref().is_none_or(|kind| {
+                matches!(kind, crate::types::message::StanzaMessageType::Unknown(_))
+            }) {
+                Some(NackReason::UnrecognizedStanzaType)
+            } else if nr
+                .attrs()
+                .optional_string("t")
+                .is_none_or(|t| t.parse::<u64>().is_err())
+            {
+                Some(NackReason::ParsingError)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.spawn_stanza_nack(nr, reason, None);
+                return None;
+            }
+        }
 
         // Newsletters use <plaintext> instead of <enc> because they are not E2E encrypted.
         if info.source.chat.is_newsletter() {
@@ -425,7 +492,7 @@ impl Client {
             .await;
             let client = Arc::clone(self);
             let info2 = Arc::clone(&info);
-            let skip_ack = info.source.chat.is_status_broadcast();
+            let skip_ack = info.source.chat.is_status_broadcast() && !info.is_status_stanza;
             self.outbound_flush.spawn(&*self.runtime, async move {
                 // Unrecoverable fanouts have no content the phone will resend, so
                 // ack directly. Otherwise PDO is the only recovery (no retry
@@ -1009,7 +1076,7 @@ impl Client {
         } else if session_had_duplicates
             && !session_decrypted_successfully
             && !session_dispatched_undecryptable
-            && !info.source.chat.is_status_broadcast()
+            && (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
         {
             // Duplicate (already-processed) with no group content: ack it so the
             // server drops it from the offline queue (whatsmeow/WA Web treat
@@ -2074,7 +2141,7 @@ impl Client {
                     // offline queue. status is already acked by the should_ack gate,
                     // so skip it to avoid a redundant receipt. With a durability hook,
                     // a buffered copy means the original commit never acked: replay it.
-                    if !info.source.chat.is_status_broadcast() {
+                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
                         self.ack_or_replay_to_hook(info).await;
                     }
                 }
@@ -2184,7 +2251,7 @@ impl Client {
                         decrypt_fail_mode,
                     )
                     .await;
-                    if !info.source.chat.is_status_broadcast() {
+                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
                         self.spawn_nack(info, NackReason::UnhandledError, None);
                     }
                 }
@@ -2611,7 +2678,7 @@ impl Client {
                             (matches!(state, InboundCommitState::Durable), Some(state))
                         } else {
                             (
-                                !info.source.chat.is_status_broadcast()
+                                (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
                                     && self.ack_or_replay_to_hook(info).await,
                                 None,
                             )

@@ -489,7 +489,10 @@ impl NackSource for NodeRef<'_> {
         if reason == NackReason::UnrecognizedStanza
             || matches!(
                 StanzaTag::try_from(self.tag.as_ref()),
-                Ok(StanzaTag::Message | StanzaTag::Notification | StanzaTag::Receipt)
+                Ok(StanzaTag::Message
+                    | StanzaTag::Status
+                    | StanzaTag::Notification
+                    | StanzaTag::Receipt)
             )
         {
             Ok(self.tag.as_ref())
@@ -1016,13 +1019,20 @@ impl Client {
         reason: NackReason,
         failure_reason: Option<i32>,
     ) {
+        if info.is_status_stanza
+            && !info
+                .meta_info
+                .as_deref()
+                .is_some_and(|meta| meta.status_can_nack)
+        {
+            self.spawn_message_ack(info);
+            return;
+        }
         let client = Arc::clone(self);
         let info = Arc::clone(info);
-        self.runtime
-            .spawn(Box::pin(async move {
-                client.send_nack(&info, reason, failure_reason).await;
-            }))
-            .detach();
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.send_nack(&info, reason, failure_reason).await;
+        });
     }
 
     fn build_nack_from_snapshot<S: NackSource + ?Sized>(
@@ -1056,15 +1066,13 @@ impl Client {
             }
         };
         let client = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                if let Err(error) = client.send_node(nack).await
-                    && !matches!(error, crate::client::ClientError::NotConnected)
-                {
-                    log::warn!(target: "Client/Receipt", "Failed to send stanza nack: {error:?}");
-                }
-            }))
-            .detach();
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            if let Err(error) = client.send_node(nack).await
+                && !matches!(error, crate::client::ClientError::NotConnected)
+            {
+                log::warn!(target: "Client/Receipt", "Failed to send stanza nack: {error:?}");
+            }
+        });
     }
 
     /// Emits a nack so the server stops retransmitting an unrecoverable

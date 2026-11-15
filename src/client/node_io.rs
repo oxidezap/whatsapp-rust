@@ -95,10 +95,6 @@ fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
                 .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
 }
 
-fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
-    from_jid_matches(node, |jid| jid.is_status_broadcast())
-}
-
 fn is_non_newsletter_status_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| !jid.is_newsletter())
 }
@@ -109,7 +105,7 @@ fn is_non_newsletter_status_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
 /// when their lane lets go of them.
 fn reaches_message_handler(tag: Option<StanzaTag>, node: &wacore_binary::NodeRef<'_>) -> bool {
     tag == Some(StanzaTag::Message)
-        || (tag == Some(StanzaTag::Status) && is_status_broadcast_stanza(node))
+        || (tag == Some(StanzaTag::Status) && is_non_newsletter_status_stanza(node))
 }
 
 fn group_repair_time_left(
@@ -883,7 +879,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            Some(StanzaTag::Status) if is_status_broadcast_stanza(nr) => {
+            Some(StanzaTag::Status) if is_non_newsletter_status_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline_scoped(
                     self.clone(),
                     node,
@@ -891,12 +887,9 @@ impl Client {
                     Some(NotificationScope::new(generation, shutdown)),
                 )
                 .await;
-            }
-            Some(StanzaTag::Status) if is_non_newsletter_status_stanza(nr) => {
-                // ACK-only experiment prompted by Baileys #2858/#2883.
-                // Server retention and equivalent Rust incidents are unproven;
-                // this branch does not implement the Web's status processing.
-                // The deferred gate below sends the single plain status ACK.
+                // The processing result owns the response. Intercepted status
+                // stanzas still use the earlier deferred-ACK path.
+                cancelled = true;
             }
             _ => {
                 let handled = self
@@ -962,8 +955,8 @@ impl Client {
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
     /// arrives. message and status@broadcast only enqueue here, and a spawned
     /// enqueue could put a group message ahead of the pkmsg that establishes its
-    /// session. Other non-newsletter statuses only queue an ACK, also in arrival
-    /// order. Acks and receipts qualify only while nothing observes them.
+    /// session. Non-newsletter statuses use that same queue. Acks and receipts
+    /// qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(

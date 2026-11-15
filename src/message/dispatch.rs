@@ -474,6 +474,12 @@ impl Client {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
         }
+        if info.is_status_stanza
+            && info.r#type == Some(wacore::types::message::StanzaMessageType::MediaNotify)
+        {
+            self.spawn_message_ack(info);
+            return;
+        }
         // WA Web `sendAggregateReceipts`: for a DELIVERY where the chat is NOT
         // a bot but the author IS a bot (a bot reply inside a group), it emits
         // a bare `<ack class="message">` via `sendBotInvokeResponseAcks`, not a
