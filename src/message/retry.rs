@@ -98,10 +98,10 @@ impl Client {
         );
     }
 
-    /// Same, for a classification-time failure where the `type` attribute is
-    /// whatever the wire carried — a type this build does not implement, or
-    /// none at all. The copy is made past the gate, so an unheld lease still
-    /// costs one atomic load.
+    /// Report without failing the shared receipt scope: classification has no
+    /// scope yet, and terminal expired slots must not block durable siblings.
+    /// The wire type may be unknown or absent. Copy only past the forwarding
+    /// gate, so an unheld lease still costs one atomic load.
     pub(crate) fn report_raw_enc_decrypt_failure(
         &self,
         info: &Arc<MessageInfo>,
@@ -510,7 +510,6 @@ impl Client {
     /// Returns whether the caller should send the ack: `false` when we intended
     /// to retry but the send failed (so the stanza stays queued for another try),
     /// `true` when the resend went out or we deliberately gave up at the cap.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     #[cfg(test)]
     pub(crate) async fn run_retry_receipt(
         self: &Arc<Self>,
@@ -523,6 +522,7 @@ impl Client {
             .is_some()
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     async fn run_retry_receipt_outcome(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,

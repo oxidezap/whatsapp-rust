@@ -986,6 +986,96 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
 }
 
 #[tokio::test]
+async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    for missing_key in [false, true] {
+        for failure_first in [false, true] {
+            let (client, transport) = capturing_client("expired_status_mixed").await;
+            client
+                .inbound_durability_hook
+                .set(Arc::new(Hook))
+                .ok()
+                .unwrap();
+            client.enter_drain_mode_for_tests();
+            let group = Jid::status_broadcast();
+            let mut alice = joined_group_sender(&client, "100000000000012@lid", &group).await;
+            let ciphertext = encrypt_group_text(&mut alice, &group, "save before responding").await;
+            let bad = if missing_key {
+                let mut stranger = AlicePeer::new("100000000000012@lid").await;
+                stranger.create_group_skdm(&group).await;
+                encrypt_group_text(&mut stranger, &group, "unknown sender key").await
+            } else {
+                vec![0]
+            };
+            let mut payloads = vec![
+                skmsg_payload_from_bytes(ciphertext),
+                skmsg_payload_from_bytes(bad),
+            ];
+            if failure_first {
+                payloads.reverse();
+            }
+            for (index, payload) in payloads.iter_mut().enumerate() {
+                payload.enc_index = index;
+            }
+            let mut info =
+                (*group_message_info("EXPIRED_MIXED_COMMIT", &group, &alice.jid, false)).clone();
+            info.is_status_stanza = true;
+            info.timestamp = chrono::Utc::now() - chrono::Duration::hours(25);
+            let info = Arc::new(info);
+            process_group_classified_with_sessions(
+                &client,
+                info.clone(),
+                &alice.jid,
+                vec![],
+                payloads,
+            )
+            .await;
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                transport.sent_count(),
+                0,
+                "pending commit must withhold the stanza response"
+            );
+            client
+                .inbound_commit_batch
+                .fail_commits
+                .store(true, Ordering::Release);
+            assert!(
+                !client
+                    .flush_inbound_commits_under_permit(true, None, None)
+                    .await
+            );
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                transport.sent_count(),
+                0,
+                "failed commit must withhold the stanza response"
+            );
+            client
+                .inbound_commit_batch
+                .fail_commits
+                .store(false, Ordering::Release);
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(true, None, None)
+                    .await
+            );
+            assert_exactly_one_confirmation(&transport, &info.id).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn terminal_status_outcomes_send_one_final_ack() {
     for mode in ["own_success", "retry_cap", "retry_suppressed"] {
         let (client, transport) = capturing_client_configured("status_terminal", |builder| {

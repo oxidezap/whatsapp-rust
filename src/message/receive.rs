@@ -1009,6 +1009,7 @@ impl Client {
         // the SKDM it carried is lost, so skmsg will always fail with NoSenderKey — skip it
         // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
         // to resend the entire message including SKDM.
+        let mut expired_group_only = false;
         if !group_payloads.is_empty() {
             let should_process_skmsg =
                 should_process_skmsg_after_session(session_payloads_empty, session_outcome);
@@ -1026,8 +1027,8 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(()) => {
-                        // Processed successfully or handled errors (e.g. sent retry receipt)
+                    Ok(expired_only) => {
+                        expired_group_only = expired_only;
                     }
                     Err(e) => {
                         log::warn!(
@@ -1147,9 +1148,24 @@ impl Client {
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
+        expired_group_only &= bot_payloads.is_empty();
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
             Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
+        }
+
+        // A failing sibling cannot acknowledge content whose commit still owns
+        // this stanza. Successful/duplicate siblings own their normal response.
+        if expired_group_only
+            && !session_decrypted_successfully
+            && !session_had_duplicates
+            && (!self.inbound_journal_enabled()
+                || !self
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_owned_for_message(&info))
+        {
+            self.spawn_message_ack(&info);
         }
 
         if let Some(producer) = &receipt_producer
@@ -2057,9 +2073,9 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
-    ) -> Result<(), DecryptionError> {
+    ) -> Result<bool, DecryptionError> {
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut adapter = self.signal_adapter();
 
@@ -2080,7 +2096,8 @@ impl Client {
             .sender_key_lock(&sender_key_name)
             .await;
 
-        let mut expired_status_acked = false;
+        let mut expired_only =
+            info.is_status_stanza && info.is_expired_status_with(|| self.runtime.wall_time_utc());
 
         for payload in payloads {
             let padding_version = payload.padding_version;
@@ -2118,6 +2135,7 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
+                    expired_only = false;
                     let padded_plaintext = bytes::Bytes::from(padded_plaintext);
                     self.stage_retained_plaintext(
                         info,
@@ -2168,6 +2186,7 @@ impl Client {
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
+                    expired_only = false;
                     log::debug!(
                         "Skipping already-processed sender key message from {} in group {} (iteration {}, counter {}). This is normal during reconnection.",
                         info.source.sender.observe(),
@@ -2184,19 +2203,15 @@ impl Client {
                     }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
-                    // Reported before the expired-status early return: the enc
-                    // failed either way, and only what happens next differs.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        EncDecryptFailureReason::NoSenderKey,
-                    );
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
-                        if info.is_status_stanza && !expired_status_acked {
-                            self.spawn_message_ack(info);
-                            expired_status_acked = true;
-                        }
+                        // Expiry deliberately ends recovery for this slot, but
+                        // cannot poison a useful sibling's durable receipt.
+                        self.report_raw_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            Some(enc_type),
+                            EncDecryptFailureReason::NoSenderKey,
+                        );
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
                             ObservedId::new(info.id.as_str()),
@@ -2204,6 +2219,13 @@ impl Client {
                         );
                         continue;
                     }
+
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::NoSenderKey,
+                    );
 
                     let is_unknown_device = !self.is_from_known_device(&info.source.sender).await;
                     let retry_reason = if is_unknown_device {
@@ -2236,24 +2258,21 @@ impl Client {
                     // classifier; only what it leaves unnamed is refined by the
                     // same predicate the retry decision uses, so the reported
                     // cause and the recovery the client chose cannot disagree.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        match signal_error_reason(&e) {
-                            EncDecryptFailureReason::SignalError
-                                if group_decrypt_retry_reason(&e).is_some() =>
-                            {
-                                EncDecryptFailureReason::InvalidMessage
-                            }
-                            reason => reason,
-                        },
-                    );
-                    if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
-                        if info.is_status_stanza && !expired_status_acked {
-                            self.spawn_message_ack(info);
-                            expired_status_acked = true;
+                    let reason = match signal_error_reason(&e) {
+                        EncDecryptFailureReason::SignalError
+                            if group_decrypt_retry_reason(&e).is_some() =>
+                        {
+                            EncDecryptFailureReason::InvalidMessage
                         }
+                        reason => reason,
+                    };
+                    if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
+                        self.report_raw_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            Some(enc_type),
+                            reason,
+                        );
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
                             ObservedId::new(info.id.as_str()),
@@ -2262,6 +2281,7 @@ impl Client {
                         );
                         continue;
                     }
+                    self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
                     // Recoverable sender-key desync: retry receipt (prompts an SKDM
                     // resend), not a 500 NACK that would drop the message permanently.
@@ -2303,7 +2323,7 @@ impl Client {
                 }
             }
         }
-        Ok(())
+        Ok(expired_only)
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
