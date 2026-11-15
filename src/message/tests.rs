@@ -1029,147 +1029,169 @@ async fn status_parser_rejects_invalid_envelopes_before_decryption() {
 #[tokio::test]
 async fn status_session_pkmsg_decrypt_uses_only_selected_namespace() {
     use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
-    for (from, state, scope, split) in [
-        ("status@broadcast", 1, Some("status"), true),
-        ("status@broadcast", 0, Some("status"), false),
-        ("status@broadcast", 1, None, false),
-        ("status@broadcast", 3, None, true),
-        ("120363000000000001@g.us", 1, Some("status"), true),
-        ("120363000000000001@g.us", 3, None, false),
-        ("15550000002@s.whatsapp.net", 3, Some("status"), false),
-    ] {
-        let (client, transport) = capturing_client("status_session_crypto").await;
-        let recorder = Arc::new(EventRecorder::default());
-        client
-            .core
-            .event_bus
-            .subscribe_handler(recorder.clone())
-            .detach();
-        client
-            .ab_props()
-            .apply_props(
-                false,
-                [(
-                    STATUS_INFRA_1_1_SESSION_SPLIT.code,
-                    state.to_string().into(),
-                )]
-                .into_iter(),
-            )
-            .await;
-        let mut peer = AlicePeer::new("15550000002@s.whatsapp.net").await;
-        let (bundle, receiver) = bobs_prekey_bundle(&client).await;
-        let ordinary_receiver = receiver.to_protocol_address();
-        let receiver_address = if split {
-            ProtocolAddress::new(
-                &format!("{}_status", ordinary_receiver.name()),
-                ordinary_receiver.device_id(),
-            )
-        } else {
-            ordinary_receiver
-        };
-        peer.install_bob_session(&receiver_address, &bundle).await;
-        for (index, id) in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"]
-            .into_iter()
-            .enumerate()
-        {
-            if id == "STATUS-SESSION-MESSAGE" {
-                peer.sessions
-                    .0
-                    .get_mut(&receiver_address)
-                    .unwrap()
-                    .session_state_mut()
-                    .unwrap()
-                    .clear_unacknowledged_pre_key_message();
-            }
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("synthetic status session".into());
-            let ciphertext = peer
-                .encrypt(&receiver_address, &MessageUtils::encode_and_pad(&proto))
-                .await;
-            let enc = enc_payload_from_ciphertext(&ciphertext);
-            let mut children = vec![
-                NodeBuilder::new("enc")
-                    .attr("type", enc.enc_type.as_wire_str())
-                    .attr("v", "2")
-                    .bytes(enc.ciphertext.to_vec())
-                    .build(),
-            ];
-            if let Some(scope) = scope {
-                children.push(
-                    NodeBuilder::new("meta")
-                        .attr("session_scope", scope)
-                        .build(),
-                );
-            }
+    for companion in [false, true] {
+        for (from, state, scope, split) in [
+            ("status@broadcast", 1, Some("status"), true),
+            ("status@broadcast", 0, Some("status"), false),
+            ("status@broadcast", 1, None, false),
+            ("status@broadcast", 3, None, true),
+            ("120363000000000001@g.us", 1, Some("status"), true),
+            ("120363000000000001@g.us", 3, None, false),
+            ("15550000002@s.whatsapp.net", 3, Some("status"), false),
+        ] {
+            let (client, transport) = capturing_client("status_session_crypto").await;
+            let recorder = Arc::new(EventRecorder::default());
             client
-                .clone()
-                .process_node(node_to_arc(
-                    NodeBuilder::new("status")
-                        .attr("from", from)
-                        .attr("participant", peer.jid.clone())
-                        .attr("id", id)
-                        .attr("type", "text")
-                        .attr("t", wacore::time::now_secs().to_string())
-                        .children(children)
-                        .build(),
-                ))
+                .core
+                .event_bus
+                .subscribe_handler(recorder.clone())
+                .detach();
+            client
+                .ab_props()
+                .apply_props(
+                    false,
+                    [(
+                        STATUS_INFRA_1_1_SESSION_SPLIT.code,
+                        state.to_string().into(),
+                    )]
+                    .into_iter(),
+                )
                 .await;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let count = recorder
-                        .events
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|event| matches!(&***event, Event::Messages(_)))
-                        .count();
-                    if count == index + 1 {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
+            let mut peer = AlicePeer::new(if companion {
+                "15550000002:2@s.whatsapp.net"
+            } else {
+                "15550000002@s.whatsapp.net"
             })
-            .await
-            .expect("dispatcher must deliver the decrypted status");
-            assert_exactly_one_confirmation(&transport, id).await;
+            .await;
+            if companion {
+                crate::test_utils::seed_adv_primary(&client, &peer.jid).await;
+            }
+            let from_jid = if from == "15550000002@s.whatsapp.net" {
+                peer.jid.clone()
+            } else {
+                from.parse().unwrap()
+            };
+            let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+            let ordinary_receiver = receiver.to_protocol_address();
+            let receiver_address = if split {
+                ProtocolAddress::new(
+                    &format!("{}_status", ordinary_receiver.name()),
+                    ordinary_receiver.device_id(),
+                )
+            } else {
+                ordinary_receiver
+            };
+            peer.install_bob_session(&receiver_address, &bundle).await;
+            for (index, id) in ["STATUS-SESSION-PREKEY", "STATUS-SESSION-MESSAGE"]
+                .into_iter()
+                .enumerate()
+            {
+                if id == "STATUS-SESSION-MESSAGE" && !companion {
+                    peer.sessions
+                        .0
+                        .get_mut(&receiver_address)
+                        .unwrap()
+                        .session_state_mut()
+                        .unwrap()
+                        .clear_unacknowledged_pre_key_message();
+                }
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("synthetic status session".into());
+                let ciphertext = peer
+                    .encrypt(&receiver_address, &MessageUtils::encode_and_pad(&proto))
+                    .await;
+                let enc = enc_payload_from_ciphertext(&ciphertext);
+                let mut children = vec![
+                    NodeBuilder::new("enc")
+                        .attr("type", enc.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .bytes(enc.ciphertext.to_vec())
+                        .build(),
+                ];
+                if companion && index == 0 {
+                    children.push(
+                        NodeBuilder::new("device-identity")
+                            .bytes(peer.adv_certificate())
+                            .build(),
+                    );
+                }
+                if let Some(scope) = scope {
+                    children.push(
+                        NodeBuilder::new("meta")
+                            .attr("session_scope", scope)
+                            .build(),
+                    );
+                }
+                client
+                    .clone()
+                    .process_node(node_to_arc(
+                        NodeBuilder::new("status")
+                            .attr("from", from_jid.clone())
+                            .attr("participant", peer.jid.clone())
+                            .attr("id", id)
+                            .attr("type", "text")
+                            .attr("t", wacore::time::now_secs().to_string())
+                            .children(children)
+                            .build(),
+                    ))
+                    .await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let count = recorder
+                            .events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|event| matches!(&***event, Event::Messages(_)))
+                            .count();
+                        if count == index + 1 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dispatcher must deliver the decrypted status");
+                assert_exactly_one_confirmation(&transport, id).await;
+            }
+            let ordinary = peer.jid.to_protocol_address();
+            assert_eq!(
+                recorder
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(&***event, Event::Messages(_)))
+                    .count(),
+                2,
+                "both pkmsg and msg must authenticate and deliver through the selected session"
+            );
+            let scoped =
+                ProtocolAddress::new(&format!("{}_status", ordinary.name()), ordinary.device_id());
+            let backend = client
+                .persistence_manager
+                .get_device_snapshot()
+                .backend
+                .clone();
+            assert_eq!(
+                client
+                    .signal_cache
+                    .get_session(&ordinary, &*backend)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                !split
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .get_session(&scoped, &*backend)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                split
+            );
         }
-        let ordinary = peer.jid.to_protocol_address();
-        assert_eq!(
-            recorder
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|event| matches!(&***event, Event::Messages(_)))
-                .count(),
-            2,
-            "both pkmsg and msg must authenticate and deliver through the selected session"
-        );
-        let scoped =
-            ProtocolAddress::new(&format!("{}_status", ordinary.name()), ordinary.device_id());
-        let backend = client
-            .persistence_manager
-            .get_device_snapshot()
-            .backend
-            .clone();
-        assert_eq!(
-            client
-                .signal_cache
-                .get_session(&ordinary, &*backend)
-                .await
-                .unwrap()
-                .is_some(),
-            !split
-        );
-        assert_eq!(
-            client
-                .signal_cache
-                .get_session(&scoped, &*backend)
-                .await
-                .unwrap()
-                .is_some(),
-            split
-        );
     }
 }
 

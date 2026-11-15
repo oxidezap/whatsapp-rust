@@ -1713,6 +1713,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_change_resets_a_status_only_legacy_identity_and_session() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let peer = Jid::pn("15550000002");
+        let status =
+            wacore::types::jid::status_session_address(&peer.to_protocol_address()).unwrap();
+        client
+            .signal_cache
+            .put_session(&status, SessionRecord::new_fresh())
+            .await;
+        client.signal_cache.put_identity(&status, &[7; 32]).await;
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", peer)
+            .attr("id", "STATUS-IDENTITY-RESET")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+        let backend = client.persistence_manager.backend();
+        assert!(
+            !client
+                .signal_cache
+                .has_session(&status, &*backend)
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&status, &*backend)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_identity_change_rotates_status_sender_key() {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;

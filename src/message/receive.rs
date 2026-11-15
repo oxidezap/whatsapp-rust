@@ -180,25 +180,71 @@ fn defer_plaintext(
 }
 
 impl Client {
+    async fn incoming_signal_address(
+        &self,
+        info: &MessageInfo,
+        sender: &Jid,
+    ) -> wacore::libsignal::protocol::ProtocolAddress {
+        let ordinary = sender.to_protocol_address();
+        if !info.uses_status_session(3) {
+            return ordinary;
+        }
+        let state = self
+            .ab_props
+            .get_int(wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT)
+            .await;
+        if info.uses_status_session(state) {
+            wacore::types::jid::status_session_address(&ordinary).unwrap_or(ordinary)
+        } else {
+            ordinary
+        }
+    }
+
+    #[cfg(test)]
     async fn validate_incoming_companion_identity(
         &self,
         sender: &Jid,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
     ) -> anyhow::Result<()> {
-        let address = sender.to_protocol_address();
+        self.validate_incoming_companion_identity_at_address(
+            sender,
+            &sender.to_protocol_address(),
+            certificate,
+            identity,
+        )
+        .await
+    }
+
+    async fn validate_incoming_companion_identity_at_address(
+        &self,
+        sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
+        certificate: Option<&[u8]>,
+        identity: &[u8; 32],
+    ) -> anyhow::Result<()> {
         let backend = self
             .persistence_manager
             .get_device_snapshot()
             .backend
             .clone();
-        if self
-            .signal_cache
-            .get_identity(&address, &*backend)
-            .await?
-            .is_some_and(|known| known.as_ref() == identity)
-        {
-            return Ok(());
+        match self.signal_cache.get_identity(address, &*backend).await? {
+            Some(known) if known.as_ref() == identity => return Ok(()),
+            None => {
+                let ordinary = sender.to_protocol_address();
+                if address != &ordinary
+                    && self
+                        .signal_cache
+                        .get_identity(&ordinary, &*backend)
+                        .await?
+                        .is_some_and(|known| known.as_ref() == identity)
+                {
+                    return Ok(());
+                }
+            }
+            // A conflicting scoped identity must be authenticated again. A
+            // stale ordinary identity cannot authorize rolling this scope back.
+            Some(_) => {}
         }
         let certificate = certificate
             .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
@@ -739,6 +785,9 @@ impl Client {
         }
 
         if sender_encryption_jid.device != 0 {
+            let signal_address = self
+                .incoming_signal_address(&info, &sender_encryption_jid)
+                .await;
             for payload in &session_payloads {
                 if payload.enc_type != EncType::PreKeyMessage {
                     continue;
@@ -749,8 +798,9 @@ impl Client {
                 let identity = *message.identity_key().public_key().public_key_bytes();
                 drop(message);
                 if self
-                    .validate_incoming_companion_identity(
+                    .validate_incoming_companion_identity_at_address(
                         &sender_encryption_jid,
+                        &signal_address,
                         device_identity.as_deref(),
                         &identity,
                     )
@@ -1241,23 +1291,9 @@ impl Client {
         // multiple messages from the same sender are processed concurrently.
         // Use the full Signal protocol address string as the lock key so it matches
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
-        let default_address = sender_encryption_jid.to_protocol_address();
-        let receiver_state = self
-            .ab_props
-            .get_int(wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT)
+        let signal_address = self
+            .incoming_signal_address(info, sender_encryption_jid)
             .await;
-        let signal_address =
-            if info.uses_status_session(receiver_state) && !sender_encryption_jid.is_hosted() {
-                wacore::libsignal::protocol::ProtocolAddress::from_writer(
-                    default_address.device_id(),
-                    |name| {
-                        name.push_str(default_address.name());
-                        name.push_str("_status");
-                    },
-                )
-            } else {
-                default_address
-            };
 
         // `session_guard` is held across the decrypt loop (and released before the
         // plaintext drain below); it's also dropped around calls into
@@ -3049,6 +3085,51 @@ mod tests {
 #[cfg(test)]
 mod adv_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_adv_identity_requires_reverification_after_reset_or_conflict() {
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("15550000002", 7);
+        let ordinary = sender.to_protocol_address();
+        let status = wacore::types::jid::status_session_address(&ordinary).unwrap();
+        let identity = [7; 32];
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err()
+        );
+        client.signal_cache.put_identity(&ordinary, &identity).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_ok()
+        );
+        client.signal_cache.put_identity(&status, &[8; 32]).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err(),
+            "a conflicting scoped key must not fall back to a stale ordinary key"
+        );
+        client.signal_cache.put_identity(&status, &identity).await;
+        client.signal_cache.delete_identity(&ordinary).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_ok()
+        );
+        client.delete_sessions_for_devices(&sender.user, &[7]).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn incoming_companions_require_adv_before_trusting_a_new_identity() {

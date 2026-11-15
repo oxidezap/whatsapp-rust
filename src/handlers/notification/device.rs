@@ -259,6 +259,12 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
         }
     }
 
+    let status_addrs: Vec<_> = reset_addrs
+        .iter()
+        .filter_map(wacore::types::jid::status_session_address)
+        .collect();
+    reset_addrs.extend(status_addrs);
+
     // Treat a backend read error as had-prior (fail-safe): run the reset rather
     // than silently skip it, matching the old always-reset behavior. Collapsing
     // an Err into "no prior identity" would be a fail-open regression on a
