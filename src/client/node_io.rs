@@ -96,7 +96,7 @@ fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
 }
 
 fn is_non_newsletter_status_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
-    from_jid_matches(node, |jid| !jid.is_newsletter())
+    !from_jid_matches(node, |jid| jid.is_newsletter())
 }
 
 /// Whether dispatch hands this stanza to the message handler, which queues it
