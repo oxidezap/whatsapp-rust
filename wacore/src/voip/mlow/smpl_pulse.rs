@@ -46,11 +46,10 @@ pub(crate) fn decode_smpl_pulses(
     let pos_per_subfr = p2 / p3;
 
     // --- pulse COUNT ---
-    let total: i32;
-    if p6 != 0 {
+    let total: i32 = if p6 != 0 {
         // WB low-rate: the pulse-count CDF for this voicing class.
         let cdf = cc.n_pulse_count(idx);
-        total = dec.decode_cdf(cdf);
+        dec.decode_cdf(cdf)
     } else {
         // NB (config=0, our path): a TRIANGULAR prior over [0, frame_len4k].
         let l = frame_len4k as u32;
@@ -80,8 +79,8 @@ pub(crate) fn decode_smpl_pulses(
             prev_cum = cum;
             k += 1;
         }
-        total = k as i32;
-    }
+        k as i32
+    };
 
     // --- recursive binary SPLIT (p3==4 path) ---
     let mut split = [0i32; 8];

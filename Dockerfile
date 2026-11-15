@@ -20,13 +20,12 @@
 #   docker run -v whatsapp-data:/data whatsapp-rust --phone 15551234567
 
 # --- Planner: extract dependency recipe ---
+# Bootstrap image; rustup installs the exact stable version from the copied file.
 FROM rust:alpine AS chef
 RUN apk add --no-cache musl-dev
 COPY rust-toolchain.toml .
-# rust-src feeds -Zbuild-std in the builder stage. cargo-chef is pinned to an
-# exact release (plus --locked for its dependency graph) so image rebuilds are
-# deterministic instead of tracking the latest crates.io release.
-RUN rustup show && rustup component add rust-src && cargo install cargo-chef --locked --version 0.1.77
+# Pin cargo-chef and its dependency graph for reproducible dependency layers.
+RUN rustup show && cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /app
 
 FROM chef AS planner
@@ -36,32 +35,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 # --- Builder: cook deps (cached layer), then compile source ---
 FROM chef AS builder
 
-# -Zshare-generics reuses upstream monomorphizations instead of re-codegening
-# them per crate, deduplicating most cross-crate generic/coroutine copies
-# (measured: -666 KiB, -5.6% .text). Nightly-only, which this image already
-# pins via rust-toolchain.toml; with fat LTO the historical inlining downside
-# does not apply since LTO sees all bitcode anyway.
-# No -C target-cpu: a published image must run on any host of its arch, so we
-# keep the portable musl baseline instead of pinning the build machine's CPU
-# (target-cpu=native would risk SIGILL on older/different hosts and is
-# meaningless under emulated cross-arch builds).
-ENV RUSTFLAGS="-Zshare-generics=y"
-
-# build-std recompiles std with the release profile so it participates in fat
-# LTO and dead-code elimination instead of linking the prebuilt rustup std
-# (measured: another -303 KiB). The env form reaches both the chef cook and
-# the final build, keeping the dependency cache layer valid; build-std
-# requires an explicit --target, hence the musl triple on both invocations.
-ENV CARGO_UNSTABLE_BUILD_STD="std,panic_abort"
-
-# The dependency cook runs before the source COPY, so make the nightly
-# override explicit in /app instead of relying on rustup walking up to the
-# chef stage's copy at /; the nightly-only RUSTFLAGS above depends on it.
+# Use the stable prebuilt musl std instead of nightly -Zbuild-std. Both the
+# dependency cook and final build use the same toolchain and portable target.
 COPY rust-toolchain.toml .
 COPY --from=planner /app/recipe.json recipe.json
 # Cargo resolves the workspace's path patch while cooking the dependency recipe.
 COPY vendor vendor
-# build-std demands an explicit --target; derive the image's own host triple so
+# Derive the image's own host triple so
 # buildx per-arch builds (linux/amd64, linux/arm64) each target their own arch.
 # No pipe, so a rustc failure isn't masked by sed's exit status (Hadolint DL4006).
 RUN rustc -vV > /rustc-version \

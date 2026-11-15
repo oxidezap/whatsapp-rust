@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn historical_edwards_sign_bit_verifies_with_cached_context() {
-        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
         use sha2::{Digest, Sha512};
         let mut cache = GroupCryptoCache::default();
         let mut signs = [false; 2];
@@ -599,7 +599,9 @@ mod tests {
             let scalar = Scalar::from_bytes_mod_order(clamped);
             let encoded_public = EdwardsPoint::mul_base(&scalar).compress();
             signs[(encoded_public.as_bytes()[31] >> 7) as usize] = true;
-            let nonce = Scalar::from(13u64);
+            let mut nonce_bytes = [0; 32];
+            nonce_bytes[0] = 13;
+            let nonce = Scalar::from_bytes_mod_order(nonce_bytes);
             let r = EdwardsPoint::mul_base(&nonce).compress();
             let mut hash = Sha512::new();
             hash.update(r.as_bytes());

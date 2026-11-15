@@ -1444,7 +1444,7 @@ impl ProtocolStore for InMemoryBackend {
             if injected != 0
                 && self
                     .skip_pending_delete_failures
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

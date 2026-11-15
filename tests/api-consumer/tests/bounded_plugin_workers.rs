@@ -60,7 +60,7 @@ impl Pool {
         if self
             .counts
             .retained
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_add(input.len())
                     .filter(|next| *next <= BYTE_BUDGET)
             })

@@ -398,7 +398,9 @@ impl<'a> Decoder<'a> {
     fn decode_packed_hex(packed_data: &[u8], out: &mut [u8], pos: &mut usize) {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
-            .chunks_exact_mut(2)
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
             .zip(packed_data)
         {
             slot.copy_from_slice(&HEX_PAIRS[byte as usize]);
@@ -414,7 +416,9 @@ impl<'a> Decoder<'a> {
     fn decode_packed_nibble(packed_data: &[u8], out: &mut [u8], pos: &mut usize) -> Result<()> {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
-            .chunks_exact_mut(2)
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
             .zip(packed_data)
         {
             let pair = NIBBLE_PAIRS[byte as usize];

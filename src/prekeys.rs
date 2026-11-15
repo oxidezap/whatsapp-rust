@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
-use wacore::libsignal::protocol::{KeyPair, PublicKey};
+use wacore::libsignal::protocol::{IdentityKey, KeyPair, PreKeyBundle, PublicKey};
 use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
 use wacore_binary::Jid;
@@ -280,9 +280,7 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
     n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
 }
 
-fn authenticated_primary_identity(
-    bundle: &wacore::libsignal::protocol::PreKeyBundle,
-) -> anyhow::Result<wacore::libsignal::protocol::IdentityKey> {
+fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<IdentityKey> {
     let identity = *bundle.identity_key()?;
     let signature: &[u8; 64] = bundle
         .signed_pre_key_signature()?
@@ -295,6 +293,29 @@ fn authenticated_primary_identity(
         anyhow::bail!("invalid primary signed prekey signature");
     }
     Ok(identity)
+}
+
+fn authenticate_cold_primary_bundles(
+    outcome: &mut wacore::prekeys::PreKeyFetchOutcome,
+    companions: &[Jid],
+    primaries: &[Jid],
+    mut authenticate: impl FnMut(&PreKeyBundle) -> anyhow::Result<IdentityKey>,
+) -> anyhow::Result<()> {
+    // Validate every primary before publication. The fetch owns its immutable
+    // bundles, so publishing can read their keys without repeating crypto.
+    for primary in primaries {
+        if let Some(bundle) = outcome.bundles.get(primary) {
+            authenticate(bundle)?;
+        }
+    }
+    // Do not let a companion certificate replace an omitted primary bundle.
+    for companion in companions {
+        let primary = wacore::types::jid::adv_account_jid(companion);
+        if !outcome.bundles.contains_key(&primary) {
+            outcome.bundles.remove(companion);
+        }
+    }
+    Ok(())
 }
 
 impl Client {
@@ -375,17 +396,12 @@ impl Client {
         let spec = spec.with_account_identities(account_identities);
 
         let mut outcome = self.execute(spec).await?;
-        // A self-contained companion certificate does not replace the requested
-        // primary trust anchor. An omitted primary must not leave a session
-        // authenticated only by a sender-selected account key.
-        for companion in &cold_companions {
-            let primary = wacore::types::jid::adv_account_jid(companion);
-            if let Some(bundle) = outcome.bundles.get(&primary) {
-                authenticated_primary_identity(bundle)?;
-            } else {
-                outcome.bundles.remove(companion);
-            }
-        }
+        authenticate_cold_primary_bundles(
+            &mut outcome,
+            &cold_companions,
+            &bootstrap_primaries,
+            authenticated_primary_identity,
+        )?;
         // Remember every cold account anchor before returning companions, even
         // when device 0 was explicitly requested: fanout validates bundles
         // before installing any primary session. The caller may already own
@@ -393,7 +409,7 @@ impl Client {
         // reacquiring sessions, and checks known reciprocal account aliases.
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
-                let identity = authenticated_primary_identity(bundle)?;
+                let identity = bundle.identity_key()?;
                 if !self
                     .persist_adv_bootstrap_identity_in_epoch(
                         jid,
@@ -1395,6 +1411,10 @@ impl Client {
 #[cfg(test)]
 #[path = "prekeys/adv_bootstrap_tests.rs"]
 mod adv_bootstrap_tests;
+
+#[cfg(test)]
+#[path = "prekeys/cold_primary_tests.rs"]
+mod cold_primary_tests;
 
 #[cfg(test)]
 mod tests {

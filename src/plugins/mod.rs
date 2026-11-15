@@ -469,7 +469,7 @@ impl TaskTracker {
         // comes from both being read-modify-writes on one location, which the
         // per-location modification order already totally orders.
         self.state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                 if state & TRACKER_CLOSED != 0 {
                     return None;
                 }

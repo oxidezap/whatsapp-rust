@@ -33,11 +33,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      # Build the driver once with the pinned nightly, then it explicitly
+      # Build the driver once with the pinned stable toolchain, then it explicitly
       # selects the host toolchain so MSRV checks use the declared floor.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.lane == 'msrv'
       - name: Install protoc and cargo-nextest
@@ -50,18 +50,18 @@ jobs:
           key: api-consumers-${{ matrix.lane }}
       - name: Test registry with the CI profile
         if: matrix.lane == 'native'
-        run: cargo +nightly-2026-06-16 nextest run --profile ci --locked -p whatsapp-xtask consumers::tests
+        run: cargo +1.100.0 nextest run --profile ci --locked -p whatsapp-xtask consumers::tests
       # Both independent runners need their own executable. run also validates
       # the registry, so no additional lane-independent check step is necessary.
       - name: Build driver
-        run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
+        run: cargo +1.100.0 build --locked -p whatsapp-xtask
       - name: Run isolated native profiles and shared negative controls
         if: matrix.lane == 'native'
         # Bound compilation within a profile; the registry stays sequential.
         # Keep this step-local so scheduling does not change the Rust cache key.
         env:
           CARGO_BUILD_JOBS: "2"
-        run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16
+        run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain 1.100.0
       - name: Run isolated MSRV profiles and shared negative controls
         if: matrix.lane == 'msrv'
         env:

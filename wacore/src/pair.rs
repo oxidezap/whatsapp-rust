@@ -53,15 +53,15 @@ impl PairUtils {
     /// (`WAWebLinkDeviceQrcode.react`); 4-field form rejected since
     /// tulir/whatsmeow#1110.
     pub fn make_qr_data(
-        device_state: &DeviceState,
+        noise_public_key: &PublicKey,
+        identity_public_key: &PublicKey,
+        adv_secret_key: &[u8; 32],
         ref_str: &str,
         client_type: CompanionWebClientType,
     ) -> String {
-        let noise_b64 =
-            BASE64_STANDARD.encode(device_state.noise_key.public_key.public_key_bytes());
-        let identity_b64 =
-            BASE64_STANDARD.encode(device_state.identity_key.public_key.public_key_bytes());
-        let adv_b64 = BASE64_STANDARD.encode(device_state.adv_secret_key);
+        let noise_b64 = BASE64_STANDARD.encode(noise_public_key.public_key_bytes());
+        let identity_b64 = BASE64_STANDARD.encode(identity_public_key.public_key_bytes());
+        let adv_b64 = BASE64_STANDARD.encode(adv_secret_key);
 
         format!("{ref_str},{noise_b64},{identity_b64},{adv_b64},{client_type}")
     }
@@ -174,6 +174,21 @@ impl PairUtils {
         device_state: &DeviceState,
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
+        Self::do_pair_crypto_with(
+            &device_state.identity_key,
+            &device_state.adv_secret_key,
+            device_identity_bytes,
+        )
+    }
+
+    /// [`Self::do_pair_crypto`] with only the two secrets it uses, so a
+    /// process that holds the identity key but never the noise key (an
+    /// external Signal store) can complete pairing.
+    pub fn do_pair_crypto_with(
+        identity_key: &KeyPair,
+        adv_secret_key: &[u8; 32],
+        device_identity_bytes: &[u8],
+    ) -> Result<(Vec<u8>, u32), PairCryptoError> {
         let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
             device_identity_bytes,
         )
@@ -185,12 +200,14 @@ impl PairUtils {
 
         let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
-        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
-            .map_err(|e| PairCryptoError {
-            code: 500,
-            text: "internal-error",
-            source: e.into(),
-        })?;
+        let mut mac =
+            <HmacSha256 as hmac::KeyInit>::new_from_slice(adv_secret_key).map_err(|e| {
+                PairCryptoError {
+                    code: 500,
+                    text: "internal-error",
+                    source: e.into(),
+                }
+            })?;
         let details_bytes = hmac_container
             .details
             .as_deref()
@@ -255,7 +272,7 @@ impl PairUtils {
 
         let msg_to_verify = AccountSignatureMessage::new(
             inner_details_bytes,
-            &device_state.identity_key.public_key,
+            &identity_key.public_key,
             identity_details.device_type,
         );
 
@@ -283,8 +300,7 @@ impl PairUtils {
         // WAWebAdvSignatureApi.generateDeviceSignature always signs a regular companion.
         let msg_to_sign =
             msg_to_verify.for_device(&account_public_key, DeviceSignatureKind::Companion);
-        let device_signature = device_state
-            .identity_key
+        let device_signature = identity_key
             .private_key
             .calculate_signature(&msg_to_sign, &mut rand::make_rng::<rand::rngs::StdRng>())
             .map_err(|e| PairCryptoError {
@@ -458,7 +474,13 @@ mod tests {
     #[test]
     fn make_qr_data_has_five_fields_with_client_type_suffix() {
         let state = dummy_device_state();
-        let qr = PairUtils::make_qr_data(&state, "the-ref", CompanionWebClientType::Chrome);
+        let qr = PairUtils::make_qr_data(
+            &state.noise_key.public_key,
+            &state.identity_key.public_key,
+            &state.adv_secret_key,
+            "the-ref",
+            CompanionWebClientType::Chrome,
+        );
         let parts: Vec<&str> = qr.split(',').collect();
         assert_eq!(parts.len(), 5, "expected 5 fields, got {qr:?}");
         assert_eq!(parts[0], "the-ref");
@@ -482,19 +504,34 @@ mod tests {
             (CompanionWebClientType::AndroidPhone, "e"),
             (CompanionWebClientType::AndroidAmbiguous, "f"),
         ] {
-            let qr = PairUtils::make_qr_data(&state, "r", ct);
+            let qr = PairUtils::make_qr_data(
+                &state.noise_key.public_key,
+                &state.identity_key.public_key,
+                &state.adv_secret_key,
+                "r",
+                ct,
+            );
             assert_eq!(qr.rsplit(',').next(), Some(wire), "{ct:?}");
         }
     }
 
     #[test]
     fn parse_qr_code_accepts_new_five_field_format() {
-        let state = dummy_device_state();
-        let qr = PairUtils::make_qr_data(&state, "the-ref", CompanionWebClientType::OtherWebClient);
+        let noise_bytes = [9; 32];
+        let identity_bytes = [8; 32];
+        let noise_key = PublicKey::from_djb_public_key_bytes(&noise_bytes).unwrap();
+        let identity_key = PublicKey::from_djb_public_key_bytes(&identity_bytes).unwrap();
+        let qr = PairUtils::make_qr_data(
+            &noise_key,
+            &identity_key,
+            &[7; 32],
+            "the-ref",
+            CompanionWebClientType::OtherWebClient,
+        );
         let (pairing_ref, noise, identity) = PairUtils::parse_qr_code(&qr).unwrap();
         assert_eq!(pairing_ref, "the-ref");
-        assert_eq!(noise, *state.noise_key.public_key.public_key_bytes());
-        assert_eq!(identity, *state.identity_key.public_key.public_key_bytes());
+        assert_eq!(noise, noise_bytes);
+        assert_eq!(identity, identity_bytes);
     }
 
     #[test]
@@ -516,7 +553,13 @@ mod tests {
     #[test]
     fn parse_qr_code_accepts_native_camera_prefix() {
         let state = dummy_device_state();
-        let inner = PairUtils::make_qr_data(&state, "r", CompanionWebClientType::Chrome);
+        let inner = PairUtils::make_qr_data(
+            &state.noise_key.public_key,
+            &state.identity_key.public_key,
+            &state.adv_secret_key,
+            "r",
+            CompanionWebClientType::Chrome,
+        );
         let prefixed = format!("https://wa.me/settings/linked_devices#{inner}");
         let (pairing_ref, _, _) = PairUtils::parse_qr_code(&prefixed).unwrap();
         assert_eq!(pairing_ref, "r");
@@ -525,7 +568,13 @@ mod tests {
     #[test]
     fn parse_qr_code_accepts_faq_url_suffix() {
         let state = dummy_device_state();
-        let inner = PairUtils::make_qr_data(&state, "r", CompanionWebClientType::Chrome);
+        let inner = PairUtils::make_qr_data(
+            &state.noise_key.public_key,
+            &state.identity_key.public_key,
+            &state.adv_secret_key,
+            "r",
+            CompanionWebClientType::Chrome,
+        );
         let suffixed = format!("{inner},https://faq.whatsapp.com/r/ld");
         let (pairing_ref, _, _) = PairUtils::parse_qr_code(&suffixed).unwrap();
         assert_eq!(pairing_ref, "r");
@@ -614,7 +663,13 @@ mod tests {
                 proto
             };
             let ct = companion_web_client_type_for_props(&props);
-            let qr = PairUtils::make_qr_data(&state, "ref", ct);
+            let qr = PairUtils::make_qr_data(
+                &state.noise_key.public_key,
+                &state.identity_key.public_key,
+                &state.adv_secret_key,
+                "ref",
+                ct,
+            );
             let trailing = qr.rsplit(',').next().unwrap();
             assert_eq!(trailing, expected_wire, "{pt:?}");
         }
@@ -627,7 +682,13 @@ mod tests {
 
         let state = dummy_device_state();
         let ct = companion_web_client_type_for_props(&wa::DeviceProps::default());
-        let qr = PairUtils::make_qr_data(&state, "ref", ct);
+        let qr = PairUtils::make_qr_data(
+            &state.noise_key.public_key,
+            &state.identity_key.public_key,
+            &state.adv_secret_key,
+            "ref",
+            ct,
+        );
         let parts: Vec<&str> = qr.split(',').collect();
         assert_eq!(parts.len(), 5);
         assert_eq!(parts[4], "9");
@@ -651,7 +712,13 @@ mod tests {
             CompanionWebClientType::AndroidPhone,
             CompanionWebClientType::AndroidAmbiguous,
         ] {
-            let qr = PairUtils::make_qr_data(&state, "the-ref", ct);
+            let qr = PairUtils::make_qr_data(
+                &state.noise_key.public_key,
+                &state.identity_key.public_key,
+                &state.adv_secret_key,
+                "the-ref",
+                ct,
+            );
             let (pairing_ref, noise, identity) = PairUtils::parse_qr_code(&qr)
                 .unwrap_or_else(|e| panic!("{ct:?} round-trip failed: {e}"));
             assert_eq!(pairing_ref, "the-ref", "{ct:?}");
@@ -1213,7 +1280,13 @@ mod tests {
             CompanionWebClientType::Uwp,
             CompanionWebClientType::AndroidPhone,
         ] {
-            let qr = PairUtils::make_qr_data(&state, "r", ct);
+            let qr = PairUtils::make_qr_data(
+                &state.noise_key.public_key,
+                &state.identity_key.public_key,
+                &state.adv_secret_key,
+                "r",
+                ct,
+            );
             let trailing = qr.rsplit(',').next().unwrap();
             assert_eq!(trailing, &(ct.wire_byte() as char).to_string());
         }

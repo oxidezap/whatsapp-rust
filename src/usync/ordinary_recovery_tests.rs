@@ -3767,6 +3767,83 @@ async fn group_identity_conflicts_retain_only_the_affected_contact() {
     }
 }
 
+/// One member whose PN and LID primaries disagree must not block the fanout
+/// of a cache-preferred group send (it once muted a 962-member group).
+#[tokio::test]
+async fn group_send_skips_a_cold_contact_with_conflicting_primaries() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    for group in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let bad = Jid::pn("12025550197");
+        let lid = Jid::lid("100000000000197");
+        let good = Jid::pn("12025550198");
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                lid.user.as_str(),
+                bad.user.as_str(),
+                LearningSource::Usync,
+            ))
+            .await;
+        for user in [&bad, &lid, &good] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+        }
+        client
+            .signal_cache
+            .put_identity(&lid.to_protocol_address(), &[42; 32])
+            .await;
+        let wires: Vec<_> = [&bad, &good]
+            .into_iter()
+            .map(|user| {
+                adv_wire_response(user, signed_key_index_bytes(vec![1], 1))
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap()[0]
+                    .clone()
+            })
+            .collect();
+        let wire = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list").children(wires).build()])
+                .build()])
+            .build();
+        let caller = {
+            let client = client.clone();
+            let users = vec![bad.clone(), good.clone()];
+            tokio::spawn(async move {
+                if group {
+                    client.get_group_user_devices_owned(users).await
+                } else {
+                    client
+                        .get_user_devices_owned(users)
+                        .await
+                        .map(|devices| (devices, true))
+                }
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &wire).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap()
+            .unwrap();
+        if group {
+            let (devices, complete) = result.unwrap();
+            assert!(!complete, "a partial fanout must not be memoized");
+            assert!(devices.contains(&good.with_device(2)));
+            assert!(!devices.iter().any(|device| device.user == bad.user));
+        } else {
+            assert!(result.unwrap_err().is::<DeviceListIdentityConflict>());
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
 /// A cold contact's alias conflict must not prevent valid peers from publishing.
 #[tokio::test]
 async fn group_refresh_publishes_peers_after_a_cold_bootstrap_alias_conflict() {

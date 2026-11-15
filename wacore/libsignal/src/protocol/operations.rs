@@ -10,7 +10,7 @@ impl<R: rand::Rng + rand::CryptoRng> RandomSource for RandomAdapter<'_, R> {
         Ok(())
     }
 }
-struct NoRandomSource;
+pub(super) struct NoRandomSource;
 impl RandomSource for NoRandomSource {
     fn fill(&mut self, _out: &mut [u8]) -> engine::Result<()> {
         Err(engine::Error::Crypto)
@@ -506,9 +506,7 @@ pub async fn process_sender_key_distribution_message<S: SenderKeyStore + ?Sized>
         .load_sender_key(name)
         .await?
         .unwrap_or_else(SenderKeyRecord::new_empty);
-    engine::Engine::new(&engine::RustCrypto, &mut NoRandomSource)
-        .process_sender_distribution(&mut record.inner, &message.bytes)?;
-    record.warm_current_verifier();
+    record.process_distribution(message)?;
     store.store_sender_key(name, record).await
 }
 /// The caller must hold the store's stable sender-key lock across this operation,

@@ -572,8 +572,11 @@ pub(crate) fn select_group_history_messages(
         }
     }
     let mut selected = newest.into_vec();
-    selected.sort_by_key(|std::cmp::Reverse((timestamp, index))| (*timestamp, *index));
-    let oldest_timestamp = selected.first()?.0.0;
+    // Web retrieves newest first and reverses the parsed bundle before chat
+    // insertion. Keep that wire order while retaining the oldest timestamp
+    // for metadata and retry-window checks.
+    selected.sort_unstable();
+    let oldest_timestamp = selected.last()?.0.0;
     let messages = selected
         .into_iter()
         .map(|std::cmp::Reverse((timestamp, index))| {
@@ -969,21 +972,21 @@ mod tests {
                 .key
                 .as_option()
                 .and_then(|key| key.id.as_deref()),
-            Some("newer")
+            Some("latest")
         );
         assert_eq!(
             selected.messages[1]
                 .key
                 .as_option()
                 .and_then(|key| key.id.as_deref()),
-            Some("latest")
+            Some("newer")
         );
-        assert_eq!(selected.messages[1].starred, None);
-        assert!(selected.messages[1].labels.is_empty());
-        assert_eq!(selected.messages[1].message_secret, None);
-        assert!(selected.messages[1].message_add_ons.is_empty());
+        assert_eq!(selected.messages[0].starred, None);
+        assert!(selected.messages[0].labels.is_empty());
+        assert_eq!(selected.messages[0].message_secret, None);
+        assert!(selected.messages[0].message_add_ons.is_empty());
         assert_eq!(
-            selected.messages[1]
+            selected.messages[0]
                 .message
                 .as_option()
                 .and_then(|message| message.message_context_info.as_option())
@@ -1056,7 +1059,7 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect();
-        assert_eq!(ids, vec!["kept-2", "evicted"]);
+        assert_eq!(ids, vec!["evicted", "kept-2"]);
         assert_eq!(selected.oldest_timestamp, 950);
     }
 
@@ -1186,7 +1189,9 @@ mod tests {
         assert_eq!(selected.oldest_timestamp, 950);
         assert_eq!(selected.messages.len(), 3);
         assert_eq!(selected.messages[0].message_timestamp, Some(950));
-        assert_eq!(selected.messages[0].key, archive[1].key);
+        assert_eq!(selected.messages[0].key, archive[4].key);
+        assert_eq!(selected.messages[1].key, archive[3].key);
+        assert_eq!(selected.messages[2].key, archive[1].key);
         let selected = select_group_history_messages(
             &group,
             &archive,

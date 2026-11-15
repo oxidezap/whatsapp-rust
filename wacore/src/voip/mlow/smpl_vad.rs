@@ -518,7 +518,9 @@ mod ground_truth_tests {
     fn vad_matches_c_ground_truth() {
         let raw = include_bytes!("testdata/synth_mic.raw");
         let samples: Vec<i16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let gt: Value = serde_json::from_str(include_str!("testdata/vad_ground_truth.json"))
@@ -564,7 +566,9 @@ mod ground_truth_tests {
     fn vad_matches_wasm_routing() {
         let raw = include_bytes!("testdata/synth_mic.raw");
         let samples: Vec<i16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let gt: Value = serde_json::from_str(include_str!("testdata/wasm_derived_vad.json"))
@@ -600,12 +604,14 @@ mod ground_truth_tests {
         .expect("wasm speech activity");
         let records = records.as_array().unwrap();
         let samples: Vec<i16> = include_bytes!("testdata/synth_mic.raw")
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
         let mut vad = SmplVadState::new();
         assert_eq!(records.len(), 330);
-        for (packet, pcm) in samples.chunks_exact(960).enumerate() {
+        for (packet, pcm) in samples.as_chunks::<960>().0.iter().enumerate() {
             let result = vad.process_packet(pcm, 320);
             for internal in 0..3 {
                 let expected = records[packet * 3 + internal]["sp_act_prob"]

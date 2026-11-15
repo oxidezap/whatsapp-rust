@@ -307,6 +307,9 @@ impl Encodable for SenderRecord<'_> {
             sink.message(1, state);
         }
         self.metadata.encode(sink);
+        if self.record.legacy_receiver_recovery_disabled {
+            sink.uint(102, 1);
+        }
     }
 }
 

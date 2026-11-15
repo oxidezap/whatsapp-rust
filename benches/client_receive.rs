@@ -24,6 +24,9 @@ use wacore::types::message::{MessageInfo, MessageSource};
 use waproto::whatsapp as wa;
 use whatsapp_rust::bench_support::ReceiveHarness;
 
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     divan::main();
 }

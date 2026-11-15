@@ -116,7 +116,7 @@ fn half(identifier: &str, keys: &[IdentityKey]) -> Result<String, SecurityCodeEr
     }
     let mut result = String::with_capacity(30);
     use std::fmt::Write;
-    for chunk in digest[..30].chunks_exact(5) {
+    for chunk in digest[..30].as_chunks::<5>().0.iter() {
         let value = chunk.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
         // Writing to String is infallible.
         let _ = write!(result, "{:05}", value % 100_000);

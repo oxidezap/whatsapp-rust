@@ -3464,16 +3464,20 @@ mod tests {
             proto
         };
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let mut newest = source.clone();
+        newest.key.as_option_mut().unwrap().id = Some("SYNTHETIC-NEWEST-ID".into());
+        newest.message_timestamp = Some(1_700_000_005);
         let selected = select_group_history_messages(
             &group,
-            &[source],
+            &[source, newest],
             1_700_000_010,
             GroupHistoryLimits {
-                max_messages: 1,
+                max_messages: 2,
                 time_window_seconds: 60,
             },
         )
         .unwrap();
+        assert_eq!(selected.oldest_timestamp, 1_700_000_000);
         let compressed = compress_group_history(selected.messages).expect("compress history");
         let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
         let mut protobuf = Vec::new();
@@ -3482,7 +3486,17 @@ mod tests {
             .expect("decompress history");
         let decoded = waproto::codec::group_history_decode(&protobuf).expect("decode protobuf");
 
-        assert_eq!(decoded.messages.len(), 1);
+        assert_eq!(decoded.messages.len(), 2);
+        assert_eq!(decoded.messages[0].message_timestamp, Some(1_700_000_005));
+        assert_eq!(decoded.messages[1].message_timestamp, Some(1_700_000_000));
+        // Web reverses the bundle before inserting history into the chat.
+        let receiver_timestamps: Vec<_> = decoded
+            .messages
+            .iter()
+            .rev()
+            .map(|message| message.message_timestamp.unwrap())
+            .collect();
+        assert_eq!(receiver_timestamps, [1_700_000_000, 1_700_000_005]);
         assert_eq!(decoded.messages[0].starred, None);
         assert!(decoded.messages[0].message_add_ons.is_empty());
         assert_eq!(
@@ -3490,7 +3504,7 @@ mod tests {
                 .key
                 .as_option()
                 .and_then(|key| key.id.as_deref()),
-            Some("SYNTHETIC-HISTORY-ID")
+            Some("SYNTHETIC-NEWEST-ID")
         );
     }
 

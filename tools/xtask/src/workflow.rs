@@ -128,9 +128,9 @@ fn size_toolchain<'a>(
         default
     };
     ensure!(
-        regex::Regex::new(r"\Anightly-[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\z")?
+        regex::Regex::new(r"\A([0-9]+\.[0-9]+\.[0-9]+|nightly-[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]))\z")?
             .is_match(selected),
-        "binary size toolchain must be a dated nightly, nightly-YYYY-MM-DD"
+        "binary size toolchain must be an exact stable version or dated nightly"
     );
     Ok((selected, selected == default))
 }
@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn size_compiler_override_is_dispatch_only_and_does_not_publish() {
-        let default = "nightly-2026-06-16";
-        let alternate = "nightly-2026-07-01";
+        let default = "1.100.0";
+        let alternate = "1.99.1";
         for event in ["push", "pull_request"] {
             assert_eq!(
                 size_toolchain(event, alternate, default).unwrap(),
@@ -541,6 +541,10 @@ mod tests {
             size_toolchain("workflow_dispatch", alternate, default).unwrap(),
             (alternate, false)
         );
+        assert_eq!(
+            size_toolchain("workflow_dispatch", "nightly-2026-06-16", default).unwrap(),
+            ("nightly-2026-06-16", false)
+        );
         let workflow = include_str!("../../../.github/workflows/binary-size.yml");
         assert!(workflow.contains(&format!("default: {default}")));
         assert!(workflow.contains(&format!("RUSTUP_TOOLCHAIN: {default}")));
@@ -556,6 +560,10 @@ mod tests {
             "+nightly-2026-06-16",
             "nightly",
             "stable",
+            "1.100",
+            "1.100.0-beta",
+            "1.100.0\n",
+            "1.100.0;id",
             "../toolchain",
             "nightly-2026-06-16 --profile complete",
             "nightly-2026-06-16;id",
@@ -567,7 +575,7 @@ mod tests {
             "nightly-2026-13-16",
         ] {
             assert!(
-                size_toolchain("workflow_dispatch", requested, "nightly-2026-06-16").is_err(),
+                size_toolchain("workflow_dispatch", requested, "1.100.0").is_err(),
                 "{requested:?}"
             );
         }
