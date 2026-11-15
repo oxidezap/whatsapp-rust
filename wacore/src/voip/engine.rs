@@ -2348,10 +2348,9 @@ impl CallEngine {
         }
         let group = self.group.as_ref()?;
         group
-            .registry
-            .video_streams()
-            .iter()
-            .filter_map(|(id, _)| group.keyframe_requests.get(id).and_then(|r| r.pending))
+            .keyframe_requests
+            .values()
+            .filter_map(|r| r.pending)
             .min()
     }
 
@@ -10218,8 +10217,11 @@ mod tests {
                 }
                 let (plain, _) = unprotect_srtcp(&key, local, &packet)
                     .expect("local group epoch decrypts feedback");
-                (plain.len() >= 12 && plain[1] == RTCP_PT_PSFB && plain[0] & 0x1f == 1)
-                    .then_some(plain)
+                if plain.len() < 12 || plain[1] != RTCP_PT_PSFB || plain[0] & 0x0f != 1 {
+                    return None;
+                }
+                assert_eq!(plain[0], 0x91, "WhatsApp video-profile PLI");
+                Some(plain)
             })
             .collect()
     }
@@ -10252,7 +10254,8 @@ mod tests {
         assert_eq!(eng.media_stats().peer_keyframe_requests, 2);
         eng.handle_input(2200, Input::Timeout);
         assert!(group_plis(&mut eng, &epoch).is_empty());
-        assert_eq!(eng.poll_timeout(), None);
+        assert_eq!(eng.group_keyframe_deadline(), None);
+        assert_eq!(eng.poll_timeout(), Some(NEVER));
     }
 
     #[test]
@@ -10319,7 +10322,7 @@ mod tests {
             eng.apply_group_update(300, &update).unwrap();
             let other_id = ssrc::format_e2e_srtp_participant_id(OTHER);
             let other_ssrc = ssrc::derive_video_participant_ssrc("CID", &other_id);
-            let mut other = VideoPipeline::new(&crate::voip::session::VideoPipelineParams {
+            let mut other = VideoPipeline::new(&VideoPipelineParams {
                 call_key: &epoch,
                 self_lid: OTHER,
                 peer_lid: SELF_LID,
