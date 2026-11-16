@@ -1979,28 +1979,21 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                 )
                 .await;
             }
-            if !expired && failure == "invalid_ciphertext" && can_nack {
+            if !expired && failure == "invalid_ciphertext" {
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(transport.sent_count(), 1);
                 let frame = decode_frame(0, &transport.sent()[0]).unwrap();
                 let node = wacore_binary::marshal::unmarshal_packed_ref(&frame).unwrap();
-                assert_eq!(node.tag.as_ref(), "ack");
+                assert_eq!(node.tag.as_ref(), "receipt");
                 assert_eq!(
-                    node.attrs().optional_string("error").as_deref(),
-                    Some("500")
+                    node.attrs().optional_string("type").as_deref(),
+                    Some("retry")
                 );
                 assert_eq!(
                     node.attrs().optional_string("id").as_deref(),
                     Some(info.id.as_str())
                 );
-                assert_eq!(
-                    node.attrs().optional_string("class").as_deref(),
-                    Some(if is_status_stanza {
-                        "status"
-                    } else {
-                        "message"
-                    })
-                );
+                assert!(node.get_attr("error").is_none());
                 assert_eq!(confirmations_for(&transport.sent(), &info.id), 0);
             } else {
                 assert_exactly_one_confirmation(&transport, &info.id).await;
@@ -2147,6 +2140,15 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
                 assert_eq!(frames.len(), 1);
                 let bytes = decode_frame(0, &frames[0]).unwrap();
                 let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                if invalid_ciphertext {
+                    assert_eq!(response.tag.as_ref(), "receipt");
+                    assert_eq!(
+                        response.attrs().optional_string("type").as_deref(),
+                        Some("retry")
+                    );
+                    assert!(response.get_attr("error").is_none());
+                    continue;
+                }
                 assert_eq!(response.tag.as_ref(), "ack");
                 assert_eq!(
                     response.attrs().optional_string("class").as_deref(),
@@ -2154,7 +2156,7 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
                 );
                 assert_eq!(
                     response.attrs().optional_string("error").as_deref(),
-                    can_nack.then_some(if invalid_ciphertext { "500" } else { "491" })
+                    can_nack.then_some("491")
                 );
             }
         }

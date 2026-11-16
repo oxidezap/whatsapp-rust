@@ -1561,7 +1561,7 @@ impl Client {
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info);
-        // A terminal group failure invalidates this arrival's shared receipt
+        // A group Signal failure invalidates this arrival's shared receipt
         // scope. A session sibling's dispatch/duplicate cannot own a response
         // that the failed scope suppresses; retained ownership still gates it.
         let failed_journal_receipt =
@@ -1576,14 +1576,17 @@ impl Client {
             && !retained
         {
             if group_outcome.unanswered_decrypt_failure {
-                self.dispatch_undecryptable_event(
-                    Arc::clone(&info),
-                    false,
-                    crate::types::events::UnavailableType::Unknown,
+                // Web's CryptoLibrary wraps every non-duplicate group decrypt
+                // failure in SignalDecryptionError, including malformed binary
+                // ciphertext. Its decryption handler retries these; they are
+                // not decrypted-protobuf validation failures or terminal NACKs.
+                self.handle_decrypt_failure(
+                    &info,
+                    RetryReason::UnknownError,
                     decrypt_fail_mode,
+                    ack_recipient.as_ref(),
                 )
                 .await;
-                self.spawn_nack(&info, NackReason::UnhandledError, None);
             } else {
                 self.handle_plaintext_failure(&info, decrypt_fail_mode)
                     .await;
@@ -2772,7 +2775,7 @@ impl Client {
         let mut expired_only = info.is_status_stanza || info.source.chat.is_status_broadcast();
         let mut skdm_only = true;
         let mut plaintext_failed = false;
-        let mut terminal_decrypt_failed = false;
+        let mut unclassified_decrypt_failed = false;
         let mut response_claimed = false;
 
         for payload in payloads {
@@ -2997,12 +3000,12 @@ impl Client {
                         sender_address.observe(),
                         e
                     );
-                    // A terminal failure must not settle a status whose useful
-                    // sibling still owns an uncommitted delivery. Aggregate it
-                    // before choosing the guarded response, just like plaintext
-                    // failures; ordinary messages keep their existing NACK path.
+                    // Web retries even unclassified Signal decrypt failures.
+                    // Aggregate the status response first so a useful sibling
+                    // can reach its durable owner before requesting recovery.
+                    // Ordinary messages keep their existing NACK path.
                     if info.is_status_stanza || info.source.chat.is_status_broadcast() {
-                        terminal_decrypt_failed = true;
+                        unclassified_decrypt_failed = true;
                         continue;
                     }
                     response_claimed = true;
@@ -3023,8 +3026,8 @@ impl Client {
             unanswered_plaintext_failure: plaintext_failed && !response_claimed,
             // A failed journal receipt scope also suppresses a successful or
             // duplicate sibling's deferred ACK. Once its commit is durable,
-            // the terminal failure must still settle the redelivered stanza.
-            unanswered_decrypt_failure: terminal_decrypt_failed
+            // the failure must still request recovery for the redelivered stanza.
+            unanswered_decrypt_failure: unclassified_decrypt_failed
                 && (!response_claimed || self.inbound_journal_enabled()),
         })
     }
