@@ -187,6 +187,12 @@ struct IncomingAccountFence {
     address: Option<wacore::libsignal::protocol::ProtocolAddress>,
 }
 
+#[derive(Default)]
+struct GroupBatchOutcome {
+    expired_only: bool,
+    unanswered_plaintext_failure: bool,
+}
+
 impl Client {
     async fn preseed_sender_retry_count(&self, info: &MessageInfo, sender_count: u8) {
         if sender_count == 0 {
@@ -1278,7 +1284,7 @@ impl Client {
         // the SKDM it carried is lost, so skmsg will always fail with NoSenderKey — skip it
         // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
         // to resend the entire message including SKDM.
-        let mut expired_group_only = false;
+        let mut group_outcome = GroupBatchOutcome::default();
         if !group_payloads.is_empty() {
             let should_process_skmsg =
                 should_process_skmsg_after_session(session_payloads_empty, session_outcome);
@@ -1296,8 +1302,8 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(expired_only) => {
-                        expired_group_only = expired_only;
+                    Ok(outcome) => {
+                        group_outcome = outcome;
                     }
                     Err(e) => {
                         log::warn!(
@@ -1417,7 +1423,8 @@ impl Client {
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
-        expired_group_only &= bot_payloads.is_empty();
+        group_outcome.expired_only &= bot_payloads.is_empty();
+        group_outcome.unanswered_plaintext_failure &= bot_payloads.is_empty();
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
             Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
@@ -1425,16 +1432,30 @@ impl Client {
 
         // A failing sibling cannot acknowledge content whose commit still owns
         // this stanza. Successful/duplicate siblings own their normal response.
-        if expired_group_only && should_ack_skdm_only_session_fallback(session_outcome, true) {
+        let retained = (group_outcome.expired_only || group_outcome.unanswered_plaintext_failure)
+            && self.inbound_journal_enabled()
+            && self
+                .inbound_commit_batch
+                .live_retention
+                .has_owned_for_message(&info);
+        if info.is_status_stanza
+            && group_outcome.unanswered_plaintext_failure
+            && !session_outcome.dispatched
+            && !session_outcome.had_failure
+            && !session_had_duplicates
+            && !session_dispatched_undecryptable
+            && !retained
+        {
+            self.handle_plaintext_failure(&info, decrypt_fail_mode)
+                .await;
+        } else if group_outcome.expired_only
+            && should_ack_skdm_only_session_fallback(session_outcome, true)
+        {
             self.ack_received_message(&info);
-        } else if expired_group_only
+        } else if group_outcome.expired_only
             && !session_decrypted_successfully
             && !session_had_duplicates
-            && (!self.inbound_journal_enabled()
-                || !self
-                    .inbound_commit_batch
-                    .live_retention
-                    .has_owned_for_message(&info))
+            && !retained
         {
             self.spawn_message_ack(&info);
         }
@@ -2559,9 +2580,9 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
-    ) -> Result<bool, DecryptionError> {
+    ) -> Result<GroupBatchOutcome, DecryptionError> {
         if payloads.is_empty() {
-            return Ok(false);
+            return Ok(GroupBatchOutcome::default());
         }
         let mut adapter = self.signal_adapter();
 
@@ -2579,6 +2600,8 @@ impl Client {
 
         let mut expired_only =
             info.is_status_stanza && info.is_expired_status_with(|| self.runtime.wall_time_utc());
+        let mut plaintext_failed = false;
+        let mut response_claimed = false;
 
         for payload in payloads {
             let padding_version = payload.padding_version;
@@ -2642,7 +2665,7 @@ impl Client {
                         self.handle_unknown_device_sync(info).await;
                     }
 
-                    if let Err(e) = self
+                    match self
                         .handle_decrypted_plaintext_in_scope(
                             "skmsg",
                             padded_plaintext,
@@ -2657,17 +2680,22 @@ impl Client {
                         )
                         .await
                     {
-                        log::warn!("Failed processing group plaintext (batch): {e:?}");
-                        self.report_enc_decrypt_failure(
-                            info,
-                            enc_index,
-                            enc_type,
-                            EncDecryptFailureReason::PlaintextUnusable,
-                        );
+                        Ok(_) => response_claimed = true,
+                        Err(e) => {
+                            plaintext_failed = true;
+                            log::warn!("Failed processing group plaintext (batch): {e:?}");
+                            self.report_enc_decrypt_failure(
+                                info,
+                                enc_index,
+                                enc_type,
+                                EncDecryptFailureReason::PlaintextUnusable,
+                            );
+                        }
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
                     expired_only = false;
+                    response_claimed = true;
                     log::debug!(
                         "Skipping already-processed sender key message from {} in group {} (iteration {}, counter {}). This is normal during reconnection.",
                         info.source.sender.observe(),
@@ -2701,6 +2729,7 @@ impl Client {
                         continue;
                     }
 
+                    response_claimed = true;
                     self.report_enc_decrypt_failure(
                         info,
                         enc_index,
@@ -2762,6 +2791,7 @@ impl Client {
                         );
                         continue;
                     }
+                    response_claimed = true;
                     self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
                     // Recoverable sender-key desync: retry receipt (prompts an SKDM
@@ -2803,7 +2833,10 @@ impl Client {
                 }
             }
         }
-        Ok(expired_only)
+        Ok(GroupBatchOutcome {
+            expired_only,
+            unanswered_plaintext_failure: plaintext_failed && !response_claimed,
+        })
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.

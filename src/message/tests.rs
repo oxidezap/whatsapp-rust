@@ -998,7 +998,7 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
             Ok(())
         }
     }
-    for missing_key in [false, true] {
+    for failure in ["missing_key", "invalid_ciphertext", "invalid_plaintext"] {
         for failure_first in [false, true] {
             let (client, transport) = capturing_client("expired_status_mixed").await;
             client
@@ -1010,10 +1010,12 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
             let group = Jid::status_broadcast();
             let mut alice = joined_group_sender(&client, "100000000000012@lid", &group).await;
             let ciphertext = encrypt_group_text(&mut alice, &group, "save before responding").await;
-            let bad = if missing_key {
+            let bad = if failure == "missing_key" {
                 let mut stranger = AlicePeer::new("100000000000012@lid").await;
                 stranger.create_group_skdm(&group).await;
                 encrypt_group_text(&mut stranger, &group, "unknown sender key").await
+            } else if failure == "invalid_plaintext" {
+                alice.encrypt_group_message(&group, &[0, 1]).await
             } else {
                 vec![0]
             };
@@ -1027,6 +1029,7 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
             for (index, payload) in payloads.iter_mut().enumerate() {
                 payload.enc_index = index;
             }
+            let replay: Vec<_> = payloads.iter().map(|p| p.ciphertext.to_vec()).collect();
             let mut info =
                 (*group_message_info("EXPIRED_MIXED_COMMIT", &group, &alice.jid, false)).clone();
             info.is_status_stanza = true;
@@ -1070,7 +1073,126 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
                     .flush_inbound_commits_under_permit(true, None, None)
                     .await
             );
+            if failure == "invalid_plaintext" {
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                assert_eq!(
+                    transport.sent_count(),
+                    0,
+                    "an unusable sibling blocks this arrival's receipt"
+                );
+                let payloads = replay
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, bytes)| {
+                        let mut payload = skmsg_payload_from_bytes(bytes);
+                        payload.enc_index = index;
+                        payload
+                    })
+                    .collect();
+                process_group_classified_with_sessions(
+                    &client,
+                    Arc::new((*info).clone()),
+                    &alice.jid,
+                    vec![],
+                    payloads,
+                )
+                .await;
+            }
             assert_exactly_one_confirmation(&transport, &info.id).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("unusable plaintext must not reach the durability hook")
+        }
+    }
+    for journal in [false, true] {
+        for can_nack in [false, true] {
+            for (malformed, expired_sibling) in
+                [(vec![5], false), (vec![0, 1], false), (vec![0, 1], true)]
+            {
+                let (client, transport) = capturing_client("unusable_status_plaintext").await;
+                let _ = bobs_prekey_bundle(&client).await;
+                if journal {
+                    client
+                        .inbound_durability_hook
+                        .set(Arc::new(Hook))
+                        .ok()
+                        .unwrap();
+                }
+                let group: Jid = if expired_sibling {
+                    Jid::status_broadcast()
+                } else {
+                    "120363000000000001@g.us".parse().unwrap()
+                };
+                let mut peer = joined_group_sender(&client, "100000000000002@lid", &group).await;
+                let ciphertext = peer.encrypt_group_message(&group, &malformed).await;
+                let mut children = vec![
+                    NodeBuilder::new("enc")
+                        .attr("type", "skmsg")
+                        .attr("v", "2")
+                        .bytes(ciphertext)
+                        .build(),
+                ];
+                if expired_sibling {
+                    children.push(
+                        NodeBuilder::new("enc")
+                            .attr("type", "skmsg")
+                            .attr("v", "2")
+                            .bytes(vec![0])
+                            .build(),
+                    );
+                }
+                client
+                    .clone()
+                    .process_node(node_to_arc(
+                        NodeBuilder::new("status")
+                            .attr("from", group)
+                            .attr("participant", peer.jid)
+                            .attr("id", "STATUS-UNUSABLE")
+                            .attr("type", if can_nack { "text" } else { "reaction" })
+                            .attr(
+                                "t",
+                                (wacore::time::now_secs()
+                                    - if expired_sibling { 25 * 3600 } else { 0 })
+                                .to_string(),
+                            )
+                            .children(children)
+                            .build(),
+                    ))
+                    .await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while transport.sent_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("unusable status must receive a terminal response");
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                let frames = transport.sent();
+                assert_eq!(frames.len(), 1);
+                let bytes = decode_frame(0, &frames[0]).unwrap();
+                let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                assert_eq!(response.tag.as_ref(), "ack");
+                assert_eq!(
+                    response.attrs().optional_string("class").as_deref(),
+                    Some("status")
+                );
+                assert_eq!(
+                    response.attrs().optional_string("error").as_deref(),
+                    can_nack.then_some("491")
+                );
+            }
         }
     }
 }
