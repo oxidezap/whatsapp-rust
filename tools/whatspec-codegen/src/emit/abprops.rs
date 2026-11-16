@@ -1,6 +1,6 @@
 //! `wacore/src/iq/abprops.rs`: the A/B-props (feature-flag) registry.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Result, ensure};
 
@@ -49,9 +49,10 @@ pub fn generate(ir: &AbPropsIr) -> Result<String> {
             !ir.configs
                 .iter()
                 .any(|current| current.module == historical.module
-                    && current.name == historical.name),
-            "upstream reclaimed {}; reconcile retained-abprops.json before regenerating",
-            historical.name
+                    && (current.name == historical.name || current.code == historical.code)),
+            "upstream reclaimed {} or wire code {}; reconcile retained-abprops.json before regenerating",
+            historical.name,
+            historical.code
         );
     }
     for (module, retained) in [
@@ -97,6 +98,19 @@ pub fn generate(ir: &AbPropsIr) -> Result<String> {
         ));
         emitted.push(ident);
         i = j;
+    }
+
+    let retained_modules: BTreeSet<_> = retained
+        .configs
+        .iter()
+        .map(|config| config.module.as_str())
+        .collect();
+    for module in retained_modules {
+        if seen_modules.insert(module) {
+            let ident = unique_ident(&module_ident(module), &mut module_idents, "m");
+            out.push_str(&render_module(&ident, module, &[], &retained.configs));
+            emitted.push(ident);
+        }
     }
 
     out.push_str(
@@ -296,6 +310,26 @@ fn default_lit(s: &Scalar) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn retained_only_registries_keep_their_constants_outside_all() {
+        let code = generate(&ir(vec![])).unwrap();
+        let group = code.split("pub mod group {").nth(1).unwrap();
+        assert!(group.contains("GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS_GROUP_LEVEL: AbProp"));
+        assert!(group.contains("pub const ALL: &[AbProp] = &[\n    ];"));
+    }
+
+    #[test]
+    fn retained_wire_codes_cannot_be_reused_with_another_name() {
+        let current = ir(vec![cfg(
+            "WAWebGroupABPropsConfigs",
+            "future_limit",
+            26270,
+            AbPropType::Int,
+            Scalar::Int(1),
+        )]);
+        let error = generate(&current).unwrap_err().to_string();
+        assert!(error.contains("26270"), "{error}");
+    }
+    #[test]
     fn newly_absent_group_props_keep_their_api_without_reentering_the_catalog() {
         let current = ir(vec![cfg(
             "WAWebGroupABPropsConfigs",
@@ -392,7 +426,9 @@ mod tests {
             "pub const FLAG_B: AbProp = AbProp { name: \"flag_b\", code: 10, value_type: AbPropType::Bool, default: AbDefault::Bool(false) };"
         ));
         assert!(code.contains("default: AbDefault::Float(0.5) }"));
-        assert!(code.contains("pub const ALL: &[&[AbProp]] = &[\n    web::ALL,\n];"));
+        assert!(code.contains(
+            "pub const ALL: &[&[AbProp]] = &[\n    web::ALL,\n    group::ALL,\n    hybrid::ALL,\n];"
+        ));
     }
 
     #[test]

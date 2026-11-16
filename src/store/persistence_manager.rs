@@ -821,6 +821,33 @@ mod tests {
     use wacore::time::Instant;
 
     #[tokio::test]
+    async fn shared_default_props_detach_before_snapshot_publication() {
+        let first = PersistenceManager::new(Arc::new(wacore::store::InMemoryBackend::new()))
+            .await
+            .unwrap();
+        let second = PersistenceManager::new(Arc::new(wacore::store::InMemoryBackend::new()))
+            .await
+            .unwrap();
+        let before = first.get_device_snapshot();
+        let other = second.get_device_snapshot();
+        assert!(Arc::ptr_eq(&before.device_props, &other.device_props));
+        first
+            .process_command(DeviceCommand::SetDeviceProps(
+                wacore::store::DevicePropsOverride::new().with_os("synthetic override"),
+            ))
+            .await;
+        let after = first.get_device_snapshot();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(!Arc::ptr_eq(&before.device_props, &after.device_props));
+        assert_eq!(after.device_props.os.as_deref(), Some("synthetic override"));
+        assert_eq!(before.device_props.os.as_deref(), Some("rust"));
+        assert_eq!(
+            second.get_device_snapshot().device_props.os.as_deref(),
+            Some("rust")
+        );
+    }
+
+    #[tokio::test]
     async fn adv_review_round4_ownership_fence_keeps_pending_save_and_allows_unrelated_commands() {
         let backend = Arc::new(wacore::store::InMemoryBackend::new());
         let device = Device::new(backend.clone());

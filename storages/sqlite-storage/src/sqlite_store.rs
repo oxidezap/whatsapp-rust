@@ -2298,7 +2298,7 @@ impl SqliteStore {
                 app_version_secondary: row.app_version_secondary as u32,
                 app_version_tertiary: row.app_version_tertiary.try_into().unwrap_or(0u32),
                 app_version_last_fetched_ms: row.app_version_last_fetched_ms,
-                device_props: Arc::new(wacore::store::device::DEVICE_PROPS.clone()),
+                device_props: wacore::store::device::default_device_props(),
                 client_profile: wacore::client_profile::ClientProfile::web(),
                 edge_routing_info: row.edge_routing_info,
                 props_hash: row.props_hash,
