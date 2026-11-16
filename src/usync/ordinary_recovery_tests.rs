@@ -3160,6 +3160,29 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
                     let primary_session = seed_fresh_session(&client, &user).await;
                     let companion_session = seed_fresh_session(&client, &user.with_device(2)).await;
                     let alias_primary_session = seed_fresh_session(&client, &alias).await;
+                    let mut status_addresses: Vec<_> =
+                        [&primary_session, &alias_primary_session, &companion_session]
+                            .into_iter()
+                            .map(|address| {
+                                wacore::types::jid::status_session_address(address).unwrap()
+                            })
+                            .collect();
+                    status_addresses.push(
+                        wacore::types::jid::status_session_address(
+                            &user.with_device(3).to_protocol_address(),
+                        )
+                        .unwrap(),
+                    );
+                    for address in &status_addresses {
+                        client.signal_cache.put_identity(address, &old_key).await;
+                        client
+                            .signal_cache
+                            .put_session(
+                                address,
+                                wacore::libsignal::protocol::SessionRecord::new_fresh(),
+                            )
+                            .await;
+                    }
                     let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
                     let response = adv_wire_response(&user, signed_list(&account, embedded_key));
                     let task = {
@@ -3241,6 +3264,20 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
                         .unwrap()
                         .unwrap();
                     if matches!(outcome, Outcome::Rotated) {
+                        for address in &status_addresses {
+                            assert!(!has_session(&client, address).await);
+                            assert!(
+                                client
+                                    .signal_cache
+                                    .get_identity(
+                                        address,
+                                        &*client.persistence_manager.get_device_snapshot().backend
+                                    )
+                                    .await
+                                    .unwrap()
+                                    .is_none()
+                            );
+                        }
                         assert_eq!(result.unwrap(), vec![user.clone(), user.with_device(2)]);
                         assert_eq!(
                             client.cached_adv_account_identity(&user).await.unwrap(),
@@ -3256,6 +3293,21 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
                         assert!(collector.events().iter().any(|event| matches!(&**event,
                         Event::IdentityChange(change) if change.implicit)));
                     } else {
+                        for address in &status_addresses {
+                            assert!(has_session(&client, address).await);
+                            assert_eq!(
+                                client
+                                    .signal_cache
+                                    .get_identity(
+                                        address,
+                                        &*client.persistence_manager.get_device_snapshot().backend
+                                    )
+                                    .await
+                                    .unwrap()
+                                    .as_deref(),
+                                Some(old_key.as_slice())
+                            );
+                        }
                         assert!(result.is_err(), "{outcome:?} must fail closed");
                         assert_eq!(
                             client.cached_adv_account_identity(&user).await.unwrap(),

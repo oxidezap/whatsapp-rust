@@ -1192,12 +1192,28 @@ impl Client {
 
         let mut outcome = crate::features::SignalSessionMigration::default();
 
-        for device_id in 0..MIGRATION_DEVICE_RANGE {
+        // The alias changes both session namespaces. Reuse the same account,
+        // device and mapping fences for each scope; never borrow an ordinary
+        // ratchet when a status session is absent.
+        for (device_id, status_scope) in
+            (0..MIGRATION_DEVICE_RANGE).flat_map(|id| [(id, false), (id, true)])
+        {
             let pn_jid = from.with_device(device_id);
             let lid_jid = to.with_device(device_id);
 
-            let pn_proto = pn_jid.to_protocol_address();
-            let lid_proto = lid_jid.to_protocol_address();
+            let mut pn_proto = pn_jid.to_protocol_address();
+            let mut lid_proto = lid_jid.to_protocol_address();
+            if status_scope {
+                let (Some(scoped_pn), Some(scoped_lid)) = (
+                    wacore::types::jid::status_session_address(&pn_proto),
+                    wacore::types::jid::status_session_address(&lid_proto),
+                ) else {
+                    // Hosted addresses have no status-session namespace.
+                    continue;
+                };
+                pn_proto = scoped_pn;
+                lid_proto = scoped_lid;
+            }
 
             // Include both account anchors for companion writes: recovery
             // must not publish new trust while this iteration retains old
@@ -1211,6 +1227,20 @@ impl Client {
             keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
             keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
             let _guards = self.session_guards_for(&keys).await;
+            // Receive acquires account anchors before the selected scoped
+            // ratchet. Keep that order, then order both alias ratchets alike
+            // in either migration direction. Primary decrypts hold only these
+            // scoped mutexes, so ordinary account guards cannot replace them.
+            let mut scoped_guards = Vec::new();
+            if status_scope {
+                let mut addresses = vec![&pn_proto, &lid_proto];
+                addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                addresses.dedup_by(|a, b| a.as_str() == b.as_str());
+                for address in addresses {
+                    let mutex = self.session_lock_for(address.as_str()).await;
+                    scoped_guards.push(mutex.lock_arc().await);
+                }
+            }
 
             // Session -> mapping is publication's lock order. Hold ownership
             // through both the session and identity transfer, not just device0.
@@ -3808,6 +3838,85 @@ mod tests {
     /// still exclude identity recovery under both primary account locks.
     #[tokio::test]
     async fn companion_migration_holds_both_primary_fences_while_retaining_old_state() {
+        for status_scope in [false, true] {
+            check_companion_migration_fences(status_scope).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_status_migration_waits_for_each_scoped_session_lock() {
+        use wacore::types::jid::JidExt as _;
+        for lock_source in [false, true] {
+            let client =
+                crate::test_utils::create_test_client_with_name("scoped_migration_lock").await;
+            let phone = Jid::pn("12025550197");
+            let lid = Jid::lid("100000000000197");
+            let source =
+                wacore::types::jid::status_session_address(&phone.to_protocol_address()).unwrap();
+            let target =
+                wacore::types::jid::status_session_address(&lid.to_protocol_address()).unwrap();
+            let backend = client
+                .persistence_manager
+                .get_device_snapshot()
+                .backend
+                .clone();
+            backend
+                .put_session(source.as_str(), &tagged_session_blob(4242))
+                .await
+                .unwrap();
+            let mutex = client
+                .session_lock_for(if lock_source {
+                    source.as_str()
+                } else {
+                    target.as_str()
+                })
+                .await;
+            let guard = mutex.lock().await;
+            let baseline = Arc::strong_count(&mutex);
+            let mut migration = Box::pin(client.migrate_signal_sessions(&phone, &lid));
+            tokio::select! {
+                result = migration.as_mut() => panic!("migration bypassed a scoped lock: {result:?}"),
+                () = crate::test_utils::wait_for_lock_waiter(&mutex, baseline) => {}
+            }
+            assert!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                backend
+                    .get_session(target.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(guard);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+                .await
+                .unwrap();
+            assert_eq!(outcome.migrated, 1);
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            assert!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .get_session(target.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    async fn check_companion_migration_fences(status_scope: bool) {
         use crate::store::release::tests::ProbeBackend;
         use wacore::types::jid::JidExt as _;
         let (mut probe, _) = ProbeBackend::new();
@@ -3818,12 +3927,15 @@ mod tests {
         probe.gate_method = "after:get_session";
         let phone = Jid::pn("12025550198");
         let lid = Jid::lid("100000000000198");
+        let ordinary = phone.with_device(1).to_protocol_address();
+        let address = if status_scope {
+            wacore::types::jid::status_session_address(&ordinary).unwrap()
+        } else {
+            ordinary
+        };
         probe
             .backend
-            .put_session(
-                phone.with_device(1).to_protocol_address().as_str(),
-                &tagged_session_blob(4242),
-            )
+            .put_session(address.as_str(), &tagged_session_blob(4242))
             .await
             .unwrap();
         let (client, _) =
@@ -3839,12 +3951,15 @@ mod tests {
                     .await
             })
         };
-        // Device 0 first, then device 1 with an old session retained by I/O.
-        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        release.send(()).await.unwrap();
+        // Pass both device-0 scopes, and the ordinary device-1 slot when
+        // observing a scoped companion. Stop with its source record retained.
+        for _ in 0..if status_scope { 3 } else { 2 } {
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            release.send(()).await.unwrap();
+        }
         tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
             .await
             .unwrap()
@@ -3858,7 +3973,7 @@ mod tests {
                 "recovery cannot publish while companion migration retains old state"
             );
         }
-        for _ in 0..MIGRATION_DEVICE_RANGE {
+        for _ in 0..2 * MIGRATION_DEVICE_RANGE {
             release.send(()).await.unwrap();
         }
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), migration)

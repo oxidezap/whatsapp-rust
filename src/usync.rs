@@ -2544,6 +2544,10 @@ impl Client {
             if update.reset_primary_session {
                 for (address, _) in &update.identities {
                     self.signal_cache.delete_session(address).await;
+                    if let Some(status) = wacore::types::jid::status_session_address(address) {
+                        self.signal_cache.delete_session(&status).await;
+                        self.signal_cache.delete_identity(&status).await;
+                    }
                 }
                 maintenance.flush().await?;
             }

@@ -80,8 +80,6 @@ fn from_jid_matches(
     }
 }
 
-/// The wire shape the server uses for E2EE status updates, carrying the same
-/// payload as `<message from="status@broadcast">`.
 /// Stanzas that carry connection state, which an interceptor may not claim.
 ///
 /// `success` and `failure` settle authentication, `stream:error` drives
@@ -112,8 +110,8 @@ fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
                 .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
 }
 
-fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
-    from_jid_matches(node, |jid| jid.is_status_broadcast())
+fn is_non_newsletter_status_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
+    !from_jid_matches(node, |jid| jid.is_newsletter())
 }
 
 /// Whether dispatch hands this stanza to the message handler, which queues it
@@ -122,7 +120,7 @@ fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
 /// when their lane lets go of them.
 fn reaches_message_handler(tag: Option<StanzaTag>, node: &wacore_binary::NodeRef<'_>) -> bool {
     tag == Some(StanzaTag::Message)
-        || (tag == Some(StanzaTag::Status) && is_status_broadcast_stanza(node))
+        || (tag == Some(StanzaTag::Status) && is_non_newsletter_status_stanza(node))
 }
 
 fn group_repair_time_left(
@@ -880,8 +878,8 @@ impl Client {
         // Arc in this dispatcher while decryption starts. Besides removing an
         // atomic refcount pair, this lets a large uniquely-owned pkmsg donate
         // its receive buffer to authenticated in-place decryption. Newsletter
-        // and status messages keep the extra owner until their deferred ack is
-        // encoded, preserving the existing acknowledgement semantics.
+        // and status messages keep the extra owner for interceptor responses;
+        // built-in status processing owns its response after queue admission.
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
@@ -975,6 +973,10 @@ impl Client {
                 self.handle_receipt_inline(node);
             }
             Some(StanzaTag::Message) => {
+                // Classic statuses share the result-driven response path with
+                // raw status stanzas. An enqueue ACK could precede cold props,
+                // decryption or a pending durable commit.
+                cancelled |= from_jid_matches(node.get(), |jid| jid.is_status_broadcast());
                 crate::handlers::message::MessageHandler::handle_inline_scoped(
                     self.clone(),
                     node,
@@ -985,7 +987,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            Some(StanzaTag::Status) if is_status_broadcast_stanza(nr) => {
+            Some(StanzaTag::Status) if is_non_newsletter_status_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline_scoped(
                     self.clone(),
                     node,
@@ -993,6 +995,9 @@ impl Client {
                     Some(NotificationScope::new(generation, shutdown)),
                 )
                 .await;
+                // The processing result owns the response. Intercepted status
+                // stanzas still use the earlier deferred-ACK path.
+                cancelled = true;
             }
             _ => {
                 let handled = self
@@ -1058,7 +1063,8 @@ impl Client {
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
     /// arrives. message and status@broadcast only enqueue here, and a spawned
     /// enqueue could put a group message ahead of the pkmsg that establishes its
-    /// session. Acks and receipts qualify only while nothing observes them.
+    /// session. Non-newsletter statuses use that same queue. Acks and receipts
+    /// qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(
@@ -1068,7 +1074,7 @@ impl Client {
                 | StanzaTag::Message
                 | StanzaTag::InfoBanner,
             ) => true,
-            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Status) => is_non_newsletter_status_stanza(node),
             Ok(StanzaTag::Notification) => self.queues_group_notification(node),
             Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
@@ -1089,9 +1095,8 @@ impl Client {
         }
     }
 
-    /// Answering nothing leaves the stanza in the offline queue forever, which
-    /// is how an unhandled `<status>` kept recycling the stream. Returns whether
-    /// a nack was queued; one without `id`/`from` would have nothing to address.
+    /// Reject an unmodeled stanza when `id` and `from` allow addressing a reply.
+    /// Returns whether a NACK was queued.
     fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;
@@ -1109,13 +1114,9 @@ impl Client {
     /// `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
     /// their dedicated handlers, not via this gate.
     ///
-    /// status@broadcast is included as a fallback: drop paths in
-    /// `process_group_enc_batch` (expired status, missing sender key, generic
-    /// decrypt error) intentionally skip the delivery receipt to avoid
-    /// inflating the server-side offline counter for messages we'll never
-    /// process. Without the transport `<ack>` from this gate, the server
-    /// would redeliver indefinitely. WA Web emits `<receipt class="status">`
-    /// in the success path on top of this; the duplicate is tolerated.
+    /// Status responses remain reserved here for claimed interceptors. The
+    /// built-in message handler cancels this generic ACK for both status
+    /// formats and selects a response after processing, like WA Web.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;
@@ -1125,7 +1126,7 @@ impl Client {
             Ok(StanzaTag::Message) => {
                 from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
             }
-            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Status) => is_non_newsletter_status_stanza(node),
             _ => false,
         }
     }

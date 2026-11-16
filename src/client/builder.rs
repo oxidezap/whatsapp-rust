@@ -565,12 +565,15 @@ impl ClientBuilder {
     /// KB that cannot afford even the compressed frame plus the inflate state
     /// (~80 KB together) at the moment it arrives.
     ///
-    /// Turned off, every flag reads as its registry default, the value WA Web
+    /// Turned off, flags read as their registry defaults, the values WA Web
     /// itself uses before its first fetch: the server sees no `abt` request
     /// (whatsmeow never sends one) and accepts the client either way, but an
     /// account the server has 1:1-LID-migrated is not recognised as such from
     /// the props (`lid_one_on_one_migration_enabled` defaults to off), and
     /// privacy-token and trusted-contact-token gates run on their defaults.
+    /// Status messages whose Signal session depends on props wait for a known
+    /// catalog instead of assuming a namespace. Call `Client::fetch_props`
+    /// manually before receiving those messages when automatic fetch is off.
     pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
         self.options.ab_props_fetch = enabled;
         self

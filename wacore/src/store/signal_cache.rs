@@ -551,10 +551,11 @@ fn protocol_address_matches_user(address: &str, user: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':'))
 }
 
-/// The user half of a protocol address, matching the prefix
-/// [`protocol_address_matches_user`] tests.
 fn is_companion_identity_address(address: &ProtocolAddress) -> bool {
-    u32::from(address.device_id()) != 0
+    // A scoped identity is session state, never the ordinary account anchor,
+    // including when that session's sender is a primary device.
+    crate::types::jid::status_session_base_name(address.name()).is_some()
+        || u32::from(address.device_id()) != 0
         || address.name().contains('@')
             && address
                 .name()
@@ -565,6 +566,7 @@ fn is_companion_identity_address(address: &ProtocolAddress) -> bool {
 }
 
 fn user_of_protocol_address(address: &str) -> &str {
+    let address = crate::types::jid::status_session_base_name(address).unwrap_or(address);
     match address.find(['@', ':']) {
         Some(end) => &address[..end],
         None => address,
@@ -9697,6 +9699,27 @@ mod identity_continuity_tests {
                 .with_device(device)
                 .to_protocol_address();
             assert_eq!(u32::from(companion.device_id()), 0);
+            for scoped in [&primary, &companion]
+                .into_iter()
+                .filter_map(crate::types::jid::status_session_address)
+            {
+                let epoch = cache.identity_continuity.snapshot();
+                cache.delete_identity(&scoped).await;
+                assert!(
+                    cache
+                        .identity_continuity
+                        .unchanged_primary_for(epoch, [user])
+                );
+                assert!(!cache.identity_continuity.unchanged_for(epoch, [user]));
+                assert!(
+                    cache
+                        .persist_identity_and_alias_in_epoch(
+                            &primary, None, &[1; 32], &backend, epoch
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
             let epoch = cache.identity_continuity.snapshot();
             cache.delete_identity(&companion).await;
             assert!(
@@ -9720,6 +9743,9 @@ mod identity_continuity_tests {
             "12025550135:bad@c.us",
             "12025550135:7",
             "12025550135:7@unknown.invalid",
+            "12025550135:7@unknown.invalid_status",
+            "12025550135:7_status",
+            "unknown_status",
             "unknown",
         ] {
             let cache = SignalStoreCache::new();

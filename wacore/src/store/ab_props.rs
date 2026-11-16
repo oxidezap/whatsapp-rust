@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use wacore_binary::CompactString;
 
 use crate::iq::abprops::{AbDefault, AbProp};
@@ -20,8 +20,11 @@ use crate::iq::props::WATCHED;
 /// Only materializes props whose code is in the interest set.
 /// Pre-populated with the `WATCHED` flags; extend via `watch()`.
 pub struct AbPropsCache {
+    fetch: Mutex<()>,
     state: RwLock<PropsState>,
-    interest: RwLock<HashSet<u32>>,
+    // Built-in codes already live in WATCHED; only application additions need
+    // per-client heap storage. Materialize the complete set only for a fetch.
+    extra_interest: RwLock<HashSet<u32>>,
     seeded: AtomicBool,
 }
 
@@ -108,24 +111,36 @@ impl AbPropsSnapshot {
 impl AbPropsCache {
     pub fn new() -> Self {
         Self {
+            fetch: Mutex::new(()),
             state: RwLock::new(PropsState::default()),
-            interest: RwLock::new(WATCHED.iter().map(|p| p.code).collect()),
+            extra_interest: RwLock::new(HashSet::new()),
             seeded: AtomicBool::new(false),
         }
+    }
+
+    /// Serialize catalog fetches without holding the cache's state lock.
+    /// Initial-fetch callers must recheck readiness after acquiring the guard.
+    pub async fn lock_fetch(&self) -> async_lock::MutexGuard<'_, ()> {
+        self.fetch.lock().await
     }
 
     /// Register a flag to be retained when props are fetched.
     /// Call before the first `fetch_props` to ensure the value is captured.
     pub async fn watch(&self, prop: AbProp) {
-        self.interest.write().await.insert(prop.code);
+        let mut extra = self.extra_interest.write().await;
+        if !Self::is_builtin(prop.code) {
+            extra.insert(prop.code);
+        }
     }
 
     /// Register multiple flags at once.
     pub async fn watch_many(&self, props: &[AbProp]) {
-        self.interest
-            .write()
-            .await
-            .extend(props.iter().map(|p| p.code));
+        self.extra_interest.write().await.extend(
+            props
+                .iter()
+                .map(|p| p.code)
+                .filter(|code| !Self::is_builtin(*code)),
+        );
     }
 
     /// Mark the start of a connection generation without discarding cached props.
@@ -141,7 +156,16 @@ impl AbPropsCache {
     /// request time so the response can be filtered as it streams in without
     /// holding the lock across the read loop.
     pub async fn interest(&self) -> HashSet<u32> {
-        self.interest.read().await.clone()
+        let extra = self.extra_interest.read().await;
+        WATCHED
+            .iter()
+            .map(|prop| prop.code)
+            .chain(extra.iter().copied())
+            .collect()
+    }
+
+    fn is_builtin(code: u32) -> bool {
+        WATCHED.iter().any(|prop| prop.code == code)
     }
 
     /// True after the first full (non-delta) update.
@@ -169,7 +193,7 @@ impl AbPropsCache {
         delta_update: bool,
         props: impl Iterator<Item = (u32, CompactString)>,
     ) {
-        let interest = self.interest.read().await;
+        let interest = self.extra_interest.read().await;
         let mut state = self.state.write().await;
         self.apply_props_locked(delta_update, props, &interest, &mut state);
         state.applied_in_generation = true;
@@ -186,7 +210,7 @@ impl AbPropsCache {
         delta_update: bool,
         props: impl Iterator<Item = (u32, CompactString)>,
     ) -> Option<AbPropsSnapshot> {
-        let interest = self.interest.read().await;
+        let interest = self.extra_interest.read().await;
         let mut state = self.state.write().await;
         if state.generation != generation {
             return None;
@@ -207,7 +231,7 @@ impl AbPropsCache {
             state.props.clear();
         }
         for (code, value) in props {
-            if interest.contains(&code) {
+            if Self::is_builtin(code) || interest.contains(&code) {
                 state.props.insert(code, value);
             }
         }
@@ -233,7 +257,7 @@ impl AbPropsCache {
     #[cfg(debug_assertions)]
     async fn debug_assert_watched(&self, prop: AbProp) {
         assert!(
-            self.interest.read().await.contains(&prop.code),
+            Self::is_builtin(prop.code) || self.extra_interest.read().await.contains(&prop.code),
             "AB prop {:?} (code {}) was read but is not watched, so the server's \
              value is discarded and this read always yields the registry default. \
              Add it to `WATCHED` in wacore/src/iq/props.rs, or call `watch()` \
@@ -489,6 +513,49 @@ mod tests {
         assert!(cache.is_enabled(web::RECEIPT_MODE_BITMASK_ENABLED).await);
         // Unwatched code should NOT be retained
         assert_eq!(cache.get(flag(99999)).await, None);
+    }
+
+    #[tokio::test]
+    async fn custom_interest_preserves_all_builtin_flags_across_fetches() {
+        let cache = AbPropsCache::new();
+        let first = flag(99_999_001);
+        let second = flag(99_999_002);
+        cache.watch(first).await;
+        cache.watch_many(&[WATCHED[0], first, second]).await;
+        let interest = cache.interest().await;
+        assert_eq!(interest.len(), WATCHED.len() + 2);
+        for prop in WATCHED.iter().chain([first, second].iter()) {
+            assert!(interest.contains(&prop.code));
+        }
+        cache.begin_generation(1).await;
+        cache
+            .apply_props_for_generation(
+                1,
+                false,
+                interest
+                    .iter()
+                    .map(|code| (*code, CompactString::from("1"))),
+            )
+            .await
+            .unwrap();
+        cache
+            .apply_props_for_generation(
+                1,
+                true,
+                [
+                    (first.code, CompactString::from("2")),
+                    (99_999_003, CompactString::from("unwatched")),
+                ]
+                .into_iter(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.get(first).await.as_deref(), Some("2"));
+        assert_eq!(cache.get(second).await.as_deref(), Some("1"));
+        for prop in WATCHED {
+            assert_eq!(cache.get(*prop).await.as_deref(), Some("1"));
+        }
+        assert!(cache.get(flag(99_999_003)).await.is_none());
     }
 
     /// The guard has to fire on the read, not on the fetch: at fetch time a

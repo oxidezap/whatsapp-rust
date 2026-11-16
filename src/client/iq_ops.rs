@@ -9,6 +9,19 @@ impl Client {
     }
 
     pub async fn fetch_props(&self) -> Result<(), crate::request::IqError> {
+        let _fetch = self.ab_props.lock_fetch().await;
+        self.fetch_props_inner().await
+    }
+
+    pub(crate) async fn fetch_initial_props(&self) -> Result<(), crate::request::IqError> {
+        let _fetch = self.ab_props.lock_fetch().await;
+        if self.ab_props.is_seeded() {
+            return Ok(());
+        }
+        self.fetch_props_inner().await
+    }
+
+    async fn fetch_props_inner(&self) -> Result<(), crate::request::IqError> {
         use wacore::iq::props::PropsSpec;
         use wacore::store::commands::DeviceCommand;
 

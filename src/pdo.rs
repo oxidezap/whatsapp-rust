@@ -212,7 +212,7 @@ impl PdoRequestMemo {
     }
 
     #[cfg(test)]
-    fn sent_for_test(
+    pub(crate) fn sent_for_test(
         info: &Arc<MessageInfo>,
         request_id: String,
         explicit_retry: bool,
@@ -1859,6 +1859,7 @@ impl Client {
             .unwrap_or_else(|| self.runtime.wall_time_utc());
 
         Ok(MessageInfo {
+            is_status_stanza: false,
             id: id.unwrap_or_default().into(),
             server_id: 0,
             newsletter_server_id: None,
