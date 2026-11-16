@@ -192,7 +192,7 @@ struct GroupBatchOutcome {
     expired_only: bool,
     skdm_only: bool,
     unanswered_validation_failure: Option<NackReason>,
-    unanswered_decrypt_failure: bool,
+    retry_reason: Option<RetryReason>,
 }
 
 impl Client {
@@ -1547,7 +1547,9 @@ impl Client {
         group_outcome.unanswered_validation_failure = group_outcome
             .unanswered_validation_failure
             .filter(|_| bot_payloads.is_empty());
-        group_outcome.unanswered_decrypt_failure &= bot_payloads.is_empty();
+        group_outcome.retry_reason = group_outcome
+            .retry_reason
+            .filter(|_| bot_payloads.is_empty());
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
             Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
@@ -1557,7 +1559,7 @@ impl Client {
         // this stanza. Successful/duplicate siblings own their normal response.
         let retained = (group_outcome.expired_only
             || group_outcome.unanswered_validation_failure.is_some()
-            || group_outcome.unanswered_decrypt_failure)
+            || group_outcome.retry_reason.is_some())
             && self.inbound_journal_enabled()
             && self
                 .inbound_commit_batch
@@ -1566,26 +1568,29 @@ impl Client {
         // A group Signal failure invalidates this arrival's shared receipt
         // scope. A session sibling's dispatch/duplicate cannot own a response
         // that the failed scope suppresses; retained ownership still gates it.
-        let failed_journal_receipt = (group_outcome.unanswered_decrypt_failure
+        let failed_journal_receipt = (group_outcome.retry_reason.is_some()
             || group_outcome.unanswered_validation_failure == Some(NackReason::ParsingError))
             && self.inbound_journal_enabled();
         if (info.is_status_stanza || info.source.chat.is_status_broadcast())
             && (group_outcome.unanswered_validation_failure.is_some()
-                || group_outcome.unanswered_decrypt_failure)
+                || group_outcome.retry_reason.is_some())
             && (!session_outcome.dispatched || failed_journal_receipt)
             && !session_outcome.had_failure
             && (!session_had_duplicates || failed_journal_receipt)
             && !session_dispatched_undecryptable
             && !retained
         {
-            if group_outcome.unanswered_decrypt_failure {
+            if let Some(reason) = group_outcome.retry_reason {
+                if reason == RetryReason::UnknownCompanionNoPrekey {
+                    self.handle_unknown_device_sync(&info).await;
+                }
                 // Web's CryptoLibrary wraps every non-duplicate group decrypt
                 // failure in SignalDecryptionError, including malformed binary
                 // ciphertext. Its decryption handler retries these; they are
                 // not decrypted-protobuf validation failures or terminal NACKs.
                 self.handle_decrypt_failure(
                     &info,
-                    RetryReason::UnknownError,
+                    reason,
                     decrypt_fail_mode,
                     ack_recipient.as_ref(),
                 )
@@ -2807,10 +2812,11 @@ impl Client {
 
         // Derive the terminal outcome from the decisions made for each slot;
         // time may cross expiry while a decrypt waits for the sender-key lock.
-        let mut expired_only = info.is_status_stanza || info.source.chat.is_status_broadcast();
+        let status_context = info.is_status_stanza || info.source.chat.is_status_broadcast();
+        let mut expired_only = status_context;
         let mut skdm_only = true;
         let mut plaintext_failed = false;
-        let mut unclassified_decrypt_failed = false;
+        let mut pending_retry = None;
         let mut response_claimed = false;
 
         for payload in payloads {
@@ -2945,7 +2951,6 @@ impl Client {
                     }
 
                     expired_only = false;
-                    response_claimed = true;
                     self.report_enc_decrypt_failure(
                         info,
                         enc_index,
@@ -2967,6 +2972,11 @@ impl Client {
                         msg
                     );
 
+                    if status_context {
+                        pending_retry = Some(retry_reason);
+                        continue;
+                    }
+                    response_claimed = true;
                     if is_unknown_device {
                         self.handle_unknown_device_sync(info).await;
                     }
@@ -3013,6 +3023,10 @@ impl Client {
                     // Recoverable sender-key desync: retry receipt (prompts an SKDM
                     // resend), not a 500 NACK that would drop the message permanently.
                     if let Some(reason) = group_decrypt_retry_reason(&e) {
+                        if status_context {
+                            pending_retry = Some(reason);
+                            continue;
+                        }
                         response_claimed = true;
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),
@@ -3039,8 +3053,8 @@ impl Client {
                     // Aggregate the status response first so a useful sibling
                     // can reach its durable owner before requesting recovery.
                     // Ordinary messages keep their existing NACK path.
-                    if info.is_status_stanza || info.source.chat.is_status_broadcast() {
-                        unclassified_decrypt_failed = true;
+                    if status_context {
+                        pending_retry = Some(RetryReason::UnknownError);
                         continue;
                     }
                     response_claimed = true;
@@ -3060,11 +3074,12 @@ impl Client {
             skdm_only,
             unanswered_validation_failure: (plaintext_failed && !response_claimed)
                 .then_some(NackReason::InvalidProtobuf),
-            // A failed journal receipt scope also suppresses a successful or
-            // duplicate sibling's deferred ACK. Once its commit is durable,
-            // the failure must still request recovery for the redelivered stanza.
-            unanswered_decrypt_failure: unclassified_decrypt_failed
-                && (!response_claimed || self.inbound_journal_enabled()),
+            // Web chooses one recovery result after processing all encrypted
+            // children and flushing Signal writes. Do not spend retry attempts
+            // or emit a cap ACK while a useful sibling still owns its commit.
+            // Failed journal scopes suppress successful/duplicate receipts too.
+            retry_reason: pending_retry
+                .filter(|_| !response_claimed || self.inbound_journal_enabled()),
         })
     }
 

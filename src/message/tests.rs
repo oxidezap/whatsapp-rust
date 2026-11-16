@@ -1814,20 +1814,29 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
 
 #[tokio::test]
 async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
-    check_status_mixed_group_payloads_commit(true, false).await;
+    check_status_mixed_group_payloads_commit(true, false, 0).await;
 }
 
 #[tokio::test]
 async fn unexpired_status_mixed_group_payloads_wait_for_durable_commit() {
-    check_status_mixed_group_payloads_commit(false, false).await;
+    check_status_mixed_group_payloads_commit(false, false, 0).await;
 }
 
 #[tokio::test]
 async fn status_session_sibling_and_terminal_group_failure_wait_for_durable_commit() {
-    check_status_mixed_group_payloads_commit(false, true).await;
+    check_status_mixed_group_payloads_commit(false, true, 0).await;
 }
 
-async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling: bool) {
+#[tokio::test]
+async fn capped_status_group_recovery_waits_for_durable_commit() {
+    check_status_mixed_group_payloads_commit(false, false, MAX_DECRYPT_RETRIES).await;
+}
+
+async fn check_status_mixed_group_payloads_commit(
+    expired: bool,
+    session_sibling: bool,
+    initial_retry_count: u8,
+) {
     #[derive(Default)]
     struct Hook {
         content: std::sync::Mutex<Vec<String>>,
@@ -1851,9 +1860,7 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
         if session_sibling && failure != "invalid_ciphertext" {
             continue;
         }
-        if !expired && failure == "missing_key" {
-            continue;
-        }
+        let requires_recovery = !expired && failure != "invalid_plaintext";
         for (failure_first, is_status_stanza, can_nack) in [
             (false, true, false),
             (true, true, false),
@@ -1924,6 +1931,10 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
             info.timestamp =
                 chrono::Utc::now() - chrono::Duration::hours(if expired { 25 } else { 0 });
             let info = Arc::new(info);
+            let key = client
+                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+                .await;
+            client.preseed_retry_count(&key, initial_retry_count).await;
             process_group_classified_with_sessions(
                 &client,
                 info.clone(),
@@ -1963,14 +1974,14 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                     .flush_inbound_commits_under_permit(true, None, None)
                     .await
             );
-            if !expired && failure == "invalid_ciphertext" {
+            if requires_recovery {
                 // Recovery also runs the existing first-attempt PDO, which
                 // waits for offline sync. The useful content is now durable;
                 // finish the drain before exercising its recovery redelivery.
                 client.enter_live_mode_for_tests();
             }
             assert_eq!(&*hook.content.lock().unwrap(), &["save before responding"]);
-            if failure == "invalid_plaintext" || (!expired && failure == "invalid_ciphertext") {
+            if failure == "invalid_plaintext" || requires_recovery {
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(
                     transport.sent_count(),
@@ -1996,7 +2007,7 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                 )
                 .await;
             }
-            if !expired && failure == "invalid_ciphertext" {
+            if requires_recovery && initial_retry_count < MAX_DECRYPT_RETRIES {
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(transport.sent_count(), 1);
                 let frame = decode_frame(0, &transport.sent()[0]).unwrap();
@@ -2016,6 +2027,113 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                 assert_exactly_one_confirmation(&transport, &info.id).await;
             }
             assert_eq!(&*hook.content.lock().unwrap(), &["save before responding"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_group_signal_failures_request_recovery_once_per_arrival() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("undecryptable siblings must not reach the durability hook")
+        }
+    }
+    for journal in [false, true] {
+        for raw_status in [false, true] {
+            for reverse in [false, true] {
+                for initial_count in [0, MAX_DECRYPT_RETRIES - 1, MAX_DECRYPT_RETRIES] {
+                    let (client, transport) = capturing_client("single_status_recovery").await;
+                    if journal {
+                        client
+                            .inbound_durability_hook
+                            .set(Arc::new(Hook))
+                            .ok()
+                            .unwrap();
+                    }
+                    // Fifth retries include keys. Provision a real synthetic ADV
+                    // certificate rather than bypassing the production preflight.
+                    let snapshot = client.persistence_manager.get_device_snapshot();
+                    let certificate = wacore::adv::test_util::signed_identity(
+                        crate::test_utils::adv_test_account(),
+                        &snapshot.core.identity_key,
+                        b"\x18\x01",
+                        &[6, 0],
+                        Some(&[6, 1]),
+                        true,
+                    );
+                    client
+                        .persistence_manager
+                        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+                            certificate,
+                        )))
+                        .await;
+                    let group = Jid::status_broadcast();
+                    let peer = joined_group_sender(&client, "100000000000044@lid", &group).await;
+                    let mut stranger = AlicePeer::new("100000000000044@lid").await;
+                    stranger.create_group_skdm(&group).await;
+                    let foreign = encrypt_group_text(&mut stranger, &group, "unknown chain").await;
+                    let mut payloads = vec![
+                        skmsg_payload_from_bytes(vec![0]),
+                        skmsg_payload_from_bytes(foreign),
+                    ];
+                    if reverse {
+                        payloads.reverse();
+                    }
+                    for (index, payload) in payloads.iter_mut().enumerate() {
+                        payload.enc_index = index;
+                    }
+                    let mut info =
+                        (*group_message_info("ONE-STATUS-RECOVERY", &group, &peer.jid, false))
+                            .clone();
+                    info.is_status_stanza = raw_status;
+                    info.timestamp = chrono::Utc::now();
+                    let info = Arc::new(info);
+                    let key = client
+                        .make_retry_cache_key(&group, &info.id, &peer.jid)
+                        .await;
+                    client.preseed_retry_count(&key, initial_count).await;
+                    process_group_classified_with_sessions(
+                        &client,
+                        info.clone(),
+                        &peer.jid,
+                        Vec::new(),
+                        payloads,
+                    )
+                    .await;
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    let frames = transport.sent();
+                    assert_eq!(
+                        frames.len(),
+                        1,
+                        "journal={journal}, raw={raw_status}, reverse={reverse}, initial={initial_count}"
+                    );
+                    let bytes = decode_frame(0, &frames[0]).unwrap();
+                    let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                    if initial_count < MAX_DECRYPT_RETRIES {
+                        assert_eq!(node.tag.as_ref(), "receipt");
+                        assert_eq!(
+                            node.attrs().optional_string("type").as_deref(),
+                            Some("retry")
+                        );
+                        let retry = node.get_optional_child("retry").expect("retry details");
+                        assert_eq!(
+                            retry.attrs().optional_string("count").as_deref(),
+                            Some((initial_count + 1).to_string().as_str())
+                        );
+                    } else {
+                        assert_eq!(node.tag.as_ref(), "ack");
+                        assert!(node.get_attr("error").is_none());
+                    }
+                    let count = client.message_retry_counts.get(&key).await.unwrap().0;
+                    assert_eq!(count, (initial_count + 1).min(MAX_DECRYPT_RETRIES));
+                }
+            }
         }
     }
 }
