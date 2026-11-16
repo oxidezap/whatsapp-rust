@@ -193,16 +193,16 @@ mod tests {
 
     #[test]
     fn provenance_cannot_follow_a_new_pin_without_review() {
-        assert!(validate_revision("ae3880925bacd23863cc30ec480c9f82bfd869f1").is_ok());
+        assert!(validate_revision("2ff44531865451b99cf2840cbe9670d4eef3f8ef").is_ok());
         assert!(validate_revision("0000000000000000000000000000000000000000").is_err());
     }
 
     #[test]
     fn deterministic_cases_have_independently_recorded_expectations() {
-        let output = generate(&ir().to_string(), "2.3000.1052559453").unwrap();
+        let output = generate(&ir().to_string(), "2.3000.1054751086").unwrap();
         assert_eq!(
             output,
-            generate(&ir().to_string(), "2.3000.1052559453").unwrap()
+            generate(&ir().to_string(), "2.3000.1054751086").unwrap()
         );
         assert!(output.contains("unknown_between_duplicates"));
         assert!(output.contains("AcceptGroupAddSuccess::Success, \"duplicate\""));
@@ -224,7 +224,7 @@ mod tests {
                     variants.as_array_mut().unwrap().push(extra);
                 }
             }
-            assert!(generate(&ir.to_string(), "2.3000.1052559453").is_err());
+            assert!(generate(&ir.to_string(), "2.3000.1054751086").is_err());
         }
         assert!(generate(&original.to_string(), "future").is_err());
     }

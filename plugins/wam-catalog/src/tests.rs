@@ -539,3 +539,40 @@ fn historical_video_types_and_optional_fields_keep_public_wire_contracts() {
     expected.write_event(&ExpectedCall, TS, 1).unwrap();
     assert_eq!(actual.as_bytes(), expected.as_bytes());
 }
+
+#[test]
+fn removed_invite_events_and_enum_members_keep_their_wire_contracts() {
+    assert_eq!(enums::BannerTypes::Squid.wire(), 69);
+    assert_eq!(events::StatusRowView::CODE, 1656);
+    assert_eq!(events::DangerousFileOpenStatsV2::CODE, 6708);
+    assert_eq!(events::GroupInviteLinkPageVisit::CODE, 7380);
+    struct ExpectedInvite;
+    impl WamEvent for ExpectedInvite {
+        const NAME: &'static str = "GroupInviteLinkClick";
+        const CODE: u32 = 3526;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(3, Some(0));
+            fields.integer(1, Some(1));
+        }
+    }
+    let mut actual = buffer(1);
+    actual
+        .write_event(
+            &events::GroupInviteLinkClick {
+                group_invite_link_click_action: Some(
+                    enums::GroupInviteLinkClickActionType::GroupInviteLinkSmsSent,
+                ),
+                group_invite_link_entry_point: Some(enums::GroupInviteLinkEntryPoint::CopyLink),
+                ..Default::default()
+            },
+            TS,
+            1,
+        )
+        .unwrap();
+    let mut expected = buffer(1);
+    expected.write_event(&ExpectedInvite, TS, 1).unwrap();
+    assert_eq!(actual.as_bytes(), expected.as_bytes());
+}

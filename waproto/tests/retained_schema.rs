@@ -41,6 +41,44 @@ fn absent_bundle_families_keep_their_public_types() {
 }
 
 #[test]
+fn reclaimed_labyrinth_inputs_keep_their_distinct_wire_contracts() {
+    use buffa::{MessageView as _, ViewEncode as _};
+    let historical = [0x0a, 1, 1, 0x12, 1, 2, 0x1a, 1, b'x', 0x20, 1, 0x2a, 1, 3];
+    let current = [0x0a, 1, 1, 0x10, 2, 0x1a, 1, b'x', 0x20, 1, 0x2a, 1, 3];
+    let old = wa::DecryptMessageInput::decode_from_slice(&historical).unwrap();
+    let new = wa::WebDecryptMessageInput::decode_from_slice(&current).unwrap();
+    assert_eq!(old.epoch_anon_id, [2]);
+    assert_eq!(new.epoch_anon_id, 2);
+    assert_eq!(old.encode_to_vec(), historical);
+    assert_eq!(new.encode_to_vec(), current);
+    assert!(wa::DecryptMessageInput::decode_from_slice(&current).is_err());
+    assert!(wa::WebDecryptMessageInput::decode_from_slice(&historical).is_err());
+    let old_view = wa::DecryptMessageInputView::decode_view(&historical).unwrap();
+    let new_view = wa::WebDecryptMessageInputView::decode_view(&current).unwrap();
+    assert_eq!(old_view.epoch_anon_id, [2]);
+    assert_eq!(new_view.epoch_anon_id, 2);
+    assert_eq!(old_view.encode_to_vec(), historical);
+    assert_eq!(new_view.encode_to_vec(), current);
+    assert_eq!(old_view.to_owned_message().unwrap(), old);
+    assert_eq!(new_view.to_owned_message().unwrap(), new);
+}
+
+#[test]
+fn reclaimed_labyrinth_outputs_preserve_flat_and_wrapped_payloads() {
+    let historical = [0x0a, 1, 42];
+    let current = [0x0a, 3, 0x0a, 1, 42];
+    let old = wa::DecryptMessageOutput::decode_from_slice(&historical).unwrap();
+    let new = wa::WebDecryptMessageOutput::decode_from_slice(&current).unwrap();
+    assert_eq!(old.plaintext_payload.as_deref(), Some([42].as_slice()));
+    let Some(wa::web_decrypt_message_output::Result::Success(success)) = &new.result else {
+        panic!("expected wrapped success");
+    };
+    assert_eq!(success.plaintext_payload, [42]);
+    assert_eq!(old.encode_to_vec(), historical);
+    assert_eq!(new.encode_to_vec(), current);
+}
+
+#[test]
 fn message_clone_preserves_retained_and_new_fields_without_aliasing() {
     // Retained field 117 contains a nested conversation, and new field 132
     // contains an empty FutureProofMessage. Both must survive Clone unchanged.

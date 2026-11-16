@@ -12,9 +12,8 @@
 //! cargo run -p whatspec-codegen -- --update-lock --rev main
 //! ```
 //!
-//! Regeneration is all-or-nothing on purpose. Every artifact carries the same
-//! `waVersion` stamp, and the version a device announces is generated from it,
-//! so refreshing one domain alone is the drift this tool exists to remove.
+//! Regeneration writes all domains together. Independently qualified captures
+//! retain their source version until their reference programs are requalified.
 
 // A CLI's output is its interface; the workspace print lints are aimed at the
 // library, where diagnostics belong in `log`.
@@ -283,6 +282,9 @@ fn stamped_version(ir: &Ir) -> Result<String> {
 }
 
 fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
+    // Upstream retains these specialized projections from the qualified capture.
+    // Their byte guards below prevent a new catalog from silently replacing it.
+    let group_version = emit::group_normalization::VERSION;
     ensure!(
         ir.get("notif/group-envelope.json")? == include_bytes!("../fixtures/group_envelope.json"),
         "qualified group envelope fixture differs from pinned IR"
@@ -330,37 +332,37 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
     Ok(vec![
         Artifact {
             path: "wacore/src/stanza/groups/normalization_conformance.rs",
-            content: emit::group_normalization::conformance(wa_version)?,
+            content: emit::group_normalization::conformance(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/actions_conformance.rs",
-            content: emit::group_actions_conformance::generate(wa_version)?,
+            content: emit::group_actions_conformance::generate(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/envelope_conformance.rs",
-            content: emit::group_envelope_conformance::generate(wa_version)?,
+            content: emit::group_envelope_conformance::generate(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/link_generated.rs",
-            content: emit::group_link_normalization::generate(wa_version)?,
+            content: emit::group_link_normalization::generate(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/envelope_generated.rs",
-            content: emit::group_envelope_normalization::generate(wa_version)?,
+            content: emit::group_envelope_normalization::generate(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/create_conformance.rs",
-            content: emit::group_create_conformance::generate(wa_version)?,
+            content: emit::group_create_conformance::generate(group_version)?,
             rust: true,
         },
         Artifact {
             path: "wacore/src/stanza/groups/unlink_generated.rs",
-            content: emit::group_normalization::generate(wa_version)?,
+            content: emit::group_normalization::generate(group_version)?,
             rust: true,
         },
         Artifact {

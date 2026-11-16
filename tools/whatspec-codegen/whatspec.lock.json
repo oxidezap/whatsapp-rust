@@ -1,22 +1,22 @@
 {
   "repo": "https://github.com/oxidezap/whatspec",
-  "rev": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
-  "waVersion": "2.3000.1052559453",
+  "rev": "2ff44531865451b99cf2840cbe9670d4eef3f8ef",
+  "waVersion": "2.3000.1054751086",
   "files": {
-    "abprops/index.json": "sha256:a1ea0449a2cf9b12597d7d3614b988f57466e916fd3b03b48588d1344afb8222",
-    "appstate/index.json": "sha256:74e505640a3d08e128da70cede2db98333918affef88d435745274e7c1f16307",
-    "enums/index.json": "sha256:2efcd35d395027acbbfdf423afec6daef4378c1f3eec83328f4e06171ad4e42c",
-    "iq/index.json": "sha256:9cf6a4d81d718a0f84f6d0c0ce04714acd3a5b57ad010e089949ebc1c15e3fbc",
-    "manifest.json": "sha256:8a9c5f290f6485aaba42949fb7c4f23c942f7002042f90f2375a978e6c57a511",
-    "mex/index.json": "sha256:d91b1d03a24f3240af5f846d848c0e1f296833c6fbb4067c64e9d27439566199",
+    "abprops/index.json": "sha256:589be689f04e9dd09e9c8e4aa350945794a635169b0fb1e88ccfa38725563010",
+    "appstate/index.json": "sha256:06047417f49e6fe1bafe71c0d42e10487d27e21a3b3cdaee20efe2287ce4eb8d",
+    "enums/index.json": "sha256:dd139e969bb73331bf9297a7d6ef13e1ff94609cf60a0006ff5e5704fa0377f3",
+    "iq/index.json": "sha256:d3abf969d30c4e0143615e3b5fd1cc4bc11ab9e5c8b358b5447b8af319016cb2",
+    "manifest.json": "sha256:5e052cc1c2ed31a61e2433d4880cd5317f4730f832bdd3aac5c83c330be86b34",
+    "mex/index.json": "sha256:83dea581aee95959498835f7cac4be911fdb275f21467b702b200a7a9bacab23",
     "notif/group-envelope.json": "sha256:0c2fc8456a028c0d3cf253cb0d9cd142cf031bcc35d4b702a6cf329e6046effa",
     "notif/group-link.json": "sha256:80f39ae823f54827de3ad7af9e96e103d1212a91a109d0a97888913ec902b641",
     "notif/group-unlink.json": "sha256:4ad96a230e7850d6e5407bd8b3e4c073d13ab0a2c123bad54907c09e13405ff2",
-    "notif/index.json": "sha256:38a2a24b2243a4d1faa6cc3f7cd4b1aafb788203d4edb6c043acf7b2f964d10f",
-    "proto/WAProto.proto": "sha256:9c8933cb377747c75223d606f71383f3992185468c76a5a358e46acc32c60f28",
-    "srvreq/index.json": "sha256:e05a75341c425c6779c24233139d9da80560ed68199ac7bf716b092850db56f0",
-    "stanza/index.json": "sha256:25770d1a955b5126681c2b0aeb257045a60eb2da5d8eaf96ff46542c570c47e7",
-    "tokens/index.json": "sha256:2aa63c08d47aea45fa2df6a78be71ba785d80851aedb17ef94d8e47b85af2070",
-    "wam/index.json": "sha256:b18af54f40089d3a3bdb917599ed5c88a1ebb68b77260a831fc7e3776add1638"
+    "notif/index.json": "sha256:d42db5ed58e4ed3890a8c058ed0d5e7964e4f955acb1a96728d2c4230b7689ae",
+    "proto/WAProto.proto": "sha256:127dde250b670d3e2fea54393b2f051e2431a4dcce8d565ba6f1af7003b5d9ca",
+    "srvreq/index.json": "sha256:2bb66a84ac03d03d248ee77861a2e6cf2e8b1d9ee0b33e754d47d65fa664f419",
+    "stanza/index.json": "sha256:fc994381a2504c44f2aafdf615378afad5656c9c4e115254b5dde5eacacf0cdf",
+    "tokens/index.json": "sha256:cdeab140288c1d273ab268a910ac2c14801bb31a0b2612b6baabd7a368efe9e5",
+    "wam/index.json": "sha256:6eaf0fddaded6742e0c9e4de38d947de0031c00aa926145f7908a47f964be095"
   }
 }

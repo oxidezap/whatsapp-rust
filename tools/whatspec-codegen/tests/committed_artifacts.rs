@@ -1,4 +1,4 @@
-//! The committed artifacts all describe one WhatsApp build.
+//! Catalog artifacts follow the main pin; qualified captures follow their source.
 //!
 //! This is the offline half of `--check`: it needs no whatspec checkout, so it
 //! runs in the ordinary test matrix and catches the failure that actually
@@ -50,7 +50,6 @@ fn every_generated_rust_file_stamps_the_locked_version() {
     // artifact left over from another build when `--check` cannot reach the
     // network to fetch the IR.
     for rel in [
-        "wacore/src/stanza/groups/normalization_conformance.rs",
         "wacore/src/version/generated.rs",
         "wacore/src/iq/abprops.rs",
         "wacore/src/iq/mex_operations.rs",
@@ -75,6 +74,27 @@ fn every_generated_rust_file_stamps_the_locked_version() {
             "{rel} was generated from WhatsApp {got} but the lock pins {want}; \
              regenerate the whole set with `cargo run -p whatspec-codegen`"
         );
+    }
+}
+
+#[test]
+fn group_artifacts_stamp_the_independently_qualified_capture() {
+    let evidence: serde_json::Value = serde_json::from_str(&read(
+        "tools/whatspec-codegen/fixtures/group_link_evidence.json",
+    ))
+    .unwrap();
+    let version = evidence["waVersion"].as_str().unwrap();
+    for name in [
+        "normalization_conformance",
+        "actions_conformance",
+        "envelope_conformance",
+        "link_generated",
+        "envelope_generated",
+        "create_conformance",
+        "unlink_generated",
+    ] {
+        let path = format!("wacore/src/stanza/groups/{name}.rs");
+        assert_eq!(stamped_in_header(&read(&path)), Some(version), "{path}");
     }
 }
 

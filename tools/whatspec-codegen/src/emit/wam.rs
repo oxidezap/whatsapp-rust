@@ -75,6 +75,11 @@ pub struct Artifacts {
 }
 
 pub fn generate(ir: &WamIr, wa_version: &str) -> Result<Artifacts> {
+    let compatible = retain_previous_catalog(ir)?;
+    generate_checked(ir, wa_version, &compatible)
+}
+
+fn generate_checked(ir: &WamIr, wa_version: &str, compatible: &WamIr) -> Result<Artifacts> {
     for (name, code) in [("ChannelsVideoPlay", 6556), ("MediaStreamPlayback", 1584)] {
         ensure!(
             !ir.events.iter().any(|e| e.name == name || e.code == code),
@@ -103,11 +108,74 @@ pub fn generate(ir: &WamIr, wa_version: &str) -> Result<Artifacts> {
                 .any(|value| value.module == "WAWebWamEnumRingtoneEntryType"),
         "upstream reclaimed retained ringtone contracts; reconcile wam-catalog/src/unlisted.rs"
     );
-    let enums = enum_names(ir)?;
+    let enums = enum_names(compatible)?;
     Ok(Artifacts {
-        catalog: catalog(ir, wa_version, &enums)?,
+        catalog: catalog(compatible, wa_version, &enums, ir)?,
         call_sites: call_sites(ir, wa_version),
     })
+}
+
+fn retain_previous_catalog(ir: &WamIr) -> Result<WamIr> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Retained {
+        source_rev: String,
+        events: Vec<WamEventDef>,
+        enums: Vec<crate::ir::WamEnum>,
+        missing_enums: Vec<crate::ir::WamEnum>,
+    }
+    let retained: Retained =
+        serde_json::from_str(include_str!("../../fixtures/wam-snapshot-retention.json"))?;
+    ensure!(
+        retained.source_rev == "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+        "historical WAM source changed"
+    );
+    let mut compatible = ir.clone();
+    for event in retained.events {
+        ensure!(
+            !compatible
+                .events
+                .iter()
+                .any(|current| current.name == event.name || current.code == event.code),
+            "reconcile retained WAM event {}",
+            event.name
+        );
+        compatible.events.push(event);
+    }
+    for value in retained.missing_enums {
+        ensure!(
+            !compatible
+                .enums
+                .iter()
+                .any(|current| current.module == value.module),
+            "reconcile retained WAM enum {}",
+            value.module
+        );
+        compatible.enums.push(value);
+    }
+    for value in retained.enums {
+        let current = compatible
+            .enums
+            .iter_mut()
+            .find(|current| current.module == value.module)
+            .ok_or_else(|| anyhow::anyhow!("retained WAM enum {} missing", value.module))?;
+        ensure!(
+            current.name == value.name,
+            "historical WAM enum identity changed"
+        );
+        for variant in value.variants {
+            ensure!(
+                !current
+                    .variants
+                    .iter()
+                    .any(|v| v.key == variant.key || v.value == variant.value),
+                "reconcile historical WAM variant {}",
+                variant.key
+            );
+            current.variants.push(variant);
+        }
+    }
+    Ok(compatible)
 }
 
 /// Module to Rust type name for every enum in the catalog.
@@ -130,7 +198,12 @@ fn enum_names(ir: &WamIr) -> Result<BTreeMap<String, String>> {
     Ok(names)
 }
 
-fn catalog(ir: &WamIr, wa_version: &str, enums: &BTreeMap<String, String>) -> Result<String> {
+fn catalog(
+    ir: &WamIr,
+    wa_version: &str,
+    enums: &BTreeMap<String, String>,
+    source: &WamIr,
+) -> Result<String> {
     let mut out = String::with_capacity(1 << 20);
     out.push_str(&format!(
         "//! Auto-generated WAM catalog (WhatsApp {wa_version}). DO NOT EDIT.\n\
@@ -147,9 +220,9 @@ fn catalog(ir: &WamIr, wa_version: &str, enums: &BTreeMap<String, String>) -> Re
 
     out.push_str(&constants(ir)?);
     out.push_str(&private_stats_ids(ir));
-    out.push_str(&enum_module(ir, enums)?);
+    out.push_str(&enum_module(ir, enums, source)?);
     out.push_str(&globals_module(ir, enums)?);
-    out.push_str(&events_module(ir, enums)?);
+    out.push_str(&events_module(ir, enums, source)?);
     Ok(out)
 }
 
@@ -226,7 +299,12 @@ fn private_stats_ids(ir: &WamIr) -> String {
     out
 }
 
-fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> Result<String> {
+fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>, source: &WamIr) -> Result<String> {
+    let source: BTreeMap<_, _> = source
+        .enums
+        .iter()
+        .map(|value| (value.module.as_str(), value))
+        .collect();
     let mut out = String::new();
     out.push_str(
         "/// Every enum a WAM field or global is typed by.\n\
@@ -237,6 +315,10 @@ fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> Result<String> {
          pub mod enums {\n    pub use crate::unlisted::{RingtoneEntryType, PlaybackOriginType, PlaybackStateType, VideoPlayOrigin, VideoPlayResult, VideoPlayType};\n",
     );
     for e in &ir.enums {
+        let current = source.get(e.module.as_str());
+        if current.is_none() {
+            out.push_str("    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.\n");
+        }
         let rust = &names[&e.module];
         out.push_str(&format!(
             "    /// `{}` (`{}`).\n    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n    pub enum {rust} {{\n",
@@ -246,7 +328,9 @@ fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> Result<String> {
         let mut variants = Vec::with_capacity(e.variants.len());
         for v in compatible_variants(e)? {
             let ident = unique_type_ident(&type_ident(&v.key), &mut used, "Variant");
-            if !e.variants.iter().any(|current| current.key == v.key) {
+            if !current
+                .is_some_and(|value| value.variants.iter().any(|variant| variant.key == v.key))
+            {
                 out.push_str(
                     "        /// Historical SDK member; absent from the current Web capture.\n",
                 );
@@ -388,7 +472,12 @@ fn const_name(name: &str) -> String {
     snake_case(name).to_uppercase()
 }
 
-fn events_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String> {
+fn events_module(ir: &WamIr, enums: &BTreeMap<String, String>, source: &WamIr) -> Result<String> {
+    let current_events: BTreeSet<_> = source
+        .events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect();
     let mut out = String::new();
     out.push_str(
         "/// One struct per WAM event, with one `Option` field per declared field.\n\
@@ -401,6 +490,9 @@ fn events_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String>
          \x20   use crate::{Channel, EventFields, WamEvent};\n\n",
     );
     for e in &ir.events {
+        if !current_events.contains(e.name.as_str()) {
+            out.push_str("    /// Historical SDK event from whatspec ae388092; no current Web call-site evidence.\n");
+        }
         let mut compatible = e.clone();
         retain_historical_fields(&mut compatible)?;
         if compatible.fields.len() != e.fields.len() {
@@ -609,6 +701,42 @@ fn call_site(s: &WamCallSite) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn generate(ir: &WamIr, wa_version: &str) -> Result<Artifacts> {
+        generate_checked(ir, wa_version, ir)
+    }
+
+    #[test]
+    fn snapshot_retention_rejects_reclaimed_names_and_wire_values() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/wam-snapshot-retention.json"))
+                .unwrap();
+        let mut current: WamIr = serde_json::from_value(serde_json::json!({
+            "events":[], "enums":fixture["enums"],
+        }))
+        .unwrap();
+        for value in &mut current.enums {
+            value.variants.clear();
+        }
+        let compatible = retain_previous_catalog(&current).unwrap();
+        assert_eq!(compatible.events.len(), 4);
+        assert!(
+            compatible
+                .events
+                .iter()
+                .all(|event| event.call_sites.is_empty())
+        );
+        assert!(current.events.is_empty());
+        current.events.push(compatible.events[0].clone());
+        assert!(retain_previous_catalog(&current).is_err());
+        current.events.clear();
+        current.enums[0].variants = compatible.enums[0].variants.clone();
+        assert!(retain_previous_catalog(&current).is_err());
+        current.enums[0].variants.clear();
+        current
+            .enums
+            .push(compatible.enums[current.enums.len()].clone());
+        assert!(retain_previous_catalog(&current).is_err());
+    }
     use super::*;
 
     #[test]
