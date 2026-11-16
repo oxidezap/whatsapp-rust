@@ -54,3 +54,13 @@ in `tests/api-consumer`; `--lane msrv --toolchain 1.95.0` and `--lane wasm`
 select the other gates. The single lock is mandatory. Directed negatives share
 one validator for error code, message and primary source. There is no staging
 exemption for missing fixtures. Add new contracts to an existing domain module.
+
+`cargo xt ci compatibility` runs declared profiles and checkout consumers by
+default. During preparation, main pushes and pull requests targeting main can
+delegate native/MSRV checkout consumers with `--preparing-consumers api-hosts`.
+The task verifies the event, exact head, compiler and unfiltered owner workflow
+before delegating. The separate API host result remains authoritative; this task
+does not claim to have executed those consumers. Scheduled, dispatched and local
+runs keep the full default. Frozen baseline and release qualification always run
+their original consumers. Packaged artifacts and mutation controls still run in
+Supply Chain, and WASM keeps both maintained compiler qualifications.

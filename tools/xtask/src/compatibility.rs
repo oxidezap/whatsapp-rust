@@ -11,6 +11,30 @@ use std::{
 use xtask_support::{capture, run as execute};
 
 const POLICY: &str = "tools/xtask/compatibility.json";
+mod ownership;
+pub use ownership::PreparingConsumers;
+
+enum ConsumerQualification<'a> {
+    Checkout,
+    ApiHosts(String),
+    Frozen(&'a str),
+}
+
+fn consumer_qualification<'a>(
+    root: &Path,
+    baseline: Option<&'a str>,
+    preparing_consumers: PreparingConsumers,
+    lane: Lane,
+    toolchain: &str,
+) -> Result<ConsumerQualification<'a>> {
+    match (baseline, preparing_consumers) {
+        (Some(baseline), _) => Ok(ConsumerQualification::Frozen(baseline)),
+        (None, PreparingConsumers::Local) => Ok(ConsumerQualification::Checkout),
+        (None, PreparingConsumers::ApiHosts) => Ok(ConsumerQualification::ApiHosts(
+            ownership::api_hosts_head(root, lane, toolchain)?,
+        )),
+    }
+}
 
 pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
     ensure!(
@@ -429,7 +453,13 @@ fn baseline_msrv<'a>(before: &'a toml::Value, workspace: &'a toml::Value) -> Res
     }
 }
 
-pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8> {
+pub fn run(
+    root: &Path,
+    release: bool,
+    lane: Lane,
+    toolchain: &str,
+    preparing_consumers: PreparingConsumers,
+) -> Result<u8> {
     let policy: Policy = serde_json::from_slice(&std::fs::read(root.join(POLICY))?)?;
     let meta: Value = serde_json::from_slice(
         &capture(
@@ -440,6 +470,13 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
         .stdout,
     )?;
     policy.validate(&meta, release)?;
+    let consumer_qualification = consumer_qualification(
+        root,
+        policy.baseline.as_deref(),
+        preparing_consumers,
+        lane,
+        toolchain,
+    )?;
     if let Some(baseline) = &policy.baseline {
         let exact = capture(
             Command::new("git")
@@ -476,7 +513,7 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
         }
     } else {
         println!(
-            "API preparation: checking candidate profiles and current consumers; no RC compatibility claim or release authorization"
+            "API preparation checks candidate profiles without RC compatibility or release authorization"
         );
     }
     // Do not gate intentional pre-1.0 changes against the published 0.7.0 API.
@@ -510,23 +547,52 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
         }
         execute(&mut command)?;
     }
-    if let Some(baseline) = &policy.baseline {
-        return crate::package_consumers::frozen(root, baseline, lane, toolchain);
+    match consumer_qualification {
+        ConsumerQualification::Frozen(baseline) => {
+            crate::package_consumers::frozen(root, baseline, lane, toolchain)
+        }
+        ConsumerQualification::ApiHosts(head) => {
+            println!(
+                "Preparing {lane:?} checkout consumers are delegated to the independent API host CI result at {head}; they were not executed by this job."
+            );
+            Ok(0)
+        }
+        ConsumerQualification::Checkout => consumers::run(
+            root,
+            consumers::Task::Run {
+                lane,
+                toolchain: Some(toolchain.into()),
+                manifest: None,
+                dry_run: false,
+            },
+        ),
     }
-    consumers::run(
-        root,
-        consumers::Task::Run {
-            lane,
-            toolchain: Some(toolchain.into()),
-            manifest: None,
-            dry_run: false,
-        },
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_and_frozen_qualification_never_depend_on_external_ci() {
+        let absent = Path::new("not-a-checkout");
+        assert!(matches!(
+            consumer_qualification(
+                absent,
+                None,
+                PreparingConsumers::Local,
+                Lane::Wasm,
+                "1.95.0"
+            )
+            .unwrap(),
+            ConsumerQualification::Checkout
+        ));
+        let baseline = "a".repeat(40);
+        for preparing in [PreparingConsumers::Local, PreparingConsumers::ApiHosts] {
+            assert!(
+                matches!(consumer_qualification(absent, Some(&baseline), preparing, Lane::Wasm, "1.95.0").unwrap(), ConsumerQualification::Frozen(value) if value == baseline)
+            );
+        }
+    }
     #[test]
     fn failed_control_restores_source_and_preserves_spawn_error() {
         let dir = tempfile::tempdir().unwrap();

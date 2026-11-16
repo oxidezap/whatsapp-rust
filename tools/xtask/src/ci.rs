@@ -38,6 +38,9 @@ pub enum Task {
         lane: super::consumers::Lane,
         #[arg(long)]
         toolchain: String,
+        /// Delegate only preparing native/MSRV checkout consumers to their CI owner.
+        #[arg(long, value_enum, default_value = "local")]
+        preparing_consumers: super::compatibility::PreparingConsumers,
     },
     /// Qualify existing consumers against packaged crates outside this checkout.
     PackageConsumers {
@@ -254,8 +257,9 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             release,
             lane,
             toolchain,
+            preparing_consumers,
         } => {
-            return super::compatibility::run(root, release, lane, &toolchain);
+            return super::compatibility::run(root, release, lane, &toolchain, preparing_consumers);
         }
         Task::PackageConsumers { lane, toolchain } => {
             return super::package_consumers::run(root, lane, &toolchain);

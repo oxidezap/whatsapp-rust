@@ -113,7 +113,10 @@ jobs:
         run: target/debug/whatsapp-xtask ci compatibility --release --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Validate candidate or frozen contracts
         if: ${{ !inputs.release-check }}
-        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN"
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PREPARING_CONSUMERS: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.base_ref == 'main')) && (matrix.lane == 'native' || matrix.lane == 'msrv') && 'api-hosts' || 'local' }}
+        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN" --preparing-consumers "$PREPARING_CONSUMERS"
       - name: Reclaim completed consumer build artifacts
         # Package consumers use an independent temporary target directory.
         # The completed checkout consumers are not reused by the remaining checks.
