@@ -1,0 +1,472 @@
+{
+  "sourceRev": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+  "events": [
+    {
+      "name": "StatusRowView",
+      "code": 1656,
+      "module": "WAWebStatusRowViewWamEvent",
+      "channel": "regular",
+      "weights": [
+        1,
+        1,
+        1
+      ],
+      "fields": [
+        {
+          "name": "dedupKey",
+          "id": 11,
+          "kind": "integer"
+        },
+        {
+          "name": "psaCampaigns",
+          "id": 8,
+          "kind": "string"
+        },
+        {
+          "name": "statusRowEntryMethod",
+          "id": 5,
+          "kind": "enum",
+          "module": "WAWebWamEnumStatusRowEntryMethod"
+        },
+        {
+          "name": "statusRowIndex",
+          "id": 4,
+          "kind": "integer"
+        },
+        {
+          "name": "statusRowSection",
+          "id": 3,
+          "kind": "enum",
+          "module": "WAWebWamEnumStatusRowSection"
+        },
+        {
+          "name": "statusRowUnreadItemCount",
+          "id": 7,
+          "kind": "integer"
+        },
+        {
+          "name": "statusRowViewCount",
+          "id": 6,
+          "kind": "integer"
+        },
+        {
+          "name": "statusSessionId",
+          "id": 1,
+          "kind": "integer"
+        },
+        {
+          "name": "statusViewerSessionId",
+          "id": 2,
+          "kind": "integer"
+        },
+        {
+          "name": "unifiedSessionId",
+          "id": 9,
+          "kind": "string"
+        },
+        {
+          "name": "updatesTabSessionId",
+          "id": 10,
+          "kind": "integer"
+        }
+      ],
+      "consumers": [
+        "WAWebStatusViewer.react"
+      ]
+    },
+    {
+      "name": "GroupInviteLinkClick",
+      "code": 3526,
+      "module": "WAWebGroupInviteLinkClickWamEvent",
+      "channel": "regular",
+      "weights": [
+        1,
+        1,
+        1
+      ],
+      "fields": [
+        {
+          "name": "dedupKey",
+          "id": 5,
+          "kind": "integer"
+        },
+        {
+          "name": "groupInviteLinkClickAction",
+          "id": 3,
+          "kind": "enum",
+          "module": "WAWebWamEnumGroupInviteLinkClickActionType"
+        },
+        {
+          "name": "groupInviteLinkClickGroupId",
+          "id": 4,
+          "kind": "string"
+        },
+        {
+          "name": "groupInviteLinkEntryPoint",
+          "id": 1,
+          "kind": "enum",
+          "module": "WAWebWamEnumGroupInviteLinkEntryPoint"
+        },
+        {
+          "name": "groupTypeClient",
+          "id": 2,
+          "kind": "enum",
+          "module": "WAWebWamEnumGroupTypeClient"
+        }
+      ],
+      "consumers": [
+        "WAWebAddMemberInviteLinkLogger"
+      ]
+    },
+    {
+      "name": "DangerousFileOpenStatsV2",
+      "code": 6708,
+      "module": "WAWebDangerousFileOpenStatsV2WamEvent",
+      "channel": "private",
+      "weights": [
+        1,
+        1,
+        1
+      ],
+      "privateStatsId": 0,
+      "fields": [
+        {
+          "name": "harmfulFileWarningClickthroughAction",
+          "id": 1,
+          "kind": "enum",
+          "module": "WAWebWamEnumHarmfulFileWarningClickthroughAction"
+        },
+        {
+          "name": "harmfulFileWarningSenderRelationship",
+          "id": 2,
+          "kind": "enum",
+          "module": "WAWebWamEnumHarmfulFileWarningSenderRelationship"
+        }
+      ],
+      "consumers": [
+        "WAWebHarmfulFileWamLogger"
+      ]
+    },
+    {
+      "name": "GroupInviteLinkPageVisit",
+      "code": 7380,
+      "module": "WAWebGroupInviteLinkPageVisitWamEvent",
+      "channel": "regular",
+      "weights": [
+        1,
+        1,
+        1
+      ],
+      "fields": [
+        {
+          "name": "dedupKey",
+          "id": 4,
+          "kind": "integer"
+        },
+        {
+          "name": "groupId",
+          "id": 1,
+          "kind": "string"
+        },
+        {
+          "name": "inviteLinkEntryPoint",
+          "id": 2,
+          "kind": "enum",
+          "module": "WAWebWamEnumInviteLinkEntryPointType"
+        },
+        {
+          "name": "userJourneyEventMs",
+          "id": 3,
+          "kind": "integer"
+        }
+      ],
+      "consumers": [
+        "WAWebAddMemberInviteLinkLogger"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "BANNER_TYPES",
+      "module": "WAWebWamEnumBannerTypes",
+      "variants": [
+        {
+          "key": "SQUID",
+          "value": 69
+        },
+        {
+          "key": "CF_MIGRATION",
+          "value": 94
+        },
+        {
+          "key": "AVATAR_BOTTOMSHEET",
+          "value": 95
+        },
+        {
+          "key": "AVATAR_DEPRECATION",
+          "value": 106
+        }
+      ]
+    },
+    {
+      "name": "PRIVACY_CONTROL_ITEM_TYPE",
+      "module": "WAWebWamEnumPrivacyControlItemType",
+      "variants": [
+        {
+          "key": "AVATAR",
+          "value": 21
+        }
+      ]
+    },
+    {
+      "name": "PRODUCT_AREA",
+      "module": "WAWebWamEnumProductArea",
+      "variants": [
+        {
+          "key": "AVATARS",
+          "value": 55
+        }
+      ]
+    },
+    {
+      "name": "SETTINGS_ITEM_TYPE",
+      "module": "WAWebWamEnumSettingsItemType",
+      "variants": [
+        {
+          "key": "AVATAR",
+          "value": 28
+        }
+      ]
+    },
+    {
+      "name": "SETTINGS_PAGE_TYPE",
+      "module": "WAWebWamEnumSettingsPageType",
+      "variants": [
+        {
+          "key": "AVATAR_COINFLIP",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "TS_SURFACE",
+      "module": "WAWebWamEnumTsSurface",
+      "variants": [
+        {
+          "key": "COINFLIP_PREVIEW",
+          "value": 117
+        },
+        {
+          "key": "AVATAR_HOME",
+          "value": 118
+        },
+        {
+          "key": "AVATAR_POSE_AND_BACKGROUND",
+          "value": 119
+        },
+        {
+          "key": "AVATAR_HOME_PREVIEW",
+          "value": 125
+        }
+      ]
+    }
+  ],
+  "missingEnums": [
+    {
+      "name": "GROUP_INVITE_LINK_CLICK_ACTION_TYPE",
+      "module": "WAWebWamEnumGroupInviteLinkClickActionType",
+      "variants": [
+        {
+          "key": "GROUP_INVITE_LINK_SMS_SENT",
+          "value": 0
+        },
+        {
+          "key": "GROUP_INVITE_LINK_EMAIL_SENT",
+          "value": 1
+        },
+        {
+          "key": "GROUP_INVITE_LINK_SMS_TAPPED",
+          "value": 2
+        },
+        {
+          "key": "GROUP_INVITE_LINK_EMAIL_TAPPED",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "GROUP_INVITE_LINK_ENTRY_POINT",
+      "module": "WAWebWamEnumGroupInviteLinkEntryPoint",
+      "variants": [
+        {
+          "key": "COPY_LINK",
+          "value": 1
+        },
+        {
+          "key": "QR_CODE",
+          "value": 2
+        },
+        {
+          "key": "SHARE_GROUP_LINK",
+          "value": 3
+        },
+        {
+          "key": "SEND_IN_WHATSAPP",
+          "value": 4
+        },
+        {
+          "key": "SEND_IN_STATUS",
+          "value": 5
+        },
+        {
+          "key": "SEND_VIA_SMS",
+          "value": 6
+        },
+        {
+          "key": "SEND_VIA_EMAIL",
+          "value": 7
+        },
+        {
+          "key": "GROUP_LINK_HEADER",
+          "value": 8
+        },
+        {
+          "key": "SEND_VIA_INSTAGRAM",
+          "value": 9
+        },
+        {
+          "key": "SEND_VIA_MESSENGER",
+          "value": 10
+        },
+        {
+          "key": "COPY_LINK_ADD_MEMBER",
+          "value": 11
+        }
+      ]
+    },
+    {
+      "name": "HARMFUL_FILE_WARNING_CLICKTHROUGH_ACTION",
+      "module": "WAWebWamEnumHarmfulFileWarningClickthroughAction",
+      "variants": [
+        {
+          "key": "CANCEL",
+          "value": 0
+        },
+        {
+          "key": "OPEN",
+          "value": 1
+        },
+        {
+          "key": "DIALOG_DISMISSED",
+          "value": 2
+        },
+        {
+          "key": "LEARN_MORE",
+          "value": 3
+        },
+        {
+          "key": "DIALOG_OPEN",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "name": "HARMFUL_FILE_WARNING_SENDER_RELATIONSHIP",
+      "module": "WAWebWamEnumHarmfulFileWarningSenderRelationship",
+      "variants": [
+        {
+          "key": "NON_CONTACT",
+          "value": 0
+        },
+        {
+          "key": "CONTACT",
+          "value": 1
+        },
+        {
+          "key": "SIDE_CONTACT",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "INVITE_LINK_ENTRY_POINT_TYPE",
+      "module": "WAWebWamEnumInviteLinkEntryPointType",
+      "variants": [
+        {
+          "key": "UNKNOWN",
+          "value": 0
+        },
+        {
+          "key": "QR_ICON",
+          "value": 1
+        },
+        {
+          "key": "PARTICIPANTS_ROW",
+          "value": 2
+        },
+        {
+          "key": "CONTEXT_CARD",
+          "value": 3
+        },
+        {
+          "key": "ADD_MEMBER",
+          "value": 4
+        },
+        {
+          "key": "COMMUNITY_HOME_HEADER",
+          "value": 5
+        },
+        {
+          "key": "COMMUNITY_HOME_ADD_MEMBERS_BOTTOM_SHEET",
+          "value": 6
+        },
+        {
+          "key": "SYSTEM_MESSAGE_INVITE_LINK_AVAILABLE_AGAIN",
+          "value": 7
+        },
+        {
+          "key": "SYSTEM_MESSAGE_INVITE_LINK_AVAILABLE_REVOKED",
+          "value": 8
+        },
+        {
+          "key": "GROUP_INFO_ACTION_TILE",
+          "value": 9
+        },
+        {
+          "key": "MEMBERS_LIST_INVITE_BUTTON",
+          "value": 10
+        }
+      ]
+    },
+    {
+      "name": "STATUS_ROW_ENTRY_METHOD",
+      "module": "WAWebWamEnumStatusRowEntryMethod",
+      "variants": [
+        {
+          "key": "DIRECT_ROW_TAP",
+          "value": 1
+        },
+        {
+          "key": "BACKWARDS_SWIPE",
+          "value": 2
+        },
+        {
+          "key": "FOWARDS_SWIPE",
+          "value": 3
+        },
+        {
+          "key": "BACKWARDS_TAP",
+          "value": 4
+        },
+        {
+          "key": "FOWARDS_TAP",
+          "value": 5
+        },
+        {
+          "key": "PREVIOUS_ROW_TIMEOUT",
+          "value": 6
+        }
+      ]
+    }
+  ]
+}

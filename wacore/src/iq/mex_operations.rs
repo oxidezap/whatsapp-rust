@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 // Historical contracts retained at their public paths; see the sibling's provenance.
 pub use super::mex_operations_unlisted::{
     biz_custom_url_get_user_graphql, create_labyrinth_backup, debug_labyrinth_inbox_snapshot,
-    debug_labyrinth_range, eb_message_metadata_query, rotate_labyrinth_epoch,
-    team_link_create_invitation, team_link_list_invitations, team_link_remove_invitation,
-    upload_labyrinth_messages,
+    debug_labyrinth_range, eb_message_metadata_query, fetch_about_status,
+    internal_directory_fetch_members, rotate_labyrinth_epoch, team_link_create_invitation,
+    team_link_list_invitations, team_link_remove_invitation, upload_labyrinth_messages,
 };
 
 /// `WAWebACSServerProviderConfigQuery` (query).
@@ -8144,6 +8144,8 @@ pub mod fetch_subscriptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub enabled: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expiration_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limit: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8158,6 +8160,8 @@ pub mod fetch_subscriptions {
         pub end_time: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_platform_changed: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15343,6 +15347,7 @@ pub mod usync {
     pub const DOC_ID: &str = "28340427968970000";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[
+        "include_about_status",
         "include_country_code",
         "include_orgs",
         "include_username",
@@ -15362,6 +15367,8 @@ pub mod usync {
     #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_about_status: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub include_country_code: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub include_orgs: Option<bool>,
@@ -15369,6 +15376,20 @@ pub mod usync {
         pub include_username: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct AboutStatusInfo {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timestamp: Option<i64>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -15422,6 +15443,8 @@ pub mod usync {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub about_status_info: Option<AboutStatusInfo>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

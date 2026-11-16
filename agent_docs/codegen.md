@@ -51,6 +51,10 @@ app-state schemas and stale props use their hand-written sibling files. Select
 wire enums by the owning module, not just an identical variant set. IQ targets
 are generated only where the namespace does not already imply the target.
 Incoming wire tags include notification, server-request and stanza domains.
+Focused `*-snapshot-retention.json` fixtures preserve removed public MEX and
+WAM contracts. Historical WAM members stay outside current call-site evidence;
+`retained-abprops.json` constants stay outside the current registries' `ALL`
+slices. Reclaimed names or wire IDs stop generation for review.
 
 Reclaimed Labyrinth declarations have incompatible field types, requiredness or
 result wrappers. The proto emitter keeps the historical declarations and emits

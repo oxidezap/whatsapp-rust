@@ -1160,6 +1160,8 @@ message WrapTransportSigningSecretKeyInput {
 message WrapTransportSigningSecretKeyResult {
   required bytes prefixedKey = 1;
 }
+// Retained from whatspec ae3880925bacd23863cc30ec480c9f82bfd869f1.
+// Absent from the 2.3000.1054751086 capture.
 message Reportable {
   optional uint32 minVersion = 1 [default = 1];
   optional uint32 maxVersion = 2;

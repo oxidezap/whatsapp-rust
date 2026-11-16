@@ -2864,6 +2864,18 @@ pub mod enums {
         SmbOrdersDeprecationBanner,
         /// `NOTIFICATION_SETTINGS_BLOCKER` = 141.
         NotificationSettingsBlocker,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SQUID` = 69.
+        Squid,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `CF_MIGRATION` = 94.
+        CfMigration,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_BOTTOMSHEET` = 95.
+        AvatarBottomsheet,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_DEPRECATION` = 106.
+        AvatarDeprecation,
     }
 
     impl BannerTypes {
@@ -2995,6 +3007,10 @@ pub mod enums {
                 Self::MagicCueUserEducation => 139,
                 Self::SmbOrdersDeprecationBanner => 140,
                 Self::NotificationSettingsBlocker => 141,
+                Self::Squid => 69,
+                Self::CfMigration => 94,
+                Self::AvatarBottomsheet => 95,
+                Self::AvatarDeprecation => 106,
             }
         }
     }
@@ -35462,6 +35478,9 @@ pub mod enums {
         CoverPhoto,
         /// `GROUP_CREATION` = 31.
         GroupCreation,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR` = 21.
+        Avatar,
     }
 
     impl PrivacyControlItemType {
@@ -35499,6 +35518,7 @@ pub mod enums {
                 Self::Channels => 29,
                 Self::CoverPhoto => 30,
                 Self::GroupCreation => 31,
+                Self::Avatar => 21,
             }
         }
     }
@@ -35855,6 +35875,9 @@ pub mod enums {
         AiHatch,
         /// `EVENT_V2` = 64.
         EventV2,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATARS` = 55.
+        Avatars,
     }
 
     impl ProductArea {
@@ -35923,6 +35946,7 @@ pub mod enums {
                 Self::InAppBrowser => 62,
                 Self::AiHatch => 63,
                 Self::EventV2 => 64,
+                Self::Avatars => 55,
             }
         }
     }
@@ -39342,6 +39366,9 @@ pub mod enums {
         MutedOrArchivedChat,
         /// `MUTED_OR_ARCHIVED_ARCHIVED_CHATS` = 60.
         MutedOrArchivedArchivedChats,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR` = 28.
+        Avatar,
     }
 
     impl SettingsItemType {
@@ -39407,6 +39434,7 @@ pub mod enums {
                 Self::ContextMenuAddSelfStatus => 58,
                 Self::MutedOrArchivedChat => 59,
                 Self::MutedOrArchivedArchivedChats => 60,
+                Self::Avatar => 28,
             }
         }
     }
@@ -39418,6 +39446,9 @@ pub mod enums {
         Settings,
         /// `ME_TAB` = 1.
         MeTab,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_COINFLIP` = 2.
+        AvatarCoinflip,
     }
 
     impl SettingsPageType {
@@ -39426,6 +39457,7 @@ pub mod enums {
             match self {
                 Self::Settings => 0,
                 Self::MeTab => 1,
+                Self::AvatarCoinflip => 2,
             }
         }
     }
@@ -46560,6 +46592,18 @@ pub mod enums {
         IdentityHatch,
         /// `PERMISSIONS_HATCH` = 284.
         PermissionsHatch,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `COINFLIP_PREVIEW` = 117.
+        CoinflipPreview,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_HOME` = 118.
+        AvatarHome,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_POSE_AND_BACKGROUND` = 119.
+        AvatarPoseAndBackground,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `AVATAR_HOME_PREVIEW` = 125.
+        AvatarHomePreview,
     }
 
     impl TsSurface {
@@ -46845,6 +46889,10 @@ pub mod enums {
                 Self::ScheduledTasksHatch => 282,
                 Self::IdentityHatch => 283,
                 Self::PermissionsHatch => 284,
+                Self::CoinflipPreview => 117,
+                Self::AvatarHome => 118,
+                Self::AvatarPoseAndBackground => 119,
+                Self::AvatarHomePreview => 125,
             }
         }
     }
@@ -52104,6 +52152,250 @@ pub mod enums {
                 Self::Connecting => 2,
                 Self::Connected => 3,
                 Self::Unknown => 4,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `GROUP_INVITE_LINK_CLICK_ACTION_TYPE` (`WAWebWamEnumGroupInviteLinkClickActionType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum GroupInviteLinkClickActionType {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_INVITE_LINK_SMS_SENT` = 0.
+        GroupInviteLinkSmsSent,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_INVITE_LINK_EMAIL_SENT` = 1.
+        GroupInviteLinkEmailSent,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_INVITE_LINK_SMS_TAPPED` = 2.
+        GroupInviteLinkSmsTapped,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_INVITE_LINK_EMAIL_TAPPED` = 3.
+        GroupInviteLinkEmailTapped,
+    }
+
+    impl GroupInviteLinkClickActionType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::GroupInviteLinkSmsSent => 0,
+                Self::GroupInviteLinkEmailSent => 1,
+                Self::GroupInviteLinkSmsTapped => 2,
+                Self::GroupInviteLinkEmailTapped => 3,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `GROUP_INVITE_LINK_ENTRY_POINT` (`WAWebWamEnumGroupInviteLinkEntryPoint`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum GroupInviteLinkEntryPoint {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `COPY_LINK` = 1.
+        CopyLink,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `QR_CODE` = 2.
+        QrCode,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SHARE_GROUP_LINK` = 3.
+        ShareGroupLink,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_IN_WHATSAPP` = 4.
+        SendInWhatsapp,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_IN_STATUS` = 5.
+        SendInStatus,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_VIA_SMS` = 6.
+        SendViaSms,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_VIA_EMAIL` = 7.
+        SendViaEmail,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_LINK_HEADER` = 8.
+        GroupLinkHeader,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_VIA_INSTAGRAM` = 9.
+        SendViaInstagram,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SEND_VIA_MESSENGER` = 10.
+        SendViaMessenger,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `COPY_LINK_ADD_MEMBER` = 11.
+        CopyLinkAddMember,
+    }
+
+    impl GroupInviteLinkEntryPoint {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::CopyLink => 1,
+                Self::QrCode => 2,
+                Self::ShareGroupLink => 3,
+                Self::SendInWhatsapp => 4,
+                Self::SendInStatus => 5,
+                Self::SendViaSms => 6,
+                Self::SendViaEmail => 7,
+                Self::GroupLinkHeader => 8,
+                Self::SendViaInstagram => 9,
+                Self::SendViaMessenger => 10,
+                Self::CopyLinkAddMember => 11,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `HARMFUL_FILE_WARNING_CLICKTHROUGH_ACTION` (`WAWebWamEnumHarmfulFileWarningClickthroughAction`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum HarmfulFileWarningClickthroughAction {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `CANCEL` = 0.
+        Cancel,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `OPEN` = 1.
+        Open,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `DIALOG_DISMISSED` = 2.
+        DialogDismissed,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `LEARN_MORE` = 3.
+        LearnMore,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `DIALOG_OPEN` = 4.
+        DialogOpen,
+    }
+
+    impl HarmfulFileWarningClickthroughAction {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::Cancel => 0,
+                Self::Open => 1,
+                Self::DialogDismissed => 2,
+                Self::LearnMore => 3,
+                Self::DialogOpen => 4,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `HARMFUL_FILE_WARNING_SENDER_RELATIONSHIP` (`WAWebWamEnumHarmfulFileWarningSenderRelationship`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum HarmfulFileWarningSenderRelationship {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `NON_CONTACT` = 0.
+        NonContact,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `CONTACT` = 1.
+        Contact,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SIDE_CONTACT` = 2.
+        SideContact,
+    }
+
+    impl HarmfulFileWarningSenderRelationship {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::NonContact => 0,
+                Self::Contact => 1,
+                Self::SideContact => 2,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `INVITE_LINK_ENTRY_POINT_TYPE` (`WAWebWamEnumInviteLinkEntryPointType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum InviteLinkEntryPointType {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `UNKNOWN` = 0.
+        Unknown,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `QR_ICON` = 1.
+        QrIcon,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `PARTICIPANTS_ROW` = 2.
+        ParticipantsRow,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `CONTEXT_CARD` = 3.
+        ContextCard,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `ADD_MEMBER` = 4.
+        AddMember,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `COMMUNITY_HOME_HEADER` = 5.
+        CommunityHomeHeader,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `COMMUNITY_HOME_ADD_MEMBERS_BOTTOM_SHEET` = 6.
+        CommunityHomeAddMembersBottomSheet,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SYSTEM_MESSAGE_INVITE_LINK_AVAILABLE_AGAIN` = 7.
+        SystemMessageInviteLinkAvailableAgain,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SYSTEM_MESSAGE_INVITE_LINK_AVAILABLE_REVOKED` = 8.
+        SystemMessageInviteLinkAvailableRevoked,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GROUP_INFO_ACTION_TILE` = 9.
+        GroupInfoActionTile,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MEMBERS_LIST_INVITE_BUTTON` = 10.
+        MembersListInviteButton,
+    }
+
+    impl InviteLinkEntryPointType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::Unknown => 0,
+                Self::QrIcon => 1,
+                Self::ParticipantsRow => 2,
+                Self::ContextCard => 3,
+                Self::AddMember => 4,
+                Self::CommunityHomeHeader => 5,
+                Self::CommunityHomeAddMembersBottomSheet => 6,
+                Self::SystemMessageInviteLinkAvailableAgain => 7,
+                Self::SystemMessageInviteLinkAvailableRevoked => 8,
+                Self::GroupInfoActionTile => 9,
+                Self::MembersListInviteButton => 10,
+            }
+        }
+    }
+
+    /// Historical SDK enum from whatspec ae388092; absent from the current Web capture.
+    /// `STATUS_ROW_ENTRY_METHOD` (`WAWebWamEnumStatusRowEntryMethod`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum StatusRowEntryMethod {
+        /// Historical SDK member; absent from the current Web capture.
+        /// `DIRECT_ROW_TAP` = 1.
+        DirectRowTap,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `BACKWARDS_SWIPE` = 2.
+        BackwardsSwipe,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `FOWARDS_SWIPE` = 3.
+        FowardsSwipe,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `BACKWARDS_TAP` = 4.
+        BackwardsTap,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `FOWARDS_TAP` = 5.
+        FowardsTap,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `PREVIOUS_ROW_TIMEOUT` = 6.
+        PreviousRowTimeout,
+    }
+
+    impl StatusRowEntryMethod {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::DirectRowTap => 1,
+                Self::BackwardsSwipe => 2,
+                Self::FowardsSwipe => 3,
+                Self::BackwardsTap => 4,
+                Self::FowardsTap => 5,
+                Self::PreviousRowTimeout => 6,
             }
         }
     }
@@ -89945,6 +90237,162 @@ pub mod events {
                 7,
                 self.webc_email_invite_server_send_result.map(|v| v.wire()),
             );
+        }
+    }
+
+    /// Historical SDK event from whatspec ae388092; no current Web call-site evidence.
+    /// `StatusRowView`: WAM event 1656 on the `regular` channel.
+    ///
+    /// Declared in `WAWebStatusRowViewWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct StatusRowView {
+        /// `dedupKey` (id 11).
+        pub dedup_key: Option<i64>,
+        /// `psaCampaigns` (id 8).
+        pub psa_campaigns: Option<String>,
+        /// `statusRowEntryMethod` (id 5).
+        pub status_row_entry_method: Option<enums::StatusRowEntryMethod>,
+        /// `statusRowIndex` (id 4).
+        pub status_row_index: Option<i64>,
+        /// `statusRowSection` (id 3).
+        pub status_row_section: Option<enums::StatusRowSection>,
+        /// `statusRowUnreadItemCount` (id 7).
+        pub status_row_unread_item_count: Option<i64>,
+        /// `statusRowViewCount` (id 6).
+        pub status_row_view_count: Option<i64>,
+        /// `statusSessionId` (id 1).
+        pub status_session_id: Option<i64>,
+        /// `statusViewerSessionId` (id 2).
+        pub status_viewer_session_id: Option<i64>,
+        /// `unifiedSessionId` (id 9).
+        pub unified_session_id: Option<String>,
+        /// `updatesTabSessionId` (id 10).
+        pub updates_tab_session_id: Option<i64>,
+    }
+
+    impl WamEvent for StatusRowView {
+        const NAME: &'static str = "StatusRowView";
+        const CODE: u32 = 1656;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(11, self.dedup_key);
+            fields.string(8, self.psa_campaigns.as_deref());
+            fields.integer(5, self.status_row_entry_method.map(|v| v.wire()));
+            fields.integer(4, self.status_row_index);
+            fields.integer(3, self.status_row_section.map(|v| v.wire()));
+            fields.integer(7, self.status_row_unread_item_count);
+            fields.integer(6, self.status_row_view_count);
+            fields.integer(1, self.status_session_id);
+            fields.integer(2, self.status_viewer_session_id);
+            fields.string(9, self.unified_session_id.as_deref());
+            fields.integer(10, self.updates_tab_session_id);
+        }
+    }
+
+    /// Historical SDK event from whatspec ae388092; no current Web call-site evidence.
+    /// `GroupInviteLinkClick`: WAM event 3526 on the `regular` channel.
+    ///
+    /// Declared in `WAWebGroupInviteLinkClickWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct GroupInviteLinkClick {
+        /// `dedupKey` (id 5).
+        pub dedup_key: Option<i64>,
+        /// `groupInviteLinkClickAction` (id 3).
+        pub group_invite_link_click_action: Option<enums::GroupInviteLinkClickActionType>,
+        /// `groupInviteLinkClickGroupId` (id 4).
+        pub group_invite_link_click_group_id: Option<String>,
+        /// `groupInviteLinkEntryPoint` (id 1).
+        pub group_invite_link_entry_point: Option<enums::GroupInviteLinkEntryPoint>,
+        /// `groupTypeClient` (id 2).
+        pub group_type_client: Option<enums::GroupTypeClient>,
+    }
+
+    impl WamEvent for GroupInviteLinkClick {
+        const NAME: &'static str = "GroupInviteLinkClick";
+        const CODE: u32 = 3526;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(5, self.dedup_key);
+            fields.integer(3, self.group_invite_link_click_action.map(|v| v.wire()));
+            fields.string(4, self.group_invite_link_click_group_id.as_deref());
+            fields.integer(1, self.group_invite_link_entry_point.map(|v| v.wire()));
+            fields.integer(2, self.group_type_client.map(|v| v.wire()));
+        }
+    }
+
+    /// Historical SDK event from whatspec ae388092; no current Web call-site evidence.
+    /// `DangerousFileOpenStatsV2`: WAM event 6708 on the `private` channel.
+    ///
+    /// Declared in `WAWebDangerousFileOpenStatsV2WamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct DangerousFileOpenStatsV2 {
+        /// `harmfulFileWarningClickthroughAction` (id 1).
+        pub harmful_file_warning_clickthrough_action:
+            Option<enums::HarmfulFileWarningClickthroughAction>,
+        /// `harmfulFileWarningSenderRelationship` (id 2).
+        pub harmful_file_warning_sender_relationship:
+            Option<enums::HarmfulFileWarningSenderRelationship>,
+    }
+
+    impl WamEvent for DangerousFileOpenStatsV2 {
+        const NAME: &'static str = "DangerousFileOpenStatsV2";
+        const CODE: u32 = 6708;
+        const CHANNEL: Channel = Channel::Private;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = Some(0);
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(
+                1,
+                self.harmful_file_warning_clickthrough_action
+                    .map(|v| v.wire()),
+            );
+            fields.integer(
+                2,
+                self.harmful_file_warning_sender_relationship
+                    .map(|v| v.wire()),
+            );
+        }
+    }
+
+    /// Historical SDK event from whatspec ae388092; no current Web call-site evidence.
+    /// `GroupInviteLinkPageVisit`: WAM event 7380 on the `regular` channel.
+    ///
+    /// Declared in `WAWebGroupInviteLinkPageVisitWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct GroupInviteLinkPageVisit {
+        /// `dedupKey` (id 4).
+        pub dedup_key: Option<i64>,
+        /// `groupId` (id 1).
+        pub group_id: Option<String>,
+        /// `inviteLinkEntryPoint` (id 2).
+        pub invite_link_entry_point: Option<enums::InviteLinkEntryPointType>,
+        /// `userJourneyEventMs` (id 3).
+        pub user_journey_event_ms: Option<i64>,
+    }
+
+    impl WamEvent for GroupInviteLinkPageVisit {
+        const NAME: &'static str = "GroupInviteLinkPageVisit";
+        const CODE: u32 = 7380;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(4, self.dedup_key);
+            fields.string(1, self.group_id.as_deref());
+            fields.integer(2, self.invite_link_entry_point.map(|v| v.wire()));
+            fields.integer(3, self.user_journey_event_ms);
         }
     }
 }

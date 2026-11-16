@@ -42,6 +42,18 @@ pub struct AbProp {
 ";
 
 pub fn generate(ir: &AbPropsIr) -> Result<String> {
+    let retained: AbPropsIr =
+        serde_json::from_str(include_str!("../../fixtures/retained-abprops.json"))?;
+    for historical in &retained.configs {
+        ensure!(
+            !ir.configs
+                .iter()
+                .any(|current| current.module == historical.module
+                    && current.name == historical.name),
+            "upstream reclaimed {}; reconcile retained-abprops.json before regenerating",
+            historical.name
+        );
+    }
     for (module, retained) in [
         ("WAWebABPropsConfigs", RETAINED_WEB_PROPS),
         ("WAWebHybridABPropsConfigs", RETAINED_HYBRID_PROPS),
@@ -77,7 +89,12 @@ pub fn generate(ir: &AbPropsIr) -> Result<String> {
             j += 1;
         }
         let ident = unique_ident(&module_ident(wa_module), &mut module_idents, "m");
-        out.push_str(&render_module(&ident, wa_module, &ir.configs[i..j]));
+        out.push_str(&render_module(
+            &ident,
+            wa_module,
+            &ir.configs[i..j],
+            &retained.configs,
+        ));
         emitted.push(ident);
         i = j;
     }
@@ -93,7 +110,12 @@ pub fn generate(ir: &AbPropsIr) -> Result<String> {
     Ok(out)
 }
 
-fn render_module(ident: &str, wa_module: &str, group: &[AbPropConfig]) -> String {
+fn render_module(
+    ident: &str,
+    wa_module: &str,
+    group: &[AbPropConfig],
+    retained: &[AbPropConfig],
+) -> String {
     let mut out = format!(
         "/// `{wa_module}` — {} flags.\npub mod {ident} {{\n    use super::{{AbDefault, AbProp, AbPropType}};\n\n",
         group.len()
@@ -101,6 +123,16 @@ fn render_module(ident: &str, wa_module: &str, group: &[AbPropConfig]) -> String
     // Ident scope is per module, so a flag carried by two registries keeps its
     // name in each.
     let mut used = HashSet::new();
+    if retained.iter().any(|config| config.module == wa_module) {
+        out.push_str("    // Historical API from whatspec ae388092, excluded from the current catalog's ALL.\n");
+    }
+    for historical in retained.iter().filter(|config| config.module == wa_module) {
+        let name = unique_ident(&snake_case(&historical.name).to_uppercase(), &mut used, "F");
+        out.push_str(&format!(
+            "    pub const {name}: AbProp = AbProp {{ name: {}, code: {}, value_type: AbPropType::{}, default: {} }};\n",
+            rust_lit(&historical.name), historical.code, type_variant(historical.value_type), default_lit(&historical.default),
+        ));
+    }
     if let Some(retained) = match wa_module {
         "WAWebABPropsConfigs" => Some(RETAINED_WEB_PROPS),
         "WAWebHybridABPropsConfigs" => Some(RETAINED_HYBRID_PROPS),
@@ -263,6 +295,36 @@ fn default_lit(s: &Scalar) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn newly_absent_group_props_keep_their_api_without_reentering_the_catalog() {
+        let current = ir(vec![cfg(
+            "WAWebGroupABPropsConfigs",
+            "current_flag",
+            1,
+            AbPropType::Bool,
+            Scalar::Bool(false),
+        )]);
+        let code = generate(&current).unwrap();
+        assert!(code.contains("GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS_GROUP_LEVEL: AbProp"));
+        assert!(code.contains(
+            "code: 26270, value_type: AbPropType::Int, default: AbDefault::Int(1209600)"
+        ));
+        let all = code.split("pub const ALL: &[AbProp]").nth(1).unwrap();
+        assert!(!all.contains("GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS_GROUP_LEVEL"));
+        let reclaimed = ir(vec![cfg(
+            "WAWebGroupABPropsConfigs",
+            "group_history_messages_time_limit_secs_group_level",
+            26270,
+            AbPropType::Int,
+            Scalar::Int(1209600),
+        )]);
+        assert!(
+            generate(&reclaimed)
+                .unwrap_err()
+                .to_string()
+                .contains("reclaimed")
+        );
+    }
     #[test]
     fn historical_names_are_guarded_per_registry() {
         let mut ir: AbPropsIr = serde_json::from_value(serde_json::json!({

@@ -485,7 +485,7 @@ pub struct WamPrivateStatsId {
     pub rotation_period_days: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WamIr {
     pub events: Vec<WamEventDef>,

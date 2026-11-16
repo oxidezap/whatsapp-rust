@@ -1,0 +1,58 @@
+{
+  "sourceRev": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+  "fields": [
+    {
+      "operation": "FetchSubscriptions",
+      "docId": "35324254123840149",
+      "root": "response",
+      "path": [
+        "xwa_get_subscriptions",
+        "feature_flags",
+        "[]",
+        "expiration_time"
+      ],
+      "retained": "number",
+      "reviewedDocId": "29102521762691581"
+    },
+    {
+      "operation": "FetchSubscriptions",
+      "docId": "35324254123840149",
+      "root": "response",
+      "path": [
+        "xwa_get_subscriptions",
+        "subscriptions",
+        "[]",
+        "is_platform_changed"
+      ],
+      "retained": "boolean",
+      "reviewedDocId": "29102521762691581"
+    },
+    {
+      "operation": "Usync",
+      "docId": "28496738596651319",
+      "root": "variablesShape",
+      "path": [
+        "include_about_status"
+      ],
+      "retained": "boolean",
+      "reviewedDocId": "28340427968970000"
+    },
+    {
+      "operation": "Usync",
+      "docId": "28496738596651319",
+      "root": "response",
+      "path": [
+        "xwa2_fetch_wa_users",
+        "[]",
+        "about_status_info"
+      ],
+      "retained": {
+        "__typename": "string",
+        "status": "string",
+        "text": "string",
+        "timestamp": "number"
+      },
+      "reviewedDocId": "28340427968970000"
+    }
+  ]
+}

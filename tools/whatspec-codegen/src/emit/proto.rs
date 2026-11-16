@@ -81,7 +81,6 @@ fn reconcile_reclaimed(upstream: &str, reviewed: &BTreeMap<String, String>) -> R
         let start = upstream
             .find(&format!("\nmessage {name} {{\n"))
             .map(|at| at + 1);
-        // Synthetic inputs and the first declaration need no leading newline.
         let start = start.or_else(|| {
             upstream
                 .starts_with(&format!("message {name} {{\n"))
@@ -91,7 +90,7 @@ fn reconcile_reclaimed(upstream: &str, reviewed: &BTreeMap<String, String>) -> R
         let end = end_of_message(&upstream[start..], name)
             .ok_or_else(|| anyhow::anyhow!("reclaimed message {name} incomplete"))?;
         ensure!(
-            crate::source::digest(upstream[start..start + end].as_bytes()) == *digest,
+            crate::source::digest(&upstream.as_bytes()[start..start + end]) == *digest,
             "reclaimed message {name} changed; review its wire contract"
         );
         ensure!(

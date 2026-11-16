@@ -544,3 +544,128 @@ pub mod biz_custom_url_get_user_graphql {
         pub xwa_custom_url_get_user: Option<XwaCustomUrlGetUser>,
     }
 }
+
+// Retained from whatspec ae3880925bacd23863cc30ec480c9f82bfd869f1.
+// Absent from the 2.3000.1054751086 capture.
+pub mod fetch_about_status {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexFetchAboutStatusJobQuery";
+    pub const DOC_ID: &str = "24535500086059408";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["user"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct User {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user: Option<User>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Updates {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2UsersUpdatesSince {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub updates: Option<Vec<Updates>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_users_updates_since: Option<Vec<Xwa2UsersUpdatesSince>>,
+    }
+}
+pub mod internal_directory_fetch_members {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebInternalDirectoryFetchMembersJobQuery";
+    pub const DOC_ID: &str = "28645118498472724";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["after", "first"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct After {
+        #[serde(rename = "invalidLidCount")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invalid_lid_count: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub after: Option<After>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Node {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub designation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enrollment_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub team: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Edges {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node: Option<Node>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PageInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_next_page: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaWhatsappForWorkEmployeeDirectory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub edges: Option<Vec<Edges>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub page_info: Option<PageInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_whatsapp_for_work_employee_directory: Option<XwaWhatsappForWorkEmployeeDirectory>,
+    }
+}
