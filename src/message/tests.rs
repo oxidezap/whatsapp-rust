@@ -840,14 +840,110 @@ async fn group_status_skmsg_reaches_application_with_status_context_and_receipt(
 }
 
 #[tokio::test]
+async fn confirmations_include_status_acks_but_exclude_nacks() {
+    let (client, transport) = capturing_client("confirmation_classes").await;
+    const ID: &str = "CONFIRMATION-CLASSES";
+    for (tag, class, error) in [
+        ("ack", "status", None),
+        ("ack", "message", None),
+        ("ack", "status", Some("491")),
+        ("ack", "receipt", None),
+        ("receipt", "status", None),
+    ] {
+        let mut node = NodeBuilder::new(tag).attr("id", ID).attr("class", class);
+        if let Some(error) = error {
+            node = node.attr("error", error);
+        }
+        client.send_node(node.build()).await.unwrap();
+    }
+    assert_eq!(transport.sent_count(), 5);
+    assert_eq!(confirmations_for(&transport.sent(), ID), 3);
+}
+
+#[cfg(feature = "instance-clock")]
+#[tokio::test]
+async fn status_expiring_while_waiting_for_sender_key_lock_is_terminal() {
+    use crate::{ClockedRuntime, VirtualClock};
+    let now = 1_700_100_000i64;
+    for (failure, is_status_stanza) in [
+        ("missing_key", true),
+        ("invalid_ciphertext", true),
+        ("missing_key", false),
+        ("invalid_ciphertext", false),
+    ] {
+        let clock = Arc::new(VirtualClock::new(now * 1000, wacore::time::Instant::ZERO).unwrap());
+        let backend = Arc::new(wacore::store::InMemoryBackend::new().with_clock(clock.clone()));
+        let persistence = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let (client, _) = capturing_client_configured("expiry_boundary", |builder| {
+            builder
+                .with_runtime(ClockedRuntime::new(
+                    Arc::new(crate::TokioRuntime),
+                    clock.clone(),
+                ))
+                .with_persistence_manager(persistence)
+        })
+        .await;
+        let group = Jid::status_broadcast();
+        let mut peer = AlicePeer::new("100000000000022@lid").await;
+        peer.create_group_skdm(&group).await;
+        let ciphertext = if failure == "missing_key" {
+            encrypt_group_text(&mut peer, &group, "sender key absent").await
+        } else {
+            vec![0]
+        };
+        let mut info = (*group_message_info("EXPIRY-BOUNDARY", &group, &peer.jid, false)).clone();
+        info.is_status_stanza = is_status_stanza;
+        info.timestamp = chrono::DateTime::from_timestamp(now - 86400, 0).unwrap();
+        let info = Arc::new(info);
+        let adapter = client.signal_adapter();
+        let name = make_sender_key_name(&group, &peer.jid.to_protocol_address());
+        let lock = adapter.sender_key_store.sender_key_lock(&name).await;
+        let guard = lock.lock().await;
+        let payloads = [skmsg_payload_from_bytes(ciphertext)];
+        let mut processing = Box::pin(
+            client
+                .clone()
+                .group_expiry_outcome_for_test(&payloads, &info),
+        );
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+        clock.advance(std::time::Duration::from_secs(1)).unwrap();
+        drop(guard);
+        assert!(
+            processing.await,
+            "{failure} skipped at expiry must be terminal"
+        );
+    }
+}
+
+#[tokio::test]
 async fn status_processing_failure_respects_envelope_nack_guard() {
-    for (kind, hide, error) in [
-        ("media", false, Some("487")),
-        ("media", true, None),
-        ("reaction", false, None),
-        ("reaction", true, Some("487")),
+    for (tag, from, kind, hide, error) in [
+        (
+            "status",
+            "120363000000000001@g.us",
+            "media",
+            false,
+            Some("487"),
+        ),
+        ("status", "120363000000000001@g.us", "media", true, None),
+        ("status", "120363000000000001@g.us", "reaction", false, None),
+        (
+            "status",
+            "120363000000000001@g.us",
+            "reaction",
+            true,
+            Some("487"),
+        ),
+        ("message", "status@broadcast", "media", false, Some("487")),
+        ("message", "status@broadcast", "media", true, None),
+        ("message", "status@broadcast", "reaction", false, None),
+        ("message", "status@broadcast", "reaction", true, Some("487")),
     ] {
         let (client, transport) = capturing_client("status_nack_guard").await;
+        client
+            .ab_props()
+            .apply_props(false, std::iter::empty())
+            .await;
         let mut enc = NodeBuilder::new("enc")
             .attr("type", "msg")
             .attr("v", "2")
@@ -857,8 +953,8 @@ async fn status_processing_failure_respects_envelope_nack_guard() {
         }
         client
             .process_node(node_to_arc(
-                NodeBuilder::new("status")
-                    .attr("from", "120363000000000001@g.us")
+                NodeBuilder::new(tag)
+                    .attr("from", from)
                     .attr("participant", "100000000000002@lid")
                     .attr("id", "STATUS-NACK-GUARD")
                     .attr("type", kind)
@@ -882,9 +978,549 @@ async fn status_processing_failure_respects_envelope_nack_guard() {
         assert_eq!(ack.tag.as_ref(), "ack");
         assert_eq!(
             ack.attrs().optional_string("class").as_deref(),
-            Some("status")
+            Some(if tag == "status" { "status" } else { "message" })
         );
         assert_eq!(ack.attrs().optional_string("error").as_deref(), error);
+    }
+}
+
+async fn props_request_id(transport: &crate::transport::mock::CapturingMockTransport) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            for (index, frame) in transport.sent().iter().enumerate() {
+                let Some(bytes) = decode_frame(index, frame) else {
+                    continue;
+                };
+                let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&bytes) else {
+                    continue;
+                };
+                if node.tag.as_ref() == "iq" && node.get_optional_child("props").is_some() {
+                    return node.attrs().optional_string("id").unwrap().to_string();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cold status must fetch props before choosing its Signal address")
+}
+
+#[tokio::test]
+async fn status_envelope_requires_binary_content_for_every_enc_before_decrypting() {
+    for malformed_first in [false, true] {
+        let (client, transport) = capturing_client("status_missing_binary").await;
+        let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let mut peer = joined_group_sender(&client, "100000000000024@lid", &group).await;
+        let mut proto = wa::Message::default();
+        proto.image_message.get_or_insert_default().caption =
+            Some("synthetic encrypted status media".into());
+        let ciphertext = peer
+            .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&proto))
+            .await;
+        let enc = |bytes: Vec<u8>| {
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .attr("v", "2")
+                .bytes(bytes)
+                .build()
+        };
+        let stanza = |children: Vec<wacore_binary::Node>| {
+            node_to_arc(
+                NodeBuilder::new("status")
+                    .attr("from", group.clone())
+                    .attr("participant", peer.jid.clone())
+                    .attr("type", "media")
+                    .attr("id", "STATUS-MISSING-BINARY")
+                    .attr("t", wacore::time::now_secs().to_string())
+                    .children(children)
+                    .build(),
+            )
+        };
+        let mut children = vec![
+            enc(ciphertext.clone()),
+            NodeBuilder::new("enc").attr("type", "skmsg").build(),
+        ];
+        if malformed_first {
+            children.reverse();
+        }
+        assert!(
+            client
+                .classify_incoming_message(&stanza(children))
+                .await
+                .is_none()
+        );
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1);
+        let bytes = decode_frame(0, &frames[0]).unwrap();
+        let nack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(
+            nack.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            nack.attrs().optional_string("error").as_deref(),
+            Some("487")
+        );
+        assert!(events.try_recv().is_err());
+
+        // An explicitly empty binary is present: Web accepts its envelope and
+        // leaves the ciphertext failure to per-slot processing.
+        let empty_binary = stanza(vec![enc(ciphertext.clone()), enc(vec![])]);
+        assert!(
+            client
+                .classify_incoming_message(&empty_binary)
+                .await
+                .is_some()
+        );
+
+        // Rejecting the malformed envelope must not consume the usable sibling's ratchet.
+        client
+            .clone()
+            .process_node(stanza(vec![enc(ciphertext)]))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let Some(message) = event
+                    .messages()
+                    .find(|message| message.info.id == "STATUS-MISSING-BINARY")
+                {
+                    assert_eq!(
+                        message.message.image_message.caption.as_deref(),
+                        Some("synthetic encrypted status media")
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("valid replay must still decrypt the original skmsg");
+        assert!(
+            !client.ab_props().is_seeded(),
+            "skmsg does not need status session props"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_status_reaction_fetches_props_before_selecting_a_session() {
+    use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
+    for (value, fetch_enabled) in [(Some("1"), true), (None, true), (None, false)] {
+        let split = value == Some("1");
+        let (client, transport) = capturing_client_configured("cold_status_props", |builder| {
+            builder.with_ab_props_fetch(fetch_enabled)
+        })
+        .await;
+        client.set_driver_running_for_test(true, Ordering::Release);
+        let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        assert!(!client.ab_props().is_seeded());
+        if !fetch_enabled {
+            // A manually supplied full catalog may omit the optional flag;
+            // this is known-default state, unlike an uninitialized catalog.
+            client
+                .ab_props()
+                .apply_props(false, std::iter::empty())
+                .await;
+        }
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let mut peer = AlicePeer::new("100000000000023@lid").await;
+        let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+        let ordinary_receiver = receiver.to_protocol_address();
+        let receiver_address = if split {
+            wacore::types::jid::status_session_address(&ordinary_receiver).unwrap()
+        } else {
+            ordinary_receiver
+        };
+        peer.install_bob_session(&receiver_address, &bundle).await;
+        let mut key = wa::MessageKey::default();
+        key.remote_jid = Some(group.to_string());
+        key.id = Some("SYNTHETIC-COLD-STATUS".into());
+        key.participant = Some("100000000000099@lid".into());
+        key.from_me = Some(false);
+        let mut reaction = wa::message::ReactionMessage::default();
+        reaction.key = buffa::MessageField::some(key);
+        reaction.text = Some("\u{1f44d}".into());
+        let mut proto = wa::Message::default();
+        proto.reaction_message = buffa::MessageField::some(reaction);
+        for index in 0..2 {
+            if index == 1 {
+                peer.sessions
+                    .0
+                    .get_mut(&receiver_address)
+                    .unwrap()
+                    .session_state_mut()
+                    .unwrap()
+                    .clear_unacknowledged_pre_key_message();
+            }
+            let ciphertext = peer
+                .encrypt(&receiver_address, &MessageUtils::encode_and_pad(&proto))
+                .await;
+            let enc = enc_payload_from_ciphertext(&ciphertext);
+            assert_eq!(
+                enc.enc_type,
+                if index == 0 {
+                    EncType::PreKeyMessage
+                } else {
+                    EncType::Message
+                }
+            );
+            let id = format!("COLD-STATUS-REACTION-{index}");
+            let node = node_to_arc(
+                NodeBuilder::new("status")
+                    .attr("from", group.clone())
+                    .attr("participant", peer.jid.clone())
+                    .attr("type", "reaction")
+                    .attr("id", id.as_str())
+                    .attr("t", wacore::time::now_secs().to_string())
+                    .children([
+                        NodeBuilder::new("meta")
+                            .attr("session_scope", "status")
+                            .attr("target_id", "SYNTHETIC-COLD-STATUS")
+                            .build(),
+                        NodeBuilder::new("enc")
+                            .attr("type", enc.enc_type.as_wire_str())
+                            .attr("v", "2")
+                            .bytes(enc.ciphertext.to_vec())
+                            .build(),
+                    ])
+                    .build(),
+            );
+            let classified = client.classify_incoming_message(&node).await.unwrap();
+            let processing = tokio::spawn(client.clone().process_classified_message(
+                classified,
+                client.connection_generation.load(Ordering::Acquire),
+            ));
+            if index == 0 && fetch_enabled {
+                let request = props_request_id(&transport).await;
+                let adapter = client.signal_adapter();
+                let ordinary = peer.jid.to_protocol_address();
+                assert!(
+                    adapter
+                        .session_store
+                        .load_session(&ordinary)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    adapter
+                        .session_store
+                        .load_session(
+                            &wacore::types::jid::status_session_address(&ordinary).unwrap()
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let props = value
+                    .into_iter()
+                    .map(|value| {
+                        NodeBuilder::new("prop")
+                            .attr("config_code", STATUS_INFRA_1_1_SESSION_SPLIT.code)
+                            .attr("config_value", value)
+                            .build()
+                    })
+                    .collect::<Vec<_>>();
+                client
+                    .clone()
+                    .process_node(node_to_arc(
+                        NodeBuilder::new("iq")
+                            .attr("from", "s.whatsapp.net")
+                            .attr("type", "result")
+                            .attr("id", request)
+                            .children([NodeBuilder::new("props")
+                                .attr("hash", "synthetic-props")
+                                .attr("delta_update", "false")
+                                .children(props)
+                                .build()])
+                            .build(),
+                    ))
+                    .await;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), processing)
+                .await
+                .unwrap()
+                .unwrap();
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if let Some(message) = event.messages().find(|message| message.info.id == id) {
+                        assert_eq!(
+                            message.message.reaction_message.text.as_deref(),
+                            Some("\u{1f44d}")
+                        );
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(delivered.is_ok(), "reaction must reach the application");
+            let ordinary = peer.jid.to_protocol_address();
+            let adapter = client.signal_adapter();
+            assert_eq!(
+                adapter
+                    .session_store
+                    .load_session(&ordinary)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                !split
+            );
+            assert_eq!(
+                adapter
+                    .session_store
+                    .load_session(&wacore::types::jid::status_session_address(&ordinary).unwrap())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                split
+            );
+        }
+        assert!(client.ab_props().is_seeded());
+    }
+}
+
+#[tokio::test]
+async fn classic_status_waits_for_props_before_any_ack() {
+    use wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT;
+    let (client, transport) = capturing_client("classic_status_cold_props").await;
+    client.set_driver_running_for_test(true, Ordering::Release);
+    let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let mut peer = AlicePeer::new("100000000000026@lid").await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let address =
+        wacore::types::jid::status_session_address(&receiver.to_protocol_address()).unwrap();
+    peer.install_bob_session(&address, &bundle).await;
+    let mut proto = wa::Message::default();
+    proto.conversation = Some("synthetic classic status".into());
+    let ciphertext = peer
+        .encrypt(&address, &MessageUtils::encode_and_pad(&proto))
+        .await;
+    let payload = enc_payload_from_ciphertext(&ciphertext);
+    let id = "CLASSIC-STATUS-COLD-PROPS";
+    client
+        .clone()
+        .process_node(node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", Jid::status_broadcast())
+                .attr("participant", peer.jid.clone())
+                .attr("id", id)
+                .attr("type", "text")
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("session_scope", "status")
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("type", payload.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .bytes(payload.ciphertext.to_vec())
+                        .build(),
+                ])
+                .build(),
+        ))
+        .await;
+    let request = props_request_id(&transport).await;
+    assert_eq!(
+        confirmations_for(&transport.sent(), id),
+        0,
+        "unknown status session must not be acknowledged on enqueue"
+    );
+    client
+        .clone()
+        .process_node(node_to_arc(
+            NodeBuilder::new("iq")
+                .attr("from", "s.whatsapp.net")
+                .attr("type", "result")
+                .attr("id", request)
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic-props")
+                    .attr("delta_update", "false")
+                    .children([NodeBuilder::new("prop")
+                        .attr("config_code", STATUS_INFRA_1_1_SESSION_SPLIT.code)
+                        .attr("config_value", "1")
+                        .build()])
+                    .build()])
+                .build(),
+        ))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while message_texts_for_id(&events, id).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("classic status must reach the application after props resolve");
+    assert_exactly_one_confirmation(&transport, id).await;
+    assert_eq!(delivery_receipts_for(&transport.sent(), id), 1);
+    assert_eq!(message_acks_for(&transport.sent(), id), 0);
+}
+
+#[tokio::test]
+async fn initial_props_fetch_coalesces_concurrent_receivers() {
+    let (client, transport) = capturing_client("initial_props_singleflight").await;
+    client.set_driver_running_for_test(true, Ordering::Release);
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.fetch_initial_props().await })
+    };
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move { client.fetch_initial_props().await })
+    };
+    let request = props_request_id(&transport).await;
+    client
+        .clone()
+        .process_node(node_to_arc(
+            NodeBuilder::new("iq")
+                .attr("from", "s.whatsapp.net")
+                .attr("type", "result")
+                .attr("id", request)
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic-props")
+                    .attr("delta_update", "false")
+                    .build()])
+                .build(),
+        ))
+        .await;
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert!(client.ab_props().is_seeded());
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "waiting receivers reuse the first full catalog"
+    );
+}
+
+#[tokio::test]
+async fn unknown_status_session_props_never_mutate_sessions_or_ack() {
+    for (fetch_enabled, retry_count) in [(false, 0), (true, 0), (true, MAX_DECRYPT_RETRIES)] {
+        let (client, transport) = capturing_client_configured("unknown_status_props", |builder| {
+            builder.with_ab_props_fetch(fetch_enabled)
+        })
+        .await;
+        client.set_driver_running_for_test(true, Ordering::Release);
+        let mut peer = AlicePeer::new("100000000000025@lid").await;
+        let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+        let receiver_address =
+            wacore::types::jid::status_session_address(&receiver.to_protocol_address()).unwrap();
+        peer.install_bob_session(&receiver_address, &bundle).await;
+        let ciphertext = peer
+            .encrypt(
+                &receiver_address,
+                &MessageUtils::encode_and_pad(&wa::Message::default()),
+            )
+            .await;
+        let enc = enc_payload_from_ciphertext(&ciphertext);
+        let id = "UNKNOWN-STATUS-PROPS";
+        let node = node_to_arc(
+            NodeBuilder::new("status")
+                .attr("from", "120363000000000001@g.us")
+                .attr("participant", peer.jid.clone())
+                .attr("type", "reaction")
+                .attr("id", id)
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("session_scope", "status")
+                        .attr("target_id", "SYNTHETIC-STATUS")
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("type", enc.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .attr("count", retry_count.to_string())
+                        .bytes(enc.ciphertext.to_vec())
+                        .build(),
+                ])
+                .build(),
+        );
+        let classified = client.classify_incoming_message(&node).await.unwrap();
+        // PDO is an independent recovery path with its own native suite.
+        // Model an already completed request so this fixture can await the
+        // retry task without needing an authenticated primary phone.
+        client
+            .pdo_requested
+            .insert(
+                wacore::types::message::SenderMessageId::new(
+                    classified.info.source.chat.clone(),
+                    classified.info.id.clone(),
+                    classified.info.source.sender.clone(),
+                ),
+                crate::pdo::PdoRequestMemo::sent_for_test(
+                    &classified.info,
+                    "SYNTHETIC-PRIOR-PDO".into(),
+                    false,
+                ),
+            )
+            .await;
+        let processing = tokio::spawn(client.clone().process_classified_message(
+            classified,
+            client.connection_generation.load(Ordering::Acquire),
+        ));
+        if fetch_enabled {
+            let request = props_request_id(&transport).await;
+            client
+                .clone()
+                .process_node(node_to_arc(
+                    NodeBuilder::new("iq")
+                        .attr("from", "s.whatsapp.net")
+                        .attr("type", "error")
+                        .attr("id", request)
+                        .children([NodeBuilder::new("error").attr("code", "500").build()])
+                        .build(),
+                ))
+                .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), processing)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let ordinary = peer.jid.to_protocol_address();
+        let scoped = wacore::types::jid::status_session_address(&ordinary).unwrap();
+        let adapter = client.signal_adapter();
+        assert!(
+            adapter
+                .session_store
+                .load_session(&ordinary)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .session_store
+                .load_session(&scoped)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!client.ab_props().is_seeded());
+        assert_eq!(confirmations_for(&transport.sent(), id), 0);
+        assert!(
+            adapter
+                .identity_store
+                .get_identity(&ordinary)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .identity_store
+                .get_identity(&scoped)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retries = retry_counts_for(&transport.sent(), id);
+        assert_eq!(retries.len(), usize::from(retry_count == 0));
     }
 }
 
@@ -999,7 +1635,9 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
         }
     }
     for failure in ["missing_key", "invalid_ciphertext", "invalid_plaintext"] {
-        for failure_first in [false, true] {
+        for (failure_first, is_status_stanza) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
             let (client, transport) = capturing_client("expired_status_mixed").await;
             client
                 .inbound_durability_hook
@@ -1032,7 +1670,7 @@ async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
             let replay: Vec<_> = payloads.iter().map(|p| p.ciphertext.to_vec()).collect();
             let mut info =
                 (*group_message_info("EXPIRED_MIXED_COMMIT", &group, &alice.jid, false)).clone();
-            info.is_status_stanza = true;
+            info.is_status_stanza = is_status_stanza;
             info.timestamp = chrono::Utc::now() - chrono::Duration::hours(25);
             let info = Arc::new(info);
             process_group_classified_with_sessions(
@@ -1116,7 +1754,12 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
             panic!("unusable plaintext must not reach the durability hook")
         }
     }
-    for journal in [false, true] {
+    for (journal, tag) in [
+        (false, "status"),
+        (true, "status"),
+        (false, "message"),
+        (true, "message"),
+    ] {
         for can_nack in [false, true] {
             for (malformed, expired_sibling) in
                 [(vec![5], false), (vec![0, 1], false), (vec![0, 1], true)]
@@ -1130,7 +1773,7 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
                         .ok()
                         .unwrap();
                 }
-                let group: Jid = if expired_sibling {
+                let group: Jid = if expired_sibling || tag == "message" {
                     Jid::status_broadcast()
                 } else {
                     "120363000000000001@g.us".parse().unwrap()
@@ -1156,7 +1799,7 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
                 client
                     .clone()
                     .process_node(node_to_arc(
-                        NodeBuilder::new("status")
+                        NodeBuilder::new(tag)
                             .attr("from", group)
                             .attr("participant", peer.jid)
                             .attr("id", "STATUS-UNUSABLE")
@@ -1186,7 +1829,7 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
                 assert_eq!(response.tag.as_ref(), "ack");
                 assert_eq!(
                     response.attrs().optional_string("class").as_deref(),
-                    Some("status")
+                    Some(if tag == "status" { "status" } else { "message" })
                 );
                 assert_eq!(
                     response.attrs().optional_string("error").as_deref(),
@@ -1199,7 +1842,14 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
 
 #[tokio::test]
 async fn terminal_status_outcomes_send_one_final_ack() {
-    for mode in ["own_success", "retry_cap", "retry_suppressed"] {
+    for (mode, is_status_stanza) in [
+        ("own_success", true),
+        ("retry_cap", true),
+        ("retry_suppressed", true),
+        ("own_success", false),
+        ("retry_cap", false),
+        ("retry_suppressed", false),
+    ] {
         let (client, transport) = capturing_client_configured("status_terminal", |builder| {
             if mode == "retry_suppressed" {
                 builder.with_decrypt_failure_admission(FixedDecryptFailureAdmission {
@@ -1213,7 +1863,7 @@ async fn terminal_status_outcomes_send_one_final_ack() {
         .await;
         let info = Arc::new(MessageInfo {
             id: "STATUS-TERMINAL".into(),
-            is_status_stanza: true,
+            is_status_stanza,
             r#type: Some(wacore::types::message::StanzaMessageType::Media),
             source: wacore::types::message::MessageSource {
                 chat: Jid::status_broadcast(),
@@ -1245,7 +1895,11 @@ async fn terminal_status_outcomes_send_one_final_ack() {
         assert_eq!(ack.tag.as_ref(), "ack");
         assert_eq!(
             ack.attrs().optional_string("class").as_deref(),
-            Some("status")
+            Some(if is_status_stanza {
+                "status"
+            } else {
+                "message"
+            })
         );
         assert!(ack.get_attr("error").is_none());
     }
@@ -8454,6 +9108,10 @@ pub(super) fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize 
 }
 
 fn message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
+    successful_acks_for(frames, id, &["message"])
+}
+
+fn successful_acks_for(frames: &[bytes::Bytes], id: &str, classes: &[&str]) -> usize {
     let mut count = 0;
     for (i, frame) in frames.iter().enumerate() {
         let Some(buf) = decode_frame(i, frame) else {
@@ -8465,7 +9123,7 @@ fn message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
         if node.tag.as_ref() == "ack"
             && node
                 .get_attr("class")
-                .is_some_and(|v| v.as_str() == "message")
+                .is_some_and(|v| classes.iter().any(|class| v.as_str() == *class))
             && node.get_attr("error").is_none()
             && node.get_attr("id").is_some_and(|v| v.as_str() == id)
         {
@@ -8497,7 +9155,7 @@ fn sender_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
 }
 
 fn confirmations_for(frames: &[bytes::Bytes], id: &str) -> usize {
-    delivery_receipts_for(frames, id) + message_acks_for(frames, id)
+    delivery_receipts_for(frames, id) + successful_acks_for(frames, id, &["message", "status"])
 }
 
 async fn wait_for_confirmations(
@@ -8786,17 +9444,14 @@ async fn decrypt_failure_sends_retry_before_ack() {
     );
 }
 
-/// status@broadcast is already acked by the `should_ack` gate post-dispatch,
-/// so the decrypt-failure path must NOT emit a second transport ack
-/// (whatsmeow/WA Web send exactly one per message). The retry receipt still
-/// goes out.
+/// Web's sent retry receipt owns the status response, without an enqueue ACK.
 #[tokio::test]
-async fn status_broadcast_decrypt_failure_acks_to_chat() {
+async fn status_broadcast_decrypt_failure_retries_to_chat_without_extra_ack() {
     let (client, transport) = capturing_client("status_fail_ack").await;
     let info = Arc::new(MessageInfo {
         id: "STATUSMSGID".into(),
         source: crate::types::message::MessageSource {
-            sender: "236395184570386@lid".parse().expect("sender"),
+            sender: "100000000000027@lid".parse().expect("sender"),
             chat: "status@broadcast".parse().expect("status chat"),
             is_group: true,
             ..Default::default()
@@ -8808,20 +9463,18 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
         .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
         .await;
 
-    // status failures are acked from the flushed task (not just the detached
-    // should_ack gate), so the ack survives a disconnect mid-flush.
-    let mut found = None;
-    for _ in 0..80 {
-        if let Some(a) = find_message_ack(&transport.sent()) {
-            found = Some(a);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let (to, _) = found.expect("status failure must emit a flushed transport ack");
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 1);
+    let counts = retry_counts_for(&frames, &info.id);
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].0, "1");
+    assert!(find_message_ack(&frames).is_none());
+    let bytes = decode_frame(0, &frames[0]).unwrap();
+    let retry = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
     assert_eq!(
-        to, "status@broadcast",
-        "status ack `to` must be the status chat"
+        retry.attrs().optional_jid("to"),
+        Some(Jid::status_broadcast())
     );
 }
 
@@ -10040,6 +10693,10 @@ async fn check_status_skdm_only_session_receipt(expired_sibling: bool) {
     use wacore::types::events::ChannelEventHandler;
 
     let (client, transport) = capturing_client("status_skdm_only_ack").await;
+    client
+        .ab_props()
+        .apply_props(false, std::iter::empty())
+        .await;
     let (handler, rx) = ChannelEventHandler::new();
     client.core.event_bus.subscribe_handler(handler).detach();
 
@@ -10987,9 +11644,9 @@ async fn known_enc_type_with_empty_content_is_transport_acked() {
     assert_eq!(to, "5511777776666@s.whatsapp.net");
 }
 
-/// status is covered by should_ack; the fallback must not double-ack it.
+/// The status pipeline owns the unsupported-payload fallback too.
 #[tokio::test]
-async fn unknown_only_enc_on_status_skips_fallback_ack() {
+async fn unknown_only_status_enc_has_one_owned_fallback_ack() {
     let (client, transport) = capturing_client("msmsg_status_skip").await;
     let node = NodeBuilder::new("message")
         .attr("from", "status@broadcast")
@@ -11002,20 +11659,12 @@ async fn unknown_only_enc_on_status_skips_fallback_ack() {
             .build()])
         .build();
     let owned = node_to_arc(node);
-    let classified = client.classify_incoming_message(&owned).await;
-    assert!(classified.is_none());
-
-    // Give any rogue spawned task time to land on the wire.
-    for _ in 0..16 {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        if find_message_ack(&transport.sent()).is_some() {
-            break;
-        }
-    }
-    assert!(
-        find_message_ack(&transport.sent()).is_none(),
-        "status@broadcast must not get a fallback transport ack from classify"
-    );
+    client.clone().process_node(owned).await;
+    assert_exactly_one_confirmation(&transport, "MSMSG_STATUS").await;
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 1);
+    let (to, _) = find_message_ack(&frames).expect("classic fallback uses class=message");
+    assert_eq!(to, "status@broadcast");
 }
 
 /// One recognized enc + one unknown must still go through the normal path.

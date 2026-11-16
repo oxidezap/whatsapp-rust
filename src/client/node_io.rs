@@ -878,8 +878,8 @@ impl Client {
         // Arc in this dispatcher while decryption starts. Besides removing an
         // atomic refcount pair, this lets a large uniquely-owned pkmsg donate
         // its receive buffer to authenticated in-place decryption. Newsletter
-        // and status messages keep the extra owner until their deferred ack is
-        // encoded, preserving the existing acknowledgement semantics.
+        // and status messages keep the extra owner for interceptor responses;
+        // built-in status processing owns its response after queue admission.
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
@@ -973,6 +973,10 @@ impl Client {
                 self.handle_receipt_inline(node);
             }
             Some(StanzaTag::Message) => {
+                // Classic statuses share the result-driven response path with
+                // raw status stanzas. An enqueue ACK could precede cold props,
+                // decryption or a pending durable commit.
+                cancelled |= from_jid_matches(node.get(), |jid| jid.is_status_broadcast());
                 crate::handlers::message::MessageHandler::handle_inline_scoped(
                     self.clone(),
                     node,
@@ -1091,9 +1095,8 @@ impl Client {
         }
     }
 
-    /// Answering nothing leaves the stanza in the offline queue forever, which
-    /// is how an unhandled `<status>` kept recycling the stream. Returns whether
-    /// a nack was queued; one without `id`/`from` would have nothing to address.
+    /// Reject an unmodeled stanza when `id` and `from` allow addressing a reply.
+    /// Returns whether a NACK was queued.
     fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;
@@ -1111,13 +1114,9 @@ impl Client {
     /// `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
     /// their dedicated handlers, not via this gate.
     ///
-    /// status@broadcast is included as a fallback: drop paths in
-    /// `process_group_enc_batch` (expired status, missing sender key, generic
-    /// decrypt error) intentionally skip the delivery receipt to avoid
-    /// inflating the server-side offline counter for messages we'll never
-    /// process. Without the transport `<ack>` from this gate, the server
-    /// would redeliver indefinitely. WA Web emits `<receipt class="status">`
-    /// in the success path on top of this; the duplicate is tolerated.
+    /// Status responses remain reserved here for claimed interceptors. The
+    /// built-in message handler cancels this generic ACK for both status
+    /// formats and selects a response after processing, like WA Web.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;

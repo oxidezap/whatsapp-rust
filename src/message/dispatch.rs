@@ -457,10 +457,9 @@ impl Client {
             .build()
     }
 
-    /// Acknowledge a received message so the server drops it from the offline
-    /// queue: a delivery receipt when applicable (incl. the `type="sender"`
-    /// receipt for own-account self-fanouts), else a transport ack. status is
-    /// acked by the `should_ack` gate, newsletters/empty ids need nothing here.
+    /// Respond with a delivery receipt when applicable (including the
+    /// `type="sender"` receipt for own-account self-fanouts), else a transport
+    /// ACK. Status responses are owned here; newsletters/empty ids need nothing.
     pub(crate) fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if self.inbound_journal_enabled()
             && self.inbound_commit_batch.live_retention.defer_receipt(info)
@@ -474,7 +473,7 @@ impl Client {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
         }
-        if info.is_status_stanza
+        if (info.is_status_stanza || info.source.chat.is_status_broadcast())
             && info.r#type == Some(wacore::types::message::StanzaMessageType::MediaNotify)
         {
             self.spawn_message_ack(info);
@@ -492,7 +491,7 @@ impl Client {
         }
         if Self::should_send_delivery_receipt(info) {
             self.spawn_delivery_receipt(info);
-        } else if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
+        } else {
             self.spawn_message_ack(info);
         }
     }

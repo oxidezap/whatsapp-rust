@@ -211,17 +211,12 @@ impl Client {
         was_fresh
     }
 
-    /// Dispatch an undecryptable event, then send the retry receipt and the
-    /// transport ack in one ordered, flushed task.
+    /// Dispatch an undecryptable event and schedule outcome-dependent recovery.
     ///
-    /// The retry asks the sender to re-encrypt; the ack clears the stanza from
-    /// the server's offline queue (the retry alone does not). Both run in a
-    /// single `outbound_flush` task so `disconnect()` flushes them together and
-    /// the retry always goes out before the ack: if only one makes it, it is the
-    /// retry, so the message is never cleared without a resend request. status is
-    /// also acked here (flushed) rather than relying on the detached `should_ack`
-    /// gate, which can be dropped mid-flush on disconnect; the server dedups the
-    /// resulting duplicate ack.
+    /// The retry receipt and any ACK share one `outbound_flush` task.
+    /// A sent status retry owns the response;
+    /// deliberately stopped retries need a terminal ACK. Other messages order
+    /// the retry before their ACK within this same flush scope.
     ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.decrypt_failure", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
@@ -263,7 +258,7 @@ impl Client {
                 .run_retry_receipt_outcome(&info, reason, decrypt_fail_mode)
                 .await;
             if outcome.is_some()
-                && (!info.is_status_stanza
+                && (!(info.is_status_stanza || info.source.chat.is_status_broadcast())
                     || !matches!(
                         outcome,
                         Some(crate::features::RetryRequestOutcome::Sent { .. })
@@ -523,7 +518,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
-    async fn run_retry_receipt_outcome(
+    pub(super) async fn run_retry_receipt_outcome(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         reason: RetryReason,

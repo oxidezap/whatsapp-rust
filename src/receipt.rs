@@ -1019,7 +1019,7 @@ impl Client {
         reason: NackReason,
         failure_reason: Option<i32>,
     ) {
-        if info.is_status_stanza
+        if (info.is_status_stanza || info.source.chat.is_status_broadcast())
             && !info
                 .meta_info
                 .as_deref()

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use wacore_binary::CompactString;
 
 use crate::iq::abprops::{AbDefault, AbProp};
@@ -20,6 +20,7 @@ use crate::iq::props::WATCHED;
 /// Only materializes props whose code is in the interest set.
 /// Pre-populated with the `WATCHED` flags; extend via `watch()`.
 pub struct AbPropsCache {
+    fetch: Mutex<()>,
     state: RwLock<PropsState>,
     interest: RwLock<HashSet<u32>>,
     seeded: AtomicBool,
@@ -108,10 +109,17 @@ impl AbPropsSnapshot {
 impl AbPropsCache {
     pub fn new() -> Self {
         Self {
+            fetch: Mutex::new(()),
             state: RwLock::new(PropsState::default()),
             interest: RwLock::new(WATCHED.iter().map(|p| p.code).collect()),
             seeded: AtomicBool::new(false),
         }
+    }
+
+    /// Serialize catalog fetches without holding the cache's state lock.
+    /// Initial-fetch callers must recheck readiness after acquiring the guard.
+    pub async fn lock_fetch(&self) -> async_lock::MutexGuard<'_, ()> {
+        self.fetch.lock().await
     }
 
     /// Register a flag to be retained when props are fetched.

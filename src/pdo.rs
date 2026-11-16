@@ -212,7 +212,7 @@ impl PdoRequestMemo {
     }
 
     #[cfg(test)]
-    fn sent_for_test(
+    pub(crate) fn sent_for_test(
         info: &Arc<MessageInfo>,
         request_id: String,
         explicit_retry: bool,

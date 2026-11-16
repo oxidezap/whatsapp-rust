@@ -490,6 +490,7 @@ impl Client {
         node: &OwnedNodeRef,
     ) -> Option<ClassifiedMessage> {
         let nr = node.get();
+        let classification_generation = self.connection_generation.load(Ordering::Acquire);
 
         // The `<enc>` nodes are enumerated before the parse so the media type
         // they declare lands on `MessageInfo` while it is still owned. Every
@@ -519,7 +520,7 @@ impl Client {
         let info = match self.parse_message_info(nr).await {
             Ok(mut info) => {
                 info.media_type = media_type;
-                if info.is_status_stanza {
+                if info.is_status_stanza || info.source.chat.is_status_broadcast() {
                     let hide = all_enc_nodes.iter().any(|enc| {
                         enc.attrs().optional_string("decrypt-fail").as_deref() == Some("hide")
                     });
@@ -572,6 +573,8 @@ impl Client {
                             .as_ref()
                             .is_none_or(|recipient| !is_user(recipient))))
                 || (info.source.is_group && info.source.sender.is_hosted());
+            // Web's incomingMsgParser calls contentBytes() for every enc before
+            // processing any slot; a missing binary rejects the whole envelope.
             let malformed_payload = nr.get_optional_child("plaintext").is_some()
                 || (all_enc_nodes.is_empty() && nr.get_optional_child("unavailable").is_none())
                 || all_enc_nodes.iter().any(|enc| {
@@ -688,7 +691,6 @@ impl Client {
             .await;
             let client = Arc::clone(self);
             let info2 = Arc::clone(&info);
-            let skip_ack = info.source.chat.is_status_broadcast() && !info.is_status_stanza;
             self.outbound_flush.spawn(&*self.runtime, async move {
                 // Unrecoverable fanouts have no content the phone will resend, so
                 // ack directly. Otherwise PDO is the only recovery (no retry
@@ -699,7 +701,7 @@ impl Client {
                 } else {
                     client.run_pdo_request(&info2).await
                 };
-                if !skip_ack && should_ack {
+                if should_ack {
                     client
                         .send_transport_ack(&info2, ack_recipient.as_ref())
                         .await;
@@ -833,9 +835,8 @@ impl Client {
             );
         }
 
-        // Unknown-only stanzas would loop in the offline queue until
-        // <stream:error>. Custom handlers ack on their own; status is covered
-        // by should_ack. Ack from `nr` so `recipient` survives. Skip when any
+        // Unknown-only stanzas have no built-in decrypt work. Ack from `nr`
+        // so `recipient` survives. Skip when any
         // bucket has usable payloads (including msmsg) so the regular dispatch
         // path runs and the valid enc still decrypts.
         if session_payloads.is_empty()
@@ -848,7 +849,21 @@ impl Client {
                 "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
                 ObservedId::new(info.id.as_str())
             );
-            if !info.source.chat.is_status_broadcast() {
+            if self.connection_generation.load(Ordering::Acquire) == classification_generation {
+                self.spawn_node_transport_ack(nr).await;
+            }
+            return None;
+        }
+
+        // Preserve the classic status fallback for empty/custom-only payloads.
+        // Supported encrypted content instead owns its response below.
+        if info.source.chat.is_status_broadcast()
+            && !info.is_status_stanza
+            && session_payloads.is_empty()
+            && group_payloads.is_empty()
+            && bot_payloads.is_empty()
+        {
+            if self.connection_generation.load(Ordering::Acquire) == classification_generation {
                 self.spawn_node_transport_ack(nr).await;
             }
             return None;
@@ -924,9 +939,91 @@ impl Client {
             ack_recipient,
         } = msg;
 
-        let signal_address = self
-            .incoming_signal_address(&info, &sender_encryption_jid)
-            .await;
+        // Web's registered-login path restores props before starting its backend.
+        // Our cache is volatile and background refresh follows the offline
+        // drain, so a cold session-capable status must prime it independently.
+        // skmsg does not use this address. Fetch opt-out leaves an unseeded
+        // session decision pending until the application fetches props itself.
+        if !session_payloads.is_empty() && info.uses_status_session(3) && !self.ab_props.is_seeded()
+        {
+            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                self.report_stanza_not_attempted(
+                    &info,
+                    &session_payloads,
+                    &group_payloads,
+                    &bot_payloads,
+                );
+                return;
+            }
+            // Keep this rare network future out of the ordinary receive frame.
+            let fetched = self.ab_props_fetch_enabled()
+                && matches!(
+                    Box::pin(wacore::runtime::timeout(
+                        &*self.runtime,
+                        std::time::Duration::from_secs(10),
+                        self.fetch_initial_props(),
+                    ))
+                    .await,
+                    Ok(Ok(()))
+                );
+            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                self.report_stanza_not_attempted(
+                    &info,
+                    &session_payloads,
+                    &group_payloads,
+                    &bot_payloads,
+                );
+                return;
+            }
+            if !fetched || !self.ab_props.is_seeded() {
+                log::warn!(
+                    "Status-session props unavailable; leaving incoming sessions untouched and requesting retry"
+                );
+                self.report_stanza_not_attempted(
+                    &info,
+                    &session_payloads,
+                    &group_payloads,
+                    &bot_payloads,
+                );
+                self.preseed_sender_retry_count(&info, max_sender_retry_count)
+                    .await;
+                self.dispatch_undecryptable_event(
+                    Arc::clone(&info),
+                    false,
+                    crate::types::events::UnavailableType::Unknown,
+                    decrypt_fail_mode,
+                )
+                .await;
+                let client = Arc::clone(&self);
+                let info = Arc::clone(&info);
+                self.outbound_flush.spawn(&*self.runtime, async move {
+                    // No decrypt was attempted: even a stopped retry must not
+                    // clear this stanza with an ACK based on unknown configuration.
+                    client
+                        .run_retry_receipt_outcome(
+                            &info,
+                            RetryReason::UnknownError,
+                            decrypt_fail_mode,
+                        )
+                        .await;
+                });
+                return;
+            }
+        }
+
+        // A first catalog response can also latch LID migration. Resolve again
+        // before freezing the address used by ADV, account admission and decrypt.
+        let sender_encryption_jid = if !session_payloads.is_empty() && info.uses_status_session(3) {
+            self.resolve_encryption_jid(&info.source.sender).await
+        } else {
+            sender_encryption_jid
+        };
+        let signal_address = if session_payloads.is_empty() {
+            sender_encryption_jid.to_protocol_address()
+        } else {
+            self.incoming_signal_address(&info, &sender_encryption_jid)
+                .await
+        };
 
         // Cold ADV may wait for an IQ. Keep that wait outside the drain permit
         // so one unavailable account cannot stop every chat. This preflight
@@ -1402,12 +1499,10 @@ impl Client {
         } else if session_had_duplicates
             && !session_decrypted_successfully
             && !session_dispatched_undecryptable
-            && (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
         {
             // Duplicate (already-processed) with no group content: ack it so the
             // server drops it from the offline queue (whatsmeow/WA Web treat
-            // old-counter like success). Legacy broadcast messages retain their
-            // dispatcher ACK; raw status stanzas own their response here.
+            // old-counter like success). Both status formats own their response here.
             // With a durability hook, a buffered copy here
             // means the original commit never acked, so replay it instead.
             self.ack_or_replay_to_hook(&info).await;
@@ -1438,7 +1533,7 @@ impl Client {
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info);
-        if info.is_status_stanza
+        if (info.is_status_stanza || info.source.chat.is_status_broadcast())
             && group_outcome.unanswered_plaintext_failure
             && !session_outcome.dispatched
             && !session_outcome.had_failure
@@ -2571,6 +2666,25 @@ impl Client {
         (outcome, deferred, Some(timer))
     }
 
+    #[cfg(all(test, feature = "instance-clock"))]
+    pub(super) async fn group_expiry_outcome_for_test(
+        self: Arc<Self>,
+        payloads: &[EncPayload],
+        info: &Arc<MessageInfo>,
+    ) -> bool {
+        self.process_group_enc_batch(
+            payloads,
+            info,
+            &info.source.sender,
+            crate::types::events::DecryptFailMode::Show,
+            None,
+            raw_pending::StanzaOrigin::new(),
+        )
+        .await
+        .unwrap()
+        .expired_only
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %ObservedId::new(info.id.as_str())), err(Debug)))]
     async fn process_group_enc_batch(
         self: Arc<Self>,
@@ -2598,8 +2712,9 @@ impl Client {
             .sender_key_lock(&sender_key_name)
             .await;
 
-        let mut expired_only =
-            info.is_status_stanza && info.is_expired_status_with(|| self.runtime.wall_time_utc());
+        // Derive the terminal outcome from the decisions made for each slot;
+        // time may cross expiry while a decrypt waits for the sender-key lock.
+        let mut expired_only = info.is_status_stanza || info.source.chat.is_status_broadcast();
         let mut plaintext_failed = false;
         let mut response_claimed = false;
 
@@ -2707,9 +2822,7 @@ impl Client {
                     // offline queue. Raw status stanzas use this same durable
                     // response path. With a durability hook,
                     // a buffered copy means the original commit never acked: replay it.
-                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
-                        self.ack_or_replay_to_hook(info).await;
-                    }
+                    self.ack_or_replay_to_hook(info).await;
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
@@ -2729,6 +2842,7 @@ impl Client {
                         continue;
                     }
 
+                    expired_only = false;
                     response_claimed = true;
                     self.report_enc_decrypt_failure(
                         info,
@@ -2791,6 +2905,7 @@ impl Client {
                         );
                         continue;
                     }
+                    expired_only = false;
                     response_claimed = true;
                     self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
@@ -2827,9 +2942,7 @@ impl Client {
                         decrypt_fail_mode,
                     )
                     .await;
-                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
-                        self.spawn_nack(info, NackReason::UnhandledError, None);
-                    }
+                    self.spawn_nack(info, NackReason::UnhandledError, None);
                 }
             }
         }
@@ -3258,11 +3371,7 @@ impl Client {
                         } else if receipt.as_ref().is_some_and(|scope| scope.defer()) {
                             (false, None)
                         } else {
-                            (
-                                (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
-                                    && self.ack_or_replay_to_hook(info).await,
-                                None,
-                            )
+                            (self.ack_or_replay_to_hook(info).await, None)
                         };
                     if !replayed {
                         self.duplicate_dispatch_suppressed
