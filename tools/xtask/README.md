@@ -59,8 +59,11 @@ exemption for missing fixtures. Add new contracts to an existing domain module.
 default. During preparation, main pushes and pull requests targeting main can
 delegate native/MSRV checkout consumers with `--preparing-consumers api-hosts`.
 The task verifies the event, exact head, compiler and unfiltered owner workflow
-before delegating. The separate API host result remains authoritative; this task
-does not claim to have executed those consumers. Scheduled, dispatched and local
+before delegating. After package and mutation checks, Supply Chain verifies the
+matching API host job and successful consumer step for this exact head and latest
+workflow attempt. Failed, cancelled, skipped, missing or ambiguous evidence fails
+the job; pending evidence has a bounded wait. Delegation makes no local execution
+claim and needs only read access to Actions. Scheduled, dispatched and local
 runs keep the full default. Frozen baseline and release qualification always run
 their original consumers. Packaged artifacts and mutation controls still run in
 Supply Chain, and WASM keeps both maintained compiler qualifications.

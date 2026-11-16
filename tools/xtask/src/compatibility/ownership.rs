@@ -5,6 +5,11 @@ use std::process::Command;
 use xtask_support::capture;
 
 use crate::consumers::Lane;
+mod results;
+
+pub fn verify_result(root: &Path, lane: Lane, head: &str) -> Result<()> {
+    results::verify(root, lane, head)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum PreparingConsumers {
@@ -110,14 +115,18 @@ fn require_block(source: &str, marker: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Result<()> {
-    let lane_name = match lane {
-        Lane::Native => "native",
-        Lane::Msrv => "msrv",
+fn lane_name(lane: Lane) -> Result<&'static str> {
+    match lane {
+        Lane::Native => Ok("native"),
+        Lane::Msrv => Ok("msrv"),
         Lane::Wasm => {
             anyhow::bail!("WASM checkout consumers retain both maintained compiler qualifications")
         }
-    };
+    }
+}
+
+fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Result<()> {
+    let lane_name = lane_name(lane)?;
     require_block(
         source,
         "on:",
@@ -131,12 +140,12 @@ fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Resu
         "API host job matrix or conditions changed; review delegated coverage"
     );
     require_block(
-        source,
+        &job,
         "      - uses: actions/checkout@v7",
         "      - uses: actions/checkout@v7\n        with:\n          ref: ${{ github.event.pull_request.head.sha || github.sha }}",
     )?;
     require_block(
-        source,
+        &job,
         "      - name: Build driver",
         &format!(
             "      - name: Build driver\n        run: cargo +{driver} build --locked -p whatsapp-xtask"
@@ -148,7 +157,7 @@ fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Resu
         "Run isolated MSRV profiles and shared negative controls"
     };
     require_block(
-        source,
+        &job,
         &format!("      - name: {name}"),
         &format!(
             "      - name: {name}\n        if: matrix.lane == '{lane_name}'\n        env:\n          CARGO_BUILD_JOBS: \"2\"\n        run: target/debug/whatsapp-xtask ci consumers run --lane {lane_name} --toolchain {toolchain}"
@@ -166,9 +175,27 @@ mod tests {
     fn supply_chain_binds_delegation_to_the_same_events_and_head() {
         let source = include_str!("../../../../.github/workflows/supply-chain.yml");
         require_block(source, "      - name: Validate contracts before release", "      - name: Validate contracts before release\n        if: inputs.release-check\n        run: target/debug/whatsapp-xtask ci compatibility --release --lane \"$LANE\" --toolchain \"$TOOLCHAIN\"").unwrap();
-        require_block(source, "      - name: Validate candidate or frozen contracts", "      - name: Validate candidate or frozen contracts\n        if: ${{ !inputs.release-check }}\n        env:\n          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n          PREPARING_CONSUMERS: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.base_ref == 'main')) && (matrix.lane == 'native' || matrix.lane == 'msrv') && 'api-hosts' || 'local' }}\n        run: target/debug/whatsapp-xtask ci compatibility --lane \"$LANE\" --toolchain \"$TOOLCHAIN\" --preparing-consumers \"$PREPARING_CONSUMERS\"").unwrap();
+        require_block(source, "      - name: Validate candidate or frozen contracts", "      - name: Validate candidate or frozen contracts\n        if: ${{ !inputs.release-check }}\n        run: target/debug/whatsapp-xtask ci compatibility --lane \"$LANE\" --toolchain \"$TOOLCHAIN\" --preparing-consumers \"$PREPARING_CONSUMERS\"").unwrap();
+        require_block(source, "    env:", "    env:\n      LANE: ${{ matrix.lane }}\n      TOOLCHAIN: ${{ matrix.toolchain }}\n      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n      PREPARING_CONSUMERS: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.base_ref == 'main')) && (matrix.lane == 'native' || matrix.lane == 'msrv') && 'api-hosts' || 'local' }}\n      CARGO_INCREMENTAL: \"0\"\n      CARGO_PROFILE_DEV_DEBUG: \"1\"").unwrap();
+        require_block(
+            source,
+            "    permissions:",
+            "    permissions:\n      contents: read\n      actions: read",
+        )
+        .unwrap();
         require_block(source, "      - name: Qualify distributed artifacts outside the checkout", "      - name: Qualify distributed artifacts outside the checkout\n        run: target/debug/whatsapp-xtask ci package-consumers --lane \"$LANE\" --toolchain \"$TOOLCHAIN\"").unwrap();
         require_block(source, "      - name: Prove SDK and host breaks fail downstream compilation", "      - name: Prove SDK and host breaks fail downstream compilation\n        if: matrix.lane != 'msrv'\n        run: target/debug/whatsapp-xtask ci compatibility-controls --lane \"$LANE\" --toolchain \"$TOOLCHAIN\"").unwrap();
+        require_block(source, "      - name: Verify delegated checkout consumer result", "      - name: Verify delegated checkout consumer result\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: target/debug/whatsapp-xtask ci compatibility-owner-result --lane \"$LANE\" --toolchain \"$TOOLCHAIN\" --preparing-consumers \"$PREPARING_CONSUMERS\"").unwrap();
+        let controls = source
+            .find("      - name: Prove SDK and host breaks fail downstream compilation")
+            .unwrap();
+        let verify = source
+            .find("      - name: Verify delegated checkout consumer result")
+            .unwrap();
+        let record = source
+            .find("      - name: Record exact source commit")
+            .unwrap();
+        assert!(controls < verify && verify < record);
     }
 
     #[test]
@@ -273,5 +300,21 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn native_run_moved_into_a_disabled_job_is_not_an_owner() {
+        let start = OWNER
+            .find("      - name: Run isolated native profiles and shared negative controls")
+            .unwrap();
+        let end = OWNER
+            .find("      - name: Run isolated MSRV profiles and shared negative controls")
+            .unwrap();
+        let native = &OWNER[start..end];
+        let moved = format!(
+            "{}\n  disabled:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n{native}",
+            OWNER.replace(native, "")
+        );
+        assert!(verify_owner(&moved, Lane::Native, "1.100.0", "1.100.0").is_err());
     }
 }

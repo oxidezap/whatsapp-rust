@@ -258,7 +258,7 @@ fn sha(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 impl Policy {
-    fn validate(&self, meta: &Value, release: bool) -> Result<()> {
+    fn validate_phase(&self, release: bool) -> Result<()> {
         ensure!(
             self.phase == Phase::Frozen || self.baseline.is_none(),
             "preparation cannot masquerade as a frozen baseline"
@@ -271,6 +271,11 @@ impl Policy {
             !release || self.phase == Phase::Frozen,
             "release blocked: approve production profiles and freeze the RC baseline after API changes"
         );
+        Ok(())
+    }
+
+    fn validate(&self, meta: &Value, release: bool) -> Result<()> {
+        self.validate_phase(release)?;
         let packages = meta["packages"].as_array().context("packages")?;
         let published = packages
             .iter()
@@ -566,6 +571,31 @@ pub fn run(
                 dry_run: false,
             },
         ),
+    }
+}
+
+pub fn verify_preparing_consumers(
+    root: &Path,
+    lane: Lane,
+    toolchain: &str,
+    preparing_consumers: PreparingConsumers,
+) -> Result<()> {
+    let policy: Policy = serde_json::from_slice(&std::fs::read(root.join(POLICY))?)?;
+    policy.validate_phase(false)?;
+    match consumer_qualification(
+        root,
+        policy.baseline.as_deref(),
+        preparing_consumers,
+        lane,
+        toolchain,
+    )? {
+        ConsumerQualification::ApiHosts(head) => ownership::verify_result(root, lane, &head),
+        ConsumerQualification::Checkout | ConsumerQualification::Frozen(_) => {
+            println!(
+                "No external preparing consumer result is needed for local or frozen qualification."
+            );
+            Ok(())
+        }
     }
 }
 
