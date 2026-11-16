@@ -1981,6 +1981,52 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
 }
 
 #[tokio::test]
+async fn skdm_only_sender_key_status_is_acknowledged_once() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("SKDM-only content must not reach the consumer hook")
+        }
+    }
+    for journal in [false, true] {
+        for is_status_stanza in [false, true] {
+            let (client, transport) = capturing_client("skdm_sender_key_status").await;
+            if journal {
+                client
+                    .inbound_durability_hook
+                    .set(Arc::new(Hook))
+                    .ok()
+                    .unwrap();
+            }
+            let group = Jid::status_broadcast();
+            let mut peer = joined_group_sender(&client, "100000000000038@lid", &group).await;
+            let mut message = wa::Message::default();
+            message.sender_key_distribution_message =
+                buffa::MessageField::some(peer.create_group_skdm(&group).await);
+            let ciphertext = peer
+                .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&message))
+                .await;
+            let mut info = (*group_message_info("SKDM-STATUS", &group, &peer.jid, false)).clone();
+            info.is_status_stanza = is_status_stanza;
+            process_group_classified_with_sessions(
+                &client,
+                Arc::new(info),
+                &peer.jid,
+                vec![],
+                vec![skmsg_payload_from_bytes(ciphertext)],
+            )
+            .await;
+            assert_exactly_one_confirmation(&transport, "SKDM-STATUS").await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
     struct Hook;
     #[async_trait::async_trait]

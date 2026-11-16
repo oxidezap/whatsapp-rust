@@ -190,6 +190,7 @@ struct IncomingAccountFence {
 #[derive(Default)]
 struct GroupBatchOutcome {
     expired_only: bool,
+    skdm_only: bool,
     unanswered_plaintext_failure: bool,
     unanswered_decrypt_failure: bool,
 }
@@ -1542,6 +1543,7 @@ impl Client {
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
         group_outcome.expired_only &= bot_payloads.is_empty();
+        group_outcome.skdm_only &= bot_payloads.is_empty();
         group_outcome.unanswered_plaintext_failure &= bot_payloads.is_empty();
         group_outcome.unanswered_decrypt_failure &= bot_payloads.is_empty();
         for payload in bot_payloads {
@@ -1591,6 +1593,17 @@ impl Client {
             && !retained
         {
             self.spawn_message_ack(&info);
+        } else if group_outcome.skdm_only
+            && !session_outcome.dispatched
+            && !session_outcome.had_failure
+            && !session_outcome.plaintext_failed
+            && !session_dispatched_undecryptable
+            && !self.inbound_journal_enabled()
+        {
+            // Protocol-only skmsg has no consumer delivery. The journal's
+            // producer owns its ACK when enabled; otherwise settle it here,
+            // as for clean SKDM-only session payloads.
+            self.ack_received_message(&info);
         }
 
         if let Some(producer) = &receipt_producer
@@ -2753,6 +2766,7 @@ impl Client {
         // Derive the terminal outcome from the decisions made for each slot;
         // time may cross expiry while a decrypt waits for the sender-key lock.
         let mut expired_only = info.is_status_stanza || info.source.chat.is_status_broadcast();
+        let mut skdm_only = true;
         let mut plaintext_failed = false;
         let mut terminal_decrypt_failed = false;
         let mut response_claimed = false;
@@ -2791,6 +2805,9 @@ impl Client {
                 }
             };
 
+            if decrypt_result.is_err() {
+                skdm_only = false;
+            }
             match decrypt_result {
                 Ok(padded_plaintext) => {
                     expired_only = false;
@@ -2834,8 +2851,12 @@ impl Client {
                         )
                         .await
                     {
-                        Ok(_) => response_claimed = true,
+                        Ok(outcome) => {
+                            skdm_only &= outcome.skdm_only;
+                            response_claimed = true;
+                        }
                         Err(e) => {
+                            skdm_only = false;
                             plaintext_failed = true;
                             log::warn!("Failed processing group plaintext (batch): {e:?}");
                             self.report_enc_decrypt_failure(
@@ -2994,6 +3015,7 @@ impl Client {
         }
         Ok(GroupBatchOutcome {
             expired_only,
+            skdm_only,
             unanswered_plaintext_failure: plaintext_failed && !response_claimed,
             // A failed journal receipt scope also suppresses a successful or
             // duplicate sibling's deferred ACK. Once its commit is durable,
