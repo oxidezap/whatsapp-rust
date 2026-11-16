@@ -1814,15 +1814,20 @@ async fn status_backfill_and_retry_have_distinct_single_responses() {
 
 #[tokio::test]
 async fn expired_status_mixed_group_payloads_wait_for_durable_commit() {
-    check_status_mixed_group_payloads_commit(true).await;
+    check_status_mixed_group_payloads_commit(true, false).await;
 }
 
 #[tokio::test]
 async fn unexpired_status_mixed_group_payloads_wait_for_durable_commit() {
-    check_status_mixed_group_payloads_commit(false).await;
+    check_status_mixed_group_payloads_commit(false, false).await;
 }
 
-async fn check_status_mixed_group_payloads_commit(expired: bool) {
+#[tokio::test]
+async fn status_session_sibling_and_terminal_group_failure_wait_for_durable_commit() {
+    check_status_mixed_group_payloads_commit(false, true).await;
+}
+
+async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling: bool) {
     struct Hook;
     #[async_trait::async_trait]
     impl crate::InboundDurabilityHook for Hook {
@@ -1835,6 +1840,9 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
         }
     }
     for failure in ["missing_key", "invalid_ciphertext", "invalid_plaintext"] {
+        if session_sibling && failure != "invalid_ciphertext" {
+            continue;
+        }
         if !expired && failure == "missing_key" {
             continue;
         }
@@ -1857,7 +1865,26 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
             client.enter_drain_mode_for_tests();
             let group = Jid::status_broadcast();
             let mut alice = joined_group_sender(&client, "100000000000012@lid", &group).await;
-            let ciphertext = encrypt_group_text(&mut alice, &group, "save before responding").await;
+            let useful = if session_sibling {
+                client
+                    .ab_props()
+                    .apply_props(false, std::iter::empty())
+                    .await;
+                let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+                let address = receiver.to_protocol_address();
+                alice.install_bob_session(&address, &bundle).await;
+                let mut message = wa::Message::default();
+                message.conversation = Some("save before responding".into());
+                enc_payload_from_ciphertext(
+                    &alice
+                        .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+                        .await,
+                )
+            } else {
+                skmsg_payload_from_bytes(
+                    encrypt_group_text(&mut alice, &group, "save before responding").await,
+                )
+            };
             let bad = if failure == "missing_key" {
                 let mut stranger = AlicePeer::new("100000000000012@lid").await;
                 stranger.create_group_skdm(&group).await;
@@ -1867,17 +1894,18 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
             } else {
                 vec![0]
             };
-            let mut payloads = vec![
-                skmsg_payload_from_bytes(ciphertext),
-                skmsg_payload_from_bytes(bad),
-            ];
+            let mut payloads = vec![useful, skmsg_payload_from_bytes(bad)];
             if failure_first {
                 payloads.reverse();
             }
             for (index, payload) in payloads.iter_mut().enumerate() {
                 payload.enc_index = index;
             }
-            let replay: Vec<_> = payloads.iter().map(|p| p.ciphertext.to_vec()).collect();
+            let replay: Vec<_> = payloads
+                .iter()
+                .map(|p| (p.ciphertext.to_vec(), p.enc_type))
+                .collect();
+            let (sessions, groups) = payloads.into_iter().partition(|p| p.enc_type.is_session());
             let mut info =
                 (*group_message_info("EXPIRED_MIXED_COMMIT", &group, &alice.jid, false)).clone();
             info.is_status_stanza = is_status_stanza;
@@ -1891,8 +1919,8 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
                 &client,
                 info.clone(),
                 &alice.jid,
-                vec![],
-                payloads,
+                sessions,
+                groups,
             )
             .await;
             crate::test_utils::wait_for_outbound_tasks(&client).await;
@@ -1932,21 +1960,22 @@ async fn check_status_mixed_group_payloads_commit(expired: bool) {
                     0,
                     "a rejected sibling blocks this arrival's receipt"
                 );
-                let payloads = replay
+                let payloads: (Vec<EncPayload>, Vec<EncPayload>) = replay
                     .into_iter()
                     .enumerate()
-                    .map(|(index, bytes)| {
+                    .map(|(index, (bytes, enc_type))| {
                         let mut payload = skmsg_payload_from_bytes(bytes);
+                        payload.enc_type = enc_type;
                         payload.enc_index = index;
                         payload
                     })
-                    .collect();
+                    .partition(|p| p.enc_type.is_session());
                 process_group_classified_with_sessions(
                     &client,
                     Arc::new((*info).clone()),
                     &alice.jid,
-                    vec![],
-                    payloads,
+                    payloads.0,
+                    payloads.1,
                 )
                 .await;
             }

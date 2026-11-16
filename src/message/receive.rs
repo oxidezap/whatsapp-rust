@@ -1561,12 +1561,17 @@ impl Client {
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info);
+        // A terminal group failure invalidates this arrival's shared receipt
+        // scope. A session sibling's dispatch/duplicate cannot own a response
+        // that the failed scope suppresses; retained ownership still gates it.
+        let failed_journal_receipt =
+            group_outcome.unanswered_decrypt_failure && self.inbound_journal_enabled();
         if (info.is_status_stanza || info.source.chat.is_status_broadcast())
             && (group_outcome.unanswered_plaintext_failure
                 || group_outcome.unanswered_decrypt_failure)
-            && !session_outcome.dispatched
+            && (!session_outcome.dispatched || failed_journal_receipt)
             && !session_outcome.had_failure
-            && !session_had_duplicates
+            && (!session_had_duplicates || failed_journal_receipt)
             && !session_dispatched_undecryptable
             && !retained
         {
@@ -1598,11 +1603,10 @@ impl Client {
             && !session_outcome.had_failure
             && !session_outcome.plaintext_failed
             && !session_dispatched_undecryptable
-            && !self.inbound_journal_enabled()
         {
-            // Protocol-only skmsg has no consumer delivery. The journal's
-            // producer owns its ACK when enabled; otherwise settle it here,
-            // as for clean SKDM-only session payloads.
+            // Protocol-only skmsg has no consumer delivery. Request its
+            // response through the shared receipt scope so the journal's
+            // producer sends it once, as for clean SKDM-only session payloads.
             self.ack_received_message(&info);
         }
 
