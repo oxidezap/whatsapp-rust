@@ -443,6 +443,9 @@ history_field_whitelist!(
                 request_location_message => is_unset,
                 bot_group_participant_message => is_unset,
                 request_location_update_message => is_unset,
+                vpc_request_message => is_unset,
+                instant_video_message => is_unset,
+                payment_details_message => is_unset,
             ]
 );
 
@@ -1132,9 +1135,9 @@ mod tests {
 
     #[test]
     fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
-        // conversation="x" plus an empty field 132 through 138. Presence of
+        // conversation="x" plus an empty field 132 through 141. Presence of
         // the new payload is enough to reject it from the text-only path.
-        for tag in [0xa2, 0xaa, 0xb2, 0xba, 0xc2, 0xca, 0xd2] {
+        for tag in [0xa2, 0xaa, 0xb2, 0xba, 0xc2, 0xca, 0xd2, 0xda, 0xe2, 0xea] {
             let content = waproto::codec::message_decode(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
             assert!(!is_shareable_history_text(&content));
         }

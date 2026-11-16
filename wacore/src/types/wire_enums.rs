@@ -1,4 +1,4 @@
-//! Auto-generated protocol enums (WhatsApp 2.3000.1052559453). DO NOT EDIT.
+//! Auto-generated protocol enums (WhatsApp 2.3000.1054751086). DO NOT EDIT.
 //!
 //! Protocol enums generated from the whatspec enum catalog.
 //!
@@ -75,6 +75,8 @@ pub enum PollType {
 pub enum EncMediaType {
     #[wire = "image"]
     Image,
+    #[wire = "instant_image"]
+    InstantImage,
     #[wire = "video"]
     Video,
     #[wire = "ptv"]

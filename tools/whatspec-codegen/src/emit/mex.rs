@@ -26,11 +26,14 @@ pub use super::mex_operations_unlisted::{
     biz_custom_url_get_user_graphql, create_labyrinth_backup, debug_labyrinth_inbox_snapshot, debug_labyrinth_range,
     eb_message_metadata_query, rotate_labyrinth_epoch, team_link_create_invitation,
     team_link_list_invitations, team_link_remove_invitation, upload_labyrinth_messages,
+    fetch_about_status, internal_directory_fetch_members,
 };
 ";
 
 pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
     retain_historical_fields(ir)?;
+    let retained = snapshot_retention()?;
+    apply_retained_fields(ir, retained.fields)?;
     for name in [
         "BizCustomUrlGetUserGraphql",
         "CreateLabyrinthBackup",
@@ -42,6 +45,8 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
         "TeamLinkListInvitations",
         "TeamLinkRemoveInvitation",
         "UploadLabyrinthMessages",
+        "FetchAboutStatus",
+        "InternalDirectoryFetchMembers",
     ] {
         anyhow::ensure!(
             !ir.operations.contains_key(name),
@@ -86,24 +91,43 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
 
 // Retaining an optional SDK field does not assert its current server support.
 // Bound each exception to the reviewed operation document and parent shape.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetainedField {
+    operation: String,
+    doc_id: String,
+    reviewed_doc_id: Option<String>,
+    root: String,
+    path: Vec<String>,
+    retained: TypeNode,
+    observed: Option<TypeNode>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotRetention {
+    source_rev: String,
+    fields: Vec<RetainedField>,
+}
+
+fn snapshot_retention() -> anyhow::Result<SnapshotRetention> {
+    let retained: SnapshotRetention =
+        serde_json::from_str(include_str!("../../fixtures/mex-snapshot-retention.json"))?;
+    anyhow::ensure!(
+        retained.source_rev == "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+        "historical MEX snapshot provenance changed"
+    );
+    Ok(retained)
+}
+
 fn retain_historical_fields(ir: &mut MexIr) -> anyhow::Result<()> {
-    use anyhow::{Context, ensure};
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct Retained {
-        operation: String,
-        doc_id: String,
-        root: String,
-        path: Vec<String>,
-        retained: TypeNode,
-        observed: Option<TypeNode>,
-    }
+    use anyhow::ensure;
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Fixture {
         source_rev: String,
         wa_version: String,
-        fields: Vec<Retained>,
+        fields: Vec<RetainedField>,
     }
     let fixture: Fixture =
         serde_json::from_str(include_str!("../../fixtures/mex-retained-shapes.json"))?;
@@ -112,12 +136,22 @@ fn retain_historical_fields(ir: &mut MexIr) -> anyhow::Result<()> {
             && fixture.wa_version == "2.3000.1047483476",
         "historical MEX provenance changed"
     );
-    for entry in fixture.fields {
+    apply_retained_fields(ir, fixture.fields)
+}
+
+fn apply_retained_fields(ir: &mut MexIr, fields: Vec<RetainedField>) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    for entry in fields {
         let Some(op) = ir.operations.get_mut(&entry.operation) else {
             continue;
         };
         ensure!(
-            op.doc_id == entry.doc_id,
+            op.doc_id
+                == entry
+                    .reviewed_doc_id
+                    .as_ref()
+                    .unwrap_or(&entry.doc_id)
+                    .as_str(),
             "review retained MEX fields for {}",
             entry.operation
         );

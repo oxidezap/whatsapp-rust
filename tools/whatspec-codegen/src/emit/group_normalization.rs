@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-pub(super) const VERSION: &str = "2.3000.1052559453";
+pub(crate) const VERSION: &str = "2.3000.1052559453";
 const REV: &str = "ae3880925bacd23863cc30ec480c9f82bfd869f1";
 const LINK: &str = include_str!("../../fixtures/group_link.json");
 const UNLINK: &str = include_str!("../../fixtures/group_unlink.json");

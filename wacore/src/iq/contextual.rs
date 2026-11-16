@@ -1,4 +1,4 @@
-//! Auto-generated IQ stanza specs (WhatsApp 2.3000.1052559453). DO NOT EDIT.
+//! Auto-generated IQ stanza specs (WhatsApp 2.3000.1054751086). DO NOT EDIT.
 //!
 //! One `pub mod` per IQ namespace; each holds the namespace const, shared child
 //! types, and one `IqSpec` impl per stanza. Regenerated from the IQ IR by wa-codegen.
@@ -14,7 +14,7 @@
     unused_imports
 )]
 
-/// IQ namespace `md`. Source: WASmaxOutMdGetCountryCodeRequest.
+/// IQ namespace `md`. Source: WASmaxMdGetCountryCodeRPC.
 pub mod md {
     use crate::iq::spec::IqSpec;
     use crate::request::InfoQuery;
@@ -29,7 +29,7 @@ pub mod md {
 
     /// makeGetCountryCodeRequest:get IQ spec.
     ///
-    /// Source: `WASmaxOutMdGetCountryCodeRequest`
+    /// Source: `WASmaxMdGetCountryCodeRPC`
     #[derive(Debug, Clone, Default)]
     pub struct MakeGetCountryCodeRequestSpec;
 
@@ -94,7 +94,7 @@ pub mod md {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutMdGetCountryCodeRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxMdGetCountryCodeRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -143,14 +143,10 @@ pub mod md {
             request_to: &str,
         ) -> Result<MakeGetCountryCodeRequestResponse, anyhow::Error> {
             if response.get_attr("from").map(|v| v.as_str()).as_deref() != Some(request_to) {
-                anyhow::bail!(
-                    "WASmaxOutMdGetCountryCodeRequest: response.from does not match request_to"
-                );
+                anyhow::bail!("WASmaxMdGetCountryCodeRPC: response.from does not match request_to");
             }
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
-                anyhow::bail!(
-                    "WASmaxOutMdGetCountryCodeRequest: response.id does not match request_id"
-                );
+                anyhow::bail!("WASmaxMdGetCountryCodeRPC: response.id does not match request_id");
             }
             fn __iq_error_code(value: &str) -> Option<i64> {
                 let value = value.trim_start_matches(|c| matches!(c, '\u{0009}'..='\u{000d}' | ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'));

@@ -62,7 +62,7 @@ const MODULES: &[&str] = &[
     "WASmaxGroupsDeleteParentGroupRPC",
     "WASmaxPassiveModeActiveIQRPC",
     "WASmaxPassiveModePassiveIQRPC",
-    "WASmaxOutMdGetCountryCodeRequest",
+    "WASmaxMdGetCountryCodeRPC",
 ];
 
 pub fn generate(wa_version: &str) -> Result<String> {

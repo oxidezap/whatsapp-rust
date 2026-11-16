@@ -78,3 +78,44 @@ fn historical_optional_fields_and_list_input_remain_source_compatible() {
         serde_json::json!({"input":["historical-input"]})
     );
 }
+
+#[test]
+fn about_status_and_subscription_contracts_survive_the_new_snapshot() {
+    use wacore::iq::mex_operations as mex;
+    let mut variables = mex::usync::Variables::default();
+    variables.include_about_status = Some(true);
+    assert_eq!(
+        serde_json::to_value(variables).unwrap(),
+        serde_json::json!({"include_about_status":true})
+    );
+    let response: mex::usync::Response = serde_json::from_value(serde_json::json!({
+        "xwa2_fetch_wa_users":[{"about_status_info":{"status":"set","text":"synthetic about","timestamp":123}}]
+    })).unwrap();
+    let about = response
+        .xwa2_fetch_wa_users
+        .unwrap()
+        .remove(0)
+        .about_status_info
+        .unwrap();
+    assert_eq!(about.text.as_deref(), Some("synthetic about"));
+    assert_eq!(about.timestamp, Some(123));
+    let response: mex::fetch_subscriptions::Response = serde_json::from_value(serde_json::json!({
+        "xwa_get_subscriptions":{"feature_flags":[{"expiration_time":123}],"subscriptions":[{"is_platform_changed":false}]}
+    })).unwrap();
+    let subscriptions = response.xwa_get_subscriptions.unwrap();
+    assert_eq!(
+        subscriptions.feature_flags.unwrap()[0].expiration_time,
+        Some(123)
+    );
+    assert_eq!(
+        subscriptions.subscriptions.unwrap()[0].is_platform_changed,
+        Some(false)
+    );
+    let _ = mex::fetch_about_status::Variables::default();
+    let _ = mex::internal_directory_fetch_members::Variables::default();
+    assert_eq!(mex::fetch_about_status::DOC_ID, "24535500086059408");
+    assert_eq!(
+        mex::internal_directory_fetch_members::DOC_ID,
+        "28645118498472724"
+    );
+}

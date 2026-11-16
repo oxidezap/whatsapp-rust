@@ -299,7 +299,19 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
 /// [`DevicePropsOverride`]. Pairing a real identity with the sync row that
 /// belongs to it is the embedder's call; the table is what makes the pairs
 /// legible.
-pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| {
+pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(build_default_device_props);
+
+// Client construction must not initialize the legacy owned template as well
+// as this shared default, retaining a duplicate set of nested allocations.
+static SHARED_DEVICE_PROPS: LazyLock<Arc<wa::DeviceProps>> =
+    LazyLock::new(|| Arc::new(build_default_device_props()));
+
+/// Shared default properties. Per-device overrides detach through `Arc::make_mut`.
+pub fn default_device_props() -> Arc<wa::DeviceProps> {
+    Arc::clone(&SHARED_DEVICE_PROPS)
+}
+
+fn build_default_device_props() -> wa::DeviceProps {
     let mut proto = wa::DeviceProps::default();
     proto.os = Some("rust".to_string());
     proto.version = buffa::MessageField::some({
@@ -313,7 +325,7 @@ pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| {
     proto.require_full_sync = Some(false);
     proto.history_sync_config = buffa::MessageField::some(default_history_sync_config());
     proto
-});
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
@@ -623,7 +635,7 @@ impl Device {
             app_version_secondary: crate::version::WA_WEB_VERSION.1,
             app_version_tertiary: crate::version::WA_WEB_VERSION.2,
             app_version_last_fetched_ms: 0,
-            device_props: Arc::new(DEVICE_PROPS.clone()),
+            device_props: default_device_props(),
             client_profile: ClientProfile::web(),
             edge_routing_info: None,
             props_hash: None,
@@ -782,7 +794,7 @@ impl Device {
             app_version_secondary: 0,
             app_version_tertiary: 0,
             app_version_last_fetched_ms: 0,
-            device_props: Arc::new(DEVICE_PROPS.clone()),
+            device_props: default_device_props(),
             client_profile: ClientProfile::web(),
             edge_routing_info: None,
             props_hash: None,
@@ -925,6 +937,16 @@ impl Device {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    #[test]
+    fn fresh_devices_share_default_props() {
+        let first = Device::new();
+        let second = Device::new();
+        assert!(Arc::ptr_eq(&first.device_props, &second.device_props));
+        assert_eq!(first.device_props.os.as_deref(), Some("rust"));
+        let third = Device::new();
+        assert!(Arc::ptr_eq(&first.device_props, &third.device_props));
+        assert_eq!(first.device_props.as_ref(), &*DEVICE_PROPS);
+    }
     use super::*;
     use buffa::Message;
 

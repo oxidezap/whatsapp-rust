@@ -56,6 +56,8 @@ macro_rules! with_context_info_fields {
             music_message => MUSIC_MESSAGE / message::music_message,
             instant_image_message => INSTANT_IMAGE_MESSAGE / message::image_message,
             request_location_message => REQUEST_LOCATION_MESSAGE / message::request_location_message,
+            instant_video_message => INSTANT_VIDEO_MESSAGE / message::video_message,
+            payment_details_message => PAYMENT_DETAILS_MESSAGE / message::payment_details_message,
         }
     };
 }

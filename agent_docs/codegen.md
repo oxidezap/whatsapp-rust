@@ -51,6 +51,18 @@ app-state schemas and stale props use their hand-written sibling files. Select
 wire enums by the owning module, not just an identical variant set. IQ targets
 are generated only where the namespace does not already imply the target.
 Incoming wire tags include notification, server-request and stanza domains.
+Focused `*-snapshot-retention.json` fixtures preserve removed public MEX and
+WAM contracts. Historical WAM members stay outside current call-site evidence;
+`retained-abprops.json` constants stay outside the current registries' `ALL`
+slices. Reclaimed names or wire IDs stop generation for review.
+
+Reclaimed Labyrinth declarations have incompatible field types, requiredness or
+result wrappers. The proto emitter keeps the historical declarations and emits
+the reviewed current family with a `Web` prefix, rewriting current references
+together. `fixtures/reclaimed-proto.json` pins each original declaration's bytes;
+review those contracts before changing the hashes. Identical independent inputs
+can return to upstream ownership. Do not update `waproto/api.snapshot` to hide a
+compatibility failure.
 
 The reviewed wallpaper migration is the exceptional same-number, different-wire
 case: `build_support/wallpaper.rs` retains historical string fields alongside the
@@ -110,6 +122,10 @@ synchronous validation/decoding; owned runtime callers use the prepared API abov
 Group normalization consumes separately pinned whatspec envelope, LINK and UNLINK
 contracts, with checked digests. The normal generator checks them against the
 main IR pin and emits static Rust guards, ordered projections and decision tables.
+These projections and their original-source captures retain their qualified
+`2.3000.1052559453` version while upstream carries them forward byte for byte.
+Their generated files retain that source stamp independently of the main catalog
+version. A changed projection still stops regeneration for review.
 Independent original-JS oracle fixtures qualify the handwritten owned CREATE and
 other action parsers as well. Update fixtures, digests, revisions and oracles
 together; regenerate and run the group conformance tests.

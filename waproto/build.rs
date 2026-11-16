@@ -57,6 +57,20 @@ struct LocalField {
 /// original wire numbers; either kind must stop on a future collision.
 const LOCAL_FIELDS: &[LocalField] = &[
     LocalField {
+        message: "Config",
+        name: "version",
+        number: 2,
+        kind: field_descriptor_proto::Type::TYPE_UINT32,
+        type_name: None,
+    },
+    LocalField {
+        message: "Field",
+        name: "notReportableMinVersion",
+        number: 3,
+        kind: field_descriptor_proto::Type::TYPE_UINT32,
+        type_name: None,
+    },
+    LocalField {
         // An explicit chain deletion must not recover stale counters from a
         // pre-device-address receive row, including after a later redistribution.
         message: "SenderKeyRecordStructure",
