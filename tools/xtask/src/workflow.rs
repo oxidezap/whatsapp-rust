@@ -14,6 +14,13 @@ pub enum Task {
     QualificationSha,
     /// Read the installed libc version for the benchmark cache key.
     LibcVersion,
+    /// Partition the complete Cargo client benchmark inventory without dropping new targets.
+    CodspeedTargets {
+        #[arg(long)]
+        shard: usize,
+        #[arg(long)]
+        shards: usize,
+    },
     /// Wait for the local self-signed mock service used by E2E/bench jobs.
     WaitForMock,
     /// Reject direct native pool references outside the SQLite platform shim.
@@ -210,6 +217,51 @@ fn install_libc_debug() -> Result<()> {
     }
     Ok(())
 }
+fn codspeed_targets(metadata: &Value, shard: usize, shards: usize) -> Result<String> {
+    let package = metadata["packages"]
+        .as_array()
+        .context("Cargo metadata packages")?
+        .iter()
+        .find(|package| package["name"] == "whatsapp-rust")
+        .context("client package missing from Cargo metadata")?;
+    let mut names = package["targets"]
+        .as_array()
+        .context("Cargo metadata targets")?
+        .iter()
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bench"))
+        })
+        .map(|target| target["name"].as_str().context("benchmark target name"))
+        .collect::<Result<Vec<_>>>()?;
+    names.sort_unstable();
+    ensure!(
+        shards > 0 && shards <= names.len() && shard < shards,
+        "invalid benchmark shard"
+    );
+    ensure!(
+        names.windows(2).all(|pair| pair[0] != pair[1]),
+        "duplicate benchmark target"
+    );
+    // Outputs become shell words in both the build and measurement steps.
+    ensure!(
+        names.iter().all(|name| !name.is_empty()
+            && !name.starts_with('-')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))),
+        "unsafe benchmark target name"
+    );
+    Ok(names
+        .into_iter()
+        .skip(shard)
+        .step_by(shards)
+        .map(|name| format!("--bench {name}"))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 pub fn run_task(root: &Path, task: Task) -> Result<()> {
     match task {
         Task::QualificationSha => {
@@ -233,6 +285,21 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
                 capture(Command::new("dpkg-query").args(["-W", "-f=${Version}", "libc6"]))?.stdout,
             )?;
             output("version", v.trim())?;
+        }
+        Task::CodspeedTargets { shard, shards } => {
+            let metadata: Value = serde_json::from_slice(
+                &capture(Command::new("cargo").current_dir(root).args([
+                    "metadata",
+                    "--locked",
+                    "--no-deps",
+                    "--format-version",
+                    "1",
+                ]))?
+                .stdout,
+            )?;
+            let args = codspeed_targets(&metadata, shard, shards)?;
+            println!("Client benchmark shard {shard}/{shards}: {args}");
+            output("args", &args)?;
         }
         Task::WaitForMock => {
             for _ in 0..30 {
@@ -435,6 +502,69 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn benchmark_metadata(names: &[String]) -> Value {
+        serde_json::json!({"packages": [
+            {"name": "other", "targets": [{"name": "foreign", "kind": ["bench"]}]},
+            {"name": "whatsapp-rust", "targets": names.iter()
+                .map(|name| serde_json::json!({"name": name, "kind": ["bench"]}))
+                .chain([serde_json::json!({"name": "library", "kind": ["lib"]})])
+                .collect::<Vec<_>>()}
+        ]})
+    }
+
+    #[test]
+    fn benchmark_shards_cover_every_target_once_including_new_targets() {
+        for count in 1..=17 {
+            let names = (0..count)
+                .map(|index| format!("bench_{index:02}"))
+                .collect::<Vec<_>>();
+            let mut shuffled = names.clone();
+            shuffled.reverse();
+            for shards in 1..=count {
+                let mut selected = Vec::new();
+                for shard in 0..shards {
+                    let args =
+                        codspeed_targets(&benchmark_metadata(&shuffled), shard, shards).unwrap();
+                    let words = args.split_whitespace().collect::<Vec<_>>();
+                    assert!(!words.is_empty());
+                    let (pairs, remainder) = words.as_chunks::<2>();
+                    assert!(remainder.is_empty());
+                    for pair in pairs {
+                        assert_eq!(pair[0], "--bench");
+                        selected.push(pair[1].to_owned());
+                    }
+                    assert_eq!(
+                        args,
+                        codspeed_targets(&benchmark_metadata(&names), shard, shards).unwrap()
+                    );
+                }
+                selected.sort();
+                assert_eq!(selected, names, "count={count}, shards={shards}");
+            }
+        }
+    }
+
+    #[test]
+    fn benchmark_shards_reject_incomplete_or_unsafe_inventories() {
+        let valid = benchmark_metadata(&["bench".into()]);
+        for (shard, shards) in [(0, 0), (1, 1), (0, 2)] {
+            assert!(codspeed_targets(&valid, shard, shards).is_err());
+        }
+        for names in [
+            vec![],
+            vec!["same", "same"],
+            vec![""],
+            vec!["space name"],
+            vec!["$(id)"],
+            vec!["--help"],
+            vec!["line\nbreak"],
+        ] {
+            let names = names.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(codspeed_targets(&benchmark_metadata(&names), 0, 1).is_err());
+        }
+        assert!(codspeed_targets(&serde_json::json!({"packages": []}), 0, 1).is_err());
+    }
     fn git(root: &Path, args: &[&str]) -> String {
         String::from_utf8(
             capture(Command::new("git").current_dir(root).args(args))
