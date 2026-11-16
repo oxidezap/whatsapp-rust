@@ -191,7 +191,7 @@ struct IncomingAccountFence {
 struct GroupBatchOutcome {
     expired_only: bool,
     skdm_only: bool,
-    unanswered_plaintext_failure: bool,
+    unanswered_validation_failure: Option<NackReason>,
     unanswered_decrypt_failure: bool,
 }
 
@@ -1544,7 +1544,9 @@ impl Client {
         // permit + per-chat enqueue lock acquired upstream.
         group_outcome.expired_only &= bot_payloads.is_empty();
         group_outcome.skdm_only &= bot_payloads.is_empty();
-        group_outcome.unanswered_plaintext_failure &= bot_payloads.is_empty();
+        group_outcome.unanswered_validation_failure = group_outcome
+            .unanswered_validation_failure
+            .filter(|_| bot_payloads.is_empty());
         group_outcome.unanswered_decrypt_failure &= bot_payloads.is_empty();
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
@@ -1554,7 +1556,7 @@ impl Client {
         // A failing sibling cannot acknowledge content whose commit still owns
         // this stanza. Successful/duplicate siblings own their normal response.
         let retained = (group_outcome.expired_only
-            || group_outcome.unanswered_plaintext_failure
+            || group_outcome.unanswered_validation_failure.is_some()
             || group_outcome.unanswered_decrypt_failure)
             && self.inbound_journal_enabled()
             && self
@@ -1564,10 +1566,11 @@ impl Client {
         // A group Signal failure invalidates this arrival's shared receipt
         // scope. A session sibling's dispatch/duplicate cannot own a response
         // that the failed scope suppresses; retained ownership still gates it.
-        let failed_journal_receipt =
-            group_outcome.unanswered_decrypt_failure && self.inbound_journal_enabled();
+        let failed_journal_receipt = (group_outcome.unanswered_decrypt_failure
+            || group_outcome.unanswered_validation_failure == Some(NackReason::ParsingError))
+            && self.inbound_journal_enabled();
         if (info.is_status_stanza || info.source.chat.is_status_broadcast())
-            && (group_outcome.unanswered_plaintext_failure
+            && (group_outcome.unanswered_validation_failure.is_some()
                 || group_outcome.unanswered_decrypt_failure)
             && (!session_outcome.dispatched || failed_journal_receipt)
             && !session_outcome.had_failure
@@ -1587,9 +1590,20 @@ impl Client {
                     ack_recipient.as_ref(),
                 )
                 .await;
-            } else {
-                self.handle_plaintext_failure(&info, decrypt_fail_mode)
+            } else if let Some(reason) = group_outcome.unanswered_validation_failure {
+                if reason == NackReason::InvalidProtobuf {
+                    self.handle_plaintext_failure(&info, decrypt_fail_mode)
+                        .await;
+                } else {
+                    self.dispatch_undecryptable_event(
+                        Arc::clone(&info),
+                        false,
+                        crate::types::events::UnavailableType::Unknown,
+                        decrypt_fail_mode,
+                    )
                     .await;
+                    self.spawn_nack(&info, reason, None);
+                }
             }
         } else if group_outcome.expired_only
             && should_ack_skdm_only_session_fallback(session_outcome, true)
@@ -2756,6 +2770,27 @@ impl Client {
         if payloads.is_empty() {
             return Ok(GroupBatchOutcome::default());
         }
+        // Web's decryptEnc only admits skmsg for a group or broadcast from.
+        // This is a per-payload validation result, not a Signal error: reject
+        // before consulting any sender key, while preserving useful session
+        // siblings and their durable ownership in the outer response plan.
+        if info.is_status_stanza
+            && !info.source.chat.is_group()
+            && info.source.chat.server != wacore_binary::Server::Broadcast
+        {
+            for payload in payloads {
+                self.report_enc_decrypt_failure(
+                    info,
+                    payload.enc_index,
+                    payload.enc_type.as_wire_str(),
+                    EncDecryptFailureReason::NotAttempted,
+                );
+            }
+            return Ok(GroupBatchOutcome {
+                unanswered_validation_failure: Some(NackReason::ParsingError),
+                ..Default::default()
+            });
+        }
         let mut adapter = self.signal_adapter();
 
         let sender_address = info.source.sender.to_protocol_address();
@@ -3023,7 +3058,8 @@ impl Client {
         Ok(GroupBatchOutcome {
             expired_only,
             skdm_only,
-            unanswered_plaintext_failure: plaintext_failed && !response_claimed,
+            unanswered_validation_failure: (plaintext_failed && !response_claimed)
+                .then_some(NackReason::InvalidProtobuf),
             // A failed journal receipt scope also suppresses a successful or
             // duplicate sibling's deferred ACK. Once its commit is durable,
             // the failure must still request recovery for the redelivered stanza.

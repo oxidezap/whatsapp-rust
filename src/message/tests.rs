@@ -2392,6 +2392,180 @@ async fn status_parser_rejects_invalid_envelopes_before_decryption() {
 }
 
 #[tokio::test]
+async fn direct_status_rejects_sender_key_context_without_advancing_it() {
+    for sender in ["15550000041@s.whatsapp.net", "100000000000041@lid"] {
+        let (client, transport) = capturing_client("direct_status_sender_key").await;
+        let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let chat: Jid = sender.parse().unwrap();
+        // The crypto store accepts opaque sender-key names. Its caller must
+        // reject this non-multicast wire context even with decryptable bytes.
+        let mut peer = joined_group_sender(&client, sender, &chat).await;
+        let ciphertext = encrypt_group_text(&mut peer, &chat, "invalid sender-key context").await;
+        let node = node_to_arc(
+            NodeBuilder::new("status")
+                .attr("from", chat.clone())
+                .attr("id", "DIRECT-SKMSG")
+                .attr("type", "text")
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(ciphertext.clone())
+                    .build()])
+                .build(),
+        );
+        let classified = client.classify_incoming_message(&node).await.unwrap();
+        client
+            .clone()
+            .process_classified_message(
+                classified,
+                client.connection_generation.load(Ordering::Acquire),
+            )
+            .await;
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1);
+        let bytes = decode_frame(0, &frames[0]).unwrap();
+        let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(response.tag.as_ref(), "ack");
+        assert_eq!(
+            response.attrs().optional_string("error").as_deref(),
+            Some("487")
+        );
+        assert_eq!(
+            response.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert_eq!(message_events_for_id(&events, "DIRECT-SKMSG"), (0, 0));
+        assert!(!client.ab_props().is_seeded());
+        let mut adapter = client.signal_adapter();
+        let key = make_sender_key_name(&chat, &peer.jid.to_protocol_address());
+        assert!(
+            group_decrypt_shared(ciphertext.into(), &mut adapter.sender_key_store, &key)
+                .await
+                .is_ok(),
+            "rejecting an invalid context must leave its stored ratchet untouched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_status_keeps_session_content_durable_before_rejecting_skmsg_context() {
+    struct Hook(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            batch: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            assert_eq!(batch.len(), 1);
+            assert_eq!(
+                batch[0].message.conversation.as_deref(),
+                Some("preserve direct sibling")
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (client, transport) = capturing_client("direct_status_mixed_context").await;
+    let hook = Arc::new(Hook(std::sync::atomic::AtomicUsize::new(0)));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    client
+        .ab_props()
+        .apply_props(false, std::iter::empty())
+        .await;
+    client.enter_drain_mode_for_tests();
+    let mut peer = AlicePeer::new("15550000042@s.whatsapp.net").await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let address = receiver.to_protocol_address();
+    peer.install_bob_session(&address, &bundle).await;
+    let mut message = wa::Message::default();
+    message.conversation = Some("preserve direct sibling".into());
+    let encrypted = peer
+        .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+        .await;
+    let payload = enc_payload_from_ciphertext(&encrypted);
+    let node = node_to_arc(
+        NodeBuilder::new("status")
+            .attr("from", peer.jid.clone())
+            .attr("id", "DIRECT-MIXED-CONTEXT")
+            .attr("type", "text")
+            .attr("t", wacore::time::now_secs().to_string())
+            .children([
+                NodeBuilder::new("enc")
+                    .attr("type", payload.enc_type.as_wire_str())
+                    .attr("v", "2")
+                    .bytes(payload.ciphertext.to_vec())
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(vec![0])
+                    .build(),
+            ])
+            .build(),
+    );
+    let classified = client.classify_incoming_message(&node).await.unwrap();
+    client
+        .clone()
+        .process_classified_message(
+            classified,
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    assert!(
+        !client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+    assert_eq!(hook.0.load(Ordering::SeqCst), 0);
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    assert_eq!(hook.0.load(Ordering::SeqCst), 1);
+    client.enter_live_mode_for_tests();
+    let classified = client.classify_incoming_message(&node).await.unwrap();
+    client
+        .clone()
+        .process_classified_message(
+            classified,
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 1);
+    let bytes = decode_frame(0, &frames[0]).unwrap();
+    let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+    assert_eq!(response.tag.as_ref(), "ack");
+    assert_eq!(
+        response.attrs().optional_string("error").as_deref(),
+        Some("487")
+    );
+    assert_eq!(hook.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn hosted_status_broadcast_is_rejected_before_props_or_signal() {
     for sender in ["15550000031:99@hosted", "100000000000031:99@hosted.lid"] {
         for (tag, from) in [
