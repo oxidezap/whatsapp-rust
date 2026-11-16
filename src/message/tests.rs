@@ -1953,6 +1953,12 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                     .flush_inbound_commits_under_permit(true, None, None)
                     .await
             );
+            if !expired && failure == "invalid_ciphertext" {
+                // Recovery also runs the existing first-attempt PDO, which
+                // waits for offline sync. The useful content is now durable;
+                // finish the drain before exercising its recovery redelivery.
+                client.enter_live_mode_for_tests();
+            }
             if failure == "invalid_plaintext" || (!expired && failure == "invalid_ciphertext") {
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(
