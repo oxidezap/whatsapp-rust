@@ -300,7 +300,7 @@ fn build_read_receipt_node(
 /// truth for both the receipt builder and the aggregation grouping key, so the
 /// two can't drift apart.
 fn delivery_receipt_type(info: &MessageInfo, active: bool) -> Option<&'static str> {
-    let is_status = info.source.chat.is_status_broadcast();
+    let is_status = info.has_status_receipt_class();
     if info.category == MessageCategory::Peer {
         Some("peer_msg")
     } else if info.source.is_self_fanout() {
@@ -315,7 +315,7 @@ fn delivery_receipt_type(info: &MessageInfo, active: bool) -> Option<&'static st
 /// Receipt-level attrs shared by the single and aggregate delivery builders
 /// (everything except `id`/`t`/the `<list>` child).
 fn delivery_receipt_builder(info: &MessageInfo, active: bool) -> NodeBuilder {
-    let is_status = info.source.chat.is_status_broadcast();
+    let is_status = info.has_status_receipt_class();
     // A peer-synced message takes `type="peer_msg"` and carries NO recipient
     // (WA Web `!l` guard), so the sender-receipt shape applies only off the
     // peer path.
@@ -379,6 +379,7 @@ fn group_delivery_receipts<'a>(
 ) -> Vec<DeliveryReceiptGroup<'a>> {
     #[derive(PartialEq, Eq, Hash)]
     struct Key<'a> {
+        status_class: bool,
         to: &'a Jid,
         participant: Option<&'a Jid>,
         receipt_type: Option<&'static str>,
@@ -401,10 +402,11 @@ fn group_delivery_receipts<'a>(
             heads.push((info, 0));
             continue;
         }
-        let is_status = info.source.chat.is_status_broadcast();
+        let is_status = info.has_status_receipt_class();
         let is_group_like = info.source.is_group || is_status;
         let sender_receipt = info.source.is_self_fanout() && info.category != MessageCategory::Peer;
         let key = Key {
+            status_class: is_status,
             to: if is_group_like {
                 &info.source.chat
             } else {
@@ -487,7 +489,10 @@ impl NackSource for NodeRef<'_> {
         if reason == NackReason::UnrecognizedStanza
             || matches!(
                 StanzaTag::try_from(self.tag.as_ref()),
-                Ok(StanzaTag::Message | StanzaTag::Notification | StanzaTag::Receipt)
+                Ok(StanzaTag::Message
+                    | StanzaTag::Status
+                    | StanzaTag::Notification
+                    | StanzaTag::Receipt)
             )
         {
             Ok(self.tag.as_ref())
@@ -516,7 +521,11 @@ impl NackSource for NodeRef<'_> {
 
 impl NackSource for MessageInfo {
     fn class(&self, _reason: NackReason) -> Result<&str, crate::features::StanzaResponseError> {
-        Ok("message")
+        Ok(if self.is_status_stanza {
+            "status"
+        } else {
+            "message"
+        })
     }
 
     fn id(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
@@ -1010,13 +1019,20 @@ impl Client {
         reason: NackReason,
         failure_reason: Option<i32>,
     ) {
+        if info.is_status_stanza
+            && !info
+                .meta_info
+                .as_deref()
+                .is_some_and(|meta| meta.status_can_nack)
+        {
+            self.spawn_message_ack(info);
+            return;
+        }
         let client = Arc::clone(self);
         let info = Arc::clone(info);
-        self.runtime
-            .spawn(Box::pin(async move {
-                client.send_nack(&info, reason, failure_reason).await;
-            }))
-            .detach();
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.send_nack(&info, reason, failure_reason).await;
+        });
     }
 
     fn build_nack_from_snapshot<S: NackSource + ?Sized>(
@@ -1050,15 +1066,13 @@ impl Client {
             }
         };
         let client = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                if let Err(error) = client.send_node(nack).await
-                    && !matches!(error, crate::client::ClientError::NotConnected)
-                {
-                    log::warn!(target: "Client/Receipt", "Failed to send stanza nack: {error:?}");
-                }
-            }))
-            .detach();
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            if let Err(error) = client.send_node(nack).await
+                && !matches!(error, crate::client::ClientError::NotConnected)
+            {
+                log::warn!(target: "Client/Receipt", "Failed to send stanza nack: {error:?}");
+            }
+        });
     }
 
     /// Emits a nack so the server stops retransmitting an unrecoverable
@@ -1260,6 +1274,37 @@ mod tests {
     use crate::store::persistence_manager::PersistenceManager;
     use crate::test_utils::{MockHttpClient, TestEventCollector};
     use crate::types::message::{MessageInfo, MessageSource};
+
+    #[test]
+    fn group_status_receipts_keep_class_and_do_not_aggregate_with_group_messages() {
+        let ordinary = Arc::new(info_with(
+            "120363000000000001@g.us",
+            "100000000000002@lid",
+            true,
+        ));
+        let mut status = (*ordinary).clone();
+        status.is_status_stanza = true;
+        status.meta_info = Some(Box::new(wacore::types::message::MsgMetaInfo {
+            is_group_status: true,
+            ..Default::default()
+        }));
+        let status = Arc::new(status);
+        let receipt = build_delivery_receipt_node(&status, false);
+        assert_eq!(
+            receipt.attrs.get("class").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
+        assert!(receipt.attrs.get("type").is_none());
+        assert_eq!(
+            NackSource::class(&*status, NackReason::ParsingError).unwrap(),
+            "status"
+        );
+        assert_eq!(
+            NackSource::class(&*ordinary, NackReason::ParsingError).unwrap(),
+            "message"
+        );
+        assert_eq!(group_delivery_receipts(&[ordinary, status], false).len(), 2);
+    }
 
     fn node_to_arc(node: wacore_binary::Node) -> Arc<OwnedNodeRef> {
         crate::test_utils::node_to_owned_ref(&node)

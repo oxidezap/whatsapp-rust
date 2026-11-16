@@ -1859,6 +1859,7 @@ impl Client {
             .unwrap_or_else(|| self.runtime.wall_time_utc());
 
         Ok(MessageInfo {
+            is_status_stanza: false,
             id: id.unwrap_or_default().into(),
             server_id: 0,
             newsletter_server_id: None,

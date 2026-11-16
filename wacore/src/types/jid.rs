@@ -10,6 +10,24 @@ const SIGNAL_ADDRESS_CAPACITY: usize = 64;
 /// Signal device_id field. The device_id is always 0.
 const SIGNAL_DEVICE_ID: DeviceId = DeviceId::new(0);
 
+/// Recover the ordinary name only for a recognized PN/LID status session.
+pub fn status_session_base_name(name: &str) -> Option<&str> {
+    let ordinary = name.strip_suffix("_status")?;
+    let jid = ordinary.parse::<Jid>().ok()?;
+    matches!(jid.server, Server::Pn | Server::Lid).then_some(ordinary)
+}
+
+/// Split the session namespace, preserving the Web's hosted-address exception.
+pub fn status_session_address(address: &ProtocolAddress) -> Option<ProtocolAddress> {
+    if address.name().ends_with("@hosted") || address.name().ends_with("@hosted.lid") {
+        return None;
+    }
+    Some(ProtocolAddress::from_writer(address.device_id(), |name| {
+        name.push_str(address.name());
+        name.push_str("_status");
+    }))
+}
+
 /// WA Web's Signal address format uses the legacy `c.us` server
 /// instead of `s.whatsapp.net`.
 #[inline]

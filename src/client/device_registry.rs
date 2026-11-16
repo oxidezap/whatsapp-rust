@@ -814,6 +814,8 @@ impl Client {
                 // row would accept new trust without proving complete cleanup.
                 // Group refresh may skip this user and still apply valid peers.
                 let wire_address = address.strip_suffix(".0").unwrap_or(&address);
+                let wire_address = wacore::types::jid::status_session_base_name(wire_address)
+                    .unwrap_or(wire_address);
                 let jid: Jid = wire_address.parse().map_err(|_| {
                     anyhow::anyhow!("invalid stored Signal address during hosted identity recovery")
                 })?;
@@ -1429,8 +1431,11 @@ impl Client {
                 let mut jid = Jid::new(key, server);
                 jid.device = device_id;
                 let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
-                self.signal_cache.delete_session(&addr).await;
-                self.signal_cache.delete_identity(&addr).await;
+                let status = wacore::types::jid::status_session_address(&addr);
+                for addr in std::iter::once(addr).chain(status) {
+                    self.signal_cache.delete_session(&addr).await;
+                    self.signal_cache.delete_identity(&addr).await;
+                }
             }
         }
     }
@@ -2909,10 +2914,15 @@ mod tests {
             Jid::new(lid, Server::HostedLid).with_device(5),
         ]
         .iter()
-        .map(wacore::types::jid::JidExt::to_protocol_address)
+        .flat_map(|jid| {
+            let ordinary = wacore::types::jid::JidExt::to_protocol_address(jid);
+            let status = wacore::types::jid::status_session_address(&ordinary);
+            std::iter::once(ordinary).chain(status)
+        })
         .collect();
 
         for address in &addresses {
+            client.signal_cache.put_identity(address, &[7; 32]).await;
             client
                 .signal_cache
                 .put_session(address, SessionRecord::new_fresh())
@@ -2923,6 +2933,14 @@ mod tests {
 
         let snapshot = client.persistence_manager.get_device_snapshot();
         for address in addresses {
+            assert!(
+                client
+                    .signal_cache
+                    .get_identity(&address, &*snapshot.backend)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(
                 !client
                     .signal_cache

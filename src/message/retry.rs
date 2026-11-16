@@ -98,10 +98,10 @@ impl Client {
         );
     }
 
-    /// Same, for a classification-time failure where the `type` attribute is
-    /// whatever the wire carried — a type this build does not implement, or
-    /// none at all. The copy is made past the gate, so an unheld lease still
-    /// costs one atomic load.
+    /// Report without failing the shared receipt scope: classification has no
+    /// scope yet, and terminal expired slots must not block durable siblings.
+    /// The wire type may be unknown or absent. Copy only past the forwarding
+    /// gate, so an unheld lease still costs one atomic load.
     pub(crate) fn report_raw_enc_decrypt_failure(
         &self,
         info: &Arc<MessageInfo>,
@@ -257,12 +257,18 @@ impl Client {
                 client.send_delivery_receipt(&info).await;
                 return;
             }
-            // Only ack once the resend request is actually out; otherwise leave
-            // the stanza queued so the server redelivers and we retry.
-            let resend_sent = client
-                .run_retry_receipt(&info, reason, decrypt_fail_mode)
+            // Failed sends stay queued. A sent status retry owns the response;
+            // deliberately stopped retries still need a terminal ACK.
+            let outcome = client
+                .run_retry_receipt_outcome(&info, reason, decrypt_fail_mode)
                 .await;
-            if resend_sent {
+            if outcome.is_some()
+                && (!info.is_status_stanza
+                    || !matches!(
+                        outcome,
+                        Some(crate::features::RetryRequestOutcome::Sent { .. })
+                    ))
+            {
                 client
                     .send_transport_ack(&info, ack_recipient.as_ref())
                     .await;
@@ -504,13 +510,25 @@ impl Client {
     /// Returns whether the caller should send the ack: `false` when we intended
     /// to retry but the send failed (so the stanza stays queued for another try),
     /// `true` when the resend went out or we deliberately gave up at the cap.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
+    #[cfg(test)]
     pub(crate) async fn run_retry_receipt(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         reason: RetryReason,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
+        self.run_retry_receipt_outcome(info, reason, decrypt_fail_mode)
+            .await
+            .is_some()
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
+    async fn run_retry_receipt_outcome(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        reason: RetryReason,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) -> Option<crate::features::RetryRequestOutcome> {
         match self
             .request_retry_for_info(
                 info,
@@ -522,14 +540,14 @@ impl Client {
             )
             .await
         {
-            Ok(_) => true,
+            Ok(outcome) => Some(outcome),
             Err(error) => {
                 log::error!(
                     "Failed to send retry receipt for message {} [{:?}]: {error:?}",
                     info.id,
                     reason
                 );
-                false
+                None
             }
         }
     }

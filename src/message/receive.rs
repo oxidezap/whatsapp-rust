@@ -184,6 +184,7 @@ fn defer_plaintext(
 struct IncomingAccountFence {
     guard: Option<async_lock::MutexGuardArc<()>>,
     retired: bool,
+    address: Option<wacore::libsignal::protocol::ProtocolAddress>,
 }
 
 impl Client {
@@ -202,31 +203,83 @@ impl Client {
         );
     }
 
+    async fn incoming_signal_address(
+        &self,
+        info: &MessageInfo,
+        sender: &Jid,
+    ) -> wacore::libsignal::protocol::ProtocolAddress {
+        let ordinary = sender.to_protocol_address();
+        if !info.uses_status_session(3) {
+            return ordinary;
+        }
+        let state = self
+            .ab_props
+            .get_int(wacore::iq::abprops::web::STATUS_INFRA_1_1_SESSION_SPLIT)
+            .await;
+        if info.uses_status_session(state) {
+            wacore::types::jid::status_session_address(&ordinary).unwrap_or(ordinary)
+        } else {
+            ordinary
+        }
+    }
+
+    #[cfg(test)]
     async fn validate_incoming_companion_identity(
         &self,
         sender: &Jid,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
     ) -> anyhow::Result<()> {
-        self.validate_incoming_companion_identity_inner(sender, certificate, identity, false)
-            .await
+        self.validate_incoming_companion_identity_at_address(
+            sender,
+            &sender.to_protocol_address(),
+            certificate,
+            identity,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn validate_incoming_companion_identity_at_address(
+        &self,
+        sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
+        certificate: Option<&[u8]>,
+        identity: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        self.validate_incoming_companion_identity_inner(
+            sender,
+            address,
+            certificate,
+            identity,
+            false,
+        )
+        .await
     }
 
     /// Find the first unverifiable companion prekey before acquiring a processing permit.
     async fn preflight_incoming_companion_identity(
         &self,
         sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
     ) -> Option<usize> {
-        self.preflight_incoming_companion_identity_inner(sender, certificate, payloads, false)
-            .await
+        self.preflight_incoming_companion_identity_inner(
+            sender,
+            address,
+            certificate,
+            payloads,
+            false,
+        )
+        .await
     }
 
     /// Validate prekey certificates without advancing sessions; account-locked callers use cached trust only.
     async fn preflight_incoming_companion_identity_inner(
         &self,
         sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
         account_locked: bool,
@@ -243,18 +296,15 @@ impl Client {
             };
             let identity = *message.identity_key().public_key().public_key_bytes();
             drop(message);
-            let validation = if account_locked {
-                self.validate_incoming_companion_identity_inner(
+            let validation = self
+                .validate_incoming_companion_identity_inner(
                     sender,
+                    address,
                     certificate,
                     &identity,
-                    true,
+                    account_locked,
                 )
-                .await
-            } else {
-                self.validate_incoming_companion_identity(sender, certificate, &identity)
-                    .await
-            };
+                .await;
             if validation.is_err() {
                 return Some(payload.enc_index);
             }
@@ -265,23 +315,33 @@ impl Client {
     async fn validate_incoming_companion_identity_inner(
         &self,
         sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
         account_locked: bool,
     ) -> anyhow::Result<()> {
-        let address = sender.to_protocol_address();
         let backend = self
             .persistence_manager
             .get_device_snapshot()
             .backend
             .clone();
-        if self
-            .signal_cache
-            .get_identity(&address, &*backend)
-            .await?
-            .is_some_and(|known| known.as_ref() == identity)
-        {
-            return Ok(());
+        match self.signal_cache.get_identity(address, &*backend).await? {
+            Some(known) if known.as_ref() == identity => return Ok(()),
+            None => {
+                let ordinary = sender.to_protocol_address();
+                if address != &ordinary
+                    && self
+                        .signal_cache
+                        .get_identity(&ordinary, &*backend)
+                        .await?
+                        .is_some_and(|known| known.as_ref() == identity)
+                {
+                    return Ok(());
+                }
+            }
+            // A conflicting scoped identity must be authenticated again. A
+            // stale ordinary identity cannot authorize rolling this scope back.
+            Some(_) => {}
         }
         let certificate = certificate
             .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
@@ -311,11 +371,15 @@ impl Client {
     async fn lock_incoming_companion_account(
         &self,
         sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
     ) -> anyhow::Result<IncomingAccountFence> {
         if sender.device == 0 || payloads.is_empty() {
-            return Ok(IncomingAccountFence::default());
+            return Ok(IncomingAccountFence {
+                address: Some(address.clone()),
+                ..Default::default()
+            });
         }
         let guard = self.lock_companion_account(sender).await;
         for payload in payloads
@@ -326,6 +390,7 @@ impl Client {
                 let identity = *message.identity_key().public_key().public_key_bytes();
                 self.validate_incoming_companion_identity_inner(
                     sender,
+                    address,
                     certificate,
                     &identity,
                     true,
@@ -336,6 +401,7 @@ impl Client {
         Ok(IncomingAccountFence {
             guard,
             retired: false,
+            address: Some(address.clone()),
         })
     }
 
@@ -447,6 +513,24 @@ impl Client {
         let info = match self.parse_message_info(nr).await {
             Ok(mut info) => {
                 info.media_type = media_type;
+                if info.is_status_stanza {
+                    let hide = all_enc_nodes.iter().any(|enc| {
+                        enc.attrs().optional_string("decrypt-fail").as_deref() == Some("hide")
+                    });
+                    let mode = if hide {
+                        crate::types::events::DecryptFailMode::Hide
+                    } else {
+                        crate::types::events::DecryptFailMode::Show
+                    };
+                    let can_nack = wacore::types::message::envelope_is_coherent(
+                        info.r#type.as_ref(),
+                        info.meta_info.as_deref().and_then(|meta| meta.poll_type),
+                        mode,
+                    );
+                    info.meta_info
+                        .get_or_insert_with(Default::default)
+                        .status_can_nack = can_nack;
+                }
                 Arc::new(info)
             }
             Err(error) => {
@@ -461,6 +545,55 @@ impl Client {
                 return None;
             }
         };
+
+        if info.is_status_stanza {
+            let is_user = |jid: &Jid| {
+                !jid.user.is_empty()
+                    && (jid.server.is_pn_family() || jid.server.is_lid_family() || jid.is_bot())
+            };
+            let from = nr.attrs().optional_jid("from");
+            let recipient = nr.attrs().optional_jid("recipient");
+            let invalid_address = !is_user(&info.source.sender)
+                || from.as_ref().is_none_or(|from| {
+                    from.user.is_empty()
+                        || (!is_user(from)
+                            && !from.is_group()
+                            && from.server != wacore_binary::Server::Broadcast)
+                })
+                || (nr.get_attr("recipient").is_some()
+                    && (!info.source.is_from_me
+                        || recipient
+                            .as_ref()
+                            .is_none_or(|recipient| !is_user(recipient))))
+                || (info.source.is_group && info.source.sender.is_hosted());
+            let malformed_payload = nr.get_optional_child("plaintext").is_some()
+                || (all_enc_nodes.is_empty() && nr.get_optional_child("unavailable").is_none())
+                || all_enc_nodes.iter().any(|enc| {
+                    !matches!(
+                        enc.attrs().optional_string("type").as_deref(),
+                        Some("msg" | "pkmsg" | "skmsg" | "msmsg")
+                    ) || enc.content_bytes().is_none()
+                });
+            let reason = if malformed_payload || invalid_address {
+                Some(NackReason::ParsingError)
+            } else if info.r#type.as_ref().is_none_or(|kind| {
+                matches!(kind, crate::types::message::StanzaMessageType::Unknown(_))
+            }) {
+                Some(NackReason::UnrecognizedStanzaType)
+            } else if nr
+                .attrs()
+                .optional_string("t")
+                .is_none_or(|t| t.parse::<u64>().is_err())
+            {
+                Some(NackReason::ParsingError)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.spawn_stanza_nack(nr, reason, None);
+                return None;
+            }
+        }
 
         // Newsletters use <plaintext> instead of <enc> because they are not E2E encrypted.
         if info.source.chat.is_newsletter() {
@@ -549,7 +682,7 @@ impl Client {
             .await;
             let client = Arc::clone(self);
             let info2 = Arc::clone(&info);
-            let skip_ack = info.source.chat.is_status_broadcast();
+            let skip_ack = info.source.chat.is_status_broadcast() && !info.is_status_stanza;
             self.outbound_flush.spawn(&*self.runtime, async move {
                 // Unrecoverable fanouts have no content the phone will resend, so
                 // ack directly. Otherwise PDO is the only recovery (no retry
@@ -785,6 +918,10 @@ impl Client {
             ack_recipient,
         } = msg;
 
+        let signal_address = self
+            .incoming_signal_address(&info, &sender_encryption_jid)
+            .await;
+
         // Cold ADV may wait for an IQ. Keep that wait outside the drain permit
         // so one unavailable account cannot stop every chat. This preflight
         // never advances a ratchet; the account fence rechecks trust under the
@@ -793,6 +930,7 @@ impl Client {
             if self.connection_generation.load(Ordering::Acquire) == lane_generation {
                 self.preflight_incoming_companion_identity(
                     &sender_encryption_jid,
+                    &signal_address,
                     device_identity.as_deref(),
                     &session_payloads,
                 )
@@ -833,6 +971,7 @@ impl Client {
             let _account = self.lock_companion_account(&sender_encryption_jid).await;
             self.preflight_incoming_companion_identity_inner(
                 &sender_encryption_jid,
+                &signal_address,
                 device_identity.as_deref(),
                 &session_payloads,
                 true,
@@ -1069,6 +1208,7 @@ impl Client {
             let account_fence = match self
                 .lock_incoming_companion_account(
                     &sender_encryption_jid,
+                    &signal_address,
                     device_identity.as_deref(),
                     &session_payloads,
                 )
@@ -1138,6 +1278,7 @@ impl Client {
         // the SKDM it carried is lost, so skmsg will always fail with NoSenderKey — skip it
         // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
         // to resend the entire message including SKDM.
+        let mut expired_group_only = false;
         if !group_payloads.is_empty() {
             let should_process_skmsg =
                 should_process_skmsg_after_session(session_payloads_empty, session_outcome);
@@ -1155,8 +1296,8 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(()) => {
-                        // Processed successfully or handled errors (e.g. sent retry receipt)
+                    Ok(expired_only) => {
+                        expired_group_only = expired_only;
                     }
                     Err(e) => {
                         log::warn!(
@@ -1255,13 +1396,13 @@ impl Client {
         } else if session_had_duplicates
             && !session_decrypted_successfully
             && !session_dispatched_undecryptable
-            && !info.source.chat.is_status_broadcast()
+            && (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
         {
             // Duplicate (already-processed) with no group content: ack it so the
             // server drops it from the offline queue (whatsmeow/WA Web treat
-            // old-counter like success). status is acked by the should_ack gate
-            // (a status SKDM pkmsg can reach here), so skip it to avoid a
-            // redundant receipt. With a durability hook, a buffered copy here
+            // old-counter like success). Legacy broadcast messages retain their
+            // dispatcher ACK; raw status stanzas own their response here.
+            // With a durability hook, a buffered copy here
             // means the original commit never acked, so replay it instead.
             self.ack_or_replay_to_hook(&info).await;
         } else if should_ack_skdm_only_session_fallback(session_outcome, bot_payloads.is_empty()) {
@@ -1276,9 +1417,26 @@ impl Client {
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
+        expired_group_only &= bot_payloads.is_empty();
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
             Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
+        }
+
+        // A failing sibling cannot acknowledge content whose commit still owns
+        // this stanza. Successful/duplicate siblings own their normal response.
+        if expired_group_only && should_ack_skdm_only_session_fallback(session_outcome, true) {
+            self.ack_received_message(&info);
+        } else if expired_group_only
+            && !session_decrypted_successfully
+            && !session_had_duplicates
+            && (!self.inbound_journal_enabled()
+                || !self
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_owned_for_message(&info))
+        {
+            self.spawn_message_ack(&info);
         }
 
         if let Some(producer) = &receipt_producer
@@ -1343,7 +1501,12 @@ impl Client {
         sender: &Jid,
     ) -> SessionBatchOutcome {
         let fence = self
-            .lock_incoming_companion_account(sender, None, &payloads)
+            .lock_incoming_companion_account(
+                sender,
+                &self.incoming_signal_address(info, sender).await,
+                None,
+                &payloads,
+            )
             .await
             .unwrap();
         let mut permit_slot = Some(self.acquire_message_processing_permit().await);
@@ -1493,7 +1656,15 @@ impl Client {
         // multiple messages from the same sender are processed concurrently.
         // Use the full Signal protocol address string as the lock key so it matches
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
-        let signal_address = sender_encryption_jid.to_protocol_address();
+        // Keep decrypt in the scope authenticated by preflight, even if an
+        // AB-prop refresh changes the split flag while admission is parked.
+        let signal_address = match &account_fence.address {
+            Some(address) => address.clone(),
+            None => {
+                self.incoming_signal_address(info, sender_encryption_jid)
+                    .await
+            }
+        };
 
         // `session_guard` is held across the decrypt loop (and released before the
         // plaintext drain below); it's also dropped around calls into
@@ -2388,9 +2559,9 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
         stanza_origin: raw_pending::StanzaOrigin,
-    ) -> Result<(), DecryptionError> {
+    ) -> Result<bool, DecryptionError> {
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut adapter = self.signal_adapter();
 
@@ -2405,6 +2576,9 @@ impl Client {
             .sender_key_store
             .sender_key_lock(&sender_key_name)
             .await;
+
+        let mut expired_only =
+            info.is_status_stanza && info.is_expired_status_with(|| self.runtime.wall_time_utc());
 
         for payload in payloads {
             let padding_version = payload.padding_version;
@@ -2442,6 +2616,7 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
+                    expired_only = false;
                     let padded_plaintext = bytes::Bytes::from(padded_plaintext);
                     self.stage_retained_plaintext(
                         info,
@@ -2492,6 +2667,7 @@ impl Client {
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
+                    expired_only = false;
                     log::debug!(
                         "Skipping already-processed sender key message from {} in group {} (iteration {}, counter {}). This is normal during reconnection.",
                         info.source.sender.observe(),
@@ -2500,23 +2676,23 @@ impl Client {
                         counter
                     );
                     // Redelivered duplicate: ack it so the server drops it from the
-                    // offline queue. status is already acked by the should_ack gate,
-                    // so skip it to avoid a redundant receipt. With a durability hook,
+                    // offline queue. Raw status stanzas use this same durable
+                    // response path. With a durability hook,
                     // a buffered copy means the original commit never acked: replay it.
-                    if !info.source.chat.is_status_broadcast() {
+                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
                         self.ack_or_replay_to_hook(info).await;
                     }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
-                    // Reported before the expired-status early return: the enc
-                    // failed either way, and only what happens next differs.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        EncDecryptFailureReason::NoSenderKey,
-                    );
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
+                        // Expiry deliberately ends recovery for this slot, but
+                        // cannot poison a useful sibling's durable receipt.
+                        self.report_raw_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            Some(enc_type),
+                            EncDecryptFailureReason::NoSenderKey,
+                        );
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
                             ObservedId::new(info.id.as_str()),
@@ -2524,6 +2700,13 @@ impl Client {
                         );
                         continue;
                     }
+
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::NoSenderKey,
+                    );
 
                     let is_unknown_device = !self.is_from_known_device(&info.source.sender).await;
                     let retry_reason = if is_unknown_device {
@@ -2556,20 +2739,21 @@ impl Client {
                     // classifier; only what it leaves unnamed is refined by the
                     // same predicate the retry decision uses, so the reported
                     // cause and the recovery the client chose cannot disagree.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        match signal_error_reason(&e) {
-                            EncDecryptFailureReason::SignalError
-                                if group_decrypt_retry_reason(&e).is_some() =>
-                            {
-                                EncDecryptFailureReason::InvalidMessage
-                            }
-                            reason => reason,
-                        },
-                    );
+                    let reason = match signal_error_reason(&e) {
+                        EncDecryptFailureReason::SignalError
+                            if group_decrypt_retry_reason(&e).is_some() =>
+                        {
+                            EncDecryptFailureReason::InvalidMessage
+                        }
+                        reason => reason,
+                    };
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
+                        self.report_raw_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            Some(enc_type),
+                            reason,
+                        );
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
                             ObservedId::new(info.id.as_str()),
@@ -2578,6 +2762,7 @@ impl Client {
                         );
                         continue;
                     }
+                    self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
                     // Recoverable sender-key desync: retry receipt (prompts an SKDM
                     // resend), not a 500 NACK that would drop the message permanently.
@@ -2603,9 +2788,8 @@ impl Client {
                         sender_address.observe(),
                         e
                     );
-                    // Always surface the failure to consumers; nack only non-status
-                    // (status is acked by the should_ack gate) so the server drops
-                    // it from the offline queue.
+                    // Surface the failure, then let the status envelope guard
+                    // choose NACK or final ACK for raw status stanzas.
                     self.dispatch_undecryptable_event(
                         Arc::clone(info),
                         false,
@@ -2613,13 +2797,13 @@ impl Client {
                         decrypt_fail_mode,
                     )
                     .await;
-                    if !info.source.chat.is_status_broadcast() {
+                    if !info.source.chat.is_status_broadcast() || info.is_status_stanza {
                         self.spawn_nack(info, NackReason::UnhandledError, None);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(expired_only)
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
@@ -3008,7 +3192,7 @@ impl Client {
                     // The sender resent a message we already handed to consumers. Ack
                     // it the way the ratchet-level duplicate is acked, so a registered
                     // durability hook still gets its replay instead of a bare ack.
-                    // status is acked by the should_ack gate. A hook whose buffered copy
+                    // A hook whose buffered copy
                     // survived replays instead of being acked, which dispatches the
                     // message again: that is the documented at-least-once shape, not a
                     // suppression, so it is not counted as one.
@@ -3042,7 +3226,7 @@ impl Client {
                             (false, None)
                         } else {
                             (
-                                !info.source.chat.is_status_broadcast()
+                                (!info.source.chat.is_status_broadcast() || info.is_status_stanza)
                                     && self.ack_or_replay_to_hook(info).await,
                                 None,
                             )
@@ -3166,7 +3350,12 @@ impl Client {
         deferred: &mut Vec<DeferredPlaintext>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> MigrationDecryptResult {
-        if !parsed_message.is_available() || !sender_jid.is_lid() {
+        // Ordinary PN/LID migration has no scoped-session contract. Never use
+        // its default-session ratchet to recover a split status session.
+        if signal_address.name().ends_with("_status")
+            || !parsed_message.is_available()
+            || !sender_jid.is_lid()
+        {
             return MigrationDecryptResult::NotDecrypted(None, None);
         }
 
@@ -3564,7 +3753,12 @@ mod adv_tests {
         );
         let fence = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.lock_incoming_companion_account(&warm, Some(&warm_certificate), &warm_payloads),
+            client.lock_incoming_companion_account(
+                &warm,
+                &warm.to_protocol_address(),
+                Some(&warm_certificate),
+                &warm_payloads,
+            ),
         )
         .await
         .expect("cold ADV must not own the warm companion's primary lock")
@@ -3608,7 +3802,12 @@ mod adv_tests {
         let permits = client.acquire_message_quiescence().await;
         assert_eq!(
             client
-                .preflight_incoming_companion_identity(&sender, Some(&certificate), &payloads,)
+                .preflight_incoming_companion_identity(
+                    &sender,
+                    &sender.to_protocol_address(),
+                    Some(&certificate),
+                    &payloads,
+                )
                 .await,
             Some(0)
         );
@@ -3620,6 +3819,7 @@ mod adv_tests {
             client
                 .preflight_incoming_companion_identity_inner(
                     &sender,
+                    &sender.to_protocol_address(),
                     Some(&certificate),
                     &payloads,
                     true,
@@ -3651,7 +3851,12 @@ mod adv_tests {
             tokio::spawn(async move {
                 entered.send(()).unwrap();
                 client
-                    .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+                    .lock_incoming_companion_account(
+                        &sender,
+                        &sender.to_protocol_address(),
+                        Some(&certificate),
+                        &payloads,
+                    )
                     .await
                     .map(|_| ())
             })
@@ -3700,7 +3905,12 @@ mod adv_tests {
             .await
             .unwrap();
         let fence = client
-            .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+            .lock_incoming_companion_account(
+                &sender,
+                &sender.to_protocol_address(),
+                Some(&certificate),
+                &payloads,
+            )
             .await
             .unwrap();
         let primary = client
@@ -3756,6 +3966,51 @@ mod adv_tests {
     #[tokio::test]
     async fn regular_companion_receive_keeps_account_fence_through_session_commit() {
         check_inbound_account_fence(true).await;
+    }
+
+    #[tokio::test]
+    async fn scoped_adv_identity_requires_reverification_after_reset_or_conflict() {
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("15550000002", 7);
+        let ordinary = sender.to_protocol_address();
+        let status = wacore::types::jid::status_session_address(&ordinary).unwrap();
+        let identity = [7; 32];
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err()
+        );
+        client.signal_cache.put_identity(&ordinary, &identity).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_ok()
+        );
+        client.signal_cache.put_identity(&status, &[8; 32]).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err(),
+            "a conflicting scoped key must not fall back to a stale ordinary key"
+        );
+        client.signal_cache.put_identity(&status, &identity).await;
+        client.signal_cache.delete_identity(&ordinary).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_ok()
+        );
+        client.delete_sessions_for_devices(&sender.user, &[7]).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity_at_address(&sender, &status, None, &identity)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

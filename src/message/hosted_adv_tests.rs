@@ -95,12 +95,22 @@ async fn hosted_own_adv_uses_paired_anchor_without_iq_or_signal_namespace_change
                 fixture(crate::test_utils::adv_test_account(), hosted, true);
             assert_eq!(
                 client
-                    .preflight_incoming_companion_identity(&sender, Some(&certificate), &payloads)
+                    .preflight_incoming_companion_identity(
+                        &sender,
+                        &sender.to_protocol_address(),
+                        Some(&certificate),
+                        &payloads
+                    )
                     .await,
                 None
             );
             let fence = client
-                .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+                .lock_incoming_companion_account(
+                    &sender,
+                    &sender.to_protocol_address(),
+                    Some(&certificate),
+                    &payloads,
+                )
                 .await
                 .unwrap();
             assert_eq!(sender.to_protocol_address(), original);
@@ -303,7 +313,12 @@ async fn hosted_receive_rechecks_the_ordinary_anchor_after_rotation() {
             let sender = sender.clone();
             tokio::spawn(async move {
                 client
-                    .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+                    .lock_incoming_companion_account(
+                        &sender,
+                        &sender.to_protocol_address(),
+                        Some(&certificate),
+                        &payloads,
+                    )
                     .await
                     .map(|_| ())
             })
@@ -411,7 +426,12 @@ async fn hosted_lid_participant_send_and_receive_use_one_account_before_device_l
     let generation = client.connection_generation.load(Ordering::Acquire);
     let mut processing_permit = Some(client.acquire_message_processing_permit().await);
     let fence = client
-        .lock_incoming_companion_account(&hosted, Some(&certificate), &payloads)
+        .lock_incoming_companion_account(
+            &hosted,
+            &hosted.to_protocol_address(),
+            Some(&certificate),
+            &payloads,
+        )
         .await
         .unwrap();
     let anchor = client
