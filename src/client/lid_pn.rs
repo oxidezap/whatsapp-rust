@@ -1227,6 +1227,20 @@ impl Client {
             keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
             keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
             let _guards = self.session_guards_for(&keys).await;
+            // Receive acquires account anchors before the selected scoped
+            // ratchet. Keep that order, then order both alias ratchets alike
+            // in either migration direction. Primary decrypts hold only these
+            // scoped mutexes, so ordinary account guards cannot replace them.
+            let mut scoped_guards = Vec::new();
+            if status_scope {
+                let mut addresses = vec![&pn_proto, &lid_proto];
+                addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                addresses.dedup_by(|a, b| a.as_str() == b.as_str());
+                for address in addresses {
+                    let mutex = self.session_lock_for(address.as_str()).await;
+                    scoped_guards.push(mutex.lock_arc().await);
+                }
+            }
 
             // Session -> mapping is publication's lock order. Hold ownership
             // through both the session and identity transfer, not just device0.
@@ -3826,6 +3840,79 @@ mod tests {
     async fn companion_migration_holds_both_primary_fences_while_retaining_old_state() {
         for status_scope in [false, true] {
             check_companion_migration_fences(status_scope).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_status_migration_waits_for_each_scoped_session_lock() {
+        use wacore::types::jid::JidExt as _;
+        for lock_source in [false, true] {
+            let client =
+                crate::test_utils::create_test_client_with_name("scoped_migration_lock").await;
+            let phone = Jid::pn("12025550197");
+            let lid = Jid::lid("100000000000197");
+            let source =
+                wacore::types::jid::status_session_address(&phone.to_protocol_address()).unwrap();
+            let target =
+                wacore::types::jid::status_session_address(&lid.to_protocol_address()).unwrap();
+            let backend = client
+                .persistence_manager
+                .get_device_snapshot()
+                .backend
+                .clone();
+            backend
+                .put_session(source.as_str(), &tagged_session_blob(4242))
+                .await
+                .unwrap();
+            let mutex = client
+                .session_lock_for(if lock_source {
+                    source.as_str()
+                } else {
+                    target.as_str()
+                })
+                .await;
+            let guard = mutex.lock().await;
+            let baseline = Arc::strong_count(&mutex);
+            let mut migration = Box::pin(client.migrate_signal_sessions(&phone, &lid));
+            tokio::select! {
+                result = migration.as_mut() => panic!("migration bypassed a scoped lock: {result:?}"),
+                () = crate::test_utils::wait_for_lock_waiter(&mutex, baseline) => {}
+            }
+            assert!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                backend
+                    .get_session(target.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(guard);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+                .await
+                .unwrap();
+            assert_eq!(outcome.migrated, 1);
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            assert!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .get_session(target.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            client.signal_shutdown_sync();
         }
     }
 

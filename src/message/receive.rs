@@ -2860,7 +2860,7 @@ impl Client {
                     {
                         Ok(outcome) => {
                             skdm_only &= outcome.skdm_only;
-                            response_claimed = true;
+                            response_claimed |= !outcome.skdm_only;
                         }
                         Err(e) => {
                             skdm_only = false;

@@ -1828,14 +1828,22 @@ async fn status_session_sibling_and_terminal_group_failure_wait_for_durable_comm
 }
 
 async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling: bool) {
-    struct Hook;
+    #[derive(Default)]
+    struct Hook {
+        content: std::sync::Mutex<Vec<String>>,
+    }
     #[async_trait::async_trait]
     impl crate::InboundDurabilityHook for Hook {
         async fn on_messages(
             &self,
             _: Arc<Client>,
-            _: &[wacore::types::events::InboundMessage],
+            batch: &[wacore::types::events::InboundMessage],
         ) -> anyhow::Result<()> {
+            self.content.lock().unwrap().extend(
+                batch
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap_or_default()),
+            );
             Ok(())
         }
     }
@@ -1857,9 +1865,10 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
             (true, false, true),
         ] {
             let (client, transport) = capturing_client("expired_status_mixed").await;
+            let hook = Arc::new(Hook::default());
             client
                 .inbound_durability_hook
-                .set(Arc::new(Hook))
+                .set(hook.clone())
                 .ok()
                 .unwrap();
             client.enter_drain_mode_for_tests();
@@ -1944,6 +1953,7 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                 0,
                 "failed commit must withhold the stanza response"
             );
+            assert!(hook.content.lock().unwrap().is_empty());
             client
                 .inbound_commit_batch
                 .fail_commits
@@ -1959,6 +1969,7 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
                 // finish the drain before exercising its recovery redelivery.
                 client.enter_live_mode_for_tests();
             }
+            assert_eq!(&*hook.content.lock().unwrap(), &["save before responding"]);
             if failure == "invalid_plaintext" || (!expired && failure == "invalid_ciphertext") {
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(
@@ -2004,6 +2015,7 @@ async fn check_status_mixed_group_payloads_commit(expired: bool, session_sibling
             } else {
                 assert_exactly_one_confirmation(&transport, &info.id).await;
             }
+            assert_eq!(&*hook.content.lock().unwrap(), &["save before responding"]);
         }
     }
 }
@@ -2050,6 +2062,96 @@ async fn skdm_only_sender_key_status_is_acknowledged_once() {
             )
             .await;
             assert_exactly_one_confirmation(&transport, "SKDM-STATUS").await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn skdm_only_sibling_does_not_hide_status_plaintext_failure() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("protocol-only and malformed payloads must not reach the consumer hook")
+        }
+    }
+    for journal in [false, true] {
+        for is_status_stanza in [false, true] {
+            for can_nack in [false, true] {
+                for failure_first in [false, true] {
+                    let (client, transport) = capturing_client("skdm_bad_status_sibling").await;
+                    if journal {
+                        client
+                            .inbound_durability_hook
+                            .set(Arc::new(Hook))
+                            .ok()
+                            .unwrap();
+                    }
+                    let group = Jid::status_broadcast();
+                    let mut peer =
+                        joined_group_sender(&client, "100000000000039@lid", &group).await;
+                    let mut message = wa::Message::default();
+                    message.sender_key_distribution_message =
+                        buffa::MessageField::some(peer.create_group_skdm(&group).await);
+                    let good = peer
+                        .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&message))
+                        .await;
+                    let bad = peer.encrypt_group_message(&group, &[5]).await;
+                    let mut payloads = vec![
+                        skmsg_payload_from_bytes(good),
+                        skmsg_payload_from_bytes(bad),
+                    ];
+                    if failure_first {
+                        payloads.reverse();
+                    }
+                    for (index, payload) in payloads.iter_mut().enumerate() {
+                        payload.enc_index = index;
+                    }
+                    let mut info =
+                        (*group_message_info("SKDM-BAD-SIBLING", &group, &peer.jid, false)).clone();
+                    info.is_status_stanza = is_status_stanza;
+                    info.meta_info
+                        .get_or_insert_with(Default::default)
+                        .status_can_nack = can_nack;
+                    process_group_classified_with_sessions(
+                        &client,
+                        Arc::new(info),
+                        &peer.jid,
+                        vec![],
+                        payloads,
+                    )
+                    .await;
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while transport.sent_count() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("a protocol-only sibling cannot swallow the failure response");
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    let frames = transport.sent();
+                    assert_eq!(frames.len(), 1);
+                    let bytes = decode_frame(0, &frames[0]).unwrap();
+                    let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                    assert_eq!(response.tag.as_ref(), "ack");
+                    assert_eq!(
+                        response.attrs().optional_string("error").as_deref(),
+                        can_nack.then_some("491")
+                    );
+                    assert_eq!(
+                        response.attrs().optional_string("class").as_deref(),
+                        Some(if is_status_stanza {
+                            "status"
+                        } else {
+                            "message"
+                        })
+                    );
+                }
+            }
         }
     }
 }
