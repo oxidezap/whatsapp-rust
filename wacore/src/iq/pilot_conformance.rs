@@ -1,12 +1,12 @@
-//! Auto-generated private IQ bundle conformance cases (WhatsApp 2.3000.1052559453). DO NOT EDIT.
+//! Auto-generated private IQ bundle conformance cases (WhatsApp 2.3000.1054751086). DO NOT EDIT.
 //!
-//! Reviewed whatspec ae3880925bacd23863cc30ec480c9f82bfd869f1.
-//! Bundle set d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf.
-//! Archive SHA-256 2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62.
-//! Source asset: https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1052559453-d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf.tar.xz
+//! Reviewed whatspec 2ff44531865451b99cf2840cbe9670d4eef3f8ef.
+//! Bundle set a2fcddddfcfa3fd73d880c9d6e625923c91ab2da89c9b39f5f060d8fffd955d1.
+//! Archive SHA-256 4b690aa5aef47e269d72c6e32ffba2045c7b0f97b5eac2393e84ef85fd05609c.
+//! Source asset: https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1054751086-a2fcddddfcfa3fd73d880c9d6e625923c91ab2da89c9b39f5f060d8fffd955d1.tar.xz
 //! Correlation/error dispatch are outside this payload-only fixture.
-//! WASmaxParseUtils: a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42 bytes 27431..34172, module SHA-256 972c3f403bc0588e2060897999b16426511d058165bd7b602dc6869eb6718889.
-//! WASmaxGroupsAcceptGroupAddRPC: 29bc9cdd1e375455ed50fd0505d66eae6d7635bbab9aeee94851139d0ac38b82 bytes 19..6075, module SHA-256 de8a93c8f1a2460f967ff5ef44fff52dbd4f907d80cc56ee6b3c931ea12bdda2.
+//! WASmaxGroupsAcceptGroupAddRPC: 5022cb88fc6b1cc260c97bcb81d0f4a8b577aaed1aa763556fc3831375934e61 bytes 19..6039, module SHA-256 c77a0cebff45cb0caa69d48bafc71942911370b3d8dc35ce3b228d489bd7c4ac.
+//! WASmaxParseUtils: 581d9f49e50e896f381cc221f85eeb9655ab09b5ec2135ef2bc0762f24fde13a bytes 79568..86309, module SHA-256 972c3f403bc0588e2060897999b16426511d058165bd7b602dc6869eb6718889.
 
 use super::pilots::{AcceptGroupAddSuccess, parse_accept_group_add_payload};
 use wacore_binary::{NodeContent, builder::NodeBuilder};

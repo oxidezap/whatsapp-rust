@@ -100,7 +100,8 @@
         "direct_connection_encrypted_info"
       ],
       "retained": "string",
-      "observed": null
+      "observed": null,
+      "reviewedDocId": "29516483177936279"
     },
     {
       "operation": "QueryCatalogHasCategories",
@@ -112,7 +113,8 @@
         "direct_connection_encrypted_info"
       ],
       "retained": "string",
-      "observed": null
+      "observed": null,
+      "reviewedDocId": "29139727815639514"
     },
     {
       "operation": "QueryCatalogProduct",
@@ -124,7 +126,8 @@
         "direct_connection_encrypted_info"
       ],
       "retained": "string",
-      "observed": null
+      "observed": null,
+      "reviewedDocId": "28846496438335971"
     },
     {
       "operation": "QueryProductCollections",
@@ -136,7 +139,8 @@
         "direct_connection_encrypted_info"
       ],
       "retained": "string",
-      "observed": null
+      "observed": null,
+      "reviewedDocId": "29398139243143451"
     },
     {
       "operation": "QueryProductSingleCollection",
@@ -148,7 +152,8 @@
         "direct_connection_encrypted_info"
       ],
       "retained": "string",
-      "observed": null
+      "observed": null,
+      "reviewedDocId": "40688642257401415"
     }
   ]
 }

@@ -247,10 +247,6 @@ message ConsumerApplication {
   }
 }
 
-message CreateBackupInput {
-  required string recoveryCode = 1;
-  required uint64 userId = 2;
-}
 
 message CreateBackupOutput {
   optional DeviceOutput device = 1;
@@ -1091,10 +1087,6 @@ message MmkFromDetachedDevice {
   required MerkleMembershipProof membershipProof = 3;
 }
 
-message OrfThreadIdInput {
-  required bytes orfClientState = 1;
-  required string threadId = 2;
-}
 
 message OrfThreadIdOutput {
   optional bytes orfThreadId = 1;
@@ -1167,4 +1159,10 @@ message WrapTransportSigningSecretKeyInput {
 
 message WrapTransportSigningSecretKeyResult {
   required bytes prefixedKey = 1;
+}
+message Reportable {
+  optional uint32 minVersion = 1 [default = 1];
+  optional uint32 maxVersion = 2;
+  optional uint32 notReportableMinVersion = 3;
+  optional bool never = 4;
 }

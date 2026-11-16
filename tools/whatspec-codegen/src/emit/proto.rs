@@ -7,7 +7,8 @@
 //! survives a sync, and a sync that starts declaring the same name fails the
 //! build rather than quietly taking over a type we already persist.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
+use std::collections::BTreeMap;
 
 /// A message this repository declares that the upstream bundle no longer does.
 struct LocalBlock {
@@ -43,10 +44,15 @@ message LIDMigrationMappingSyncPayload {
 ];
 
 pub fn generate(upstream: &str) -> Result<String> {
-    let mut out = upstream.to_string();
+    let reviewed = serde_json::from_str(include_str!("../../fixtures/reclaimed-proto.json"))?;
+    generate_with_review(upstream, &reviewed)
+}
+
+fn generate_with_review(upstream: &str, reviewed: &BTreeMap<String, String>) -> Result<String> {
+    let mut out = reconcile_reclaimed(upstream, reviewed)?;
     for block in LOCAL_BLOCKS {
         for name in block.text.lines().filter_map(declaration_name) {
-            if upstream
+            if out
                 .lines()
                 .filter_map(declaration_name)
                 .any(|upstream| upstream == name)
@@ -66,6 +72,72 @@ pub fn generate(upstream: &str) -> Result<String> {
             )
         })?;
         out.insert_str(at, &format!("\n{}", block.text));
+    }
+    Ok(out)
+}
+
+fn reconcile_reclaimed(upstream: &str, reviewed: &BTreeMap<String, String>) -> Result<String> {
+    for (name, digest) in reviewed {
+        let start = upstream
+            .find(&format!("\nmessage {name} {{\n"))
+            .map(|at| at + 1);
+        // Synthetic inputs and the first declaration need no leading newline.
+        let start = start.or_else(|| {
+            upstream
+                .starts_with(&format!("message {name} {{\n"))
+                .then_some(0)
+        });
+        let start = start.ok_or_else(|| anyhow::anyhow!("reclaimed message {name} missing"))?;
+        let end = end_of_message(&upstream[start..], name)
+            .ok_or_else(|| anyhow::anyhow!("reclaimed message {name} incomplete"))?;
+        ensure!(
+            crate::source::digest(upstream[start..start + end].as_bytes()) == *digest,
+            "reclaimed message {name} changed; review its wire contract"
+        );
+        ensure!(
+            !upstream
+                .lines()
+                .any(|line| line == format!("message Web{name} {{")),
+            "reclaimed message Web{name} already exists"
+        );
+    }
+    // These Labyrinth names now denote incompatible wire contracts. Rewrite
+    // current references together; historical declarations are appended later.
+    let mut out = String::with_capacity(upstream.len());
+    let bytes = upstream.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        if bytes[at] == b'"' || bytes[at] == b'\'' {
+            let quote = bytes[at];
+            at += 1;
+            while at < bytes.len() {
+                let byte = bytes[at];
+                at += 1;
+                if byte == b'\\' {
+                    at = (at + 1).min(bytes.len());
+                } else if byte == quote {
+                    break;
+                }
+            }
+        } else if bytes[at..].starts_with(b"//") {
+            at += upstream[at..].find('\n').unwrap_or(bytes.len() - at);
+        } else if bytes[at..].starts_with(b"/*") {
+            at += upstream[at + 2..]
+                .find("*/")
+                .map_or(bytes.len() - at, |end| end + 4);
+        } else if bytes[at].is_ascii_alphabetic() || bytes[at] == b'_' {
+            at += 1;
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                at += 1;
+            }
+            if reviewed.contains_key(&upstream[start..at]) {
+                out.push_str("Web");
+            }
+        } else {
+            at += upstream[at..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push_str(&upstream[start..at]);
     }
     Ok(out)
 }
@@ -101,6 +173,30 @@ fn end_of_message(proto: &str, name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generate(upstream: &str) -> Result<String> {
+        generate_with_review(upstream, &BTreeMap::new())
+    }
+
+    #[test]
+    fn reclaimed_contracts_keep_current_references_separate_and_preserve_literals() {
+        let message = "message Legacy {\n  required int32 id = 1;\n}\n";
+        let source = format!(
+            "{message}// Legacy\n/* Legacy */\nmessage Holder {{\n  optional Legacy child = 1;\n  optional string text = 2 [default = \"Legacy\"];\n}}\n"
+        );
+        let reviewed =
+            BTreeMap::from([("Legacy".into(), crate::source::digest(message.as_bytes()))]);
+        let out = reconcile_reclaimed(&source, &reviewed).unwrap();
+        assert!(out.contains("message WebLegacy {"));
+        assert!(out.contains("optional WebLegacy child = 1;"));
+        assert!(out.contains("// Legacy\n/* Legacy */"));
+        assert!(out.contains("[default = \"Legacy\"]"));
+        assert!(reconcile_reclaimed(&source.replace("int32", "bytes"), &reviewed).is_err());
+        assert!(reconcile_reclaimed("", &reviewed).is_err());
+        assert!(
+            reconcile_reclaimed(&format!("{source}message WebLegacy {{\n}}\n"), &reviewed).is_err()
+        );
+    }
 
     const UPSTREAM: &str = "\
 syntax = \"proto2\";
@@ -145,10 +241,7 @@ message WebNotificationsInfo {
 
     #[test]
     fn retained_messages_and_enums_cannot_be_silently_reclaimed() {
-        for declaration in [
-            "message LabyrinthWaCommand {}",
-            "enum FUTURE_PROOF_BEHAVIOR {}",
-        ] {
+        for declaration in ["message MinosCommand {}", "enum FUTURE_PROOF_BEHAVIOR {}"] {
             let err = generate(&format!("{UPSTREAM}\n{declaration}\n")).expect_err("collision");
             assert!(err.to_string().contains("drop the local block"), "{err}");
         }

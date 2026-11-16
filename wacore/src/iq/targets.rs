@@ -1,4 +1,4 @@
-//! Auto-generated IQ addressing (WhatsApp 2.3000.1052559453). DO NOT EDIT.
+//! Auto-generated IQ addressing (WhatsApp 2.3000.1054751086). DO NOT EDIT.
 //!
 //! How the official client addresses the requests this repository sends.
 //!

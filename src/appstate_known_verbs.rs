@@ -1,4 +1,4 @@
-//! Auto-generated AppState known verbs (log gating) (WhatsApp 2.3000.1052559453). DO NOT EDIT.
+//! Auto-generated AppState known verbs (log gating) (WhatsApp 2.3000.1054751086). DO NOT EDIT.
 //!
 
 //! Declared syncd action names for log gating. Shares its arms with

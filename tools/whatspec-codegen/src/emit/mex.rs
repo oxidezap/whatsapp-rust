@@ -93,6 +93,7 @@ fn retain_historical_fields(ir: &mut MexIr) -> anyhow::Result<()> {
     struct Retained {
         operation: String,
         doc_id: String,
+        reviewed_doc_id: Option<String>,
         root: String,
         path: Vec<String>,
         retained: TypeNode,
@@ -117,7 +118,12 @@ fn retain_historical_fields(ir: &mut MexIr) -> anyhow::Result<()> {
             continue;
         };
         ensure!(
-            op.doc_id == entry.doc_id,
+            op.doc_id
+                == entry
+                    .reviewed_doc_id
+                    .as_ref()
+                    .unwrap_or(&entry.doc_id)
+                    .as_str(),
             "review retained MEX fields for {}",
             entry.operation
         );

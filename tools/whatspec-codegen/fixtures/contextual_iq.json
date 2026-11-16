@@ -1,16 +1,20 @@
 {
   "schemaVersion": "4.5.0",
-  "waVersion": "2.3000.1052559453",
+  "waVersion": "2.3000.1054751086",
   "stanzas": [
     {
-      "moduleName": "WASmaxOutMdGetCountryCodeRequest",
+      "moduleName": "WASmaxMdGetCountryCodeRPC",
       "namespace": "md",
       "iqType": "get",
       "target": "s.whatsapp.net",
       "parserName": "WASmaxMdGetCountryCodeRPC",
       "exportedFunction": "makeGetCountryCodeRequest",
       "allExports": [
-        "makeGetCountryCodeRequest"
+        "sendGetCountryCodeRPC",
+        "parseGetCountryCodeResponseError",
+        "parseGetCountryCodeResponseGetCountryCodeResponse",
+        "makeGetCountryCodeRequest",
+        "parseCountryCodeErrors"
       ],
       "request": {
         "namespace": "md",
@@ -58,7 +62,7 @@
         "variants": [
           {
             "tag": "GetCountryCodeResponseGetCountryCodeResponse",
-            "moduleName": "WASmaxInMdGetCountryCodeResponseGetCountryCodeResponse",
+            "moduleName": "WASmaxMdGetCountryCodeRPC",
             "kind": "success",
             "assertions": [
               {
@@ -108,7 +112,7 @@
           },
           {
             "tag": "GetCountryCodeResponseError",
-            "moduleName": "WASmaxInMdGetCountryCodeResponseError",
+            "moduleName": "WASmaxMdGetCountryCodeRPC",
             "kind": "error",
             "errorArms": [
               {
@@ -459,8 +463,7 @@
         "parseAcceptGroupAddResponseGroupJoinRequestSuccess",
         "parseAcceptGroupAddResponseServerError",
         "parseAcceptGroupAddResponseSuccess",
-        "makeAcceptGroupAddRequest",
-        "parseAcceptGroupAddClientErrors"
+        "makeAcceptGroupAddRequest"
       ],
       "request": {
         "namespace": "w:g2",
@@ -1424,8 +1427,7 @@
         "parseDeleteParentGroupResponseClientError",
         "parseDeleteParentGroupResponseServerError",
         "parseDeleteParentGroupResponseSuccess",
-        "makeDeleteParentGroupRequest",
-        "parseDeleteParentGroupClientError"
+        "makeDeleteParentGroupRequest"
       ],
       "request": {
         "namespace": "w:g2",
@@ -1947,8 +1949,7 @@
         "parseJoinLinkedGroupResponseGroupJoinRequestSuccess",
         "parseJoinLinkedGroupResponseServerError",
         "parseJoinLinkedGroupResponseSuccess",
-        "makeJoinLinkedGroupRequest",
-        "parseJoinLinkedGroupClientErrors"
+        "makeJoinLinkedGroupRequest"
       ],
       "request": {
         "namespace": "w:g2",
@@ -2842,9 +2843,7 @@
         "parseSetSubjectResponseClientError",
         "parseSetSubjectResponseServerError",
         "parseSetSubjectResponseSuccess",
-        "makeSetSubjectRequest",
-        "parseSetSubjectClientErrors",
-        "mergeSetSubjectChangeSubjectMixin"
+        "makeSetSubjectRequest"
       ],
       "request": {
         "namespace": "w:g2",
