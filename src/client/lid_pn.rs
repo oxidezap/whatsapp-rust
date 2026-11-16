@@ -1192,12 +1192,28 @@ impl Client {
 
         let mut outcome = crate::features::SignalSessionMigration::default();
 
-        for device_id in 0..MIGRATION_DEVICE_RANGE {
+        // The alias changes both session namespaces. Reuse the same account,
+        // device and mapping fences for each scope; never borrow an ordinary
+        // ratchet when a status session is absent.
+        for (device_id, status_scope) in
+            (0..MIGRATION_DEVICE_RANGE).flat_map(|id| [(id, false), (id, true)])
+        {
             let pn_jid = from.with_device(device_id);
             let lid_jid = to.with_device(device_id);
 
-            let pn_proto = pn_jid.to_protocol_address();
-            let lid_proto = lid_jid.to_protocol_address();
+            let mut pn_proto = pn_jid.to_protocol_address();
+            let mut lid_proto = lid_jid.to_protocol_address();
+            if status_scope {
+                let (Some(scoped_pn), Some(scoped_lid)) = (
+                    wacore::types::jid::status_session_address(&pn_proto),
+                    wacore::types::jid::status_session_address(&lid_proto),
+                ) else {
+                    // Hosted addresses have no status-session namespace.
+                    continue;
+                };
+                pn_proto = scoped_pn;
+                lid_proto = scoped_lid;
+            }
 
             // Include both account anchors for companion writes: recovery
             // must not publish new trust while this iteration retains old
@@ -3808,6 +3824,12 @@ mod tests {
     /// still exclude identity recovery under both primary account locks.
     #[tokio::test]
     async fn companion_migration_holds_both_primary_fences_while_retaining_old_state() {
+        for status_scope in [false, true] {
+            check_companion_migration_fences(status_scope).await;
+        }
+    }
+
+    async fn check_companion_migration_fences(status_scope: bool) {
         use crate::store::release::tests::ProbeBackend;
         use wacore::types::jid::JidExt as _;
         let (mut probe, _) = ProbeBackend::new();
@@ -3818,12 +3840,15 @@ mod tests {
         probe.gate_method = "after:get_session";
         let phone = Jid::pn("12025550198");
         let lid = Jid::lid("100000000000198");
+        let ordinary = phone.with_device(1).to_protocol_address();
+        let address = if status_scope {
+            wacore::types::jid::status_session_address(&ordinary).unwrap()
+        } else {
+            ordinary
+        };
         probe
             .backend
-            .put_session(
-                phone.with_device(1).to_protocol_address().as_str(),
-                &tagged_session_blob(4242),
-            )
+            .put_session(address.as_str(), &tagged_session_blob(4242))
             .await
             .unwrap();
         let (client, _) =
@@ -3839,12 +3864,15 @@ mod tests {
                     .await
             })
         };
-        // Device 0 first, then device 1 with an old session retained by I/O.
-        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        release.send(()).await.unwrap();
+        // Pass both device-0 scopes, and the ordinary device-1 slot when
+        // observing a scoped companion. Stop with its source record retained.
+        for _ in 0..if status_scope { 3 } else { 2 } {
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            release.send(()).await.unwrap();
+        }
         tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
             .await
             .unwrap()
@@ -3858,7 +3886,7 @@ mod tests {
                 "recovery cannot publish while companion migration retains old state"
             );
         }
-        for _ in 0..MIGRATION_DEVICE_RANGE {
+        for _ in 0..2 * MIGRATION_DEVICE_RANGE {
             release.send(()).await.unwrap();
         }
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), migration)

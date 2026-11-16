@@ -191,6 +191,7 @@ struct IncomingAccountFence {
 struct GroupBatchOutcome {
     expired_only: bool,
     unanswered_plaintext_failure: bool,
+    unanswered_decrypt_failure: bool,
 }
 
 impl Client {
@@ -571,8 +572,7 @@ impl Client {
                     && (!info.source.is_from_me
                         || recipient
                             .as_ref()
-                            .is_none_or(|recipient| !is_user(recipient))))
-                || (info.source.is_group && info.source.sender.is_hosted());
+                            .is_none_or(|recipient| !is_user(recipient))));
             // Web's incomingMsgParser calls contentBytes() for every enc before
             // processing any slot; a missing binary rejects the whole envelope.
             let malformed_payload = nr.get_optional_child("plaintext").is_some()
@@ -602,6 +602,17 @@ impl Client {
                 self.spawn_stanza_nack(nr, reason, None);
                 return None;
             }
+        }
+
+        // Web's parser rejects hosted participants in broadcasts/groups. The
+        // hosted Signal-address exception applies to valid direct contexts;
+        // it is not permission to admit an invalid hosted status participant.
+        if info.source.sender.is_hosted()
+            && (info.source.chat.is_status_broadcast()
+                || (info.is_status_stanza && info.source.is_group))
+        {
+            self.spawn_stanza_nack(nr, NackReason::InvalidHostedCompanionStanza, None);
+            return None;
         }
 
         // Newsletters use <plaintext> instead of <enc> because they are not E2E encrypted.
@@ -953,7 +964,10 @@ impl Client {
         // drain, so a cold session-capable status must prime it independently.
         // skmsg does not use this address. Fetch opt-out leaves an unseeded
         // session decision pending until the application fetches props itself.
-        if !session_payloads.is_empty() && info.uses_status_session(3) && !self.ab_props.is_seeded()
+        if !session_payloads.is_empty()
+            && info.uses_status_session(3)
+            && !sender_encryption_jid.is_hosted()
+            && !self.ab_props.is_seeded()
         {
             if self.connection_generation.load(Ordering::Acquire) != lane_generation {
                 self.report_stanza_not_attempted(
@@ -1529,6 +1543,7 @@ impl Client {
         // permit + per-chat enqueue lock acquired upstream.
         group_outcome.expired_only &= bot_payloads.is_empty();
         group_outcome.unanswered_plaintext_failure &= bot_payloads.is_empty();
+        group_outcome.unanswered_decrypt_failure &= bot_payloads.is_empty();
         for payload in bot_payloads {
             // Keep the bot-only decrypt frame out of every chat lane future.
             Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
@@ -1536,22 +1551,36 @@ impl Client {
 
         // A failing sibling cannot acknowledge content whose commit still owns
         // this stanza. Successful/duplicate siblings own their normal response.
-        let retained = (group_outcome.expired_only || group_outcome.unanswered_plaintext_failure)
+        let retained = (group_outcome.expired_only
+            || group_outcome.unanswered_plaintext_failure
+            || group_outcome.unanswered_decrypt_failure)
             && self.inbound_journal_enabled()
             && self
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info);
         if (info.is_status_stanza || info.source.chat.is_status_broadcast())
-            && group_outcome.unanswered_plaintext_failure
+            && (group_outcome.unanswered_plaintext_failure
+                || group_outcome.unanswered_decrypt_failure)
             && !session_outcome.dispatched
             && !session_outcome.had_failure
             && !session_had_duplicates
             && !session_dispatched_undecryptable
             && !retained
         {
-            self.handle_plaintext_failure(&info, decrypt_fail_mode)
+            if group_outcome.unanswered_decrypt_failure {
+                self.dispatch_undecryptable_event(
+                    Arc::clone(&info),
+                    false,
+                    crate::types::events::UnavailableType::Unknown,
+                    decrypt_fail_mode,
+                )
                 .await;
+                self.spawn_nack(&info, NackReason::UnhandledError, None);
+            } else {
+                self.handle_plaintext_failure(&info, decrypt_fail_mode)
+                    .await;
+            }
         } else if group_outcome.expired_only
             && should_ack_skdm_only_session_fallback(session_outcome, true)
         {
@@ -2725,6 +2754,7 @@ impl Client {
         // time may cross expiry while a decrypt waits for the sender-key lock.
         let mut expired_only = info.is_status_stanza || info.source.chat.is_status_broadcast();
         let mut plaintext_failed = false;
+        let mut terminal_decrypt_failed = false;
         let mut response_claimed = false;
 
         for payload in payloads {
@@ -2915,12 +2945,12 @@ impl Client {
                         continue;
                     }
                     expired_only = false;
-                    response_claimed = true;
                     self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
                     // Recoverable sender-key desync: retry receipt (prompts an SKDM
                     // resend), not a 500 NACK that would drop the message permanently.
                     if let Some(reason) = group_decrypt_retry_reason(&e) {
+                        response_claimed = true;
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),
                             "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}. Sending retry receipt.",
@@ -2942,8 +2972,15 @@ impl Client {
                         sender_address.observe(),
                         e
                     );
-                    // Surface the failure, then let the status envelope guard
-                    // choose NACK or final ACK for raw status stanzas.
+                    // A terminal failure must not settle a status whose useful
+                    // sibling still owns an uncommitted delivery. Aggregate it
+                    // before choosing the guarded response, just like plaintext
+                    // failures; ordinary messages keep their existing NACK path.
+                    if info.is_status_stanza || info.source.chat.is_status_broadcast() {
+                        terminal_decrypt_failed = true;
+                        continue;
+                    }
+                    response_claimed = true;
                     self.dispatch_undecryptable_event(
                         Arc::clone(info),
                         false,
@@ -2958,6 +2995,11 @@ impl Client {
         Ok(GroupBatchOutcome {
             expired_only,
             unanswered_plaintext_failure: plaintext_failed && !response_claimed,
+            // A failed journal receipt scope also suppresses a successful or
+            // duplicate sibling's deferred ACK. Once its commit is durable,
+            // the terminal failure must still settle the redelivered stanza.
+            unanswered_decrypt_failure: terminal_decrypt_failed
+                && (!response_claimed || self.inbound_journal_enabled()),
         })
     }
 
