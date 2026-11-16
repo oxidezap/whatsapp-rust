@@ -2858,9 +2858,6 @@ impl Client {
                 }
             };
 
-            if decrypt_result.is_err() {
-                skdm_only = false;
-            }
             match decrypt_result {
                 Ok(padded_plaintext) => {
                     expired_only = false;
@@ -2922,6 +2919,7 @@ impl Client {
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
+                    skdm_only = false;
                     expired_only = false;
                     response_claimed = true;
                     log::debug!(
@@ -2955,6 +2953,9 @@ impl Client {
                         continue;
                     }
 
+                    // An intentionally ignored expired error must not erase
+                    // a protocol-only sibling's successful response.
+                    skdm_only = false;
                     expired_only = false;
                     self.report_enc_decrypt_failure(
                         info,
@@ -3023,6 +3024,7 @@ impl Client {
                         );
                         continue;
                     }
+                    skdm_only = false;
                     expired_only = false;
                     self.report_enc_decrypt_failure(info, enc_index, enc_type, reason);
 
