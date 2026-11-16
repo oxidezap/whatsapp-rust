@@ -48,6 +48,9 @@ jobs:
 
   validate-compatibility:
     name: Validate release contracts and packaged consumers
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/supply-chain.yml
     with:
       release-check: true

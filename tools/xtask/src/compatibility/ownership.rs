@@ -317,4 +317,10 @@ mod tests {
         );
         assert!(verify_owner(&moved, Lane::Native, "1.100.0", "1.100.0").is_err());
     }
+
+    #[test]
+    fn release_caller_grants_the_qualification_workflow_read_permissions() {
+        let source = include_str!("../../../../.github/workflows/release.yml");
+        require_block(source, "  validate-compatibility:", "  validate-compatibility:\n    name: Validate release contracts and packaged consumers\n    permissions:\n      contents: read\n      actions: read\n    uses: ./.github/workflows/supply-chain.yml\n    with:\n      release-check: true").unwrap();
+    }
 }
