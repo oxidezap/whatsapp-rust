@@ -1362,6 +1362,197 @@ async fn classic_status_waits_for_props_before_any_ack() {
 }
 
 #[tokio::test]
+async fn classic_empty_status_receives_one_parsing_nack() {
+    check_classic_status_fanout("empty").await;
+}
+
+#[tokio::test]
+async fn classic_status_for_other_device_receives_one_parsing_nack() {
+    check_classic_status_fanout("other_device").await;
+}
+
+#[tokio::test]
+async fn classic_status_for_local_device_is_decrypted() {
+    check_classic_status_fanout("local_device").await;
+}
+
+#[tokio::test]
+async fn classic_mixed_status_fanout_decrypts_only_local_copy() {
+    check_classic_status_fanout("mixed_devices").await;
+}
+
+#[tokio::test]
+async fn classic_unavailable_status_keeps_its_success_ack() {
+    check_classic_status_fanout("unavailable").await;
+}
+
+async fn check_classic_status_fanout(shape: &str) {
+    let (client, transport) = capturing_client("classic_status_fanout").await;
+    client
+        .ab_props()
+        .apply_props(false, std::iter::empty())
+        .await;
+    let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let mut peer = AlicePeer::new("100000000000028@lid").await;
+    let (bundle, _) = bobs_prekey_bundle(&client).await;
+    let receiver = client.pn().unwrap();
+    peer.install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let mut proto = wa::Message::default();
+    proto.conversation = Some("synthetic local status fanout".into());
+    let ciphertext = peer
+        .encrypt(
+            &receiver.to_protocol_address(),
+            &MessageUtils::encode_and_pad(&proto),
+        )
+        .await;
+    let payload = enc_payload_from_ciphertext(&ciphertext);
+    let for_us = matches!(shape, "local_device" | "mixed_devices");
+    let mut destinations = Vec::new();
+    let mut other = receiver.clone();
+    other.device += 1;
+    for (recipient, include) in [
+        (other, matches!(shape, "other_device" | "mixed_devices")),
+        (receiver, for_us),
+    ] {
+        if !include {
+            continue;
+        }
+        destinations.push(
+            NodeBuilder::new("to")
+                .attr("jid", recipient)
+                .children([NodeBuilder::new("enc")
+                    .attr("type", payload.enc_type.as_wire_str())
+                    .attr("v", "2")
+                    .bytes(payload.ciphertext.to_vec())
+                    .build()])
+                .build(),
+        );
+    }
+    let id = "CLASSIC-STATUS-FANOUT";
+    let mut stanza = NodeBuilder::new("message")
+        .attr("from", Jid::status_broadcast())
+        .attr("participant", peer.jid.clone())
+        .attr("id", id)
+        .attr("type", "text")
+        .attr("t", wacore::time::now_secs().to_string());
+    if shape == "unavailable" {
+        stanza = stanza.children([NodeBuilder::new("unavailable")
+            .attr("type", "view_once")
+            .build()]);
+    } else if !destinations.is_empty() {
+        stanza = stanza.children([NodeBuilder::new("participants")
+            .children(destinations)
+            .build()]);
+    }
+    client
+        .clone()
+        .process_node(node_to_arc(stanza.build()))
+        .await;
+    if for_us {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let Some(message) = event.messages().find(|message| message.info.id == id) {
+                    assert_eq!(
+                        message.message.conversation.as_deref(),
+                        Some("synthetic local status fanout")
+                    );
+                    assert!(!message.info.is_status_stanza);
+                    assert!(message.info.source.chat.is_status_broadcast());
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("locally addressed ciphertext must reach the application");
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while transport.sent_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("classic status must receive a terminal response");
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 1, "shape={shape}");
+    let bytes = decode_frame(0, &frames[0]).unwrap();
+    let response = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+    assert_eq!(response.attrs().optional_string("id").as_deref(), Some(id));
+    assert_eq!(
+        response.attrs().optional_jid("to"),
+        Some(Jid::status_broadcast())
+    );
+    let ordinary = peer.jid.to_protocol_address();
+    let scoped = wacore::types::jid::status_session_address(&ordinary).unwrap();
+    let adapter = client.signal_adapter();
+    if for_us {
+        assert_eq!(response.tag.as_ref(), "receipt");
+        assert_eq!(
+            response.attrs().optional_string("class").as_deref(),
+            Some("status")
+        );
+        assert!(
+            adapter
+                .session_store
+                .load_session(&ordinary)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    } else {
+        assert_eq!(response.tag.as_ref(), "ack");
+        assert_eq!(
+            response.attrs().optional_string("class").as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            response.attrs().optional_string("error").as_deref(),
+            if shape == "unavailable" {
+                None
+            } else {
+                Some("487")
+            }
+        );
+        assert!(message_texts_for_id(&events, id).is_empty());
+        assert!(
+            adapter
+                .session_store
+                .load_session(&ordinary)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .identity_store
+                .get_identity(&ordinary)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        adapter
+            .session_store
+            .load_session(&scoped)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        adapter
+            .identity_store
+            .get_identity(&scoped)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn initial_props_fetch_coalesces_concurrent_receivers() {
     let (client, transport) = capturing_client("initial_props_singleflight").await;
     client.set_driver_running_for_test(true, Ordering::Release);

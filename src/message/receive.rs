@@ -639,6 +639,15 @@ impl Client {
                 ObservedId::new(info.id.as_str()),
                 ProtocolText::new(nr.tag.as_ref())
             );
+            // Classic statuses bypass the dispatcher's generic ACK. Web rejects
+            // a status without locally selected enc/unavailable content before
+            // decryption, so this early return must own its parsing NACK too.
+            if info.source.chat.is_status_broadcast()
+                && !info.is_status_stanza
+                && self.connection_generation.load(Ordering::Acquire) == classification_generation
+            {
+                self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
+            }
             return None;
         }
 
