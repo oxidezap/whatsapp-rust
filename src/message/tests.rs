@@ -2107,6 +2107,7 @@ async fn status_group_signal_failures_request_recovery_once_per_arrival() {
                     )
                     .await;
                     crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    assert!(client.pending_device_sync.take_all().is_empty());
                     let frames = transport.sent();
                     assert_eq!(
                         frames.len(),
@@ -2133,6 +2134,142 @@ async fn status_group_signal_failures_request_recovery_once_per_arrival() {
                     let count = client.message_retry_counts.get(&key).await.unwrap().0;
                     assert_eq!(count, (initial_count + 1).min(MAX_DECRYPT_RETRIES));
                 }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_unknown_companion_refresh_survives_later_signal_failure() {
+    for raw_status in [false, true] {
+        for reverse in [false, true] {
+            let (client, transport) = capturing_client("status_unknown_companion_refresh").await;
+            let group = Jid::status_broadcast();
+            let peer = joined_group_sender(&client, "100000000000045:1@lid", &group).await;
+            assert!(!client.is_from_known_device(&peer.jid).await);
+            let mut stranger = AlicePeer::new("100000000000045:1@lid").await;
+            stranger.create_group_skdm(&group).await;
+            let foreign = encrypt_group_text(&mut stranger, &group, "unknown chain").await;
+            let mut payloads = vec![
+                skmsg_payload_from_bytes(foreign),
+                skmsg_payload_from_bytes(vec![0]),
+            ];
+            if reverse {
+                payloads.reverse();
+            }
+            for (index, payload) in payloads.iter_mut().enumerate() {
+                payload.enc_index = index;
+            }
+            let mut info =
+                (*group_message_info("UNKNOWN-STATUS-COMPANION", &group, &peer.jid, false)).clone();
+            info.is_status_stanza = raw_status;
+            info.is_offline = true;
+            info.timestamp = chrono::Utc::now();
+            let info = Arc::new(info);
+            process_group_classified_with_sessions(&client, info, &peer.jid, Vec::new(), payloads)
+                .await;
+            assert_eq!(
+                client.pending_device_sync.take_all(),
+                vec![peer.jid.to_non_ad()],
+                "raw={raw_status}, reverse={reverse}"
+            );
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                transport.sent_count(),
+                1,
+                "device refresh must not duplicate recovery"
+            );
+            let bytes = decode_frame(0, &transport.sent()[0]).unwrap();
+            let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+            assert_eq!(node.tag.as_ref(), "receipt");
+            let retry = node.get_optional_child("retry").unwrap();
+            assert_eq!(retry.attrs().optional_string("count").as_deref(), Some("1"));
+            let expected_reason =
+                reverse.then(|| (RetryReason::UnknownCompanionNoPrekey as u8).to_string());
+            assert_eq!(
+                retry.attrs().optional_string("error").as_deref(),
+                expected_reason.as_deref()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_skdm_session_does_not_respond_before_group_recovery() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("protocol-only session and failed group ciphertext have no consumer content")
+        }
+    }
+    for journal in [false, true] {
+        for raw_status in [false, true] {
+            for missing_key in [false, true] {
+                let (client, transport) = capturing_client("status_skdm_group_recovery").await;
+                if journal {
+                    client
+                        .inbound_durability_hook
+                        .set(Arc::new(Hook))
+                        .ok()
+                        .unwrap();
+                }
+                client
+                    .ab_props()
+                    .apply_props(false, std::iter::empty())
+                    .await;
+                let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+                let address = receiver.to_protocol_address();
+                let group = Jid::status_broadcast();
+                let mut peer = AlicePeer::new("100000000000046@lid").await;
+                peer.install_bob_session(&address, &bundle).await;
+                let mut message = wa::Message::default();
+                message.sender_key_distribution_message =
+                    buffa::MessageField::some(peer.create_group_skdm(&group).await);
+                let session = peer
+                    .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+                    .await;
+                let group_bytes = if missing_key {
+                    let mut stranger = AlicePeer::new("100000000000046@lid").await;
+                    stranger.create_group_skdm(&group).await;
+                    encrypt_group_text(&mut stranger, &group, "unknown chain").await
+                } else {
+                    vec![0]
+                };
+                let mut group_payload = skmsg_payload_from_bytes(group_bytes);
+                group_payload.enc_index = 1;
+                let mut info =
+                    (*group_message_info("SKDM-STATUS-RECOVERY", &group, &peer.jid, false)).clone();
+                info.is_status_stanza = raw_status;
+                info.timestamp = chrono::Utc::now();
+                let info = Arc::new(info);
+                process_group_classified_with_sessions(
+                    &client,
+                    info.clone(),
+                    &peer.jid,
+                    vec![enc_payload_from_ciphertext(&session)],
+                    vec![group_payload],
+                )
+                .await;
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                let frames = transport.sent();
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "journal={journal}, raw={raw_status}, missing_key={missing_key}"
+                );
+                let bytes = decode_frame(0, &frames[0]).unwrap();
+                let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                assert_eq!(node.tag.as_ref(), "receipt");
+                assert_eq!(
+                    node.attrs().optional_string("type").as_deref(),
+                    Some("retry")
+                );
+                assert_eq!(confirmations_for(&frames, &info.id), 0);
             }
         }
     }

@@ -193,6 +193,7 @@ struct GroupBatchOutcome {
     skdm_only: bool,
     unanswered_validation_failure: Option<NackReason>,
     retry_reason: Option<RetryReason>,
+    needs_device_sync: bool,
 }
 
 impl Client {
@@ -1539,6 +1540,12 @@ impl Client {
             self.ack_received_message(&info);
         }
 
+        // Discovery is an independent side effect: a later Signal failure can
+        // select another retry reason without cancelling this refresh.
+        if group_outcome.needs_device_sync {
+            self.handle_unknown_device_sync(&info).await;
+        }
+
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
@@ -1581,9 +1588,6 @@ impl Client {
             && !retained
         {
             if let Some(reason) = group_outcome.retry_reason {
-                if reason == RetryReason::UnknownCompanionNoPrekey {
-                    self.handle_unknown_device_sync(&info).await;
-                }
                 // Web's CryptoLibrary wraps every non-duplicate group decrypt
                 // failure in SignalDecryptionError, including malformed binary
                 // ciphertext. Its decryption handler retries these; they are
@@ -2817,6 +2821,7 @@ impl Client {
         let mut skdm_only = true;
         let mut plaintext_failed = false;
         let mut pending_retry = None;
+        let mut needs_device_sync = false;
         let mut response_claimed = false;
 
         for payload in payloads {
@@ -2973,6 +2978,7 @@ impl Client {
                     );
 
                     if status_context {
+                        needs_device_sync |= is_unknown_device;
                         pending_retry = Some(retry_reason);
                         continue;
                     }
@@ -3080,6 +3086,7 @@ impl Client {
             // Failed journal scopes suppress successful/duplicate receipts too.
             retry_reason: pending_retry
                 .filter(|_| !response_claimed || self.inbound_journal_enabled()),
+            needs_device_sync,
         })
     }
 
