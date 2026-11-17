@@ -364,14 +364,16 @@ impl SignedPreKeyStore for Device {
                 self.signed_pre_key_id,
                 &self.signed_pre_key,
                 self.signed_pre_key_signature,
-                self.backend
-                    .instance_clock()
-                    .map_or_else(wacore::time::now_utc, |clock| {
+                self.backend.instance_clock().map_or_else(
+                    || wacore::time::now_utc().as_secs(),
+                    |clock| {
                         clock
                             .reading()
                             .expect("clock implementation returned an invalid calendar time")
                             .wall_time_utc()
-                    }),
+                            .as_secs()
+                    },
+                ),
             )
             .map_err(|error| Box::new(error) as StoreError)?;
             return Ok(Some(record));
@@ -729,7 +731,7 @@ mod tests {
             old_id,
             &kp,
             [9u8; 64],
-            wacore::time::now_utc(),
+            wacore::time::now_utc().as_secs(),
         )
         .unwrap();
         backend

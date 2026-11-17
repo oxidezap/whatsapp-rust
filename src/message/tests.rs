@@ -893,7 +893,7 @@ async fn status_expiring_while_waiting_for_sender_key_lock_is_terminal() {
         };
         let mut info = (*group_message_info("EXPIRY-BOUNDARY", &group, &peer.jid, false)).clone();
         info.is_status_stanza = is_status_stanza;
-        info.timestamp = chrono::DateTime::from_timestamp(now - 86400, 0).unwrap();
+        info.timestamp = wacore::time::Timestamp::from_secs(now - 86400).unwrap();
         let info = Arc::new(info);
         let adapter = client.signal_adapter();
         let name = make_sender_key_name(&group, &peer.jid.to_protocol_address());
@@ -1928,8 +1928,13 @@ async fn check_status_mixed_group_payloads_commit(
             info.meta_info
                 .get_or_insert_with(Default::default)
                 .status_can_nack = can_nack;
-            info.timestamp =
-                chrono::Utc::now() - chrono::Duration::hours(if expired { 25 } else { 0 });
+            info.timestamp = wacore::time::now_utc()
+                .checked_sub(std::time::Duration::from_secs(if expired {
+                    25 * 3600
+                } else {
+                    0
+                }))
+                .unwrap();
             let info = Arc::new(info);
             let key = client
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
@@ -2092,7 +2097,7 @@ async fn status_group_signal_failures_request_recovery_once_per_arrival() {
                         (*group_message_info("ONE-STATUS-RECOVERY", &group, &peer.jid, false))
                             .clone();
                     info.is_status_stanza = raw_status;
-                    info.timestamp = chrono::Utc::now();
+                    info.timestamp = wacore::time::now_utc();
                     let info = Arc::new(info);
                     let key = client
                         .make_retry_cache_key(&group, &info.id, &peer.jid)
@@ -2164,7 +2169,7 @@ async fn status_unknown_companion_refresh_survives_later_signal_failure() {
                 (*group_message_info("UNKNOWN-STATUS-COMPANION", &group, &peer.jid, false)).clone();
             info.is_status_stanza = raw_status;
             info.is_offline = true;
-            info.timestamp = chrono::Utc::now();
+            info.timestamp = wacore::time::now_utc();
             let info = Arc::new(info);
             process_group_classified_with_sessions(&client, info, &peer.jid, Vec::new(), payloads)
                 .await;
@@ -2245,7 +2250,7 @@ async fn status_skdm_session_does_not_respond_before_group_recovery() {
                 let mut info =
                     (*group_message_info("SKDM-STATUS-RECOVERY", &group, &peer.jid, false)).clone();
                 info.is_status_stanza = raw_status;
-                info.timestamp = chrono::Utc::now();
+                info.timestamp = wacore::time::now_utc();
                 let info = Arc::new(info);
                 process_group_classified_with_sessions(
                     &client,
@@ -2380,7 +2385,9 @@ async fn ignored_expired_group_failure_preserves_skdm_only_status_response() {
                         (*group_message_info("EXPIRED-SKDM-SIBLING", &group, &peer.jid, false))
                             .clone();
                     info.is_status_stanza = raw_status;
-                    info.timestamp = chrono::Utc::now() - chrono::Duration::hours(25);
+                    info.timestamp = wacore::time::now_utc()
+                        .checked_sub(std::time::Duration::from_secs(25 * 3600))
+                        .unwrap();
                     let info = Arc::new(info);
                     let key = client
                         .make_retry_cache_key(&group, &info.id, &peer.jid)
@@ -8597,7 +8604,9 @@ async fn test_pdo_skipped_for_ancient_messages() {
 
     let mut info =
         create_test_message_info("85010891714716@lid", "ANCIENT_MSG_1", "85010891714716@lid");
-    info.timestamp = wacore::time::now_utc() - chrono::Duration::days(30);
+    info.timestamp = wacore::time::now_utc()
+        .checked_sub(std::time::Duration::from_secs(30 * 86_400))
+        .unwrap();
     let info = Arc::new(info);
 
     let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
@@ -8626,8 +8635,9 @@ async fn test_pdo_rejects_just_past_14d_boundary() {
 
     let mut info =
         create_test_message_info("85010891714716@lid", "BOUNDARY_MSG_1", "85010891714716@lid");
-    info.timestamp =
-        wacore::time::now_utc() - chrono::Duration::days(14) - chrono::Duration::minutes(1);
+    info.timestamp = wacore::time::now_utc()
+        .checked_sub(std::time::Duration::from_secs(14 * 86_400 + 60))
+        .unwrap();
     let info = Arc::new(info);
 
     let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
@@ -11966,8 +11976,13 @@ async fn check_status_skdm_only_session_receipt(expired_sibling: bool) {
     let id = "STATUS_SKDM_ONLY";
     let mut info = (*group_message_info(id, &status, &alice.jid, false)).clone();
     info.is_status_stanza = true;
-    info.timestamp =
-        chrono::Utc::now() - chrono::Duration::hours(if expired_sibling { 25 } else { 0 });
+    info.timestamp = wacore::time::now_utc()
+        .checked_sub(std::time::Duration::from_secs(if expired_sibling {
+            25 * 3600
+        } else {
+            0
+        }))
+        .unwrap();
     let info = Arc::new(info);
 
     process_group_classified(
@@ -14130,8 +14145,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
 
     let info = Arc::new(MessageInfo {
         id: edit_id.into(),
-        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(parent_ts + edit_offset, 0)
-            .unwrap(),
+        timestamp: wacore::time::Timestamp::from_secs(parent_ts + edit_offset).unwrap(),
         source: crate::types::message::MessageSource {
             chat: chat.parse().unwrap(),
             sender: chat.parse().unwrap(),
@@ -14266,8 +14280,7 @@ async fn run_secret_edit_via_resolver(
 
     let info = Arc::new(MessageInfo {
         id: edit_id.into(),
-        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(parent_ts + edit_offset, 0)
-            .unwrap(),
+        timestamp: wacore::time::Timestamp::from_secs(parent_ts + edit_offset).unwrap(),
         source: crate::types::message::MessageSource {
             chat: chat.parse().unwrap(),
             sender: chat.parse().unwrap(),

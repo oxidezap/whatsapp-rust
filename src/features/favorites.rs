@@ -33,7 +33,7 @@ pub(crate) fn dispatch_favorites_mutation_outcome(
 }
 
 pub(crate) fn dispatch_favorites_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -160,7 +160,7 @@ mod tests {
         );
         match &*events[0] {
             Event::FavoritesUpdate(u) => {
-                assert_eq!(u.timestamp.timestamp_millis(), 1_700_000_000_000);
+                assert_eq!(u.timestamp.as_millis(), 1_700_000_000_000);
                 assert!(u.from_full_sync);
             }
             other => panic!("expected FavoritesUpdate, got {other:?}"),

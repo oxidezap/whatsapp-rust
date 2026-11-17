@@ -136,7 +136,7 @@ impl CallFixture {
                 user: Arc::from(peer.user.as_str()),
                 devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(2, None)]
                     .into_boxed_slice(),
-                timestamp: wacore::time::now_utc().timestamp(),
+                timestamp: wacore::time::now_utc().as_secs(),
                 phash: None,
                 raw_id: None,
             })

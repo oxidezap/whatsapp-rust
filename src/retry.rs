@@ -1858,7 +1858,7 @@ impl Client {
         let mut retry_builder = NodeBuilder::new("retry")
             .attr("v", "1")
             .attr("id", info.id.clone())
-            .attr("t", info.timestamp.timestamp())
+            .attr("t", info.timestamp.as_secs())
             .attr("count", retry_count);
 
         // Include the error code if it's not UnknownError (matches WhatsApp Web's behavior

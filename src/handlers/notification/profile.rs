@@ -156,8 +156,8 @@ pub(crate) fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_
 
 pub(crate) fn notification_timestamp(
     node: &NodeRef<'_>,
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
+    now: impl FnOnce() -> wacore::time::Timestamp,
+) -> wacore::time::Timestamp {
     node.attrs()
         .optional_u64("t")
         .and_then(|t| i64::try_from(t).ok())

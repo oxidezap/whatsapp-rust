@@ -331,7 +331,7 @@ fn spawn_flush_loop(
     tasks.spawn_cooperative(async move {
         let mut writer = WamWriter::default();
         while worker.sleep(BUFFERING_INTERVAL).await.is_ok() {
-            let now = whatsapp_rust::wacore::time::now_utc().timestamp();
+            let now = whatsapp_rust::wacore::time::now_utc().as_secs();
             let mut roll = rand::random::<f64>;
             runtime
                 .tick(
@@ -357,7 +357,7 @@ fn spawn_flush_loop(
         runtime.observe(PendingEvent::WebWamForceFlush(
             events::WebWamForceFlush::default(),
         ));
-        let now = whatsapp_rust::wacore::time::now_utc().timestamp();
+        let now = whatsapp_rust::wacore::time::now_utc().as_secs();
         let mut roll = rand::random::<f64>;
         runtime
             .tick(

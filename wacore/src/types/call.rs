@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::Serialize;
 use wacore_binary::Jid;
 
@@ -312,10 +312,10 @@ pub struct IncomingCall {
     /// Server timestamp, absent on mid-call `enc_rekey` stanzas that omit `t`.
     /// Key rotation is ordered by its transaction id and does not need a date.
     #[serde(
-        with = "chrono::serde::ts_seconds_option",
+        with = "crate::time::serde_seconds_option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub timestamp: Option<DateTime<Utc>>,
+    pub timestamp: Option<Timestamp>,
     pub offline: bool,
     pub action: CallAction,
     /// Peer measurements retained as metadata, never as trusted transport destinations.
@@ -380,15 +380,15 @@ pub struct MissedCall {
     pub from: Jid,
     /// The call id (from the `<offer>` action); distinct from the `<call>` stanza id.
     pub call_id: String,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_seconds")]
+    pub timestamp: Timestamp,
     pub reason: MissedReason,
 }
 
 impl MissedCall {
     /// Construct a missed-call event. `#[non_exhaustive]` blocks the struct literal cross-crate, so
     /// this is how the high-level crate builds one.
-    pub fn new(from: Jid, call_id: String, timestamp: DateTime<Utc>, reason: MissedReason) -> Self {
+    pub fn new(from: Jid, call_id: String, timestamp: Timestamp, reason: MissedReason) -> Self {
         Self {
             from,
             call_id,
@@ -420,8 +420,8 @@ pub struct CallEndedElsewhere {
     pub from: Jid,
     /// The call id (from the `<offer>` action); distinct from the `<call>` stanza id.
     pub call_id: String,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_seconds")]
+    pub timestamp: Timestamp,
     pub outcome: ElsewhereOutcome,
 }
 
@@ -431,7 +431,7 @@ impl CallEndedElsewhere {
     pub fn new(
         from: Jid,
         call_id: String,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
         outcome: ElsewhereOutcome,
     ) -> Self {
         Self {
@@ -508,7 +508,7 @@ impl IncomingCall {
     pub fn new_for_test(
         from: Jid,
         stanza_id: String,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
         action: CallAction,
     ) -> Self {
         Self::builder()

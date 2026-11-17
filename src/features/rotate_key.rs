@@ -214,9 +214,13 @@ impl Client {
                             "Ed25519 signature must be 64 bytes".to_string(),
                         ))
                     })?;
-                let record =
-                    new_signed_pre_key_record(new_id, &kp, signature, self.runtime.wall_time_utc())
-                        .map_err(SignalMaintenanceError::Signal)?;
+                let record = new_signed_pre_key_record(
+                    new_id,
+                    &kp,
+                    signature,
+                    self.runtime.wall_time_utc().as_secs(),
+                )
+                .map_err(SignalMaintenanceError::Signal)?;
                 backend
                     .store_signed_prekey(
                         new_id,
@@ -236,7 +240,7 @@ impl Client {
             old_id,
             &snapshot.signed_pre_key,
             snapshot.signed_pre_key_signature,
-            self.runtime.wall_time_utc(),
+            self.runtime.wall_time_utc().as_secs(),
         )
         .map_err(SignalMaintenanceError::Signal)?;
         backend

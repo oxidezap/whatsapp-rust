@@ -5,6 +5,7 @@
 //! Signature and provenance fields record an operator's evidence and require
 //! independent review before any artifact can be treated as an official oracle.
 
+mod acquisition_time;
 mod evidence;
 mod observations;
 mod zip_lineage;
@@ -211,8 +212,10 @@ impl ApkLock {
             "acquisition URL must be credential-free HTTPS without a query or fragment"
         );
         nonempty(&self.acquisition.acquired_at_utc, "acquired_at_utc")?;
-        chrono::DateTime::parse_from_rfc3339(&self.acquisition.acquired_at_utc)
-            .context("invalid acquisition timestamp")?;
+        ensure!(
+            acquisition_time::valid_acquisition_time(&self.acquisition.acquired_at_utc),
+            "invalid acquisition timestamp"
+        );
         ensure!(
             self.acquisition.acquired_at_utc.ends_with('Z'),
             "acquisition timestamp must explicitly use UTC"

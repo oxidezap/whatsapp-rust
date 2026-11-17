@@ -842,16 +842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
-dependencies = [
- "num-traits",
- "serde",
-]
-
-[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2991,7 +2981,6 @@ name = "mobile-oracle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "hex",
  "hmac 0.13.0",
  "libc",
@@ -5619,7 +5608,6 @@ dependencies = [
  "buffa-build",
  "bytes",
  "cbc",
- "chrono",
  "ciborium",
  "codspeed-divan-compat",
  "compact_str",
@@ -5727,7 +5715,6 @@ dependencies = [
  "buffa",
  "bytes",
  "cbc",
- "chrono",
  "ciborium",
  "codspeed-divan-compat",
  "ctr 0.10.1",
@@ -6195,7 +6182,6 @@ dependencies = [
  "buffa",
  "bytes",
  "cbc",
- "chrono",
  "codspeed-divan-compat",
  "dhat",
  "diesel",

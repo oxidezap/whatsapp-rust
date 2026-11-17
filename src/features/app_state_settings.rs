@@ -36,7 +36,7 @@ pub(crate) fn dispatch_app_state_setting_mutation_outcome(
 }
 
 pub(crate) fn dispatch_app_state_setting_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -334,7 +334,7 @@ mod tests {
                 Event::UnarchiveChatsSettingUpdate(u) => {
                     assert_eq!(u.unarchive_chats, unarchive);
                     assert_eq!(u.action.unarchive_chats, Some(unarchive));
-                    assert_eq!(u.timestamp.timestamp_millis(), 1000);
+                    assert_eq!(u.timestamp.as_millis(), 1000);
                 }
                 other => panic!("expected UnarchiveChatsSettingUpdate, got {other:?}"),
             }

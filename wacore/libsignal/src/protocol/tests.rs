@@ -668,14 +668,12 @@ fn cancelling_pending_commit_does_not_cancel_queued_restoration() {
 fn signed_key_helper_stores_seconds_and_clamps_pre_epoch() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(2);
     let key = KeyPair::generate(&mut rng);
-    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000).unwrap();
     let record =
-        crate::store::record_helpers::new_signed_pre_key_record(4, &key, [5; 64], timestamp)
+        crate::store::record_helpers::new_signed_pre_key_record(4, &key, [5; 64], 1_700_000_000)
             .unwrap();
     assert_eq!(record.timestamp, Some(1_700_000_000));
-    let negative = chrono::DateTime::from_timestamp(-1, 0).unwrap();
     assert_eq!(
-        crate::store::record_helpers::new_signed_pre_key_record(4, &key, [5; 64], negative)
+        crate::store::record_helpers::new_signed_pre_key_record(4, &key, [5; 64], -1)
             .unwrap()
             .timestamp,
         Some(0)

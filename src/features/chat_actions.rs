@@ -157,7 +157,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
 }
 
 pub(crate) fn dispatch_chat_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -1948,8 +1948,8 @@ mod registry_tests {
     /// An event's name, `timestamp` and `action_timestamp`.
     type Stamps = (
         &'static str,
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        wacore::time::Timestamp,
+        Option<wacore::time::Timestamp>,
     );
 
     /// The timestamps of every event the mutations dispatch.
@@ -2004,12 +2004,12 @@ mod registry_tests {
     #[test]
     fn a_missing_timestamp_is_absent_on_every_chat_event() {
         for (event, timestamp, action_timestamp) in dispatched_timestamps(None) {
-            assert_eq!(timestamp, chrono::DateTime::UNIX_EPOCH, "{event}");
+            assert_eq!(timestamp, wacore::time::Timestamp::UNIX_EPOCH, "{event}");
             assert_eq!(action_timestamp, None, "{event}");
         }
     }
 
-    /// A timestamp `DateTime` cannot hold is no more an instant than a missing
+    /// A timestamp `Timestamp` cannot hold is no more an instant than a missing
     /// one, whatever `timestamp` falls back to.
     #[test]
     fn an_out_of_range_timestamp_is_absent_on_every_chat_event() {

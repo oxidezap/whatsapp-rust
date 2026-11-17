@@ -1,11 +1,11 @@
-use chrono::{DateTime, Utc};
+use wacore::time::Timestamp;
 use whatsapp_rust::types::events::{
     LabelAssociationUpdate, LabelEditUpdate, MessageLabelAssociationUpdate,
 };
 
 #[test]
 fn existing_label_builders_keep_the_optional_timestamp_unset() {
-    let timestamp = DateTime::<Utc>::from_timestamp_millis(0).unwrap();
+    let timestamp = Timestamp::from_millis(0).unwrap();
     let edit = LabelEditUpdate::builder()
         .label_id("5".into())
         .timestamp(timestamp)
@@ -35,14 +35,14 @@ fn existing_label_builders_keep_the_optional_timestamp_unset() {
         serde_json::to_value(association).unwrap(),
         serde_json::to_value(message).unwrap(),
     ] {
-        assert_eq!(json["timestamp"], "1970-01-01T00:00:00Z");
+        assert_eq!(json["timestamp"], 0);
         assert_eq!(json.get("action_timestamp"), Some(&serde_json::Value::Null));
     }
 }
 
 #[test]
 fn label_builders_accept_carried_and_optional_timestamps() {
-    let timestamp = DateTime::<Utc>::from_timestamp_millis(0).unwrap();
+    let timestamp = Timestamp::from_millis(0).unwrap();
     let edit = LabelEditUpdate::builder()
         .label_id("5".into())
         .timestamp(timestamp)
@@ -75,7 +75,7 @@ fn label_builders_accept_carried_and_optional_timestamps() {
         serde_json::to_value(association).unwrap(),
         serde_json::to_value(message).unwrap(),
     ] {
-        assert_eq!(json["action_timestamp"], "1970-01-01T00:00:00Z");
-        assert_eq!(json["timestamp"], "1970-01-01T00:00:00Z");
+        assert_eq!(json["action_timestamp"], 0);
+        assert_eq!(json["timestamp"], 0);
     }
 }

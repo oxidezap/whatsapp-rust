@@ -148,7 +148,7 @@ impl dyn Runtime {
     ///
     /// # Panics
     /// Panics if a custom clock violates its calendar-range contract after construction.
-    pub fn wall_time_utc(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn wall_time_utc(&self) -> crate::time::Timestamp {
         #[cfg(feature = "instance-clock")]
         if let Some(clock) = self.clock() {
             return clock

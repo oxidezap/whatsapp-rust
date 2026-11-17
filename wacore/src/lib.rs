@@ -1,8 +1,7 @@
 extern crate self as wacore;
 
+pub use time::Timestamp;
 pub use wacore_appstate as appstate;
-// time::* returns chrono types; re-exported so consumers do not pin their own.
-pub use chrono;
 pub use wacore_noise as noise;
 
 // Re-export derive macros

@@ -1805,7 +1805,7 @@ mod tests {
             let node = rekey_call_node(Some(ts));
             let call = parse_call_stanza(&node.as_node_ref()).unwrap().unwrap();
             assert_eq!(
-                call.timestamp.unwrap().timestamp(),
+                call.timestamp.unwrap().as_secs(),
                 ts.parse::<i64>().unwrap()
             );
             let serialized = serde_json::to_value(&call).unwrap();
@@ -1879,7 +1879,7 @@ mod tests {
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
         assert_eq!(call.stanza_id, "STANZA-ID-0001");
         assert_eq!(call.from, fake_caller_lid());
-        assert_eq!(call.timestamp.unwrap().timestamp(), 1766847151);
+        assert_eq!(call.timestamp.unwrap().as_secs(), 1766847151);
         assert!(!call.offline);
         assert_eq!(call.notify.as_deref(), Some("Test Caller"));
         assert_eq!(call.platform.as_deref(), Some("android"));

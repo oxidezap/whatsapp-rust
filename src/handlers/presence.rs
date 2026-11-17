@@ -111,7 +111,7 @@ mod tests {
             };
             assert_eq!(update.from.to_string(), from);
             assert_eq!(update.status, status);
-            assert_eq!(update.last_seen.unwrap().timestamp(), 1700000000);
+            assert_eq!(update.last_seen.unwrap().as_secs(), 1700000000);
         }
     }
 }

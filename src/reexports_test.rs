@@ -1,6 +1,6 @@
 //! Compile-shaped proof that a downstream crate can build message literals and
 //! implement the async traits using only this crate's re-exports (no direct
-//! buffa/bytes/anyhow/async-trait/chrono dependency of its own).
+//! buffa/bytes/anyhow/async-trait dependency of its own).
 #![cfg(test)]
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
@@ -80,11 +80,10 @@ fn retry_admission_is_object_safe_and_constructible() {
 }
 
 #[test]
-fn bytes_and_chrono_reexports_are_usable() {
+fn bytes_and_timestamp_reexports_are_usable() {
     let b = whatsapp_rust::bytes::Bytes::from_static(b"frame");
     assert_eq!(b.len(), 5);
-    let _ts: whatsapp_rust::chrono::DateTime<whatsapp_rust::chrono::Utc> =
-        whatsapp_rust::wacore::time::now_utc();
+    let _ts: whatsapp_rust::Timestamp = whatsapp_rust::wacore::time::now_utc();
 }
 
 struct AdmitAllDecryptFailures;

@@ -451,7 +451,7 @@ mod tests {
 
     /// Missing `<user t>` attr leaves `timestamp` as `None` so the handler
     /// can fall back to the stanza-level `t`. Previous code defaulted to 0,
-    /// which silently produced an epoch-zero `DateTime` instead of the
+    /// which silently produced an epoch-zero `Timestamp` instead of the
     /// stanza ts.
     #[test]
     fn participants_user_missing_t_yields_none_timestamp() {

@@ -34,7 +34,7 @@ pub(crate) fn dispatch_sticker_mutation_outcome(
 }
 
 pub(crate) fn dispatch_sticker_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -266,7 +266,7 @@ mod tests {
             Event::RemoveRecentStickerUpdate(u) => {
                 assert_eq!(u.filehash, FILEHASH);
                 assert_eq!(u.action.last_sticker_sent_ts, Some(1_700_000_000_000));
-                assert_eq!(u.timestamp.timestamp_millis(), 1_700_000_000_500);
+                assert_eq!(u.timestamp.as_millis(), 1_700_000_000_500);
             }
             other => panic!("expected RemoveRecentStickerUpdate, got {other:?}"),
         }

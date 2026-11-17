@@ -1909,7 +1909,7 @@ impl Client {
         // Skip ancient messages (14d, matching the AB prop), compared in seconds
         // like WA Web's `age_s > i`. Uses the wacore time primitive (mockable).
         const PDO_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
-        let age_secs = self.runtime.wall_time_secs() - info.timestamp.timestamp();
+        let age_secs = self.runtime.wall_time_secs() - info.timestamp.as_secs();
         if age_secs > PDO_MAX_AGE_SECS {
             debug!(
                 "PDO request skipped for message {} (age {age_secs}s exceeds {PDO_MAX_AGE_SECS}s limit)",
