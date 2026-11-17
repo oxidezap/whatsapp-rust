@@ -215,6 +215,13 @@ pub struct SqliteFirstDm {
 
 #[cfg(feature = "sqlite-storage")]
 pub async fn sqlite_first_dm() -> Result<SqliteFirstDm> {
+    sqlite_first_dm_with_pause(std::future::ready(())).await
+}
+
+#[cfg(feature = "sqlite-storage")]
+async fn sqlite_first_dm_with_pause(
+    before_flush: impl Future<Output = ()>,
+) -> Result<SqliteFirstDm> {
     use crate::store::{SignalStore, Synchronous};
     use wacore::time::Instant;
 
@@ -225,9 +232,13 @@ pub async fn sqlite_first_dm() -> Result<SqliteFirstDm> {
     let mut input = session.prepare_first_dm().await?;
     let peer = Jid::new(super::PEER_USER, Server::Pn).to_protocol_address();
 
+    // The live coalescer takes the same gate, so it cannot persist the first
+    // receive before the timed explicit flush.
+    let flush_gate = session.client.signal_flush_lifecycle.lock().await;
     let start = Instant::now();
     session.receive_first_dm(&mut input).await?;
     let receive_us = start.elapsed().as_micros();
+    before_flush.await;
     ensure!(
         backend
             .backend()
@@ -240,6 +251,7 @@ pub async fn sqlite_first_dm() -> Result<SqliteFirstDm> {
     let start = Instant::now();
     session.client.flush_pending_signal_state().await?;
     let signal_flush_us = start.elapsed().as_micros();
+    drop(flush_gate);
     log::debug!("first DM Signal flush completed");
     let saved = backend
         .backend()
@@ -1257,6 +1269,16 @@ impl Transport for Wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sqlite-storage")]
+    #[tokio::test(start_paused = true)]
+    async fn sqlite_first_dm_flush_owns_the_record_after_the_coalescing_window() -> Result<()> {
+        sqlite_first_dm_with_pause(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        })
+        .await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn prepared_activity_joins_passive_startup_but_preserves_offline_drain() -> Result<()> {
