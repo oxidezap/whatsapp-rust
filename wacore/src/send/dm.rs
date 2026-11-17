@@ -199,6 +199,11 @@ pub struct DmStanzaRequest<'a> {
     pub own_lid: Option<&'a Jid>,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
     pub to: &'a Jid,
+    /// The peer's phone number, written as `peer_recipient_pn` on a
+    /// LID-addressed stanza. The server relays it on our own companions' copy,
+    /// which is how they learn the number behind a new LID chat; without it
+    /// they show the peer as an unknown user. `None` leaves the attribute off.
+    pub peer_recipient_pn: Option<&'a Jid>,
     pub message: &'a wa::Message,
     pub message_id: &'a str,
     pub edit: Option<&'a crate::types::message::EditAttribute>,
@@ -227,6 +232,7 @@ pub async fn prepare_dm_stanza(
         own_lid,
         account,
         to: to_jid,
+        peer_recipient_pn,
         message,
         message_id: request_id,
         edit,
@@ -432,6 +438,10 @@ pub async fn prepare_dm_stanza(
         .attr("to", to_jid)
         .attr("id", request_id)
         .attr("type", stanza_type);
+
+    if let Some(pn) = peer_recipient_pn {
+        stanza_builder = stanza_builder.attr("peer_recipient_pn", pn);
+    }
 
     if let Some(edit_attr) = edit
         && *edit_attr != crate::types::message::EditAttribute::Empty

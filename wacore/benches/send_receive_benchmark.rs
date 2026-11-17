@@ -959,6 +959,7 @@ fn run_dm_fanout(d: &mut DmFanoutData) {
             own_lid: None,
             account: Some(&d.account),
             to: &d.to_jid,
+            peer_recipient_pn: None,
             message: &d.msg,
             message_id: "b-dm",
             edit: None,

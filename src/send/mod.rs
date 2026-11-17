@@ -3785,6 +3785,35 @@ impl Client {
 
             let stanza_to = dm_stanza_to(&recipient_bare, &to);
 
+            // WAWebSendMsgCreateFanoutStanza names the peer's number on every
+            // LID-addressed stanza (`peer_recipient_pn`). The server relays it
+            // on our companions' copy, and it is how they learn the number
+            // behind a LID chat they have never seen: without it a new chat
+            // opened here shows on the phone as an unknown user (#1924). WA
+            // Web omits it for a chat opened from a number-hidden CTWA ad
+            // (`LidOriginType.PNH_CTWA`); the engine does not track a chat's
+            // LID origin, but it also cannot hold a number for such a peer
+            // unless the server or the peer disclosed it. A status reaction
+            // borrows this branch and is not a 1:1 chat, so it stays bare.
+            let peer_recipient_pn = if stanza_to.is_lid() && !is_status_addon {
+                if to.is_pn() {
+                    Some(to.to_non_ad())
+                } else {
+                    match self.get_lid_pn_entry(&stanza_to).await {
+                        Ok(entry) => entry.map(|entry| Jid::pn(&*entry.phone_number)),
+                        Err(e) => {
+                            log::warn!(
+                                "LID-PN lookup failed for {}, sending without peer_recipient_pn: {e:?}",
+                                stanza_to.observe()
+                            );
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+
             // DM fanout, memoized per recipient: a warm repeat DM skips both
             // registry lookups, the list rebuild and the phash. See
             // `resolve_dm_devices_memoized` for its freshness contract.
@@ -3850,6 +3879,7 @@ impl Client {
                     own_lid: device_snapshot.lid.as_ref(),
                     account: device_snapshot.account.as_deref(),
                     to: &stanza_to,
+                    peer_recipient_pn: peer_recipient_pn.as_ref(),
                     message,
                     message_id: request_id,
                     edit: edit.as_ref(),
@@ -4017,6 +4047,7 @@ impl Client {
                 own_lid: Some(own_lid),
                 account: device_snapshot.account.as_deref(),
                 to: &to,
+                peer_recipient_pn: None,
                 message,
                 message_id: request_id,
                 edit: None,
@@ -9283,7 +9314,7 @@ mod tests {
         // Caller passes the PN form; the resolved namespace must win on the wire.
         let result = client
             .send_message_impl(
-                peer_pn,
+                peer_pn.clone(),
                 &msg,
                 SendPipelineOptions {
                     request_id: Some(request_id),
@@ -9317,6 +9348,13 @@ mod tests {
             peer_lid.user.as_str(),
             "outer to user must be the peer LID"
         );
+        // #1924: the number the caller addressed rides along, so our other
+        // devices can name the new LID chat.
+        assert_eq!(
+            node.attrs().optional_string("peer_recipient_pn").as_deref(),
+            Some(peer_pn.to_non_ad().to_string().as_str()),
+            "a LID-addressed DM must carry the peer's number"
+        );
 
         // Uniformity guard: every <participants>/<to> is LID too (no mix).
         let participants = node
@@ -9339,6 +9377,51 @@ mod tests {
                 "participant {pj} must be LID (uniform namespace)"
             );
         }
+    }
+
+    /// #1924: a caller that already holds the LID still gets the peer's number
+    /// on the stanza, from the stored LID-PN mapping, as WA Web resolves it
+    /// with `getPhoneNumber(chatJid)`.
+    #[tokio::test]
+    async fn dm_addressed_by_lid_carries_mapped_peer_recipient_pn() {
+        let client = crate::test_utils::create_test_client_with_name("lid_dm_peer_pn").await;
+        let (peer_pn, peer_lid) = seed_dm_wire_namespace_state(&client).await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLidMigrated(true))
+            .await;
+
+        let request_id = "LID_DM_PEER_PN_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hi".into());
+            proto
+        };
+        let result = client
+            .send_message_impl(
+                peer_lid.to_non_ad(),
+                &msg,
+                SendPipelineOptions {
+                    request_id: Some(request_id),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send captures the stanza then errors"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("peer_recipient_pn").as_deref(),
+            Some(peer_pn.to_non_ad().to_string().as_str()),
+        );
     }
 
     /// Regression for #941: an account that is NOT 1:1-LID-migrated must keep
@@ -9387,6 +9470,10 @@ mod tests {
         assert!(
             to_jid.is_pn(),
             "outer <message to> must stay PN on an unmigrated account, got {to_str}"
+        );
+        assert!(
+            node.attrs().optional_string("peer_recipient_pn").is_none(),
+            "a PN-addressed DM already names the number"
         );
         assert_eq!(
             to_jid.user.as_str(),
