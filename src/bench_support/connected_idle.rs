@@ -53,6 +53,11 @@ impl BackendFixture {
 
     #[cfg(feature = "sqlite-storage")]
     pub async fn sqlite() -> Result<Self> {
+        Self::sqlite_with_synchronous(crate::store::Synchronous::Normal).await
+    }
+
+    #[cfg(feature = "sqlite-storage")]
+    async fn sqlite_with_synchronous(synchronous: crate::store::Synchronous) -> Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
@@ -69,12 +74,27 @@ impl BackendFixture {
             "refusing to reuse a fixture database: {}",
             path.display()
         );
-        let backend =
-            crate::store::SqliteStore::open(path.to_str().context("SQLite path encoding")?).await?;
+        let backend = Self::open_sqlite(&path, synchronous).await?;
         Ok(Self {
             backend: Some(Arc::new(backend)),
             path: Some(path),
         })
+    }
+
+    #[cfg(feature = "sqlite-storage")]
+    async fn open_sqlite(
+        path: &std::path::Path,
+        synchronous: crate::store::Synchronous,
+    ) -> Result<crate::store::SqliteStore> {
+        use crate::store::{SqliteDatabase, SqliteDatabaseConfig};
+
+        let config = SqliteDatabaseConfig {
+            synchronous,
+            ..Default::default()
+        };
+        let database =
+            SqliteDatabase::open(path.to_str().context("SQLite path encoding")?, config).await?;
+        Ok(database.store(1))
     }
 
     pub fn backend(&self) -> Arc<dyn Backend> {
@@ -160,6 +180,98 @@ impl InboundDurabilityHook for Commit {
 pub struct Activity {
     stanzas: Vec<Node>,
     history: wa::message::HistorySyncNotification,
+}
+
+pub struct FirstDm {
+    stanza: Option<Node>,
+    events: async_channel::Receiver<Arc<Event>>,
+    _subscription: Subscription,
+}
+
+struct FirstDmEvents(async_channel::Sender<Arc<Event>>);
+
+impl EventHandler for FirstDmEvents {
+    fn interest(&self) -> wacore::types::events::EventInterest {
+        use wacore::types::events::{EventInterest, EventKind};
+        EventInterest::of(&[EventKind::Messages])
+    }
+
+    fn handle_event(&self, event: Arc<Event>) {
+        self.0.try_send(event).expect("first DM event queue");
+    }
+}
+
+const FIRST_DM_TEXT: &str = "first message";
+const FIRST_DM_ID: &str = "IDLE-0";
+
+/// Wall-clock timings for a file-backed first DM, in microseconds.
+#[cfg(feature = "sqlite-storage")]
+#[derive(Debug, serde::Serialize)]
+pub struct SqliteFirstDm {
+    pub receive_us: u128,
+    pub signal_flush_us: u128,
+    pub reopen_and_read_us: u128,
+}
+
+#[cfg(feature = "sqlite-storage")]
+pub async fn sqlite_first_dm() -> Result<SqliteFirstDm> {
+    use crate::store::{SignalStore, Synchronous};
+    use wacore::time::Instant;
+
+    let mut backend = BackendFixture::sqlite_with_synchronous(Synchronous::Full).await?;
+    let session = Session::connect(backend.backend()).await?;
+    session.finish_control().await?;
+    session.prepare_maintenance_sample().await?;
+    let mut input = session.prepare_first_dm().await?;
+    let peer = Jid::new(super::PEER_USER, Server::Pn).to_protocol_address();
+
+    let start = Instant::now();
+    session.receive_first_dm(&mut input).await?;
+    let receive_us = start.elapsed().as_micros();
+    ensure!(
+        backend
+            .backend()
+            .get_session(peer.as_str())
+            .await?
+            .is_none(),
+        "background write reached SQLite before the explicit flush"
+    );
+    log::debug!("first DM Signal flush started");
+    let start = Instant::now();
+    session.client.flush_pending_signal_state().await?;
+    let signal_flush_us = start.elapsed().as_micros();
+    log::debug!("first DM Signal flush completed");
+    let saved = backend
+        .backend()
+        .get_session(peer.as_str())
+        .await?
+        .context("Signal flush did not save the first DM session")?;
+
+    drop(input);
+    session.shutdown().await?;
+    drop(backend.backend.take());
+    let start = Instant::now();
+    let path = backend.path.as_deref().context("SQLite fixture path")?;
+    let reopened = BackendFixture::open_sqlite(path, Synchronous::Full).await?;
+    let restored = reopened
+        .get_session(peer.as_str())
+        .await?
+        .context("first DM session missing after reopen")?;
+    let reopen_and_read_us = start.elapsed().as_micros();
+    ensure!(saved == restored, "Signal record changed after reopen");
+    let record = wacore::libsignal::protocol::SessionRecord::deserialize(&restored)?;
+    ensure!(
+        record.session_state().is_some(),
+        "restored Signal record has no session"
+    );
+    drop(reopened);
+    backend.cleanup()?;
+
+    Ok(SqliteFirstDm {
+        receive_us,
+        signal_flush_us,
+        reopen_and_read_us,
+    })
 }
 
 /// Only lifecycle observables, not a replacement for heap or process measurements.
@@ -551,6 +663,120 @@ impl Session {
 
     async fn wait_until(&self, ready: impl Fn() -> bool) -> Result<()> {
         util::wait_until(DEADLINE, ready).await
+    }
+
+    /// Prepare a prekey message on the sender only. The receiving client has
+    /// completed startup and must still establish its first pairwise session.
+    pub async fn prepare_first_dm(&self) -> Result<FirstDm> {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::{
+            CiphertextMessage, IdentityKey, PreKeyBundle, UsePQRatchet, message_encrypt,
+            process_prekey_bundle,
+        };
+        use wacore::proto_helpers::MessageBuilderExt;
+
+        let sender = Jid::new(super::PEER_USER, Server::Pn);
+        super::seed_registry(&self.client, super::PEER_USER, &[0]).await;
+        let receiver = self.client.persistence_manager.get_device_snapshot();
+        let receiver_jid = receiver.pn.as_ref().context("fixture receiver PN")?;
+        let receiver_address = receiver_jid.to_protocol_address();
+        let bundle = PreKeyBundle::new(
+            receiver.registration_id,
+            u32::from(receiver_jid.device).into(),
+            None,
+            receiver.signed_pre_key_id.into(),
+            receiver.signed_pre_key.public_key,
+            receiver.signed_pre_key_signature,
+            IdentityKey::new(receiver.identity_key.public_key),
+        )?;
+        ensure!(
+            receiver
+                .backend
+                .get_session(sender.to_protocol_address().as_str())
+                .await?
+                .is_none(),
+            "first DM receiver already has a peer session"
+        );
+
+        let peer = super::build_offline_client().await;
+        peer.persistence_manager
+            .modify_device(|device| device.registration_id = 0x2345_6789)
+            .await;
+        let mut stores = peer.signal_adapter();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(WORKLOAD_SEED);
+        process_prekey_bundle(
+            &receiver_address,
+            &mut stores.session_store,
+            &mut stores.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await?;
+        let mut plaintext = waproto::codec::message_to_vec(&wa::Message::text(FIRST_DM_TEXT));
+        plaintext.push(1);
+        let ciphertext = message_encrypt(
+            &plaintext,
+            &receiver_address,
+            &mut stores.session_store,
+            &mut stores.identity_store,
+        )
+        .await?;
+        ensure!(
+            matches!(ciphertext, CiphertextMessage::PreKeySignalMessage(_)),
+            "initial encryption did not produce a prekey message"
+        );
+        let stanza = NodeBuilder::new("message")
+            .attr("from", sender)
+            .attr("id", FIRST_DM_ID)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .attr("v", "2")
+                .bytes(ciphertext.serialize().to_vec())
+                .build()])
+            .build();
+        let (tx, events) = async_channel::bounded(1);
+        let subscription = self.client.subscribe_handler(Arc::new(FirstDmEvents(tx)));
+        Ok(FirstDm {
+            stanza: Some(stanza),
+            events,
+            _subscription: subscription,
+        })
+    }
+
+    /// Inject the encrypted stanza and observe the actual plaintext event and
+    /// delivery receipt through the production read loop.
+    pub async fn receive_first_dm(&self, input: &mut FirstDm) -> Result<()> {
+        let stanza = input
+            .stanza
+            .take()
+            .context("first DM input already consumed")?;
+        self.wire.reply(stanza).await?;
+        let event = tokio::time::timeout(DEADLINE, input.events.recv())
+            .await
+            .context("first DM did not reach the receiver")??;
+        let Event::Messages(batch) = event.as_ref() else {
+            anyhow::bail!("expected a message event");
+        };
+        let [message] = &*batch.messages else {
+            anyhow::bail!("expected one first DM");
+        };
+        ensure!(
+            message.info.id == FIRST_DM_ID
+                && message.info.source.sender == Jid::new(super::PEER_USER, Server::Pn)
+                && message.message.conversation.as_deref() == Some(FIRST_DM_TEXT),
+            "unexpected first DM payload or sender"
+        );
+        self.wait_until(|| self.delivery_receipts() == 1)
+            .await
+            .context("first DM delivery receipt did not reach the wire")?;
+        ensure!(
+            self.counts.committed.load(Ordering::Relaxed) == 1 && input.events.is_empty(),
+            "first DM must commit and dispatch exactly once"
+        );
+        Ok(())
     }
 
     pub async fn checkpoint(&self) -> Checkpoint {
