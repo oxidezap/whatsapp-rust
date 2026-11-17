@@ -109,7 +109,6 @@ buffa-build = { version = "0.9.2", default-features = false }
 buffa-descriptor = { version = "0.9.2", default-features = false }
 bytes = { version = "1.12", default-features = false }
 cbc = { version = "0.2", features = ["alloc"] }
-chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.10", default-features = false }
 ctr = { version = "0.10", default-features = false }
 diesel = { version = "2.4.0", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
@@ -288,9 +287,6 @@ base64 = { workspace = true }
 bon = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
-# `now` rather than `clock`: only `Utc::now()` is used, and `clock` exists to
-# resolve the local timezone (pulling iana-time-zone and its per-OS backends).
-chrono = { workspace = true, features = ["now"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 flate2 = { workspace = true }
@@ -558,8 +554,6 @@ opt-level = "s"
 [profile.release.package.whatsapp-rust-tokio-transport]
 opt-level = "s"
 [profile.release.package.wacore-appstate]
-opt-level = "s"
-[profile.release.package.chrono]
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"

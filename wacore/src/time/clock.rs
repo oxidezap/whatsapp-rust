@@ -33,15 +33,15 @@ pub struct ClockReading {
 
 impl ClockReading {
     pub fn new(wall_millis: i64, monotonic: Instant) -> Result<Self, ClockError> {
-        chrono::DateTime::from_timestamp_millis(wall_millis).ok_or(ClockError::WallOutOfRange)?;
+        crate::time::Timestamp::from_millis(wall_millis).ok_or(ClockError::WallOutOfRange)?;
         Ok(Self {
             wall_millis,
             monotonic,
         })
     }
 
-    pub fn wall_time_utc(self) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp_millis(self.wall_millis).expect("validated clock reading")
+    pub fn wall_time_utc(self) -> crate::time::Timestamp {
+        crate::time::Timestamp::from_millis(self.wall_millis).expect("validated clock reading")
     }
 
     pub fn wall_time_millis(self) -> i64 {
@@ -61,7 +61,7 @@ impl ClockReading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClockError {
-    #[error("wall time is outside the supported calendar range")]
+    #[error("wall time is outside the supported timestamp range")]
     WallOutOfRange,
     #[error("wall time advance overflowed")]
     WallOverflow,

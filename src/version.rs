@@ -237,7 +237,8 @@ async fn resolve_version_with_runtime(
                     runtime.wall_time_millis()
                 });
                 wacore::time::from_millis(now).is_none_or(|now| {
-                    now.signed_duration_since(last_fetched_dt) > chrono::Duration::hours(24)
+                    now.duration_since(last_fetched_dt)
+                        .is_some_and(|age| age > std::time::Duration::from_secs(86_400))
                 })
             }
             None => true,
@@ -623,7 +624,7 @@ mod tests {
                 .await
                 .expect("in-memory persistence"),
         );
-        let fresh_stamp = wacore::time::now_utc().timestamp_millis();
+        let fresh_stamp = wacore::time::now_utc().as_millis();
         persistence_manager
             .process_command(DeviceCommand::SetAppVersion((2, 3000, 111)))
             .await;

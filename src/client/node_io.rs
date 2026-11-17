@@ -2578,7 +2578,7 @@ impl Client {
                 .maybe_timestamp(
                     node.get_attr("t")
                         .and_then(|v| v.as_str().parse::<i64>().ok())
-                        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
+                        .and_then(wacore::time::Timestamp::from_secs),
                 )
                 .maybe_error(ack_error.as_ref().map(|v| v.as_str().to_string()))
                 .build();
@@ -2838,7 +2838,7 @@ impl Client {
             && let Some(expire_secs) = failure.expire
             && let Some(ban_code) = failure.code
             && let Ok(expire_secs) = i64::try_from(expire_secs)
-            && let Some(expire_duration) = chrono::Duration::try_seconds(expire_secs)
+            && expire_secs <= i64::MAX / 1000
         {
             warn!(
                 "Temporary ban connect failure: {}",
@@ -2847,7 +2847,7 @@ impl Client {
             self.core.event_bus.dispatch(Event::TemporaryBan(Box::new(
                 crate::types::events::TemporaryBan::builder()
                     .code(crate::types::events::TempBanReason::from(ban_code))
-                    .expire(expire_duration)
+                    .expire(Duration::from_secs(expire_secs as u64))
                     .maybe_message(failure.message.as_deref().map(str::to_owned))
                     .maybe_url(failure.url.as_deref().map(str::to_owned))
                     .raw(node.to_owned())

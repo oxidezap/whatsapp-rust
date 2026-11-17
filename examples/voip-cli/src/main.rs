@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
         writeln!(
             buf,
             "{} pid={pid} [{:<5}] {}",
-            wacore::time::now_utc().format("%M:%S%.3f"),
+            wacore::time::now_utc().display_hms_millis(),
             record.level(),
             record.args()
         )

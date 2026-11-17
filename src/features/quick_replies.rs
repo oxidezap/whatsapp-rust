@@ -37,7 +37,7 @@ pub(crate) fn dispatch_quick_reply_mutation_outcome(
 }
 
 pub(crate) fn dispatch_quick_reply_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,

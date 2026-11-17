@@ -70,7 +70,7 @@ pub(crate) fn dispatch_call_log_mutation_outcome(
 }
 
 pub(crate) fn dispatch_call_log_mutation_outcome_with_clock(
-    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    now: impl FnOnce() -> wacore::time::Timestamp,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -277,7 +277,7 @@ mod tests {
         };
         assert_eq!(update.call_creator_jid.to_string(), OWN_PN);
         assert_eq!(update.call_id, "call-42");
-        assert_eq!(update.timestamp.timestamp_millis(), 1_700_000_000_000);
+        assert_eq!(update.timestamp.as_millis(), 1_700_000_000_000);
     }
 
     /// The regression: a call this account placed reads as `from_me`.

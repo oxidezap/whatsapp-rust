@@ -68,7 +68,6 @@ bytes = { workspace = true }
 # Media upload/download run AES-256-CBC incrementally over a stream, which the
 # mode's own batch loop does with the chaining block in a register.
 cbc = { workspace = true }
-chrono = { workspace = true, features = ["now", "serde"] }
 compact_str = { workspace = true }
 ctr = { workspace = true }
 dhat = { version = "0.3", optional = true }
@@ -132,6 +131,10 @@ wacore = { path = ".", default-features = false, features = ["bench-internals"] 
 
 [[bench]]
 name = "reporting_token_benchmark"
+harness = false
+
+[[bench]]
+name = "time_benchmark"
 harness = false
 
 [[bench]]

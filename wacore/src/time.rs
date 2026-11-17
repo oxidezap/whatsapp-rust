@@ -20,6 +20,9 @@
 
 mod clock;
 pub use clock::{Clock, ClockError, ClockReading, GlobalClock, VirtualClock};
+mod timestamp;
+pub(crate) use timestamp::serialize_duration;
+pub use timestamp::{ClockDisplay, Timestamp, serde_seconds, serde_seconds_option};
 
 use std::sync::OnceLock;
 
@@ -95,29 +98,35 @@ pub trait TimeProvider: Send + Sync + 'static {
     fn now_millis(&self) -> i64;
 }
 
-/// Default wall-clock provider using `chrono` (native targets only).
-///
-/// cfg-gated off `wasm32` for the same reason the monotonic clock is: there is
-/// no backend for `chrono::Utc::now()` on `wasm32-unknown-unknown` (we don't pull
-/// `wasmbind`), so it falls through to `SystemTime::now()`, which panics. The
-/// wasm default is [`UnsetWasmTimeProvider`].
+/// Native wall clock. Browser WASM must inject its host's clock instead of
+/// calling the unsupported `SystemTime::now()` implementation.
 #[cfg(not(target_arch = "wasm32"))]
-struct ChronoTimeProvider;
+struct SystemTimeProvider;
 
 #[cfg(not(target_arch = "wasm32"))]
-impl TimeProvider for ChronoTimeProvider {
-    // The single legitimate call to `chrono::Utc::now()`: this IS the default
-    // provider backing `wacore::time::now_utc()`. Everywhere else must go
-    // through the abstraction — see clippy.toml.
+impl TimeProvider for SystemTimeProvider {
     #[allow(clippy::disallowed_methods)]
     fn now_millis(&self) -> i64 {
-        chrono::Utc::now().timestamp_millis()
+        system_time_millis(std::time::SystemTime::now())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn system_time_millis(time: std::time::SystemTime) -> i64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => {
+            // Unix milliseconds floor toward the earlier instant. Negating
+            // as_millis() would turn epoch - 1ns into epoch instead of -1ms.
+            let magnitude = error.duration().as_nanos().div_ceil(1_000_000);
+            i64::try_from(magnitude).map_or(i64::MIN, |millis| -millis)
+        }
     }
 }
 
 /// WASM default when no wall-clock provider is registered. Unlike the monotonic
 /// clock, the wall clock has no internal source on `wasm32` (and we won't panic
-/// like `chrono::Utc::now()` would), so this returns epoch (0) and warns once.
+/// like `SystemTime::now()` would), so this returns epoch (0) and warns once.
 /// Embedders MUST call [`set_time_provider`] with a real provider (e.g. backed
 /// by `Date.now()`) before the first timestamp.
 #[cfg(target_arch = "wasm32")]
@@ -175,10 +184,11 @@ pub fn now_millis() -> i64 {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn default_time_provider() -> Box<dyn TimeProvider> {
-    Box::new(ChronoTimeProvider)
+    Box::new(SystemTimeProvider)
 }
 
-/// Current time in seconds since Unix epoch.
+/// Current time in seconds since Unix epoch, truncating subsecond precision
+/// toward zero, as this clock helper has historically done.
 #[inline]
 pub fn now_secs() -> i64 {
     now_millis() / 1000
@@ -195,38 +205,38 @@ pub fn now_secs_u64() -> u64 {
     now_secs().max(0) as u64
 }
 
-/// Current time as `chrono::DateTime<Utc>`.
+/// Current UTC instant with millisecond precision.
 #[inline]
-pub fn now_utc() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_millis(now_millis())
+pub fn now_utc() -> Timestamp {
+    Timestamp::from_millis(now_millis())
         .expect("time provider returned out-of-range millisecond timestamp")
 }
 
-/// Convert a Unix timestamp (seconds) to `DateTime<Utc>`.
+/// Convert Unix seconds to a [`Timestamp`].
 /// Returns `None` for out-of-range values.
 #[inline]
-pub fn from_secs(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp(ts, 0)
+pub fn from_secs(ts: i64) -> Option<Timestamp> {
+    Timestamp::from_secs(ts)
 }
 
-/// Convert a Unix timestamp (seconds) to `DateTime<Utc>`,
+/// Convert Unix seconds to a [`Timestamp`],
 /// falling back to `now_utc()` for out-of-range values.
 #[inline]
-pub fn from_secs_or_now(ts: i64) -> chrono::DateTime<chrono::Utc> {
+pub fn from_secs_or_now(ts: i64) -> Timestamp {
     from_secs(ts).unwrap_or_else(now_utc)
 }
 
-/// Convert a Unix timestamp (milliseconds) to `DateTime<Utc>`.
+/// Convert Unix milliseconds to a [`Timestamp`].
 /// Returns `None` for out-of-range values.
 #[inline]
-pub fn from_millis(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp_millis(ts)
+pub fn from_millis(ts: i64) -> Option<Timestamp> {
+    Timestamp::from_millis(ts)
 }
 
-/// Convert a Unix timestamp (milliseconds) to `DateTime<Utc>`,
+/// Convert Unix milliseconds to a [`Timestamp`],
 /// falling back to `now_utc()` for out-of-range values.
 #[inline]
-pub fn from_millis_or_now(ts: i64) -> chrono::DateTime<chrono::Utc> {
+pub fn from_millis_or_now(ts: i64) -> Timestamp {
     from_millis(ts).unwrap_or_else(now_utc)
 }
 
@@ -501,6 +511,21 @@ impl AtomicInstant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_clock_floors_submillisecond_instants_before_epoch() {
+        use std::time::{Duration, UNIX_EPOCH};
+        for (delta, before, after) in [
+            (Duration::from_micros(1), -1, 0),
+            (Duration::from_micros(500), -1, 0),
+            (Duration::from_millis(1), -1, 1),
+            (Duration::from_micros(1500), -2, 1),
+        ] {
+            assert_eq!(system_time_millis(UNIX_EPOCH - delta), before);
+            assert_eq!(system_time_millis(UNIX_EPOCH + delta), after);
+        }
+    }
 
     // ── AtomicInstant ────────────────────────────────────────────────────────
 

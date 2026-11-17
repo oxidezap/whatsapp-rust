@@ -1533,7 +1533,7 @@ mod tests {
                 panic!("expected call record");
             };
             assert_eq!(call.from_me, Some(direction));
-            assert_eq!(call.timestamp.unwrap().timestamp(), seconds);
+            assert_eq!(call.timestamp.unwrap().as_secs(), seconds);
             assert_eq!(call.chunk_order, Some(7));
             assert_eq!(
                 call.sync_type,
@@ -1622,7 +1622,7 @@ mod tests {
                 };
                 assert_eq!(call.from_me, direction);
                 assert_eq!(
-                    call.timestamp.map(|time| time.timestamp()),
+                    call.timestamp.map(|time| time.as_secs()),
                     [Some(0), Some(-1), None, None, None][index]
                 );
                 assert_eq!(call.record.call_creator_jid.as_deref(), creators[index]);

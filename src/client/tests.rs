@@ -387,7 +387,7 @@ async fn test_ack_dispatches_server_ack_event() {
                 if ack.id == "ack-evt-1"
                     && ack.class.as_deref() == Some("message")
                     && ack.from.as_ref().is_some_and(|j| j.to_string() == "123456789@s.whatsapp.net")
-                    && ack.timestamp.is_some_and(|t| t.timestamp() == 1_720_000_000)
+                    && ack.timestamp.is_some_and(|t| t.as_secs() == 1_720_000_000)
                     && ack.error.is_none()
         )),
         "server <ack> should dispatch Event::ServerAck with class/from/t"
@@ -1968,7 +1968,11 @@ async fn temporary_ban_carries_message_url_and_stanza() {
     match &*events.try_recv().expect("402 dispatches TemporaryBan") {
         Event::TemporaryBan(ban) => {
             assert_eq!(ban.code, TempBanReason::SentToTooManyPeople);
-            assert_eq!(ban.expire, chrono::Duration::seconds(3600));
+            assert_eq!(ban.expire, Duration::from_secs(3600));
+            assert_eq!(
+                serde_json::to_value(ban).unwrap()["expire"],
+                serde_json::json!([3600, 0])
+            );
             assert_eq!(ban.message.as_deref(), Some("too many messages"));
             assert_eq!(ban.url.as_deref(), Some("https://faq.example.invalid/ban"));
             assert!(ban.raw.is_some(), "the <failure> stanza must survive");

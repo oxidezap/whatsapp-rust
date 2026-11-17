@@ -1,9 +1,9 @@
 use crate::stanza::BusinessSubscription;
+use crate::time::Timestamp;
 use crate::types::call::{CallEndedElsewhere, IncomingCall, MissedCall};
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatActivity, PresenceStatus, ReceiptType};
 use bytes::Bytes;
-use chrono::{DateTime, Duration, Utc};
 use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -982,8 +982,8 @@ pub struct BusinessStatusUpdate {
     /// The business account whose status changed.
     pub jid: Jid,
     pub update_type: BusinessUpdateType,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_seconds")]
+    pub timestamp: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_jid: Option<Jid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1012,8 +1012,8 @@ pub struct DisappearingModeChanged {
     pub duration: u32,
     /// When the setting was changed.
     /// Consumers should only apply this if it's newer than their stored value.
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub setting_timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_seconds")]
+    pub setting_timestamp: Timestamp,
 }
 
 /// An event dispatched by the client to registered handlers.
@@ -1958,7 +1958,8 @@ pub struct TemporaryBan {
     /// a ban stanza missing `code`/`expire`, or carrying one that does not,
     /// surfaces as [`Event::ConnectFailure`] instead, the way WA Web rejects it
     /// rather than inventing a zero.
-    pub expire: Duration,
+    #[serde(serialize_with = "crate::time::serialize_duration")]
+    pub expire: std::time::Duration,
     /// The server's `message` attribute, when present.
     pub message: Option<String>,
     /// Support/appeal link the official UI opens for the ban.
@@ -2483,7 +2484,7 @@ pub struct Receipt {
     /// Missing aliases and post authors are not filled from cached identities.
     pub source: crate::types::message::MessageSource,
     pub message_ids: Vec<MessageId>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub r#type: ReceiptType,
     /// True when the receipt carried the `offline` attribute, i.e. it was drained
     /// from the server's offline queue on reconnect rather than delivered live.
@@ -2508,7 +2509,7 @@ pub struct ServerAck {
     /// Server timestamp from the ack's `t` attribute, when present. For a
     /// message ack this is the authoritative send timestamp (whatsmeow reads
     /// the same attribute into `SendResponse.Timestamp`).
-    pub timestamp: Option<DateTime<Utc>>,
+    pub timestamp: Option<Timestamp>,
     /// Nack code (e.g. `"479"`) when the server rejected the stanza; `None`
     /// for a plain ack.
     pub error: Option<String>,
@@ -2538,7 +2539,7 @@ pub struct PresenceUpdate {
     pub from: Jid,
     /// Global availability, directly reusable with `client.presence().set` in the SDK.
     pub status: PresenceStatus,
-    pub last_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2550,7 +2551,7 @@ pub struct PictureUpdate {
     /// (the admin who changed it). `None` for personal picture updates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<Jid>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Whether the picture was removed (true) or set/updated (false).
     pub removed: bool,
     /// The server-assigned picture ID (from `<set id="..."/>`). `None` for deletions.
@@ -2564,7 +2565,7 @@ pub struct UserAboutUpdate {
     /// The contact whose about text changed.
     pub jid: Jid,
     pub status: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// A contact's profile changed (server notification).
@@ -2580,7 +2581,7 @@ pub struct UserAboutUpdate {
 pub struct ContactUpdated {
     /// The contact whose profile was updated.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// A contact changed their phone number.
@@ -2607,7 +2608,7 @@ pub struct ContactNumberChanged {
     /// New LID (if provided by server).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_lid: Option<Jid>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// Server requests a full contact re-sync.
@@ -2617,8 +2618,8 @@ pub struct ContactNumberChanged {
 #[non_exhaustive]
 pub struct ContactSyncRequested {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<DateTime<Utc>>,
-    pub timestamp: DateTime<Utc>,
+    pub after: Option<Timestamp>,
+    pub timestamp: Timestamp,
 }
 
 /// Group update notification.
@@ -2655,7 +2656,7 @@ pub struct GroupUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_country_code: Option<String>,
     /// When the change occurred
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Whether the group uses LID addressing mode
     pub is_lid_addressing_mode: bool,
     /// Whether participant identity information was incomplete in the source stanza.
@@ -2675,11 +2676,11 @@ pub struct GroupUpdate {
 pub struct ContactUpdate {
     /// The chat/contact this sync action applies to.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::ContactAction>,
     pub from_full_sync: bool,
 }
@@ -2689,11 +2690,11 @@ pub struct ContactUpdate {
 pub struct PinUpdate {
     /// The chat being pinned or unpinned.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::PinAction>,
     pub from_full_sync: bool,
 }
@@ -2703,11 +2704,11 @@ pub struct PinUpdate {
 pub struct MuteUpdate {
     /// The chat being muted or unmuted.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::MuteAction>,
     pub from_full_sync: bool,
 }
@@ -2718,11 +2719,11 @@ pub struct LockChatUpdate {
     /// The chat being locked or unlocked (chat lock, the hidden
     /// "locked chats" folder on the primary device).
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::LockChatAction>,
     pub from_full_sync: bool,
 }
@@ -2732,11 +2733,11 @@ pub struct LockChatUpdate {
 pub struct ArchiveUpdate {
     /// The chat being archived or unarchived.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::ArchiveChatAction>,
     pub from_full_sync: bool,
 }
@@ -2751,11 +2752,11 @@ pub struct StarUpdate {
     pub participant_jid: Option<Jid>,
     pub message_id: String,
     pub from_me: bool,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::StarAction>,
     pub from_full_sync: bool,
 }
@@ -2765,11 +2766,11 @@ pub struct StarUpdate {
 pub struct MarkChatAsReadUpdate {
     /// The chat being marked as read or unread.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::MarkChatAsReadAction>,
     pub from_full_sync: bool,
 }
@@ -2784,11 +2785,11 @@ pub struct DeleteChatUpdate {
     /// When the mutation was made, not which messages it covers: that bound is
     /// `action.message_range`, and WA Web's `WAWebDeleteChatSync` deletes by it
     /// without reading this timestamp.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::DeleteChatAction>,
     pub from_full_sync: bool,
 }
@@ -2806,11 +2807,11 @@ pub struct ClearChatUpdate {
     /// When the mutation was made, not which messages it covers: that bound is
     /// `action.message_range`. WA Web's `WAWebClearChatSync` reads the
     /// timestamp only to keep messages starred after it.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::ClearChatAction>,
     pub from_full_sync: bool,
 }
@@ -2823,11 +2824,11 @@ pub struct UserStatusMuteUpdate {
     pub jid: Jid,
     /// `true` = status muted, `false` = unmuted.
     pub muted: bool,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::UserStatusMuteAction>,
     pub from_full_sync: bool,
 }
@@ -2840,11 +2841,11 @@ pub struct DeleteMessageForMeUpdate {
     pub participant_jid: Option<Jid>,
     pub message_id: String,
     pub from_me: bool,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::DeleteMessageForMeAction>,
     pub from_full_sync: bool,
 }
@@ -2857,14 +2858,14 @@ pub struct LabelEditUpdate {
     /// The label identifier (the index key, not a JID).
     pub label_id: String,
     /// Legacy action time: the Unix epoch when absent, local dispatch time
-    /// when the carried value is outside `DateTime`'s range.
-    pub timestamp: DateTime<Utc>,
+    /// when the carried value is outside `Timestamp`'s range.
+    pub timestamp: Timestamp,
     /// The mutation's timestamp in milliseconds, converted without a fallback.
-    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `None` when absent or outside `Timestamp`'s range; explicit zero is
     /// `Some` of the Unix epoch. This is not a server receipt time and does
     /// not classify a mutation as replayed or live. See `from_full_sync` for
     /// whether the event was dispatched during a full sync.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::LabelEditAction>,
     pub from_full_sync: bool,
 }
@@ -2879,14 +2880,14 @@ pub struct LabelAssociationUpdate {
     /// The chat the label was associated with or removed from.
     pub chat_jid: Jid,
     /// Legacy action time: the Unix epoch when absent, local dispatch time
-    /// when the carried value is outside `DateTime`'s range.
-    pub timestamp: DateTime<Utc>,
+    /// when the carried value is outside `Timestamp`'s range.
+    pub timestamp: Timestamp,
     /// The mutation's timestamp in milliseconds, converted without a fallback.
-    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `None` when absent or outside `Timestamp`'s range; explicit zero is
     /// `Some` of the Unix epoch. This is not a server receipt time and does
     /// not classify a mutation as replayed or live. See `from_full_sync` for
     /// whether the event was dispatched during a full sync.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
     pub from_full_sync: bool,
 }
@@ -2924,9 +2925,9 @@ pub struct LabelSublistUpdate {
     pub chat_jid: Jid,
     pub change: LabelSublistChange,
     /// Carried milliseconds converted without a fallback. `None` means absent
-    /// or outside `DateTime`'s range; explicit zero is `Some` of the Unix epoch.
+    /// or outside `Timestamp`'s range; explicit zero is `Some` of the Unix epoch.
     /// This is not a server receipt time or a replay/live classifier.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     /// Whether dispatch came from a full sync. `false` can also describe
     /// recovery/replay and does not guarantee a live change.
     pub from_full_sync: bool,
@@ -2945,14 +2946,14 @@ pub struct MessageLabelAssociationUpdate {
     /// The labelled message's id.
     pub message_id: String,
     /// Legacy action time: the Unix epoch when absent, local dispatch time
-    /// when the carried value is outside `DateTime`'s range.
-    pub timestamp: DateTime<Utc>,
+    /// when the carried value is outside `Timestamp`'s range.
+    pub timestamp: Timestamp,
     /// The mutation's timestamp in milliseconds, converted without a fallback.
-    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `None` when absent or outside `Timestamp`'s range; explicit zero is
     /// `Some` of the Unix epoch. This is not a server receipt time and does
     /// not classify a mutation as replayed or live. See `from_full_sync` for
     /// whether the event was dispatched during a full sync.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
     pub from_full_sync: bool,
 }
@@ -2967,7 +2968,7 @@ pub struct MessageLabelAssociationUpdate {
 pub struct QuickReplyUpdate {
     /// The quick reply's identifier (the index key, not a JID).
     pub id: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub action: Box<wa::sync_action_value::QuickReplyAction>,
     pub from_full_sync: bool,
 }
@@ -2982,7 +2983,7 @@ pub struct FavoriteStickerUpdate {
     /// WA Web's sticker `filehash` (the index key): the base64 SHA-256 of the
     /// decrypted sticker file.
     pub filehash: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// `is_favorite` plus the media fields (`direct_path`, `media_key`,
     /// `file_enc_sha256`, `mimetype`, `width`, `height`) needed to download a
     /// newly favorited sticker.
@@ -2997,7 +2998,7 @@ pub struct FavoriteStickerUpdate {
 pub struct RemoveRecentStickerUpdate {
     /// WA Web's sticker `filehash` (the index key).
     pub filehash: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// `last_sticker_sent_ts`: WA Web drops its recent entry only when that
     /// entry is not newer than this, and unconditionally when it is `None`.
     pub action: Box<wa::sync_action_value::RemoveRecentStickerAction>,
@@ -3011,7 +3012,7 @@ pub struct RemoveRecentStickerUpdate {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct FavoritesUpdate {
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// `favorites`, in the order the phone shows them; each entry's `id` is
     /// a chat JID string.
     pub action: Box<wa::sync_action_value::FavoritesAction>,
@@ -3025,9 +3026,9 @@ pub struct FavoritesUpdate {
 #[non_exhaustive]
 pub struct StatusPrivacyUpdate {
     /// Dispatch time when the action carried no valid timestamp.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Timestamp on the mutation, if it was present and representable.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub action: Box<wa::sync_action_value::StatusPrivacyAction>,
     pub from_full_sync: bool,
 }
@@ -3040,7 +3041,7 @@ pub struct DisableLinkPreviewsUpdate {
     /// `true` when link previews are now disabled. Only emitted when the wire
     /// carried the flag; WA Web treats an absent one as a malformed mutation.
     pub previews_disabled: bool,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub action: Box<wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction>,
     pub from_full_sync: bool,
 }
@@ -3057,7 +3058,7 @@ pub struct UnarchiveChatsSettingUpdate {
     /// `true` when a new message should unarchive its chat. Only emitted when
     /// the wire carried the flag.
     pub unarchive_chats: bool,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub action: Box<wa::sync_action_value::UnarchiveChatsSetting>,
     pub from_full_sync: bool,
 }
@@ -3072,11 +3073,11 @@ pub struct UnarchiveChatsSettingUpdate {
 pub struct ContactRemoved {
     /// The contact that is no longer saved.
     pub jid: Jid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The timestamp the mutation itself carried. `None` when it carried none,
-    /// or one outside `DateTime`'s range: `timestamp` then holds a fallback
+    /// or one outside `Timestamp`'s range: `timestamp` then holds a fallback
     /// (the Unix epoch or the dispatch time), not an instant the server sent.
-    pub action_timestamp: Option<DateTime<Utc>>,
+    pub action_timestamp: Option<Timestamp>,
     pub from_full_sync: bool,
 }
 
@@ -3114,7 +3115,7 @@ pub struct CallLogSync {
     /// whether a record predates the device, so it is worth having; it is not a
     /// time to file the call under. A mutation that arrives without one falls
     /// back to the moment it was received, as every other app-state event does.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub record: Box<wa::CallLogRecord>,
     pub from_full_sync: bool,
 }
@@ -3157,7 +3158,7 @@ pub struct CallLogHistory {
     pub from_me: Option<bool>,
     /// The call's own `record.start_time` (Unix seconds), not a mutation's
     /// write time. `None` when absent or out of range, without a now fallback.
-    pub timestamp: Option<DateTime<Utc>>,
+    pub timestamp: Option<Timestamp>,
     /// All observed optional fields, outcomes and participants, unmodified.
     pub record: Box<wa::CallLogRecord>,
     /// History notification's sync type, not app-state full-sync provenance.
@@ -3283,7 +3284,7 @@ mod tests {
     fn group_update_builder_defaults_additive_scalar_fields() {
         let update = GroupUpdate::builder()
             .group_jid("120363000000000001@g.us".parse().unwrap())
-            .timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .timestamp(Timestamp::UNIX_EPOCH)
             .is_lid_addressing_mode(false)
             .action(Box::new(
                 crate::stanza::groups::GroupNotificationAction::Unlocked,

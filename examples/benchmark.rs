@@ -109,7 +109,7 @@ fn main() {
             writeln!(
                 buf,
                 "{} [{:<5}] [{}] - {}",
-                wacore::time::now_utc().format("%H:%M:%S"),
+                wacore::time::now_utc().display_hms(),
                 record.level(),
                 record.target(),
                 record.args()

@@ -14136,7 +14136,7 @@ mod control_only_tests {
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: Arc::from("333333333333333"),
                 devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into_boxed_slice(),
-                timestamp: wacore::time::now_utc().timestamp(),
+                timestamp: wacore::time::now_utc().as_secs(),
                 phash: None,
                 raw_id: None,
             })

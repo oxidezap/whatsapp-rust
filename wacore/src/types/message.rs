@@ -13,7 +13,7 @@
 //! }
 //! ```
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
 
@@ -347,7 +347,7 @@ pub struct MsgBotInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_target_id: Option<MessageId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub edit_sender_timestamp_ms: Option<DateTime<Utc>>,
+    pub edit_sender_timestamp_ms: Option<Timestamp>,
 }
 
 /// The `<reporting>` payloads: a 16 or 20 byte tag, a 16 byte token. Both fit
@@ -434,8 +434,8 @@ pub struct MessageInfo {
     /// The sender's `notify` display name. Inline up to 24 bytes, which
     /// covers most names, so a message does not allocate for it.
     pub push_name: CompactString,
-    #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
-    pub timestamp: DateTime<Utc>,
+    #[serde(serialize_with = "crate::time::serde_seconds::serialize")]
+    pub timestamp: Timestamp,
     pub category: MessageCategory,
     pub multicast: bool,
     /// The `mediatype` the stanza's `<enc>` nodes declared, aggregated to one
@@ -663,9 +663,11 @@ impl MessageInfo {
 
     /// Evaluate the status age against the supplied clock. The closure is
     /// called only for status broadcasts; exactly 24 hours is still valid.
-    pub fn is_expired_status_with(&self, now: impl FnOnce() -> DateTime<Utc>) -> bool {
+    pub fn is_expired_status_with(&self, now: impl FnOnce() -> Timestamp) -> bool {
         self.source.chat.is_status_broadcast()
-            && (now() - self.timestamp) > chrono::Duration::hours(24)
+            && now()
+                .duration_since(self.timestamp)
+                .is_some_and(|age| age > core::time::Duration::from_secs(86_400))
     }
 }
 
@@ -714,17 +716,25 @@ mod tests {
 
     #[test]
     fn status_expiry_uses_the_selected_clock_and_keeps_the_exact_boundary() {
-        let at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let at = Timestamp::from_secs(1_700_000_000).unwrap();
         let mut info = MessageInfo {
             timestamp: at,
             ..Default::default()
         };
         assert!(!info.is_expired_status_with(|| panic!("direct message read status clock")));
         info.source.chat = "status@broadcast".parse().unwrap();
-        assert!(!info.is_expired_status_with(|| at + chrono::Duration::hours(24)));
-        assert!(info.is_expired_status_with(|| at
-            + chrono::Duration::hours(24)
-            + chrono::Duration::milliseconds(1)));
+        assert!(!info.is_expired_status_with(|| {
+            at.checked_add(core::time::Duration::from_secs(86_400))
+                .unwrap()
+        }));
+        assert!(info.is_expired_status_with(|| {
+            at.checked_add(core::time::Duration::from_millis(86_400_001))
+                .unwrap()
+        }));
+        assert!(!info.is_expired_status_with(|| {
+            at.checked_sub(core::time::Duration::from_millis(1))
+                .unwrap()
+        }));
     }
 
     /// The stanza parser reads `edit` as a borrowed attribute and parses it

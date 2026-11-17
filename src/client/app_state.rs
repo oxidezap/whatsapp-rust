@@ -4498,7 +4498,7 @@ impl Client {
                     .action_value
                     .as_ref()
                     .and_then(|v| v.timestamp)
-                    .and_then(chrono::DateTime::from_timestamp_millis);
+                    .and_then(wacore::time::Timestamp::from_millis);
                 let action = m
                     .action_value
                     .as_mut()
@@ -9489,7 +9489,7 @@ mod critical_bootstrap_tests {
         for event in [set, remove] {
             let update = &event["LabelSublistUpdate"];
             assert_eq!(update["predefined_id"], 11);
-            assert_eq!(update["action_timestamp"], "1970-01-01T00:00:00Z");
+            assert_eq!(update["action_timestamp"], 0);
             assert_eq!(update["from_full_sync"], false);
         }
     }

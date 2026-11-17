@@ -52,7 +52,7 @@ impl Client {
         // BotOnly enforcement lives in build_msg_secret_entry (the chokepoint),
         // which keys off the classified bot context including group bot prompts.
         let class = wacore::msg_secret::classify(msg, chat_is_bot);
-        let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
+        let message_ts = u64::try_from(info.timestamp.as_secs()).ok();
 
         let primary = self.build_msg_secret_entry(
             &info.source.chat,
@@ -401,7 +401,7 @@ impl Client {
         // know the parent's event time; resolver-supplied secrets carry none
         // (parent_ts == 0), so we stay permissive there.
         if env.kind == SecretEncKind::MessageEdit && parent_ts > 0 {
-            let edit_ts = info.timestamp.timestamp();
+            let edit_ts = info.timestamp.as_secs();
             if edit_ts >= parent_ts + wacore::msg_secret::EDIT_PROCESSING_WINDOW_SECS {
                 log::debug!(
                     "[msg:{}] secret edit authored outside the {}s window (editTs={edit_ts}, parentTs={parent_ts}); dropping",
@@ -445,7 +445,7 @@ impl Client {
             let message_ts = if parent_ts > 0 && env.kind != SecretEncKind::EncComment {
                 u64::try_from(parent_ts).ok()
             } else {
-                u64::try_from(info.timestamp.timestamp()).ok()
+                u64::try_from(info.timestamp.as_secs()).ok()
             };
             // Primary + LID/PN alternate in one batch so both survive together.
             let mut entries = Vec::with_capacity(2);

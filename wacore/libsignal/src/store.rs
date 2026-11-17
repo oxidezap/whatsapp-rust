@@ -144,11 +144,12 @@ pub mod record_helpers {
         waproto::codec::pre_key_record_decode(&record.serialize()?)
             .map_err(|_| protocol::SignalProtocolError::InvalidProtobufEncoding)
     }
+    /// Build a record using Unix seconds, clamping pre-epoch clocks to zero.
     pub fn new_signed_pre_key_record(
         id: u32,
         key: &KeyPair,
         signature: [u8; 64],
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp_seconds: i64,
     ) -> Result<SignedPreKeyRecordStructure> {
         {
             let mut record = SignedPreKeyRecordStructure::default();
@@ -156,7 +157,7 @@ pub mod record_helpers {
             record.public_key = Some(key.public_key.public_key_bytes().to_vec());
             record.private_key = Some(key.private_key.serialize().to_vec());
             record.signature = Some(signature.to_vec());
-            record.timestamp = Some(timestamp.timestamp().max(0) as u64);
+            record.timestamp = Some(timestamp_seconds.max(0) as u64);
             Ok(record)
         }
     }

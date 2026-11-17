@@ -578,7 +578,7 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
         assert_eq!(msg.conversation.as_deref(), Some(text_ab));
         assert!(!info.id.is_empty(), "Message ID must not be empty");
         assert!(
-            info.timestamp.timestamp() > 0,
+            info.timestamp.as_secs() > 0,
             "Timestamp should be positive, got {}",
             info.timestamp
         );
