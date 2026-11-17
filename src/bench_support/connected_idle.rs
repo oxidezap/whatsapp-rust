@@ -187,6 +187,13 @@ impl Session {
     /// Connect with production XX, login and keepalive, leaving the initial offline
     /// marker to `receive_activity`/`finish_control`. Requires a running Tokio runtime.
     pub async fn connect(backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::connect_with_capture(backend, None).await
+    }
+
+    async fn connect_with_capture(
+        backend: Arc<dyn Backend>,
+        outgoing_messages: Option<async_channel::Sender<Node>>,
+    ) -> Result<Self> {
         let pm = Arc::new(PersistenceManager::new(backend).await?);
         // A valid fixed-width synthetic registration ID. Random varint widths
         // otherwise change the retained serialized Signal session by a byte.
@@ -219,6 +226,7 @@ impl Session {
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
             max_batch_frames: AtomicUsize::new(0),
+            outgoing_messages,
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -793,6 +801,7 @@ struct Wire {
     initialization_iqs: AtomicUsize,
     delivery_receipts: Mutex<[bool; MESSAGES]>,
     max_batch_frames: AtomicUsize,
+    outgoing_messages: Option<async_channel::Sender<Node>>,
 }
 
 impl Wire {
@@ -986,9 +995,14 @@ impl Transport for Wire {
                 )
                 .await?;
             }
-            if let Some(node) = node
-                && node.tag == "iq"
+            let Some(node) = node else { continue };
+            if node.tag == "message"
+                && let Some(outgoing) = &self.outgoing_messages
             {
+                outgoing
+                    .try_send(node)
+                    .context("fixture outgoing message queue")?;
+            } else if node.tag == "iq" {
                 let nr = node.as_node_ref();
                 let active = nr.get_optional_child("active").is_some();
                 let ping = nr
@@ -1027,6 +1041,8 @@ impl Transport for Wire {
         self.server_tx.close();
     }
 }
+
+pub mod ping_pong;
 
 #[cfg(test)]
 mod tests {
@@ -1073,6 +1089,7 @@ mod tests {
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
             max_batch_frames: AtomicUsize::new(0),
+            outgoing_messages: None,
         }
     }
 
