@@ -39,8 +39,8 @@ const WRITE_FLUSH: usize = 8 * 1024;
 const SIDECAR_CHUNK: usize = 64 * 1024;
 /// Each sidecar entry is a 10-byte truncated HMAC-SHA256.
 const SIDECAR_MAC_LEN: usize = 10;
-/// 16-byte (one AES block) overlap between consecutive sidecar windows, needed
-/// so each 64 KiB window carries the CBC chaining context of its neighbour.
+/// Each sidecar window opens with the 16 bytes (one AES block) before it, the
+/// IV for the first, so a window carries the CBC chaining block it decrypts from.
 const SIDECAR_OVERLAP: usize = 16;
 
 pub struct EncryptedMedia {
@@ -140,7 +140,7 @@ impl MediaEncryptor {
             scratch: Vec::new(),
             media_key,
             file_length: 0,
-            sidecar: sidecar.then(|| SidecarAccumulator::new(mac_key)),
+            sidecar: sidecar.then(|| SidecarAccumulator::new(mac_key, iv)),
         })
     }
 
@@ -347,41 +347,41 @@ fn cbc_encrypt_blocks(cbc: &mut cbc::Encryptor<Aes256>, buf: &mut [u8]) {
 }
 
 /// Accumulates a WhatsApp streaming sidecar: one 10-byte truncated HMAC-SHA256
-/// per 64 KiB window of ciphertext, each window overlapping the next by one AES
-/// block (16 bytes) to preserve CBC chaining. Fed incrementally with the
-/// encrypted blocks (and the trailing MAC) so it never holds the whole file.
+/// per 64 KiB of the uploaded blob (ciphertext + trailing MAC). Each window is
+/// prefixed with the 16 bytes that precede it, the IV for the first, so a reader
+/// that seeks to a window has the CBC chaining block it needs to decrypt it.
+/// Fed incrementally with the encrypted blocks (and the trailing MAC) so it never
+/// holds the whole file.
 ///
 /// Ciphertext is hashed straight into a running HMAC rather than staged in a
 /// 64 KiB window buffer: the only state a window boundary needs from its
-/// predecessor is the 16-byte overlap, which is cheap to carry on its own. The
+/// predecessor is its last 16 bytes, which are cheap to carry on their own. The
 /// HMAC is `finalize_reset`-ed per window, so the key schedule is derived once
 /// for the whole file instead of once per 64 KiB.
 struct SidecarAccumulator {
     /// Running HMAC over the window currently being consumed.
     mac: CryptographicMac,
-    /// The last [`SIDECAR_OVERLAP`] bytes pushed. At a window boundary these are
-    /// exactly the bytes the next window replays first.
+    /// The last [`SIDECAR_OVERLAP`] bytes pushed: what the next window opens with.
     overlap: [u8; SIDECAR_OVERLAP],
     /// Concatenated 10-byte HMACs produced so far.
     result: Vec<u8>,
-    /// Absolute offset where the current window logically starts.
-    next_chunk_start: u64,
-    /// Total bytes pushed so far.
-    total_pushed: u64,
+    /// Blob bytes hashed into the current window, excluding its 16-byte prefix.
+    in_window: usize,
     /// First HMAC finalization error, surfaced by `finish`.
     err: Option<anyhow::Error>,
 }
 
 impl SidecarAccumulator {
-    fn new(mac_key: [u8; 32]) -> Self {
+    fn new(mac_key: [u8; 32], iv: [u8; 16]) -> Self {
+        // `CryptographicMac::new` only fails on an unknown algorithm name.
+        let mut mac = CryptographicMac::new("HmacSha256", &mac_key)
+            .expect("HmacSha256 is a known MAC algorithm");
+        mac.update(&iv);
         Self {
-            // `CryptographicMac::new` only fails on an unknown algorithm name.
-            mac: CryptographicMac::new("HmacSha256", &mac_key)
-                .expect("HmacSha256 is a known MAC algorithm"),
-            overlap: [0u8; SIDECAR_OVERLAP],
+            mac,
+            overlap: iv,
             result: Vec::new(),
-            next_chunk_start: 0,
-            total_pushed: 0,
+            in_window: 0,
             err: None,
         }
     }
@@ -389,15 +389,13 @@ impl SidecarAccumulator {
     fn push(&mut self, data: &[u8]) {
         let mut src = 0;
         while src < data.len() {
-            let window_end = self.next_chunk_start + (SIDECAR_OVERLAP + SIDECAR_CHUNK) as u64;
-            let remaining = (window_end - self.total_pushed) as usize;
-            let take = remaining.min(data.len() - src);
+            let take = (SIDECAR_CHUNK - self.in_window).min(data.len() - src);
             let slice = &data[src..src + take];
             self.mac.update(slice);
             self.remember_overlap(slice);
-            self.total_pushed += take as u64;
+            self.in_window += take;
             src += take;
-            if self.total_pushed == window_end {
+            if self.in_window == SIDECAR_CHUNK {
                 self.flush();
             }
         }
@@ -411,11 +409,11 @@ impl SidecarAccumulator {
         self.overlap[SIDECAR_OVERLAP - take..].copy_from_slice(&slice[slice.len() - take..]);
     }
 
-    /// Emit the HMAC of the current window, then reseed the (reset) HMAC with
-    /// the 16-byte overlap that opens the next window.
+    /// Emit the HMAC of the current window, then seed the (reset) HMAC with the
+    /// window's last 16 bytes, which open the next one.
     fn flush(&mut self) {
-        // Nothing has been pushed into the window that is being closed.
-        if self.total_pushed <= self.next_chunk_start {
+        // A blob that ends on a window boundary has no partial window to seal.
+        if self.in_window == 0 {
             return;
         }
         match self.mac.finalize_sha256_array() {
@@ -424,14 +422,8 @@ impl SidecarAccumulator {
                 self.err.get_or_insert(e.into());
             }
         }
-        self.next_chunk_start += SIDECAR_CHUNK as u64;
-        // A boundary flush leaves the stream 16 bytes past the next window's
-        // start, so replay them; a final flush from `finish` has no successor.
-        let replay =
-            (self.total_pushed.saturating_sub(self.next_chunk_start) as usize).min(SIDECAR_OVERLAP);
-        if replay > 0 {
-            self.mac.update(&self.overlap[SIDECAR_OVERLAP - replay..]);
-        }
+        self.in_window = 0;
+        self.mac.update(&self.overlap);
     }
 
     fn finish(mut self) -> Result<Vec<u8>> {
@@ -876,26 +868,23 @@ mod tests {
     }
 
     /// Independent ("naive") reimplementation of the sidecar straight from the
-    /// full encrypted blob, used to pin the incremental accumulator's behaviour.
-    fn naive_sidecar(enc_full: &[u8], mac_key: &[u8; 32]) -> Vec<u8> {
-        let c = SIDECAR_CHUNK;
-        let o = SIDECAR_OVERLAP;
+    /// full encrypted blob, used to pin the incremental accumulator's behaviour:
+    /// window `k` is the 16 bytes before `k * 64 KiB` (the IV for the first)
+    /// followed by up to 64 KiB of the blob.
+    fn naive_sidecar(enc_full: &[u8], keys: &([u8; 16], [u8; 32])) -> Vec<u8> {
+        let (iv, mac_key) = keys;
+        let stream = [&iv[..], enc_full].concat();
         let mut out = Vec::new();
-        let mut start = 0usize;
-        while start + c + o <= enc_full.len() {
-            out.extend_from_slice(
-                &hmac_sha256_trunc10(mac_key, &enc_full[start..start + c + o]).unwrap(),
-            );
-            start += c;
+        for start in (0..enc_full.len()).step_by(SIDECAR_CHUNK) {
+            let end = (start + SIDECAR_OVERLAP + SIDECAR_CHUNK).min(stream.len());
+            out.extend_from_slice(&hmac_sha256_trunc10(mac_key, &stream[start..end]).unwrap());
         }
-        // Final flush: always runs (the blob is never empty — it carries the MAC).
-        out.extend_from_slice(&hmac_sha256_trunc10(mac_key, &enc_full[start..]).unwrap());
         out
     }
 
-    fn mac_key_for(media_key: &[u8; 32], media_type: MediaType) -> [u8; 32] {
-        let (_, _, mac_key) = DownloadUtils::get_media_keys(media_key, media_type).unwrap();
-        mac_key
+    fn sidecar_keys(media_key: &[u8; 32], media_type: MediaType) -> ([u8; 16], [u8; 32]) {
+        let (iv, _, mac_key) = DownloadUtils::get_media_keys(media_key, media_type).unwrap();
+        (iv, mac_key)
     }
 
     /// A `Write` that records how many calls it received.
@@ -1028,7 +1017,7 @@ mod tests {
         // Cross every 64 KiB boundary: just below, exactly at, and just above
         // one and two windows of *ciphertext*.
         let key = [0x33u8; 32];
-        let mac_key = mac_key_for(&key, MediaType::Audio);
+        let keys = sidecar_keys(&key, MediaType::Audio);
         for &len in &[
             0usize,
             10,
@@ -1044,7 +1033,7 @@ mod tests {
             let enc = encrypt_media_with_key_and_sidecar(&data, MediaType::Audio, Some(&key), None)
                 .unwrap();
             let sidecar = enc.streaming_sidecar.expect("audio sidecar");
-            let expected = naive_sidecar(&enc.data_to_upload, &mac_key);
+            let expected = naive_sidecar(&enc.data_to_upload, &keys);
             assert_eq!(
                 sidecar, expected,
                 "sidecar mismatch for plaintext len {len}"
@@ -1059,9 +1048,9 @@ mod tests {
 
     #[test]
     fn sidecar_first_entry_is_hmac_of_first_window() {
-        // Direct, hand-rolled check of the 64 KiB + 16 overlap window.
+        // Direct, hand-rolled check: the IV, then the first 64 KiB of ciphertext.
         let key = [0x91u8; 32];
-        let mac_key = mac_key_for(&key, MediaType::Video);
+        let (iv, mac_key) = sidecar_keys(&key, MediaType::Video);
         let data = payload(3 * SIDECAR_CHUNK, 0x11);
         let enc =
             encrypt_media_with_key_and_sidecar(&data, MediaType::Video, Some(&key), None).unwrap();
@@ -1069,10 +1058,34 @@ mod tests {
 
         let first = hmac_sha256_trunc10(
             &mac_key,
-            &enc.data_to_upload[..SIDECAR_CHUNK + SIDECAR_OVERLAP],
+            &[&iv[..], &enc.data_to_upload[..SIDECAR_CHUNK]].concat(),
         )
         .unwrap();
         assert_eq!(&sidecar[..SIDECAR_MAC_LEN], &first[..]);
+    }
+
+    /// A video sent by the WhatsApp Android app (a generated test pattern, two
+    /// sidecar windows), with the media key, sidecar and encrypted-file hash its
+    /// message carried. Encrypting it again under that key must reproduce the
+    /// app's upload and its sidecar byte for byte.
+    #[test]
+    fn sidecar_matches_whatsapp_android_upload() {
+        let plaintext = include_bytes!("testdata/sidecar_video.mp4");
+        let key: [u8; 32] =
+            hex::decode("d1d39eebc97518074a7264e257ddc35198566974a46bc44005ed969cf521ad02")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let enc = encrypt_media_with_key_and_sidecar(plaintext, MediaType::Video, Some(&key), None)
+            .unwrap();
+        assert_eq!(
+            hex::encode(enc.file_enc_sha256),
+            "1c14854d0ba34453698e36b4bab4a640c48946eca9227f4cdbadfbbef76a8d9f"
+        );
+        assert_eq!(
+            enc.streaming_sidecar.map(hex::encode).as_deref(),
+            Some("5800fb974aeaaaac7e839f24450998506f05cfe0")
+        );
     }
 
     #[test]
