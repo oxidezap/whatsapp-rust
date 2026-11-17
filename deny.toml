@@ -16,6 +16,10 @@ version = 2
 # the affected operation is structurally unreachable in this workspace and no
 # fixed dependency exists; the exact boundary must be recorded beside it.
 ignore = [
+    # Maintenance-only notice. chrono is exposed in public event/time types;
+    # vulnerability advisories for chrono remain enforced.
+    # TODO: migrate these APIs to jiff and remove this exception.
+    "RUSTSEC-2026-0543",
     # OxiTLS exposes RSA signing for server/private-key users. wa-fetch is an
     # HTTP client with no client certificate or private key, so the Marvin
     # private-key timing path is unreachable. No fixed pure-Rust RSA release
