@@ -223,3 +223,42 @@ numerator and denominator. This preserves exact half-byte medians for even
 repeat counts without rounding the regression decision through floating point.
 Schema version 3 also records and checks the shared probe's SHA-256. The digest
 covers the driver, allocation counter and lock warmup; mismatched sources fail.
+
+## Cold startup, first DM and SQLite flush
+
+The CodSpeed `cold_startup_to_ready` case starts from fresh memory storage.
+It includes synthetic device provisioning, Noise XX, login, initial offline
+completion and the join of finite startup tasks. It uses a synthetic peer
+without real network latency.
+
+The `first_inbound_dm` case prepares a connected receiver and an encrypted prekey
+message before measurement. The receiver enters with no session for that sender.
+The measured path includes the Noise read loop, Signal session establishment,
+durability hook, plaintext dispatch and the delivery receipt observed on the wire.
+It uses a signed prekey without a one-time key. Both cases use paused Tokio time.
+
+```sh
+cargo bench -p whatsapp-rust --features bench-harness --bench connected_idle -- cold_startup_to_ready
+cargo bench -p whatsapp-rust --features bench-harness --bench connected_idle -- first_inbound_dm
+```
+
+The standalone SQLite probe reports wall-clock microseconds for first DM receive,
+explicit Signal flush, and reopening and reading back the written session. It
+requires the peer session to be absent on disk before the explicit flush, then
+compares the saved record byte for byte after closing the client and reopening
+the database. The probe opens a private file with `synchronous=FULL`. The flush
+time includes scheduling and transaction work alongside the filesystem sync.
+Crash-restart recovery is covered separately by `tests/signal_durability_sqlite.rs`.
+
+```sh
+cargo run --release -p whatsapp-rust --features bench-harness --example sqlite_first_dm
+```
+
+On Linux, collect raw sync syscall timings from a separate trace. Use the
+`first DM Signal flush started` and `first DM Signal flush completed` messages
+to locate calls in that phase. Use the untraced run for elapsed timings.
+
+```sh
+RUST_LOG=whatsapp_rust::bench_support::connected_idle=debug \
+  strace -f -yy -T -s 256 -e trace=write,fsync,fdatasync target/release/examples/sqlite_first_dm
+```

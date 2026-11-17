@@ -508,6 +508,10 @@ harness = false
 required-features = ["bench-harness"]
 
 # Internal `Cache` write/evict/sweep terms around the read path.
+[[example]]
+name = "sqlite_first_dm"
+required-features = ["bench-harness", "sqlite-storage"]
+
 [[bench]]
 name = "client_cache_maint"
 harness = false

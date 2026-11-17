@@ -105,3 +105,73 @@ fn cache_maintenance_after_activity(bencher: divan::Bencher, sqlite: bool) {
                 .expect("cache maintenance");
         });
 }
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("fixture runtime")
+}
+
+#[divan::bench(sample_count = 12, sample_size = 1)]
+fn cold_startup_to_ready(bencher: divan::Bencher) {
+    let rt = paused_runtime();
+    bencher
+        .with_inputs(|| Fixture {
+            rt: &rt,
+            session: None,
+            activity: None,
+            backend: Some(BackendFixture::memory()),
+        })
+        .bench_local_refs(|fixture| {
+            rt.block_on(async {
+                let backend = fixture.backend.as_ref().expect("fresh backend").backend();
+                fixture.session = Some(Session::connect(backend).await.expect("connect"));
+                fixture
+                    .session
+                    .as_ref()
+                    .expect("connected session")
+                    .finish_control()
+                    .await
+                    .expect("startup sync and readiness");
+            });
+        });
+}
+
+#[divan::bench(sample_count = 12, sample_size = 1)]
+fn first_inbound_dm(bencher: divan::Bencher) {
+    let rt = paused_runtime();
+    bencher
+        .with_inputs(|| {
+            rt.block_on(async {
+                let backend = BackendFixture::memory();
+                let session = Session::connect(backend.backend()).await.expect("connect");
+                session.finish_control().await.expect("ready");
+                session
+                    .prepare_maintenance_sample()
+                    .await
+                    .expect("startup flush retired");
+                let input = session.prepare_first_dm().await.expect("initial prekey DM");
+                (
+                    Fixture {
+                        rt: &rt,
+                        session: Some(session),
+                        activity: None,
+                        backend: Some(backend),
+                    },
+                    input,
+                )
+            })
+        })
+        .bench_local_refs(|(fixture, input)| {
+            rt.block_on(
+                fixture
+                    .session
+                    .as_ref()
+                    .expect("session")
+                    .receive_first_dm(input),
+            )
+            .expect("first DM committed, dispatched and receipted");
+        });
+}
