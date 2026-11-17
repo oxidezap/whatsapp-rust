@@ -7,8 +7,8 @@ use xtask_support::capture;
 use crate::consumers::Lane;
 mod results;
 
-pub fn verify_result(root: &Path, lane: Lane, head: &str) -> Result<()> {
-    results::verify(root, lane, head)
+pub fn verify_result(root: &Path, lane: Lane, head: &str, toolchain: &str) -> Result<()> {
+    results::verify(root, lane, head, toolchain)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -31,7 +31,8 @@ pub fn api_hosts_head(root: &Path, lane: Lane, toolchain: &str) -> Result<String
         &expected,
         std::str::from_utf8(&actual.stdout)?.trim(),
     )?;
-    let source = head_file(root, ".github/workflows/consumers.yml")?;
+    verify_wrapper(&head_file(root, ".github/workflows/consumers.yml")?)?;
+    let source = head_file(root, ".github/workflows/consumer-hosts.yml")?;
     let pin: toml::Value = toml::from_str(&head_file(root, "rust-toolchain.toml")?)?;
     let driver = pin["toolchain"]["channel"]
         .as_str()
@@ -125,12 +126,34 @@ fn lane_name(lane: Lane) -> Result<&'static str> {
     }
 }
 
-fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Result<()> {
-    let lane_name = lane_name(lane)?;
+fn verify_wrapper(source: &str) -> Result<()> {
     require_block(
         source,
         "on:",
         "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n  workflow_call:",
+    )?;
+    require_block(
+        source,
+        "jobs:",
+        "jobs:\n  qualify:\n    name: API hosts\n    uses: ./.github/workflows/consumer-hosts.yml",
+    )
+}
+
+pub(super) fn verify_execution(source: &str, pin: &str, lane: Lane, toolchain: &str) -> Result<()> {
+    let pin: toml::Value = toml::from_str(pin)?;
+    let driver = pin["toolchain"]["channel"]
+        .as_str()
+        .context("execution driver toolchain pin")?;
+    verify_owner(source, lane, toolchain, driver)
+}
+
+fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Result<()> {
+    let lane_name = lane_name(lane)?;
+    require_block(source, "on:", "on:\n  workflow_call:")?;
+    require_block(
+        source,
+        "env:",
+        "env:\n  EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n  CARGO_TERM_COLOR: always\n  CARGO_BUILD_JOBS: \"1\"\n  CARGO_INCREMENTAL: \"0\"\n  RUSTFLAGS: \"\"\n  CARGO_ENCODED_RUSTFLAGS: \"\"",
     )?;
     let job = block(source, "  consumers:")?;
     let header = job.split("    steps:").next().context("API host steps")?;
@@ -138,6 +161,13 @@ fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Resu
         header.trim_end()
             == "  consumers:\n    name: Independent API hosts (${{ matrix.lane }})\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        lane: [native, msrv]",
         "API host job matrix or conditions changed; review delegated coverage"
+    );
+    ensure!(
+        job.lines()
+            .filter(|line| line.contains("uses: actions/checkout@"))
+            .count()
+            == 1,
+        "API host job must contain exactly one checkout"
     );
     require_block(
         &job,
@@ -160,7 +190,7 @@ fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Resu
         &job,
         &format!("      - name: {name}"),
         &format!(
-            "      - name: {name}\n        if: matrix.lane == '{lane_name}'\n        env:\n          CARGO_BUILD_JOBS: \"2\"\n        run: target/debug/whatsapp-xtask ci consumers run --lane {lane_name} --toolchain {toolchain}"
+            "      - name: {name}\n        if: matrix.lane == '{lane_name}'\n        env:\n          CARGO_BUILD_JOBS: \"2\"\n        run: target/debug/whatsapp-xtask ci consumers run --lane {lane_name} --toolchain {toolchain} --expected-head \"$EXPECTED_SHA\""
         ),
     )?;
     Ok(())
@@ -169,7 +199,28 @@ fn verify_owner(source: &str, lane: Lane, toolchain: &str, driver: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    const OWNER: &str = include_str!("../../../../.github/workflows/consumers.yml");
+    const OWNER: &str = include_str!("../../../../.github/workflows/consumer-hosts.yml");
+
+    #[test]
+    fn wrapper_events_and_relative_execution_revision_are_fixed() {
+        let source = include_str!("../../../../.github/workflows/consumers.yml");
+        verify_wrapper(source).unwrap();
+        for mutation in [
+            source.replace("  push:", "  push:\n    paths: ['src/**']"),
+            source.replace(
+                "./.github/workflows/consumer-hosts.yml",
+                "example/project/.github/workflows/consumer-hosts.yml@main",
+            ),
+        ] {
+            assert!(verify_wrapper(&mutation).is_err());
+        }
+    }
+
+    #[test]
+    fn named_second_checkout_cannot_change_qualified_source() {
+        let source = OWNER.replace("      - name: Build driver", "      - name: Replace source\n        uses: actions/checkout@v7\n        with:\n          ref: main\n      - name: Build driver");
+        assert!(verify_owner(&source, Lane::Native, "1.100.0", "1.100.0").is_err());
+    }
 
     #[test]
     fn supply_chain_binds_delegation_to_the_same_events_and_head() {
@@ -210,12 +261,6 @@ mod tests {
     #[test]
     fn delegation_refuses_filtered_disabled_partial_or_different_head_owners() {
         for (before, after) in [
-            ("  push:\n", "  push:\n    paths: ['src/**']\n"),
-            (
-                "  pull_request:\n",
-                "  pull_request:\n    paths-ignore: ['tools/**']\n",
-            ),
-            ("    branches: [main]", "    branches: [other]"),
             ("  workflow_call:", "  workflow_dispatch:"),
             ("  consumers:\n", "  consumers:\n    if: false\n"),
             ("lane: [native, msrv]", "lane: [native]"),

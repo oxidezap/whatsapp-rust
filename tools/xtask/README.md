@@ -61,7 +61,11 @@ delegate native/MSRV checkout consumers with `--preparing-consumers api-hosts`.
 The task verifies the event, exact head, compiler and unfiltered owner workflow
 before delegating. After package and mutation checks, Supply Chain verifies the
 matching API host job and successful consumer step for this exact head and latest
-workflow attempt. Failed, cancelled, skipped, missing or ambiguous evidence fails
+workflow attempt. GitHub records the reusable host workflow revision independently
+of the checked-out source. The verifier reads the owner configuration and compiler
+pin at that execution revision, including pull-request merge revisions. The
+consumer driver checks the source head and tracked files before every command
+and after the full suite. Failed, cancelled, skipped, missing or ambiguous evidence fails
 the job; pending evidence has a bounded wait. Delegation makes no local execution
 claim and needs only read access to Actions. Scheduled, dispatched and local
 runs keep the full default. Frozen baseline and release qualification always run

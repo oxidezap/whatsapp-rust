@@ -28,6 +28,8 @@ pub enum Task {
         manifest: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, conflicts_with_all = ["manifest", "dry_run"])]
+        expected_head: Option<String>,
     },
 }
 
@@ -468,6 +470,7 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
         toolchain,
         manifest,
         dry_run,
+        expected_head,
     } = task
     else {
         println!(
@@ -513,6 +516,7 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             if dry_run {
                 continue;
             }
+            verify_source(root, expected_head.as_deref())?;
             let mut command = Command::new("cargo");
             command.args(&args);
             configure_cargo(&mut command, root, lane, build_jobs.as_deref());
@@ -579,13 +583,72 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
         count > 0,
         "no registered commands for requested lane/manifest"
     );
+    verify_source(root, expected_head.as_deref())?;
     println!("{count} consumer commands selected; first failure: {first_failure}");
     Ok(first_failure)
+}
+
+fn verify_source(root: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    ensure!(
+        expected.len() == 40 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid expected consumer source head"
+    );
+    let actual = xtask_support::capture(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root),
+    )?;
+    ensure!(
+        std::str::from_utf8(&actual.stdout)?.trim() == expected,
+        "consumer checkout changed from expected head {expected}"
+    );
+    let status = xtask_support::capture(
+        Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .current_dir(root),
+    )?;
+    ensure!(
+        status.stdout.is_empty(),
+        "consumer tracked sources changed during qualification"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_assertion_rejects_recheckout_and_tracked_mutation() {
+        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let root = tempfile::tempdir_in(cache).unwrap();
+        let git = |args: &[&str]| {
+            xtask_support::capture(Command::new("git").args(args).current_dir(root.path())).unwrap()
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(root.path().join("source"), "original").unwrap();
+        git(&["add", "source"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        verify_source(root.path(), Some(head.trim())).unwrap();
+        assert!(verify_source(root.path(), Some(&"f".repeat(40))).is_err());
+        std::fs::write(root.path().join("source"), "changed").unwrap();
+        assert!(verify_source(root.path(), Some(head.trim())).is_err());
+        verify_source(root.path(), None).unwrap();
+    }
+
     #[test]
     fn compilation_budget_preserves_lane_isolation() {
         let root = Path::new("isolated-host");

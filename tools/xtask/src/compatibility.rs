@@ -569,6 +569,7 @@ pub fn run(
                 toolchain: Some(toolchain.into()),
                 manifest: None,
                 dry_run: false,
+                expected_head: None,
             },
         ),
     }
@@ -589,7 +590,9 @@ pub fn verify_preparing_consumers(
         lane,
         toolchain,
     )? {
-        ConsumerQualification::ApiHosts(head) => ownership::verify_result(root, lane, &head),
+        ConsumerQualification::ApiHosts(head) => {
+            ownership::verify_result(root, lane, &head, toolchain)
+        }
         ConsumerQualification::Checkout | ConsumerQualification::Frozen(_) => {
             println!(
                 "No external preparing consumer result is needed for local or frozen qualification."

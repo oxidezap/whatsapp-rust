@@ -145,7 +145,7 @@ fn observe(
     );
     let pages: Vec<Jobs> =
         serde_json::from_slice(&gh(&["api", "--paginate", "--slurp", &endpoint])?)?;
-    let name = format!("Independent API hosts ({lane_name})");
+    let name = format!("API hosts / Independent API hosts ({lane_name})");
     let matches: Vec<_> = pages
         .into_iter()
         .flat_map(|page| page.jobs)
@@ -224,28 +224,85 @@ fn wait_for_result(
     }
 }
 
-pub fn verify(root: &Path, lane: Lane, head: &str) -> Result<()> {
+#[derive(Deserialize)]
+struct WorkflowReference {
+    path: String,
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct Execution {
+    referenced_workflows: Vec<WorkflowReference>,
+}
+
+fn execution_revision(source: &[u8], repo: &str, git_ref: &str) -> Result<String> {
+    let execution: Execution = serde_json::from_slice(source)?;
+    let path = format!("{repo}/.github/workflows/consumer-hosts.yml@{git_ref}");
+    let matches: Vec<_> = execution
+        .referenced_workflows
+        .into_iter()
+        .filter(|reference| reference.path == path)
+        .collect();
+    ensure!(
+        matches.len() == 1 && super::super::sha(&matches[0].sha),
+        "API host execution revision is unavailable or ambiguous"
+    );
+    Ok(matches[0].sha.clone())
+}
+
+fn execution_sources(
+    repo: &str,
+    revision: &str,
+    lane: Lane,
+    toolchain: &str,
+    mut gh: impl FnMut(&[&str]) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let mut read = |path: &str| -> Result<String> {
+        let endpoint = format!("repos/{repo}/contents/{path}?ref={revision}");
+        Ok(String::from_utf8(gh(&[
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            &endpoint,
+        ])?)?)
+    };
+    super::verify_wrapper(&read(".github/workflows/consumers.yml")?)?;
+    super::verify_execution(
+        &read(".github/workflows/consumer-hosts.yml")?,
+        &read("rust-toolchain.toml")?,
+        lane,
+        toolchain,
+    )
+}
+
+pub fn verify(root: &Path, lane: Lane, head: &str, toolchain: &str) -> Result<()> {
     let repo = std::env::var("GITHUB_REPOSITORY")
         .context("delegated result requires GITHUB_REPOSITORY")?;
     let event = std::env::var("GITHUB_EVENT_NAME")
         .context("delegated result requires GITHUB_EVENT_NAME")?;
+    let gh = |args: &[&str]| -> Result<Vec<u8>> {
+        Ok(capture(
+            Command::new("timeout")
+                .args(["45", "gh"])
+                .args(args)
+                .current_dir(root),
+        )?
+        .stdout)
+    };
     let proof = wait_for_result(
         Duration::from_secs(900),
-        || {
-            observe(&repo, head, &event, lane, |args| {
-                Ok(capture(
-                    Command::new("timeout")
-                        .args(["45", "gh"])
-                        .args(args)
-                        .current_dir(root),
-                )?
-                .stdout)
-            })
-        },
+        || observe(&repo, head, &event, lane, gh),
         std::thread::sleep,
     )?;
+    let endpoint = format!(
+        "repos/{repo}/actions/runs/{}/attempts/{}",
+        proof.run, proof.attempt
+    );
+    let git_ref = std::env::var("GITHUB_REF").context("delegated result requires GITHUB_REF")?;
+    let revision = execution_revision(&gh(&["api", &endpoint])?, &repo, &git_ref)?;
+    execution_sources(&repo, &revision, lane, toolchain, gh)?;
     println!(
-        "Verified delegated {lane:?} checkout consumers at {head}, attempt {}: https://github.com/{repo}/actions/runs/{}/job/{}",
+        "Verified delegated {lane:?} checkout consumers at {head}, workflow revision {revision}, attempt {}: https://github.com/{repo}/actions/runs/{}/job/{}",
         proof.attempt, proof.run, proof.job
     );
     Ok(())
@@ -260,7 +317,7 @@ mod tests {
     fn fixture() -> (Value, Value) {
         (
             json!([{"workflow_runs":[{"id":42,"run_number":4,"run_attempt":2,"path":".github/workflows/consumers.yml","event":"pull_request","status":"completed","head_sha":HEAD,"repository":{"full_name":"example/project"}}]}]),
-            json!([{"jobs":[{"id":99,"run_id":42,"run_attempt":2,"name":"Independent API hosts (native)","head_sha":HEAD,"status":"completed","conclusion":"success","steps":[{"name":"Run isolated native profiles and shared negative controls","status":"completed","conclusion":"success"}]}]}]),
+            json!([{"jobs":[{"id":99,"run_id":42,"run_attempt":2,"name":"API hosts / Independent API hosts (native)","head_sha":HEAD,"status":"completed","conclusion":"success","steps":[{"name":"Run isolated native profiles and shared negative controls","status":"completed","conclusion":"success"}]}]}]),
         )
     }
 
@@ -278,6 +335,49 @@ mod tests {
                 value => anyhow::bail!("unexpected endpoint {value}"),
             },
         )
+    }
+
+    #[test]
+    fn execution_reference_is_bound_to_the_event_ref_and_repository() {
+        let fixture = json!({"referenced_workflows":[{"path":"example/project/.github/workflows/consumer-hosts.yml@refs/pull/7/merge","sha":HEAD}]});
+        let bytes = serde_json::to_vec(&fixture).unwrap();
+        assert_eq!(
+            execution_revision(&bytes, "example/project", "refs/pull/7/merge").unwrap(),
+            HEAD
+        );
+        assert!(execution_revision(&bytes, "example/project", "refs/pull/8/merge").is_err());
+        assert!(execution_revision(&bytes, "other/project", "refs/pull/7/merge").is_err());
+        assert!(
+            execution_revision(
+                br#"{"referenced_workflows":[]}"#,
+                "example/project",
+                "refs/pull/7/merge"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn actual_execution_configuration_must_preserve_the_requested_compiler() {
+        let host = include_str!("../../../../../.github/workflows/consumer-hosts.yml");
+        let wrapper = include_str!("../../../../../.github/workflows/consumers.yml");
+        let check = |host: &str| {
+            execution_sources("example/project", HEAD, Lane::Native, "1.100.0", |args| {
+                let endpoint = args[3];
+                assert!(endpoint.ends_with(&format!("?ref={HEAD}")));
+                Ok(if endpoint.contains("consumer-hosts.yml") {
+                    host
+                } else if endpoint.contains("consumers.yml") {
+                    wrapper
+                } else {
+                    "[toolchain]\nchannel = \"1.100.0\""
+                }
+                .as_bytes()
+                .to_vec())
+            })
+        };
+        check(host).unwrap();
+        assert!(check(&host.replace("--toolchain 1.100.0", "--toolchain 1.95.0")).is_err());
     }
 
     #[test]
