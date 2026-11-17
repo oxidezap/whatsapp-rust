@@ -741,8 +741,52 @@ where
     }
 }
 
-type AdoptBufferedBody<W> =
-    fn(&mut W, Vec<u8>, usize) -> std::result::Result<(), DownloadPolicyError>;
+// Keep the storage choice out of the download future. The idle sync worker
+// retains the history download future inline through process_sync_task.
+trait StoreBufferedBody<W> {
+    fn store(
+        writer: &mut W,
+        body: Vec<u8>,
+        wire_len: usize,
+        budget: &DownloadBudget,
+    ) -> std::result::Result<(), DownloadRequestError>;
+}
+
+struct WriteBufferedBody;
+
+impl<W: DownloadWriter> StoreBufferedBody<W> for WriteBufferedBody {
+    fn store(
+        writer: &mut W,
+        body: Vec<u8>,
+        _: usize,
+        budget: &DownloadBudget,
+    ) -> std::result::Result<(), DownloadRequestError> {
+        use std::io::Write;
+
+        budget
+            .writer(WriterIoOrigin(writer))
+            .write_all(&body)
+            .map_err(|error| DownloadRequestError::streamed(error.into()))
+    }
+}
+
+struct AdoptBufferedBody;
+
+impl StoreBufferedBody<MemoryWriter> for AdoptBufferedBody {
+    fn store(
+        writer: &mut MemoryWriter,
+        body: Vec<u8>,
+        wire_len: usize,
+        budget: &DownloadBudget,
+    ) -> std::result::Result<(), DownloadRequestError> {
+        budget
+            .check_cancelled()
+            .map_err(DownloadRequestError::ResourcePolicy)?;
+        writer
+            .adopt_buffered_body(body, wire_len)
+            .map_err(DownloadRequestError::ResourcePolicy)
+    }
+}
 
 enum WriterAttempt<W, T> {
     Verified(T),
@@ -1282,7 +1326,7 @@ impl Client {
             .into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
-        self.download_to_writer_with_budget(downloadable, writer, budget, None)
+        self.download_to_writer_with_budget::<W, WriteBufferedBody>(downloadable, writer, budget)
             .await
     }
 
@@ -1305,11 +1349,10 @@ impl Client {
         if self.http_client.supports_streaming() {
             writer.preallocate_large()?;
         }
-        self.download_to_writer_with_budget(
+        self.download_to_writer_with_budget::<_, AdoptBufferedBody>(
             downloadable,
             writer,
             Some(DownloadBudget::cancellable(DownloadLimits::default())),
-            Some(MemoryWriter::adopt_buffered_body),
         )
         .await
         // Publish the shared owner on the caller, after the blocking download
@@ -1317,13 +1360,16 @@ impl Client {
         .map(MemoryWriter::into_bytes)
     }
 
-    async fn download_to_writer_with_budget<W: DownloadWriter + MaybeSend + 'static>(
+    async fn download_to_writer_with_budget<W, StoreBody>(
         &self,
         downloadable: &dyn Downloadable,
         writer: W,
         budget: Option<DownloadBudget>,
-        adopt_buffered: Option<AdoptBufferedBody<W>>,
-    ) -> std::result::Result<W, ClientDownloadError> {
+    ) -> std::result::Result<W, ClientDownloadError>
+    where
+        W: DownloadWriter + MaybeSend + 'static,
+        StoreBody: StoreBufferedBody<W>,
+    {
         let media_http = match self.media_http_client() {
             Ok(http) => http,
             Err(error) => {
@@ -1347,7 +1393,7 @@ impl Client {
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
-                streaming_download_and_decrypt_mapped(
+                streaming_download_and_decrypt_mapped::<_, _, _, StoreBody>(
                     media_http,
                     &self.runtime,
                     &request,
@@ -1356,7 +1402,6 @@ impl Client {
                         ..ExpectedMediaHashes::from_downloadable(downloadable)
                     },
                     writer,
-                    adopt_buffered,
                     std::convert::identity,
                 )
                 .await
@@ -1454,32 +1499,31 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     hashes: ExpectedMediaHashes,
     writer: W,
 ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
-    streaming_download_and_decrypt_mapped(
+    streaming_download_and_decrypt_mapped::<_, _, _, WriteBufferedBody>(
         http_client,
         runtime,
         request,
         hashes,
         writer,
-        None,
         std::convert::identity,
     )
     .await
     .map(WriterAttempt::into_parts)
 }
 
-async fn streaming_download_and_decrypt_mapped<W, T, Finish>(
+async fn streaming_download_and_decrypt_mapped<W, T, Finish, StoreBody>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
     writer: W,
-    adopt_buffered: Option<AdoptBufferedBody<W>>,
     finish: Finish,
 ) -> Result<WriterAttempt<W, T>>
 where
     W: DownloadWriter + MaybeSend + 'static,
     T: MaybeSend + 'static,
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
+    StoreBody: StoreBufferedBody<W>,
 {
     if !http_client.supports_streaming() {
         if hashes
@@ -1492,13 +1536,12 @@ where
                 DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
             ));
         }
-        return buffered_download_and_decrypt(
+        return buffered_download_and_decrypt::<_, _, _, StoreBody>(
             http_client,
             runtime,
             request,
             hashes,
             writer,
-            adopt_buffered,
             finish,
         )
         .await;
@@ -1609,22 +1652,20 @@ where
 }
 
 /// Buffered fallback when streaming is not available.
-async fn buffered_download_and_decrypt<W, T, Finish>(
+async fn buffered_download_and_decrypt<W, T, Finish, StoreBody>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
     writer: W,
-    adopt_buffered: Option<AdoptBufferedBody<W>>,
     finish: Finish,
 ) -> Result<WriterAttempt<W, T>>
 where
     W: DownloadWriter + MaybeSend + 'static,
     T: MaybeSend + 'static,
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
+    StoreBody: StoreBufferedBody<W>,
 {
-    use std::io::Write;
-
     if let Some(budget) = &hashes.budget
         && let Err(error) = budget.check_cancelled()
     {
@@ -1637,7 +1678,6 @@ where
         Ok(body) => body,
         Err(err) => return Ok(WriterAttempt::Failed(writer, err)),
     };
-    let wire_len = body.len();
     let decryption = request.decryption.clone();
 
     // Keep authentication/decryption and writer I/O in one blocking task so
@@ -1653,6 +1693,7 @@ where
             budget
                 .check_cancelled()
                 .map_err(DownloadRequestError::ResourcePolicy)?;
+            let wire_len = body.len();
             decrypt_or_validate_buffered_body_with_provider(
                 crypto_provider.as_deref(),
                 &mut body,
@@ -1660,17 +1701,7 @@ where
                 &hashes,
             )?;
             clear_writer(&mut writer).map_err(DownloadRequestError::writer_io)?;
-            if let Some(adopt) = adopt_buffered {
-                budget
-                    .check_cancelled()
-                    .map_err(DownloadRequestError::ResourcePolicy)?;
-                adopt(&mut writer, body, wire_len).map_err(DownloadRequestError::ResourcePolicy)?;
-            } else {
-                budget
-                    .writer(WriterIoOrigin(&mut writer))
-                    .write_all(&body)
-                    .map_err(|error| DownloadRequestError::streamed(error.into()))?;
-            }
+            StoreBody::store(&mut writer, body, wire_len, &budget)?;
             budget
                 .check_cancelled()
                 .map_err(DownloadRequestError::ResourcePolicy)?;
@@ -3726,13 +3757,12 @@ mod tests {
                 let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
                 let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let observed = finished.clone();
-                let attempt = streaming_download_and_decrypt_mapped(
+                let attempt = streaming_download_and_decrypt_mapped::<_, _, _, WriteBufferedBody>(
                     &http,
                     &runtime,
                     &request,
                     ExpectedMediaHashes::from_downloadable(&params),
                     Cursor::new(Vec::new()),
-                    None,
                     move |writer| {
                         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         (writer.into_inner(), std::thread::current().id())
@@ -3808,7 +3838,7 @@ mod tests {
                 RoutedHttpClient::new(Vec::new(), (200, body))
             };
             let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
-            let attempt = streaming_download_and_decrypt_mapped(
+            let attempt = streaming_download_and_decrypt_mapped::<_, _, _, WriteBufferedBody>(
                 &http,
                 &runtime,
                 &request,
@@ -3817,7 +3847,6 @@ mod tests {
                     inner: Cursor::new(Vec::new()),
                     seeks: 0,
                 },
-                None,
                 |_| panic!("a failed rewind must not finalize output"),
             )
             .await
