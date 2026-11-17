@@ -3785,31 +3785,8 @@ impl Client {
 
             let stanza_to = dm_stanza_to(&recipient_bare, &to);
 
-            // WAWebSendMsgCreateFanoutStanza names the peer's number on every
-            // LID-addressed stanza (`peer_recipient_pn`). The server relays it
-            // on our companions' copy, and it is how they learn the number
-            // behind a LID chat they have never seen: without it a new chat
-            // opened here shows on the phone as an unknown user (#1924). WA
-            // Web omits it for a chat opened from a number-hidden CTWA ad
-            // (`LidOriginType.PNH_CTWA`); the engine does not track a chat's
-            // LID origin, but it also cannot hold a number for such a peer
-            // unless the server or the peer disclosed it. A status reaction
-            // borrows this branch and is not a 1:1 chat, so it stays bare.
-            let peer_recipient_pn = if stanza_to.is_lid() && !is_status_addon {
-                if to.is_pn() {
-                    Some(to.to_non_ad())
-                } else {
-                    match self.get_lid_pn_entry(&stanza_to).await {
-                        Ok(entry) => entry.map(|entry| Jid::pn(&*entry.phone_number)),
-                        Err(e) => {
-                            log::warn!(
-                                "LID-PN lookup failed for {}, sending without peer_recipient_pn: {e:?}",
-                                stanza_to.observe()
-                            );
-                            None
-                        }
-                    }
-                }
+            let peer_recipient_pn = if !is_status_addon {
+                self.resolve_peer_recipient_pn(&stanza_to).await
             } else {
                 None
             };
@@ -4159,6 +4136,32 @@ impl Client {
         keys
     }
 
+    pub(crate) async fn resolve_peer_recipient_pn(&self, chat: &Jid) -> Option<Jid> {
+        if !chat.is_lid() {
+            return None;
+        }
+        let own = self.persistence_manager.get_device_snapshot();
+        if own
+            .lid
+            .as_ref()
+            .is_some_and(|lid| lid.is_same_chat_as(chat))
+        {
+            return own.pn.as_ref().map(Jid::to_non_ad);
+        }
+        // PN aliases can outlive a phone change. Web resolves from the final
+        // LID's reverse mapping, never from the caller's original PN alias.
+        match self.get_lid_pn_entry(chat).await {
+            Ok(entry) => entry.map(|entry| Jid::pn(&*entry.phone_number)),
+            Err(error) => {
+                log::warn!(
+                    "LID-PN lookup failed for {}, sending without peer_recipient_pn: {error:?}",
+                    chat.observe()
+                );
+                None
+            }
+        }
+    }
+
     /// [`Self::resolve_encryption_jid`] over a device list, in order.
     pub(crate) async fn resolve_encryption_jids(&self, device_jids: &[Jid]) -> Vec<Jid> {
         let mut keys: Vec<Jid> = Vec::with_capacity(device_jids.len());
@@ -4262,6 +4265,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 mod tests {
     mod action_identity_tests;
     mod creation_tests;
+    mod dm_peer_identity_tests;
     mod message_reference_tests;
     mod privacy_tokens;
     mod request_tests;

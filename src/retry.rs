@@ -1116,6 +1116,24 @@ impl Client {
         // participants, and shares the normal session recovery path.
         self.ensure_e2e_sessions_resolved(std::slice::from_ref(&encryption_jid))
             .await?;
+        let own = self.persistence_manager.get_device_snapshot();
+        // WAWebUserUtils.isMeAccount checks both account and addressing mode.
+        let requester_is_own_device = own
+            .pn
+            .as_ref()
+            .is_some_and(|pn| wire_requester.is_same_chat_as(pn))
+            || own
+                .lid
+                .as_ref()
+                .is_some_and(|lid| wire_requester.is_same_chat_as(lid));
+        let peer_recipient_pn = if matches!(route, RetransmissionRoute::Direct)
+            && requester_is_own_device
+            && let Some(chat) = recipient.as_ref()
+        {
+            self.resolve_peer_recipient_pn(chat).await
+        } else {
+            None
+        };
         let signal_address = encryption_jid.to_protocol_address();
         let account_guard = self.lock_companion_account(&encryption_jid).await;
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
@@ -1149,25 +1167,26 @@ impl Client {
             }
             RetransmissionRoute::Status => unreachable!("status handled above"),
         };
-        let stanza = wacore::session_engine::publication::PreparedSignal::new(
-            wacore::send::prepare_pairwise_retry_stanza_for_role(
-                &mut store_adapter.session_store,
-                &mut store_adapter.identity_store,
-                wacore::send::PairwiseRetryRequest {
-                    destination,
-                    encryption_jid,
-                    message: &message,
-                    message_id,
-                    retry_count,
-                    account: device_snapshot.account.as_deref(),
-                    edit,
-                    pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
-                },
-                self.sending_identity_role(),
-            )
-            .await?,
+        let mut node = wacore::send::prepare_pairwise_retry_stanza_for_role(
+            &mut store_adapter.session_store,
+            &mut store_adapter.identity_store,
+            wacore::send::PairwiseRetryRequest {
+                destination,
+                encryption_jid,
+                message: &message,
+                message_id,
+                retry_count,
+                account: device_snapshot.account.as_deref(),
+                edit,
+                pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
+            },
+            self.sending_identity_role(),
         )
-        .begin_commit();
+        .await?;
+        if let Some(phone) = peer_recipient_pn {
+            node.attrs.insert("peer_recipient_pn", phone);
+        }
+        let stanza = wacore::session_engine::publication::PreparedSignal::new(node).begin_commit();
 
         // Persistence may need the processing permit, whose holder may in turn
         // need this session lock. Release it before the durability gate.
