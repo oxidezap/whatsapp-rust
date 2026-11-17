@@ -55,9 +55,14 @@ jobs:
   compatibility:
     name: Compatibility and packages (${{ matrix.lane }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     env:
       LANE: ${{ matrix.lane }}
       TOOLCHAIN: ${{ matrix.toolchain }}
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PREPARING_CONSUMERS: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.base_ref == 'main')) && (matrix.lane == 'native' || matrix.lane == 'msrv') && 'api-hosts' || 'local' }}
       # Candidate profiles and external package consumers compile separate graphs.
       # Keep their generated protocol artifacts within hosted runner disk limits.
       CARGO_INCREMENTAL: "0"
@@ -113,7 +118,7 @@ jobs:
         run: target/debug/whatsapp-xtask ci compatibility --release --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Validate candidate or frozen contracts
         if: ${{ !inputs.release-check }}
-        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN"
+        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN" --preparing-consumers "$PREPARING_CONSUMERS"
       - name: Reclaim completed consumer build artifacts
         # Package consumers use an independent temporary target directory.
         # The completed checkout consumers are not reused by the remaining checks.
@@ -125,6 +130,10 @@ jobs:
       - name: Prove SDK and host breaks fail downstream compilation
         if: matrix.lane != 'msrv'
         run: target/debug/whatsapp-xtask ci compatibility-controls --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Verify delegated checkout consumer result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: target/debug/whatsapp-xtask ci compatibility-owner-result --lane "$LANE" --toolchain "$TOOLCHAIN" --preparing-consumers "$PREPARING_CONSUMERS"
       - name: Record exact source commit
         env:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

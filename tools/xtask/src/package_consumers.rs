@@ -373,6 +373,7 @@ fn run_staged(
             toolchain: Some(toolchain.into()),
             manifest: None,
             dry_run: false,
+            expected_head: None,
         },
     )
 }

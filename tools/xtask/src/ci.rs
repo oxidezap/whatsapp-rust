@@ -38,6 +38,18 @@ pub enum Task {
         lane: super::consumers::Lane,
         #[arg(long)]
         toolchain: String,
+        /// Delegate only preparing native/MSRV checkout consumers to their CI owner.
+        #[arg(long, value_enum, default_value = "local")]
+        preparing_consumers: super::compatibility::PreparingConsumers,
+    },
+    /// Verify the exact-head API host result after delegated preparing qualification.
+    CompatibilityOwnerResult {
+        #[arg(long, value_enum)]
+        lane: super::consumers::Lane,
+        #[arg(long)]
+        toolchain: String,
+        #[arg(long, value_enum, default_value = "local")]
+        preparing_consumers: super::compatibility::PreparingConsumers,
     },
     /// Qualify existing consumers against packaged crates outside this checkout.
     PackageConsumers {
@@ -254,11 +266,25 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             release,
             lane,
             toolchain,
+            preparing_consumers,
         } => {
-            return super::compatibility::run(root, release, lane, &toolchain);
+            return super::compatibility::run(root, release, lane, &toolchain, preparing_consumers);
         }
         Task::PackageConsumers { lane, toolchain } => {
             return super::package_consumers::run(root, lane, &toolchain);
+        }
+        Task::CompatibilityOwnerResult {
+            lane,
+            toolchain,
+            preparing_consumers,
+        } => {
+            super::compatibility::verify_preparing_consumers(
+                root,
+                lane,
+                &toolchain,
+                preparing_consumers,
+            )?;
+            return Ok(0);
         }
         Task::Workflow { task } => super::workflow::run_task(root, task)?,
         Task::TestWaprotoFeatures => {
