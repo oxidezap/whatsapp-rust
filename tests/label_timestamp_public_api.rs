@@ -42,40 +42,42 @@ fn existing_label_builders_keep_the_optional_timestamp_unset() {
 
 #[test]
 fn label_builders_accept_carried_and_optional_timestamps() {
-    let timestamp = Timestamp::from_millis(0).unwrap();
-    let edit = LabelEditUpdate::builder()
-        .label_id("5".into())
-        .timestamp(timestamp)
-        .action_timestamp(timestamp)
-        .action(Box::default())
-        .from_full_sync(true)
-        .build();
-    let association = LabelAssociationUpdate::builder()
-        .label_id("5".into())
-        .chat_jid("12025550111@s.whatsapp.net".parse().unwrap())
-        .timestamp(timestamp)
-        .maybe_action_timestamp(Some(timestamp))
-        .action(Box::default())
-        .from_full_sync(true)
-        .build();
-    let message = MessageLabelAssociationUpdate::builder()
-        .label_id("5".into())
-        .chat_jid("12025550111@s.whatsapp.net".parse().unwrap())
-        .message_id("MSGID".into())
-        .timestamp(timestamp)
-        .maybe_action_timestamp(Some(timestamp))
-        .action(Box::default())
-        .from_full_sync(true)
-        .build();
-    assert_eq!(edit.action_timestamp, Some(timestamp));
-    assert_eq!(association.action_timestamp, Some(timestamp));
-    assert_eq!(message.action_timestamp, Some(timestamp));
-    for json in [
-        serde_json::to_value(edit).unwrap(),
-        serde_json::to_value(association).unwrap(),
-        serde_json::to_value(message).unwrap(),
-    ] {
-        assert_eq!(json["action_timestamp"], 0);
-        assert_eq!(json["timestamp"], 0);
+    for millis in [0, 1_700_000_000_123] {
+        let timestamp = Timestamp::from_millis(millis).unwrap();
+        let edit = LabelEditUpdate::builder()
+            .label_id("5".into())
+            .timestamp(timestamp)
+            .action_timestamp(timestamp)
+            .action(Box::default())
+            .from_full_sync(true)
+            .build();
+        let association = LabelAssociationUpdate::builder()
+            .label_id("5".into())
+            .chat_jid("12025550111@s.whatsapp.net".parse().unwrap())
+            .timestamp(timestamp)
+            .maybe_action_timestamp(Some(timestamp))
+            .action(Box::default())
+            .from_full_sync(true)
+            .build();
+        let message = MessageLabelAssociationUpdate::builder()
+            .label_id("5".into())
+            .chat_jid("12025550111@s.whatsapp.net".parse().unwrap())
+            .message_id("MSGID".into())
+            .timestamp(timestamp)
+            .maybe_action_timestamp(Some(timestamp))
+            .action(Box::default())
+            .from_full_sync(true)
+            .build();
+        assert_eq!(edit.action_timestamp, Some(timestamp));
+        assert_eq!(association.action_timestamp, Some(timestamp));
+        assert_eq!(message.action_timestamp, Some(timestamp));
+        for json in [
+            serde_json::to_value(edit).unwrap(),
+            serde_json::to_value(association).unwrap(),
+            serde_json::to_value(message).unwrap(),
+        ] {
+            assert_eq!(json["action_timestamp"], millis);
+            assert_eq!(json["timestamp"], millis);
+        }
     }
 }
