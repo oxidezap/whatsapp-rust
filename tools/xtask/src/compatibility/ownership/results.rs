@@ -82,6 +82,7 @@ struct Proof {
     run: u64,
     attempt: u64,
     job: u64,
+    revision: String,
 }
 
 enum Observation {
@@ -104,6 +105,7 @@ fn observe(
     repo: &str,
     head: &str,
     event: &str,
+    git_ref: &str,
     lane: Lane,
     mut gh: impl FnMut(&[&str]) -> Result<Vec<u8>>,
 ) -> Result<Observation> {
@@ -121,8 +123,7 @@ fn observe(
     );
     let pages: Vec<Runs> =
         serde_json::from_slice(&gh(&["api", "--paginate", "--slurp", &endpoint])?)?;
-    // A newer failed or pending run must never inherit an older success.
-    let latest = pages
+    let mut candidates: Vec<_> = pages
         .into_iter()
         .flat_map(|page| page.workflow_runs)
         .filter(|run| {
@@ -131,14 +132,41 @@ fn observe(
                 && run.event == event
                 && run.repository.full_name == repo
         })
-        .max_by_key(|run| run.run_number);
-    let Some(run) = latest else {
-        return Ok(Observation::Pending("API host workflow is unavailable"));
+        .collect();
+    candidates.sort_by_key(|run| std::cmp::Reverse(run.run_number));
+    let mut latest = None;
+    for run in candidates {
+        ensure!(
+            run.run_attempt > 0 && run.run_number > 0,
+            "API host workflow run number or attempt is missing"
+        );
+        let endpoint = format!(
+            "repos/{repo}/actions/runs/{}/attempts/{}",
+            run.id, run.run_attempt
+        );
+        let source = gh(&["api", &endpoint])?;
+        let execution: Execution = serde_json::from_slice(&source)?;
+        ensure!(
+            !execution.referenced_workflows.is_empty(),
+            "API host execution references are unavailable"
+        );
+        if !execution
+            .referenced_workflows
+            .iter()
+            .any(|reference| reference.git_ref == git_ref)
+        {
+            continue;
+        }
+        let revision = execution_revision(&source, repo, git_ref)?;
+        // A newer failed or pending run for this ref must never inherit an older success.
+        latest = Some((run, revision));
+        break;
+    }
+    let Some((run, revision)) = latest else {
+        return Ok(Observation::Pending(
+            "API host workflow is unavailable for this ref",
+        ));
     };
-    ensure!(
-        run.run_attempt > 0 && run.run_number > 0,
-        "API host workflow run number or attempt is missing"
-    );
     let endpoint = format!(
         "repos/{repo}/actions/runs/{}/attempts/{}/jobs?per_page=100",
         run.id, run.run_attempt
@@ -198,6 +226,7 @@ fn observe(
         run: run.id,
         attempt: run.run_attempt,
         job: job.id,
+        revision,
     }))
 }
 
@@ -293,18 +322,14 @@ pub fn verify(root: &Path, lane: Lane, head: &str, toolchain: &str) -> Result<()
         )?
         .stdout)
     };
+    let git_ref = std::env::var("GITHUB_REF").context("delegated result requires GITHUB_REF")?;
     let proof = wait_for_result(
         Duration::from_secs(900),
-        || observe(&repo, head, &event, lane, gh),
+        || observe(&repo, head, &event, &git_ref, lane, gh),
         std::thread::sleep,
     )?;
-    let endpoint = format!(
-        "repos/{repo}/actions/runs/{}/attempts/{}",
-        proof.run, proof.attempt
-    );
-    let git_ref = std::env::var("GITHUB_REF").context("delegated result requires GITHUB_REF")?;
-    let revision = execution_revision(&gh(&["api", &endpoint])?, &repo, &git_ref)?;
-    execution_sources(&repo, &revision, lane, toolchain, gh)?;
+    let revision = &proof.revision;
+    execution_sources(&repo, revision, lane, toolchain, gh)?;
     println!(
         "Verified delegated {lane:?} checkout consumers at {head}, workflow revision {revision}, attempt {}: https://github.com/{repo}/actions/runs/{}/job/{}",
         proof.attempt, proof.run, proof.job
@@ -325,18 +350,28 @@ mod tests {
         )
     }
 
+    fn execution_fixture() -> Vec<u8> {
+        serde_json::to_vec(&json!({"referenced_workflows":[{"path":format!("example/project/.github/workflows/consumer-hosts.yml@{HEAD}"),"ref":"refs/pull/7/merge","sha":HEAD}]})).unwrap()
+    }
+
     fn exercise(runs: Value, jobs: Value) -> Result<Observation> {
         observe(
             "example/project",
             HEAD,
             "pull_request",
+            "refs/pull/7/merge",
             Lane::Native,
-            |args| match args[3] {
-                value if value.contains("/workflows/") => Ok(serde_json::to_vec(&runs)?),
-                "repos/example/project/actions/runs/42/attempts/2/jobs?per_page=100" => {
-                    Ok(serde_json::to_vec(&jobs)?)
+            |args| {
+                if args.len() == 2 {
+                    return Ok(execution_fixture());
                 }
-                value => anyhow::bail!("unexpected endpoint {value}"),
+                match args[3] {
+                    value if value.contains("/workflows/") => Ok(serde_json::to_vec(&runs)?),
+                    "repos/example/project/actions/runs/42/attempts/2/jobs?per_page=100" => {
+                        Ok(serde_json::to_vec(&jobs)?)
+                    }
+                    value => anyhow::bail!("unexpected endpoint {value}"),
+                }
             },
         )
     }
@@ -392,7 +427,8 @@ mod tests {
             Observation::Passed(Proof {
                 run: 42,
                 attempt: 2,
-                job: 99
+                job: 99,
+                ..
             })
         ));
         for (path, value) in [
@@ -441,6 +477,47 @@ mod tests {
     }
 
     #[test]
+    fn newer_run_for_another_pull_request_cannot_block_this_ref() {
+        let (mut runs, jobs) = fixture();
+        let mut other = runs[0]["workflow_runs"][0].clone();
+        other["id"] = json!(43);
+        other["run_number"] = json!(5);
+        runs[0]["workflow_runs"].as_array_mut().unwrap().push(other);
+        let result = observe(
+            "example/project",
+            HEAD,
+            "pull_request",
+            "refs/pull/7/merge",
+            Lane::Native,
+            |args| {
+                let endpoint = *args.last().unwrap();
+                if endpoint.contains("/workflows/") {
+                    return Ok(serde_json::to_vec(&runs)?);
+                }
+                if endpoint.ends_with("/attempts/2") {
+                    let git_ref = if endpoint.contains("/runs/43/") {
+                        "refs/pull/8/merge"
+                    } else {
+                        "refs/pull/7/merge"
+                    };
+                    return Ok(serde_json::to_vec(
+                        &json!({"referenced_workflows":[{"path":format!("example/project/.github/workflows/consumer-hosts.yml@{HEAD}"),"ref":git_ref,"sha":HEAD}]}),
+                    )?);
+                }
+                ensure!(
+                    endpoint.contains("/runs/42/"),
+                    "selected the other pull request"
+                );
+                Ok(serde_json::to_vec(&jobs)?)
+            },
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Observation::Passed(Proof { run: 42, .. })
+        ));
+    }
+
+    #[test]
     fn newest_run_is_selected_before_any_success_and_attempt_is_exact() {
         let (mut runs, mut jobs) = fixture();
         let mut old = runs[0]["workflow_runs"][0].clone();
@@ -458,8 +535,12 @@ mod tests {
             "example/project",
             HEAD,
             "pull_request",
+            "refs/pull/7/merge",
             Lane::Native,
             |args| {
+                if args.len() == 2 {
+                    return Ok(execution_fixture());
+                }
                 if args[3].contains("/workflows/") {
                     return Ok(serde_json::to_vec(&runs)?);
                 }
@@ -510,6 +591,7 @@ mod tests {
                 "example/project",
                 HEAD,
                 "pull_request",
+                "refs/pull/7/merge",
                 Lane::Native,
                 |_| anyhow::bail!("API unavailable")
             )
