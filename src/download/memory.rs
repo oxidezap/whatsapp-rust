@@ -152,6 +152,29 @@ impl MemoryWriter {
         Ok(())
     }
 
+    pub(super) fn adopt_buffered_body(
+        &mut self,
+        body: Vec<u8>,
+        wire_len: usize,
+    ) -> Result<(), DownloadPolicyError> {
+        if body.is_empty() {
+            return Ok(());
+        }
+        // Allow encryption overhead and capacity already reserved for this blob.
+        // Adapter over-allocation beyond that stays transient.
+        let capacity = body.capacity();
+        if let Some(reservation) = &mut self.reservation
+            && capacity <= wire_len.max(reservation.bytes)
+            && reservation.resize(capacity, capacity).is_ok()
+        {
+            self.cursor = Cursor::new(body);
+        } else {
+            self.reserve(body.len())?;
+            self.cursor.get_mut().extend_from_slice(&body);
+        }
+        Ok(())
+    }
+
     fn reserve(&mut self, required: usize) -> Result<(), DownloadPolicyError> {
         let current = self.cursor.get_ref().capacity();
         if required <= current {
