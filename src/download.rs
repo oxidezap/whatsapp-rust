@@ -1573,7 +1573,36 @@ where
     let url = request.url.clone();
     let decryption = request.decryption.clone();
 
-    Ok(wacore::runtime::blocking(&**runtime, move || {
+    Ok(wacore::runtime::blocking(
+        &**runtime,
+        streamed_download_job(
+            admission,
+            http_client,
+            url,
+            decryption,
+            hashes,
+            writer,
+            finish,
+        ),
+    )
+    .await)
+}
+
+fn streamed_download_job<W, T, Finish>(
+    admission: Option<wacore::net::StreamingRequestPermit>,
+    http_client: Arc<dyn HttpClient>,
+    url: String,
+    decryption: MediaDecryption,
+    hashes: ExpectedMediaHashes,
+    writer: W,
+    finish: Finish,
+) -> impl FnOnce() -> WriterAttempt<W, T> + MaybeSend + 'static
+where
+    W: DownloadWriter + MaybeSend + 'static,
+    T: MaybeSend + 'static,
+    Finish: FnOnce(W) -> T + MaybeSend + 'static,
+{
+    move || {
         let _admission = admission;
         let mut writer = writer;
 
@@ -1647,8 +1676,7 @@ where
             Ok(()) => WriterAttempt::Verified(finish(writer)),
             Err(error) => WriterAttempt::Failed(writer, error),
         }
-    })
-    .await)
+    }
 }
 
 /// Buffered fallback when streaming is not available.
