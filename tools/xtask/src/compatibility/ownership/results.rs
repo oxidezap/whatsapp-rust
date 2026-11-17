@@ -227,6 +227,8 @@ fn wait_for_result(
 #[derive(Deserialize)]
 struct WorkflowReference {
     path: String,
+    #[serde(rename = "ref")]
+    git_ref: String,
     sha: String,
 }
 
@@ -237,11 +239,13 @@ struct Execution {
 
 fn execution_revision(source: &[u8], repo: &str, git_ref: &str) -> Result<String> {
     let execution: Execution = serde_json::from_slice(source)?;
-    let path = format!("{repo}/.github/workflows/consumer-hosts.yml@{git_ref}");
+    let prefix = format!("{repo}/.github/workflows/consumer-hosts.yml@");
     let matches: Vec<_> = execution
         .referenced_workflows
         .into_iter()
-        .filter(|reference| reference.path == path)
+        .filter(|reference| {
+            reference.git_ref == git_ref && reference.path == format!("{prefix}{}", reference.sha)
+        })
         .collect();
     ensure!(
         matches.len() == 1 && super::super::sha(&matches[0].sha),
@@ -339,7 +343,7 @@ mod tests {
 
     #[test]
     fn execution_reference_is_bound_to_the_event_ref_and_repository() {
-        let fixture = json!({"referenced_workflows":[{"path":"example/project/.github/workflows/consumer-hosts.yml@refs/pull/7/merge","sha":HEAD}]});
+        let fixture = json!({"referenced_workflows":[{"path":format!("example/project/.github/workflows/consumer-hosts.yml@{HEAD}"),"ref":"refs/pull/7/merge","sha":HEAD}]});
         let bytes = serde_json::to_vec(&fixture).unwrap();
         assert_eq!(
             execution_revision(&bytes, "example/project", "refs/pull/7/merge").unwrap(),
