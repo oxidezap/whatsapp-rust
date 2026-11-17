@@ -212,7 +212,7 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 # API: the module it enables is `#[doc(hidden)]` and exists only so a bench
 # target, which links the crate from outside, can reach the crate-private send
 # internals it measures. Never enable it in a shipping build.
-bench-harness = ["tokio-runtime", "tokio/rt-multi-thread", "dep:wacore-noise", "wacore-noise/test-util"]
+bench-harness = ["tokio-runtime", "tokio/rt-multi-thread", "tokio/test-util", "dep:wacore-noise", "wacore-noise/test-util"]
 # Native integration fixtures only. Never enable in a shipping dependency.
 test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noise/test-util"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
@@ -439,6 +439,11 @@ required-features = ["bench-harness"]
 
 [[bench]]
 name = "client_receive"
+harness = false
+required-features = ["bench-harness"]
+
+[[bench]]
+name = "client_ping_pong"
 harness = false
 required-features = ["bench-harness"]
 
