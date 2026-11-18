@@ -189,10 +189,6 @@ where
     }
 }
 
-/// The hash a table slot was inserted with, read back when its table grows so
-/// growth never re-hashes a key. Both slot kinds carry it; the shared
-/// [`insert_slot`] tail reads it through this trait so the two `insert_unique`
-/// call sites compile from one definition instead of one per insert path.
 // Keep the hashbrown growth path out of each managed insert call site.
 #[inline(never)]
 fn insert_slot<K, V>(table: &mut HashTable<Slot<K, V>>, hash: u64, slot: Slot<K, V>) {
@@ -834,11 +830,8 @@ where
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
     ///
-    /// Stays out of line like [`PlainInner::insert_new`]: under fat LTO this
-    /// would otherwise inline into every managed insert path (`insert`,
-    /// `upsert_with_by_ref`, `insert_and_return`, plus the synchronous
-    /// [`SyncTtlGuard::insert_absent`](SyncTtlGuard::insert_absent)), stamping the eviction
-    /// prologue and the hashbrown growth call per caller instead of per table.
+    /// Keep this out of line under fat LTO so the eviction code and hashbrown
+    /// growth call compile once per table.
     #[inline(never)]
     fn insert_new(
         &mut self,
