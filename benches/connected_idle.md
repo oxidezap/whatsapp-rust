@@ -262,3 +262,28 @@ to locate calls in that phase. Use the untraced run for elapsed timings.
 RUST_LOG=whatsapp_rust::bench_support::connected_idle=debug \
   strace -f -yy -T -s 256 -e trace=write,fsync,fdatasync target/release/examples/sqlite_first_dm
 ```
+
+## Server-paced offline replay
+
+`connected_idle::offline_replay` runs 1,527 encrypted 256-byte group texts in
+32 chats with the real reader, durability hook and receipt paths. The fixture
+waits for each client pull request before sending seven full pages and one
+partial terminal page. It checks publication order
+per chat, the three full durable snapshots and the 327-message terminal
+snapshot, and one delivery receipt per message. Memory uses the in-memory
+backend. SQLite uses a fresh file with the standard settings.
+
+The native timing example reports the interval between the first and last
+pull requests, first and last durable publication, and arrival of the final
+receipt. Publication and receipt timestamps start at the preview. The
+request interval includes the seven production 100 ms continuations. Use the
+separate CodSpeed Simulation result for CPU work. Divide its total by eight
+for the mean work per requested page, including the partial page.
+
+```sh
+cargo run --release --example offline_replay_timing \
+  --features bench-harness,sqlite-storage-bundled -- sqlite
+cargo codspeed build -m simulation -p whatsapp-rust \
+  --features bench-harness,sqlite-storage-bundled --bench connected_idle
+cargo codspeed run -p whatsapp-rust --bench connected_idle -- offline_replay
+```
