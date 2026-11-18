@@ -316,7 +316,7 @@ impl Session {
 
     async fn connect_with_capture(
         backend: Arc<dyn Backend>,
-        outgoing_messages: Option<async_channel::Sender<Node>>,
+        outgoing_capture: Option<OutgoingCapture>,
     ) -> Result<Self> {
         let pm = Arc::new(PersistenceManager::new(backend).await?);
         // A valid fixed-width synthetic registration ID. Random varint widths
@@ -350,7 +350,7 @@ impl Session {
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
             max_batch_frames: AtomicUsize::new(0),
-            outgoing_messages,
+            outgoing_capture: outgoing_capture.map(Arc::new),
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -392,9 +392,11 @@ impl Session {
         Ok(session)
     }
 
-    /// Established Signal material and synthetic encryption are fixture setup, not
-    /// part of the CodSpeed timed region. The peer is dropped before this returns.
-    pub async fn prepare_activity(&self) -> Result<Activity> {
+    async fn prepare_encrypted_texts(
+        &self,
+        message_count: usize,
+        text_bytes: usize,
+    ) -> Result<(Vec<Node>, Vec<Jid>, Jid, String)> {
         // The active IQ does not join passive prekey generation/upload. Fence
         // it before preparing input, so setup cannot pay a variable fraction
         // of that work and leave the rest inside the activity measurement.
@@ -432,7 +434,7 @@ impl Session {
                 .await?;
             keys.push(key);
         }
-        let text = "x".repeat(TEXT_BYTES);
+        let text = "x".repeat(text_bytes);
         let mut plaintext = waproto::codec::message_to_vec(&{
             let mut proto_value = wa::Message::default();
             proto_value.conversation = Some(text.clone());
@@ -441,8 +443,8 @@ impl Session {
         // Fixed valid v2 padding keeps the AES scratch footprint identical.
         // Production padding remains random; only this synthetic input is fixed.
         plaintext.resize(plaintext.len() + 16, 16);
-        let mut stanzas = Vec::with_capacity(MESSAGES);
-        for i in 0..MESSAGES {
+        let mut stanzas = Vec::with_capacity(message_count);
+        for i in 0..message_count {
             let ciphertext = group_encrypt(
                 &mut adapter.sender_key_store,
                 &keys[i % LANES],
@@ -468,6 +470,14 @@ impl Session {
         drop(adapter);
         peer.flush_signal_cache().await?;
         self.client.flush_pending_signal_state().await?;
+        Ok((stanzas, groups, peer_jid, text))
+    }
+
+    /// Established Signal material and synthetic encryption are fixture setup, not
+    /// part of the CodSpeed timed region. The peer is dropped before this returns.
+    pub async fn prepare_activity(&self) -> Result<Activity> {
+        let (stanzas, groups, peer_jid, text) =
+            self.prepare_encrypted_texts(MESSAGES, TEXT_BYTES).await?;
         let history = {
             let mut proto_value = wa::HistorySync::default();
             proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
@@ -1030,6 +1040,47 @@ enum State {
     Closed,
 }
 
+enum OutgoingCapture {
+    Messages(async_channel::Sender<Node>),
+    OfflineReplay {
+        sender: async_channel::Sender<offline_replay::CapturedNode>,
+        measure_wall: bool,
+    },
+}
+
+impl OutgoingCapture {
+    fn accepts(&self, node: &Node) -> bool {
+        match self {
+            Self::Messages(_) => node.tag == "message",
+            Self::OfflineReplay { .. } => {
+                node.tag == "receipt"
+                    || node.tag == "ib"
+                        && node
+                            .as_node_ref()
+                            .get_optional_child("offline_batch")
+                            .is_some()
+            }
+        }
+    }
+
+    fn record(&self, node: Node) -> Result<()> {
+        match self {
+            Self::Messages(sender) => sender
+                .try_send(node)
+                .context("fixture outgoing message queue"),
+            Self::OfflineReplay {
+                sender,
+                measure_wall,
+            } => sender
+                .try_send(offline_replay::CapturedNode {
+                    node,
+                    timestamp: measure_wall.then(wacore::time::Instant::now),
+                })
+                .context("fixture outgoing replay queue"),
+        }
+    }
+}
+
 struct Wire {
     state: Mutex<State>,
     server_tx: async_channel::Sender<TransportEvent>,
@@ -1039,7 +1090,7 @@ struct Wire {
     initialization_iqs: AtomicUsize,
     delivery_receipts: Mutex<[bool; MESSAGES]>,
     max_batch_frames: AtomicUsize,
-    outgoing_messages: Option<async_channel::Sender<Node>>,
+    outgoing_capture: Option<Arc<OutgoingCapture>>,
 }
 
 impl Wire {
@@ -1234,12 +1285,10 @@ impl Transport for Wire {
                 .await?;
             }
             let Some(node) = node else { continue };
-            if node.tag == "message"
-                && let Some(outgoing) = &self.outgoing_messages
+            if let Some(capture) = &self.outgoing_capture
+                && capture.accepts(&node)
             {
-                outgoing
-                    .try_send(node)
-                    .context("fixture outgoing message queue")?;
+                capture.record(node)?;
             } else if node.tag == "iq" {
                 let nr = node.as_node_ref();
                 let active = nr.get_optional_child("active").is_some();
@@ -1280,6 +1329,7 @@ impl Transport for Wire {
     }
 }
 
+pub mod offline_replay;
 pub mod ping_pong;
 
 #[cfg(test)]
@@ -1337,7 +1387,7 @@ mod tests {
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
             max_batch_frames: AtomicUsize::new(0),
-            outgoing_messages: None,
+            outgoing_capture: None,
         }
     }
 

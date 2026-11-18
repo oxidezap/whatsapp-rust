@@ -211,6 +211,7 @@ fn harness_sha256() -> String {
         include_bytes!("connected_idle/process_locks.rs").as_slice(),
         include_bytes!("../src/bench_support.rs").as_slice(),
         include_bytes!("../src/bench_support/connected_idle.rs").as_slice(),
+        include_bytes!("../src/bench_support/connected_idle/offline_replay.rs").as_slice(),
         include_bytes!("../src/bench_support/connected_idle/util.rs").as_slice(),
     ] {
         hash.update((source.len() as u64).to_le_bytes());
