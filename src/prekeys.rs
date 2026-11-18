@@ -961,13 +961,25 @@ impl Client {
                 let mut pubkeys = Vec::with_capacity(gen_count);
                 let mut offsets = Vec::with_capacity(gen_count);
                 let mut buf = Vec::with_capacity(gen_count * MAX_RECORD_LEN);
-                for i in 0..gen_count {
+                const KEY_BATCH: usize = 8;
+                let mut encode = |i: usize, key_pair: KeyPair| {
                     let pre_key_id = gen_start + i as u32;
-                    let key_pair = KeyPair::generate(&mut rng);
                     let start = buf.len();
                     encode_pre_key_record_to(pre_key_id, &key_pair, &mut buf);
                     offsets.push((pre_key_id, start..buf.len()));
                     pubkeys.push((pre_key_id, key_pair.public_key));
+                };
+                let full = gen_count / KEY_BATCH * KEY_BATCH;
+                for start in (0..full).step_by(KEY_BATCH) {
+                    for (i, pair) in KeyPair::generate_batch::<KEY_BATCH>(&mut rng)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        encode(start + i, pair);
+                    }
+                }
+                for i in full..gen_count {
+                    encode(i, KeyPair::generate(&mut rng));
                 }
                 let shared = bytes::Bytes::from(buf);
                 let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets

@@ -9,10 +9,23 @@ impl MontgomeryPoint {
     pub(crate) fn to_bytes(self) -> [u8; 32] {
         self.0
     }
-    pub(crate) fn mul_base_clamped(mut bytes: [u8; 32]) -> Self {
+    pub(crate) fn mul_base_clamped(bytes: [u8; 32]) -> Self {
+        Self::mul_base_edwards(bytes).to_montgomery()
+    }
+    pub(crate) fn mul_base_clamped_batch<const N: usize>(scalars: &[[u8; 32]; N]) -> [Self; N] {
+        let mut numerators = Zeroizing::new([FieldElement::ZERO; N]);
+        let mut denominators = Zeroizing::new([FieldElement::ZERO; N]);
+        for (i, scalar) in scalars.iter().enumerate() {
+            (numerators[i], denominators[i]) =
+                Self::mul_base_edwards(*scalar).montgomery_coordinates();
+        }
+        FieldElement::invert_batch(&mut denominators);
+        core::array::from_fn(|i| Self((&numerators[i] * &denominators[i]).to_bytes()))
+    }
+    fn mul_base_edwards(mut bytes: [u8; 32]) -> EdwardsPoint {
         bytes[0] &= 248;
         bytes[31] = (bytes[31] & 127) | 64;
-        EdwardsPoint::mul_base(&Zeroizing::new(Scalar::from_bytes_mod_order(bytes))).to_montgomery()
+        EdwardsPoint::mul_base(&Zeroizing::new(Scalar::from_bytes_mod_order(bytes)))
     }
     pub(crate) fn mul_clamped(self, mut bytes: [u8; 32]) -> Self {
         bytes[0] &= 248;
