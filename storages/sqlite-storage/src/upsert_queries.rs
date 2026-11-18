@@ -47,6 +47,48 @@ impl<'a> QueryFragment<Sqlite> for UpsertSession<'a> {
     }
 }
 
+/// Static query identifier for `UpsertLidPnMapping`.
+#[derive(Debug, Clone, Copy)]
+pub struct UpsertLidPnMappingQuery;
+
+impl QueryId for UpsertLidPnMappingQuery {
+    type QueryId = Self;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+/// Fixed SQL and bind order let the connection reuse the prepared statement.
+#[derive(Debug)]
+pub struct UpsertLidPnMapping<'a> {
+    pub entry: &'a wacore::store::traits::LidPnMappingEntry,
+    pub device_id: i32,
+}
+
+impl QueryId for UpsertLidPnMapping<'_> {
+    type QueryId = UpsertLidPnMappingQuery;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertLidPnMapping<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertLidPnMapping<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO \"lid_pn_mapping\" (\"lid\", \"phone_number\", \"created_at\", \"learning_source\", \"updated_at\", \"device_id\") VALUES (");
+        out.push_bind_param::<Text, _>(&self.entry.lid)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.entry.phone_number)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.created_at)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.entry.learning_source)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.updated_at)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(") ON CONFLICT (\"lid\", \"device_id\") DO UPDATE SET \"phone_number\" = excluded.\"phone_number\", \"learning_source\" = excluded.\"learning_source\", \"updated_at\" = excluded.\"updated_at\"");
+        Ok(())
+    }
+}
+
 /// Static query identifier for `UpsertIdentity`.
 #[derive(Debug, Clone, Copy)]
 pub struct UpsertIdentityQuery;

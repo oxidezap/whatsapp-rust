@@ -3953,22 +3953,7 @@ impl ProtocolStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction::<_, DieselError, _>(|conn| {
                     for entry in entries.iter() {
-                        diesel::insert_into(lid_pn_mapping::table)
-                            .values((
-                                lid_pn_mapping::lid.eq(&entry.lid),
-                                lid_pn_mapping::phone_number.eq(&entry.phone_number),
-                                lid_pn_mapping::created_at.eq(entry.created_at),
-                                lid_pn_mapping::learning_source.eq(&entry.learning_source),
-                                lid_pn_mapping::updated_at.eq(entry.updated_at),
-                                lid_pn_mapping::device_id.eq(device_id),
-                            ))
-                            .on_conflict((lid_pn_mapping::lid, lid_pn_mapping::device_id))
-                            .do_update()
-                            .set((
-                                lid_pn_mapping::phone_number.eq(&entry.phone_number),
-                                lid_pn_mapping::learning_source.eq(&entry.learning_source),
-                                lid_pn_mapping::updated_at.eq(entry.updated_at),
-                            ))
+                        crate::upsert_queries::UpsertLidPnMapping { entry, device_id }
                             .execute(conn)?;
                     }
                     Ok(())
@@ -5470,6 +5455,49 @@ mod tests {
         SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn lid_mapping_upserts_in_order_within_each_device() {
+        let store = create_test_store().await;
+        let (_, first) = store.create_sibling_device_impl().await.unwrap();
+        let (_, sibling) = store.create_sibling_device_impl().await.unwrap();
+        let initial = LidPnMappingEntry {
+            lid: "100000000000001".into(),
+            phone_number: "15550000001".into(),
+            created_at: 10,
+            updated_at: 20,
+            learning_source: "usync".into(),
+        };
+        let replacement = LidPnMappingEntry {
+            phone_number: "15550000002".into(),
+            created_at: 30,
+            updated_at: 40,
+            learning_source: "history_sync".into(),
+            ..initial.clone()
+        };
+
+        sibling.put_lid_mapping(&initial).await.unwrap();
+        first
+            .put_lid_mappings(&[initial.clone(), replacement])
+            .await
+            .unwrap();
+
+        let updated = first.get_lid_mapping(&initial.lid).await.unwrap().unwrap();
+        assert_eq!(updated.phone_number, "15550000002");
+        assert_eq!(updated.created_at, 10);
+        assert_eq!(updated.updated_at, 40);
+        assert_eq!(updated.learning_source, "history_sync");
+
+        let sibling_mapping = sibling
+            .get_lid_mapping(&initial.lid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sibling_mapping.phone_number, initial.phone_number);
+        assert_eq!(sibling_mapping.created_at, initial.created_at);
+        assert_eq!(sibling_mapping.updated_at, initial.updated_at);
+        assert_eq!(sibling_mapping.learning_source, initial.learning_source);
     }
 
     /// Hosted recovery must never enumerate another account in the same database.
