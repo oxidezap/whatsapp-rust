@@ -5,8 +5,10 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use portable_atomic::AtomicU64;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use wacore_binary::{Jid, JidExt as _, Server};
 
 use super::Client;
@@ -106,7 +108,7 @@ pub(crate) struct GroupDevicesMemo {
     /// (participants, maps) is freed as soon as the metadata cache drops its
     /// Arc — the memo retains a struct-sized header, not the whole GroupRoutingInfo.
     pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupRoutingInfo>,
-    pub(crate) generation: u64,
+    generation: AtomicU64,
     /// Member identifiers in BOTH namespaces (participant users, their mapped
     /// counterparts, resolved device users): the scoped-invalidation check
     /// tests the topology log's touched users against this set.
@@ -274,17 +276,18 @@ impl Client {
         // it twice — the counter is meant to be free on the hit path, and a
         // second dispatch is not free.
         if let Some(memo) = self.group_devices_memo.get(group).await {
+            let memo_generation = memo.generation.load(Ordering::Acquire);
             if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
                 self.device_memo_counters
                     .record_group_devices(Outcome::MissGroupInfo);
-            } else if memo.generation == generation {
+            } else if memo_generation == generation {
                 // Refcount bump: the snapshot is immutable, so a hit shares
                 // it instead of cloning the device Vec.
                 self.device_memo_counters.record_group_devices(Outcome::Hit);
                 return Ok(Arc::clone(&memo.devices));
             } else if self
                 .device_topology
-                .unchanged_for(memo.generation, &memo.members)
+                .unchanged_for(memo_generation, &memo.members)
             {
                 // Stale stamp, but every change since it touched only users
                 // outside this group: re-stamp instead of recomputing, so
@@ -293,17 +296,8 @@ impl Client {
                 // the recompute below.
                 self.device_memo_counters
                     .record_group_devices(Outcome::Restamp);
-                self.group_devices_memo
-                    .insert(
-                        group.clone(),
-                        Arc::new(GroupDevicesMemo {
-                            group_info: memo.group_info.clone(),
-                            generation,
-                            members: Arc::clone(&memo.members),
-                            devices: Arc::clone(&memo.devices),
-                        }),
-                    )
-                    .await;
+                // A concurrent validation may have published a later stamp.
+                memo.generation.fetch_max(generation, Ordering::AcqRel);
                 return Ok(Arc::clone(&memo.devices));
             } else {
                 self.device_memo_counters
@@ -355,7 +349,7 @@ impl Client {
                 group.clone(),
                 Arc::new(GroupDevicesMemo {
                     group_info: Arc::downgrade(group_info),
-                    generation,
+                    generation: AtomicU64::new(generation),
                     members: Arc::new(members),
                     devices: Arc::clone(&devices),
                 }),
@@ -4912,7 +4906,7 @@ mod tests {
 
         GroupDevicesMemo {
             group_info: Arc::downgrade(&group_info),
-            generation: 0,
+            generation: AtomicU64::new(0),
             members: Arc::new(member_index.build()),
             devices: Arc::new(wacore::send::ResolvedGroupDevices::new(devices)),
         }

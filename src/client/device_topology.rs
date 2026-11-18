@@ -18,11 +18,12 @@ use std::sync::{Arc, Weak};
 
 use portable_atomic::AtomicU64;
 
-use super::member_index::MemberIndex;
+use super::member_index::{ChangedMembers, MemberIndex};
 
 /// Bound on the fingerprints the log retains, summed over every change still
-/// in it. A change costs 8 bytes per user it touched: a single mapping or
-/// registry write is one to three entries, a device-list refresh for a
+/// in it. Fingerprints cost 8 bytes per touched user. Large changes add a Bloom
+/// filter with 2 to 4 bytes per fingerprint. A single mapping or registry write
+/// is one to three fingerprints, and the fingerprint array for a
 /// 256-member group (three identifiers per member, recorded as ONE change)
 /// is ~6 KiB, so the log holds several such refreshes before it overflows.
 /// Overflow just disables the scoped-revalidation fast path for memos older
@@ -41,7 +42,7 @@ pub(crate) const TOPOLOGY_LOG_CAPACITY: usize = 4096;
 
 struct TopologyLog {
     /// (generation, the users that change touched), oldest first.
-    entries: VecDeque<(u64, MemberIndex)>,
+    entries: VecDeque<(u64, ChangedMembers)>,
     /// Fingerprints held across `entries`, the quantity the bound is on.
     fingerprints: usize,
     /// Highest generation evicted from `entries` (0 = nothing evicted).
@@ -152,12 +153,17 @@ impl DeviceTopology {
     }
 
     pub(crate) fn record_index(&self, touched: MemberIndex) {
+        if touched.len() > TOPOLOGY_LOG_CAPACITY {
+            self.record_global();
+            return;
+        }
+        let touched = (!touched.is_empty()).then(|| ChangedMembers::new(touched));
         let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.generation.load(Ordering::Acquire) + 1;
         // A change that touched nobody cannot invalidate a memo, so it needs
         // no entry; the generation still moves so its writer's snapshot
         // ordering is unchanged.
-        if !touched.is_empty() {
+        if let Some(touched) = touched {
             log.fingerprints += touched.len();
             log.entries.push_back((generation, touched));
             while log.fingerprints > TOPOLOGY_LOG_CAPACITY
@@ -209,7 +215,7 @@ impl DeviceTopology {
             .iter()
             .rev()
             .take_while(|(generation, _)| *generation > since)
-            .all(|(_, touched)| !members.intersects(touched))
+            .all(|(_, touched)| !touched.intersects(members))
     }
 }
 
