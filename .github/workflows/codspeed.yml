@@ -79,6 +79,9 @@ jobs:
           cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' parking_lot@=0.13.0
           cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' --rename parking_lot_012 parking_lot@=0.12.5
           git diff -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle/allocator.rs examples/connected_idle/process_locks.rs src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle/{util,ping_pong,offline_replay}.rs > .retention-out/results/base-harness.patch
+          if ! git ls-files --error-unmatch -- src/bench_support/connected_idle/offline_replay.rs >/dev/null 2>&1; then
+            git diff --no-index -- /dev/null src/bench_support/connected_idle/offline_replay.rs >> .retention-out/results/base-harness.patch || test "$?" -eq 1
+          fi
           cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
           cp target/release/examples/connected_idle .retention-out/base
           git restore -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle
