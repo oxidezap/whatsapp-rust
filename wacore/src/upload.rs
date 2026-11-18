@@ -170,12 +170,29 @@ impl MediaEncryptor {
     }
 
     /// PKCS7 pad + 10-byte MAC. Appends final bytes to `out`.
-    pub fn finalize(mut self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
+    pub fn finalize(self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
+        self.finalize_buffer(out, false)
+    }
+
+    fn finalize_buffer(
+        mut self,
+        out: &mut Vec<u8>,
+        single_window_sidecar: bool,
+    ) -> Result<EncryptedMediaInfo> {
         self.pad_and_encrypt(out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
+        // For one window, the file MAC and sidecar share IV + ciphertext.
+        // The sidecar alone also hashes the appended file MAC.
+        let sidecar = single_window_sidecar.then(|| self.hmac.clone());
         let mac = self.compute_mac()?;
         out.extend_from_slice(&mac);
-        self.finish_hashes(&mac)
+        let mut info = self.finish_hashes(&mac)?;
+        if let Some(mut sidecar) = sidecar {
+            sidecar.update(&mac);
+            info.streaming_sidecar =
+                Some(sidecar.finalize_sha256_array()?[..SIDECAR_MAC_LEN].to_vec());
+        }
+        Ok(info)
     }
 
     /// PKCS7 pad + 10-byte MAC. Writes the last of the ciphertext to `writer`.
@@ -591,15 +608,18 @@ pub fn encrypt_media_with_key_and_sidecar(
     sidecar: Option<bool>,
 ) -> Result<EncryptedMedia> {
     let want_sidecar = sidecar.unwrap_or_else(|| media_type_uses_sidecar(media_type));
+    let upload_len = encrypted_len(plaintext.len());
+    let single_window_sidecar = want_sidecar && upload_len <= SIDECAR_CHUNK;
+    let streaming_sidecar = want_sidecar && !single_window_sidecar;
     let mut enc = match media_key {
-        Some(key) => MediaEncryptor::with_key_and_sidecar(*key, media_type, want_sidecar)?,
-        None => MediaEncryptor::new_with_sidecar(media_type, want_sidecar)?,
+        Some(key) => MediaEncryptor::with_key_and_sidecar(*key, media_type, streaming_sidecar)?,
+        None => MediaEncryptor::new_with_sidecar(media_type, streaming_sidecar)?,
     };
     // Exact up front: the doubling ladder from an empty Vec copied a 16 MiB
     // video twice over on its way to 32 MiB of capacity.
-    let mut data_to_upload = Vec::with_capacity(encrypted_len(plaintext.len()));
+    let mut data_to_upload = Vec::with_capacity(upload_len);
     enc.update(plaintext, &mut data_to_upload);
-    let info = enc.finalize(&mut data_to_upload)?;
+    let info = enc.finalize_buffer(&mut data_to_upload, single_window_sidecar)?;
     Ok(EncryptedMedia {
         data_to_upload,
         media_key: info.media_key,
@@ -1022,6 +1042,8 @@ mod tests {
             0usize,
             10,
             SIDECAR_CHUNK - 32,
+            SIDECAR_CHUNK - BLOCK - 1,
+            SIDECAR_CHUNK - BLOCK,
             SIDECAR_CHUNK,
             SIDECAR_CHUNK + 16,
             SIDECAR_CHUNK + 64,
