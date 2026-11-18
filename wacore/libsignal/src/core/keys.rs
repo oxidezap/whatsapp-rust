@@ -243,6 +243,7 @@ impl KeyPair {
 
     /// Generates independent key pairs in RNG order with one field inversion per batch.
     /// The returned keys and intermediate buffers use stack space proportional to `N`.
+    /// Generate large key pools with repeated small batches to bound stack usage.
     pub fn generate_batch<const N: usize>(rng: &mut impl CryptoRng) -> [Self; N] {
         use crate::curve::montgomery::MontgomeryPoint;
         if N < 2 {
