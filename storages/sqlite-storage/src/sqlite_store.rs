@@ -21,6 +21,20 @@ use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::*;
 use wacore_binary::Jid;
 
+#[derive(diesel::deserialize::FromSqlRow)]
+#[diesel(sql_type = diesel::sql_types::Binary)]
+struct AppStateIndexMac(Option<[u8; 32]>);
+
+impl diesel::deserialize::FromSql<diesel::sql_types::Binary, diesel::sqlite::Sqlite>
+    for AppStateIndexMac
+{
+    fn from_sql(
+        mut value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        Ok(Self(value.read_blob().try_into().ok()))
+    }
+}
+
 /// Internal error type that preserves the Diesel error for structured matching
 /// before converting to `StoreError`. Used in retry loops where we need to
 /// distinguish retriable SQLite lock errors from other failures.
@@ -2849,7 +2863,7 @@ impl SqliteStore {
             const CHUNK_SIZE: usize = 500;
             for chunk in index_macs.chunks(CHUNK_SIZE) {
                 let chunk_slices: Vec<&[u8]> = chunk.iter().map(|m| m.as_slice()).collect();
-                let rows: Vec<(Vec<u8>, Vec<u8>)> = app_state_mutation_macs::table
+                let rows = app_state_mutation_macs::table
                     .select((
                         app_state_mutation_macs::index_mac,
                         app_state_mutation_macs::value_mac,
@@ -2857,15 +2871,16 @@ impl SqliteStore {
                     .filter(app_state_mutation_macs::name.eq(&name))
                     .filter(app_state_mutation_macs::index_mac.eq_any(chunk_slices))
                     .filter(app_state_mutation_macs::device_id.eq(device_id))
-                    .load(conn)
+                    .load_iter::<(AppStateIndexMac, Vec<u8>), diesel::connection::DefaultLoadingMode>(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 // Rows with a non-32-byte index_mac cannot have come from the
                 // 32-byte keys we just queried; skip defensively.
-                out.extend(
-                    rows.into_iter().filter_map(|(k, v)| {
-                        <[u8; 32]>::try_from(k.as_slice()).ok().map(|k| (k, v))
-                    }),
-                );
+                for row in rows {
+                    let (AppStateIndexMac(key), value) = row.map_err(|e| StoreError::Database(Box::new(e)))?;
+                    if let Some(key) = key {
+                        out.insert(key, value);
+                    }
+                }
             }
             Ok(out)
         })
