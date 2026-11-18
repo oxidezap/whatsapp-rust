@@ -132,7 +132,7 @@ pub struct HashUpdateResult {
 ///
 /// Mirrors `MAC_DEDUP_SCAN_LIMIT` in `wacore`'s appstate sync, which measured
 /// the same trade-off over the same kind of key (#856).
-const MAC_DEDUP_SCAN_LIMIT: usize = 64;
+pub(crate) const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 /// Where a value blob's MAC starts, by WA Web's arithmetic rather than by ours.
 ///

@@ -279,3 +279,39 @@ fn bench_update_hash_from_records(bencher: divan::Bencher, shape: (usize, bool))
             black_box(state.hash)
         });
 }
+
+#[divan::bench(args = [32, 200, 1000, 5000])]
+fn bench_verified_snapshot(bencher: divan::Bencher, n: usize) {
+    bencher
+        .with_inputs(|| {
+            let patch = setup_patch(n);
+            let mut snapshot = wa::SyncdSnapshot::default();
+            snapshot.version = patch.patch.version;
+            snapshot.key_id = patch.patch.key_id;
+            snapshot.records = patch
+                .patch
+                .mutations
+                .into_iter()
+                .map(|m| m.record.into_option().expect("fixture record"))
+                .collect();
+            let mut hash = HashState {
+                version: 1,
+                ..Default::default()
+            };
+            hash.update_hash_from_records(&snapshot.records);
+            snapshot.mac = Some(hash.generate_snapshot_mac("regular", &patch.keys.snapshot_mac));
+            (snapshot, patch.keys)
+        })
+        .bench_local_refs(|(snapshot, keys)| {
+            let mut state = HashState::default();
+            let result = wacore_appstate::process_snapshot(
+                snapshot,
+                &mut state,
+                |_| Ok(Arc::clone(keys)),
+                true,
+                "regular",
+            )
+            .expect("verify and decrypt snapshot");
+            black_box(result);
+        });
+}
