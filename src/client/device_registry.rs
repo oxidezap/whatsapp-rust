@@ -8,7 +8,6 @@ use log::{debug, info, warn};
 use portable_atomic::AtomicU64;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use wacore_binary::{Jid, JidExt as _, Server};
 
 use super::Client;
@@ -276,6 +275,7 @@ impl Client {
         // it twice — the counter is meant to be free on the hit path, and a
         // second dispatch is not free.
         if let Some(memo) = self.group_devices_memo.get(group).await {
+            use std::sync::atomic::Ordering;
             let memo_generation = memo.generation.load(Ordering::Acquire);
             if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
                 self.device_memo_counters
