@@ -1,6 +1,11 @@
 use crate::AppStateError;
-use crate::hash::{generate_content_mac, validate_index_mac};
+use crate::hash::{
+    content_mac_with, generate_content_mac, validate_index_mac, validate_index_mac_with,
+};
 use crate::keys::ExpandedAppStateKeys;
+use hmac::{Hmac, KeyInit as _};
+use sha2::{Sha256, Sha512};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
@@ -59,16 +64,63 @@ pub fn decode_record(
         key_id,
         validate_macs,
         &mut Vec::new(),
+        None,
     )
 }
 
-pub(crate) fn decode_record_into(
+#[derive(Default)]
+pub(crate) struct BatchRecordDecoder {
+    plaintext: Vec<u8>,
+    macs: Option<PreparedRecordMacs>,
+}
+
+struct PreparedRecordMacs {
+    keys: Arc<ExpandedAppStateKeys>,
+    content: Hmac<Sha512>,
+    index: Hmac<Sha256>,
+}
+
+impl BatchRecordDecoder {
+    pub(crate) fn decode(
+        &mut self,
+        operation: wa::syncd_mutation::SyncdOperation,
+        record: &wa::SyncdRecord,
+        keys: &Arc<ExpandedAppStateKeys>,
+        key_id: &[u8],
+        validate_macs: bool,
+    ) -> Result<(Mutation, RecordMacs), AppStateError> {
+        if validate_macs
+            && !self
+                .macs
+                .as_ref()
+                .is_some_and(|macs| Arc::ptr_eq(&macs.keys, keys))
+        {
+            self.macs = Some(PreparedRecordMacs {
+                keys: Arc::clone(keys),
+                content: Hmac::new_from_slice(&keys.value_mac).expect("valid HMAC key"),
+                index: Hmac::new_from_slice(&keys.index).expect("valid HMAC key"),
+            });
+        }
+        decode_record_into(
+            operation,
+            record,
+            keys,
+            key_id,
+            validate_macs,
+            &mut self.plaintext,
+            self.macs.as_ref(),
+        )
+    }
+}
+
+fn decode_record_into(
     operation: wa::syncd_mutation::SyncdOperation,
     record: &wa::SyncdRecord,
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     validate_macs: bool,
     plaintext: &mut Vec<u8>,
+    prepared: Option<&PreparedRecordMacs>,
 ) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
@@ -84,12 +136,11 @@ pub(crate) fn decode_record_into(
     let (ciphertext, value_mac) = rest.split_at(rest.len() - 32);
 
     if validate_macs {
-        let expected = generate_content_mac(
-            operation,
-            &value_blob[..value_blob.len() - 32],
-            key_id,
-            &keys.value_mac,
-        );
+        let data = &value_blob[..value_blob.len() - 32];
+        let expected = match prepared {
+            Some(macs) => content_mac_with(operation, data, key_id, macs.content.clone()),
+            None => generate_content_mac(operation, data, key_id, &keys.value_mac),
+        };
         if !bool::from(expected.as_slice().ct_eq(value_mac)) {
             return Err(AppStateError::MismatchingContentMAC);
         }
@@ -116,7 +167,11 @@ pub(crate) fn decode_record_into(
             .as_option()
             .and_then(|i| i.blob.as_ref())
             .ok_or(AppStateError::MissingIndexMAC)?;
-        validate_index_mac(action.index.as_deref().unwrap_or(&[]), stored, &keys.index)?;
+        let index = action.index.as_deref().unwrap_or(&[]);
+        match prepared {
+            Some(macs) => validate_index_mac_with(index, stored, macs.index.clone())?,
+            None => validate_index_mac(index, stored, &keys.index)?,
+        }
     }
 
     let mut index_list: Vec<String> = Vec::new();
@@ -247,6 +302,33 @@ mod tests {
     }
 
     #[test]
+    fn batch_decoder_uses_each_records_key() {
+        let first = Arc::new(expand_app_state_keys(&[7; 32]));
+        let second = Arc::new(expand_app_state_keys(&[8; 32]));
+        let key_id = b"same-key-id";
+        let op = wa::syncd_mutation::SyncdOperation::SET;
+        let action = wa::SyncActionData::default();
+        let first_record = create_test_record(op, &first, key_id, &action);
+        let second_record = create_test_record(op, &second, key_id, &action);
+        let mut decoder = BatchRecordDecoder::default();
+
+        for (record, keys) in [
+            (&first_record, &first),
+            (&second_record, &second),
+            (&first_record, &first),
+        ] {
+            let (_, expected) = decode_record(op, record, keys, key_id, true).unwrap();
+            let (_, actual) = decoder.decode(op, record, keys, key_id, true).unwrap();
+            assert_eq!(actual.index_mac, expected.index_mac);
+            assert_eq!(actual.value_mac, expected.value_mac);
+        }
+        assert!(matches!(
+            decoder.decode(op, &first_record, &second, key_id, true),
+            Err(AppStateError::MismatchingContentMAC)
+        ));
+    }
+
+    #[test]
     fn reused_plaintext_decodes_long_then_short_record() {
         let keys = expand_app_state_keys(&[7; 32]);
         let key_id = b"test-key";
@@ -258,7 +340,7 @@ mod tests {
             action.index = Some(serde_json::to_vec(&[&component]).unwrap());
             let record = create_test_record(op, &keys, key_id, &action);
             let (mutation, _) =
-                decode_record_into(op, &record, &keys, key_id, true, &mut plaintext).unwrap();
+                decode_record_into(op, &record, &keys, key_id, true, &mut plaintext, None).unwrap();
             assert_eq!(mutation.index, [component]);
             assert_eq!(plaintext, action.encode_to_vec());
         }
