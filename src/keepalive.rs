@@ -416,6 +416,25 @@ impl Client {
         // builds a cache the client never used.
         if let Some(group_cache) = self.initialized_group_cache() {
             group_cache.run_pending_tasks().await;
+
+            let orphaned = self
+                .group_devices_memo
+                .fold_entries(Vec::new(), |mut orphaned, group, memo| {
+                    if memo.group_info.strong_count() == 0 {
+                        orphaned.push((group.clone(), Arc::clone(memo)));
+                    }
+                    orphaned
+                })
+                .await;
+            // A producer with no strong owners cannot return. Compare memo
+            // identity so a concurrent replacement survives the sweep.
+            for (group, memo) in orphaned {
+                drop(
+                    self.group_devices_memo
+                        .remove_if(&group, &|current| Arc::ptr_eq(current, &memo))
+                        .await,
+                );
+            }
         }
     }
 
