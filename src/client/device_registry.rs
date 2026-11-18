@@ -1910,8 +1910,8 @@ impl Client {
             let lookup = self.resolve_lookup_keys_for_jid(&jid).await;
             for key in lookup.all_keys() {
                 if let Some(record) = self.device_registry_cache.get(key).await {
-                    let found = Self::reconstruct_device_jids(&jid, &record);
-                    if !found.is_empty() {
+                    let found = Self::device_jids(&jid, &record);
+                    if found.len() != 0 {
                         devices.extend(found);
                         continue 'users;
                     }
@@ -1934,8 +1934,8 @@ impl Client {
             let found = lookup
                 .all_keys()
                 .find_map(|key| rows.get(key))
-                .map(|record| Self::reconstruct_device_jids(&jid, record))
-                .filter(|found| !found.is_empty());
+                .map(|record| Self::device_jids(&jid, record))
+                .filter(|found| found.len() != 0);
             match found {
                 Some(found) => devices.extend(found),
                 None => missing.push(jid),
@@ -2003,14 +2003,20 @@ impl Client {
         query_jid: &Jid,
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
+        Self::device_jids(query_jid, record).collect()
+    }
+
+    fn device_jids<'a>(
+        query_jid: &Jid,
+        record: &'a wacore::store::traits::DeviceListRecord,
+    ) -> impl ExactSizeIterator<Item = Jid> + use<'a> {
         let base = query_jid.to_non_ad();
         // No range check: a registry device id is a `u16`, the width the JID
         // itself carries, so the conversion this used to guard cannot fail.
         record
             .devices
             .iter()
-            .map(|device| base.with_device_hosting(device.device_id(), device.is_hosted()))
-            .collect()
+            .map(move |device| base.with_device_hosting(device.device_id(), device.is_hosted()))
     }
 
     /// Migrate device registry entries from PN key to LID key.
