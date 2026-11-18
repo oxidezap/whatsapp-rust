@@ -1429,6 +1429,11 @@ mod tests {
         let status = info_with("status@broadcast", "100000000000001:2@lid", false);
         let mut group_status = group.clone();
         group_status.is_status_stanza = true;
+        group_status.meta_info = Some(Box::new(wacore::types::message::MsgMetaInfo {
+            is_group_status: true,
+            ..Default::default()
+        }));
+        assert!(group_status.has_status_receipt_class());
         let mut sender = dm.clone();
         sender.source.is_from_me = true;
         sender.source.recipient = Some("15550000101:3@s.whatsapp.net".parse().unwrap());
