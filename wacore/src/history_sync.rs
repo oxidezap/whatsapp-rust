@@ -2932,7 +2932,7 @@ mod tests {
 
         let mut mappings = vec![lid_match.clone(), phone_match.clone(), replacement.clone()];
         dedupe_lid_mappings(&mut mappings);
-        assert_eq!(mappings, [replacement.clone()]);
+        assert_eq!(mappings.as_slice(), std::slice::from_ref(&replacement));
 
         let bulk_lid_match = HistoryLidMapping {
             source: HistoryLidMappingSource::Bulk,
