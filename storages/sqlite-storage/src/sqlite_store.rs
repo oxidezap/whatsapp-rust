@@ -1627,25 +1627,19 @@ impl SqliteStore {
         self.with_retry(mutation.operation(), || {
             let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
             let mutation = mutation.clone();
+            let _lease = mutation.lease();
             let timestamp = timestamp.clone();
             Box::new(move |conn| {
+                let _lease = _lease;
                 conn.immediate_transaction(|conn| {
-                    let current = match read_pending_inbound_bounded_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        max_bytes,
-                        mutation.lease(),
+                    let revision = match read_pending_inbound_payload::<HashedPendingPayload>(
+                        conn, device_id, &chat, &sender, &id, max_bytes,
                     )? {
-                        Ok(current) => current,
+                        Ok(current) => {
+                            current.map_or(PendingInboundRevision::missing(), |row| row.0)
+                        }
                         Err(error) => return Ok(Err(error)),
                     };
-                    let revision = current.as_ref().map_or(
-                        PendingInboundRevision::missing(),
-                        PendingInboundRecord::revision,
-                    );
                     // Already-replaced is Applied even if the caller's expected
                     // revision is stale. Delete has no such shortcut.
                     if let OwnedPendingMutation::Replace {
@@ -3662,19 +3656,31 @@ fn insert_pending_inbound_row(
 }
 
 #[derive(QueryableByName)]
-struct BoundedPendingPayload {
+struct BoundedPendingPayload<T = Vec<u8>> {
     #[diesel(sql_type = diesel::sql_types::Text)]
     storage_type: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     byte_len: Option<i64>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
-    payload: Option<Vec<u8>>,
+    payload: Option<T>,
 }
 
 #[derive(QueryableByName)]
 struct BoundedPendingSender {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     sender: Option<String>,
+}
+
+struct HashedPendingPayload(PendingInboundRevision);
+
+impl diesel::deserialize::FromSql<diesel::sql_types::Binary, diesel::sqlite::Sqlite>
+    for HashedPendingPayload
+{
+    fn from_sql(
+        mut value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        Ok(Self(PendingInboundRevision::for_bytes(value.read_blob())))
+    }
 }
 
 fn read_pending_inbound_bounded_row(
@@ -3686,9 +3692,26 @@ fn read_pending_inbound_bounded_row(
     max_bytes: usize,
     lease: PendingInboundLease,
 ) -> QueryResult<Result<Option<PendingInboundRecord>>> {
+    Ok(
+        read_pending_inbound_payload(conn, device_id, chat, sender, id, max_bytes)?
+            .map(|row| row.map(|bytes| PendingInboundRecord::new(bytes, lease))),
+    )
+}
+
+fn read_pending_inbound_payload<T: 'static>(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+    max_bytes: usize,
+) -> QueryResult<Result<Option<T>>>
+where
+    BoundedPendingPayload<T>: QueryableByName<diesel::sqlite::Sqlite>,
+{
     // CASE keeps oversized blobs out of the Diesel value buffer. Both length
     // and payload come from one row snapshot, never separate racing queries.
-    let row: Option<BoundedPendingPayload> = crate::bounded_pending_query::BoundedPendingQuery {
+    let row: Option<BoundedPendingPayload<T>> = crate::bounded_pending_query::BoundedPendingQuery {
         max_bytes: i64::try_from(max_bytes).unwrap_or(i64::MAX),
         device_id,
         chat,
@@ -3703,7 +3726,7 @@ fn read_pending_inbound_bounded_row(
             "pending inbound payload is not a BLOB".to_owned(),
         )),
         Some(row) => match row.payload {
-            Some(bytes) => Ok(Some(PendingInboundRecord::new(bytes, lease))),
+            Some(payload) => Ok(Some(payload)),
             None => Err(StoreError::Validation(format!(
                 "pending inbound payload length {:?} exceeds limit {max_bytes}",
                 row.byte_len,
