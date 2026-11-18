@@ -257,6 +257,11 @@ impl FieldElement2625 {
         z
     }
 
+    pub(super) fn mul121666(&self) -> Self {
+        // A factor in limb zero contributes one product to each output limb.
+        Self::reduce(self.0.map(|limb| u64::from(limb) * 121666))
+    }
+
     #[rustfmt::skip] // keep alignment of carry chain
     const fn reduce(mut z: [u64; 10]) -> FieldElement2625 {
 
