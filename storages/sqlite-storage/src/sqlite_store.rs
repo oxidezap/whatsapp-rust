@@ -3765,6 +3765,18 @@ impl ProtocolStore for SqliteStore {
             let group_jid = group_jid.clone();
             let owned_entries = Arc::clone(&owned_entries);
             Box::new(move |conn: &mut SqliteConnection| {
+                if let [(device_jid, has_key)] = owned_entries.as_slice() {
+                    crate::upsert_queries::UpsertSenderKeyStatus {
+                        group_jid: &group_jid,
+                        device_jid,
+                        has_key: i32::from(*has_key),
+                        device_id,
+                        updated_at: now,
+                    }
+                    .execute(conn)?;
+                    return Ok(());
+                }
+
                 let values: Vec<_> = owned_entries
                     .iter()
                     .map(|(device_jid, has_key)| {

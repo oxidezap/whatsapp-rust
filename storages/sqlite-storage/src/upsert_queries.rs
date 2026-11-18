@@ -169,6 +169,35 @@ impl<'a> QueryFragment<Sqlite> for UpsertSenderKey<'a> {
     }
 }
 
+/// Fixed SQL and bind order let Diesel cache the sender-key status upsert.
+#[derive(Debug, QueryId)]
+pub struct UpsertSenderKeyStatus<'a> {
+    pub group_jid: &'a str,
+    pub device_jid: &'a str,
+    pub has_key: i32,
+    pub device_id: i32,
+    pub updated_at: i64,
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertSenderKeyStatus<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertSenderKeyStatus<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO sender_key_devices (group_jid, device_jid, has_key, device_id, updated_at) VALUES (");
+        out.push_bind_param::<Text, _>(&self.group_jid)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.device_jid)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.has_key)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.updated_at)?;
+        out.push_sql(") ON CONFLICT (group_jid, device_jid, device_id) DO UPDATE SET has_key = excluded.has_key, updated_at = excluded.updated_at");
+        Ok(())
+    }
+}
+
 /// Static query identifier for `UpsertDeviceRegistry`.
 #[derive(Debug, Clone, Copy)]
 pub struct UpsertDeviceRegistryQuery;
