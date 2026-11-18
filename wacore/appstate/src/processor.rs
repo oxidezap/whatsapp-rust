@@ -6,10 +6,10 @@
 
 use subtle::ConstantTimeEq;
 
-use crate::AppStateError;
 use crate::decode::{BatchRecordDecoder, Mutation, decode_record};
-use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
+use crate::hash::{FoldReport, HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
+use crate::{AppStateError, WAPATCH_INTEGRITY};
 use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -286,8 +286,8 @@ where
     let version = snapshot.version.version.unwrap_or(0);
     initial_state.version = version;
 
-    // Update hash state directly from records (no cloning needed)
-    let fold = initial_state.update_hash_from_records(&snapshot.records);
+    let winners = last_record_per_index(&snapshot.records);
+    let fold = fold_snapshot_winners(initial_state, &snapshot.records, &winners);
 
     // A record with no value blob is one nobody can agree about: WA Web reads
     // `.byteLength` off the absent buffer and the whole fold throws. Refused
@@ -435,7 +435,6 @@ where
     // default, so the consumer can apply them in either order and end up with a
     // contact, mute or label that the snapshot we just authenticated does not
     // describe.
-    let winners = last_record_per_index(&snapshot.records);
     let mut mutations = Vec::with_capacity(winners.len());
     let mut mutation_macs = Vec::with_capacity(winners.len());
     let mut decoder = BatchRecordDecoder::default();
@@ -885,14 +884,6 @@ pub fn validate_patch_macs(
 /// and this decides what we then decrypt, so a disagreement means accepting a
 /// snapshot on one set of records and storing another.
 fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
-    fn index_mac(record: &wa::SyncdRecord) -> &[u8] {
-        record
-            .index
-            .as_option()
-            .and_then(|idx| idx.blob.as_deref())
-            .unwrap_or_default()
-    }
-
     if records.len() > crate::hash::MAC_DEDUP_SCAN_LIMIT {
         let mut positions = Vec::with_capacity(records.len());
         positions.extend(
@@ -903,11 +894,12 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
         );
         // Within an index, put the last record first for deduplication.
         positions.sort_unstable_by(|&a, &b| {
-            index_mac(&records[a])
-                .cmp(index_mac(&records[b]))
+            snapshot_index_mac(&records[a])
+                .cmp(snapshot_index_mac(&records[b]))
                 .then_with(|| b.cmp(&a))
         });
-        positions.dedup_by(|a, b| index_mac(&records[*a]) == index_mac(&records[*b]));
+        positions
+            .dedup_by(|a, b| snapshot_index_mac(&records[*a]) == snapshot_index_mac(&records[*b]));
         positions.sort_unstable();
         return positions
             .into_iter()
@@ -927,7 +919,7 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
         if rec.value.blob.is_none() {
             continue;
         }
-        let index_mac = index_mac(rec);
+        let index_mac = snapshot_index_mac(rec);
         if !seen.contains(&index_mac) {
             seen.push(index_mac);
             winners.push(rec);
@@ -935,6 +927,39 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
     }
     winners.reverse();
     winners
+}
+
+fn snapshot_index_mac(record: &wa::SyncdRecord) -> &[u8] {
+    record
+        .index
+        .as_option()
+        .and_then(|idx| idx.blob.as_deref())
+        .unwrap_or_default()
+}
+
+fn fold_snapshot_winners(
+    state: &mut HashState,
+    records: &[wa::SyncdRecord],
+    winners: &[&wa::SyncdRecord],
+) -> FoldReport {
+    let mut valueless = 0;
+    let mut unkeyed = 0;
+    for record in records {
+        if record.value.blob.is_none() {
+            valueless += 1;
+        } else if snapshot_index_mac(record).is_empty() {
+            unkeyed += 1;
+        }
+    }
+    let operands = winners
+        .iter()
+        .filter_map(|record| record.value.blob.as_deref().map(value_mac_tail));
+    let folded = WAPATCH_INTEGRITY.add_from_iter(&mut state.hash, operands);
+    FoldReport {
+        folded,
+        unkeyed,
+        valueless,
+    }
 }
 
 /// Validate a snapshot MAC.
@@ -1087,6 +1112,9 @@ mod tests {
             let mut state = HashState::default();
             let fold = state.update_hash_from_records(&records);
             let winners = last_record_per_index(&records);
+            let mut reused = HashState::default();
+            assert_eq!(fold_snapshot_winners(&mut reused, &records, &winners), fold);
+            assert_eq!(reused.hash, state.hash);
 
             assert_eq!(fold.folded, 2);
             assert_eq!(winners.len(), fold.folded);
