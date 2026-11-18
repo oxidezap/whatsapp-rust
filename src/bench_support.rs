@@ -943,6 +943,21 @@ impl ReceiveHarness {
         })
     }
 
+    /// Let the coalesced Signal-cache flush armed by the previous receive run
+    /// to completion, outside any measured region.
+    ///
+    /// Every successful receive arms the 25 ms flush worker. On this
+    /// current-thread runtime that worker only runs inside a later `block_on`,
+    /// so whether its flush lands in the next measured [`Self::receive`]
+    /// depends on how much real time passed in between. Call this from a
+    /// benchmark's untimed input setup, after building the stanza, so every
+    /// measured receive starts with the worker idle: it still pays to arm a
+    /// new worker, but never the previous receive's flush.
+    pub fn settle_signal_flush(&self) {
+        self.runtime
+            .block_on(settle_signal_flush_worker(&self.client));
+    }
+
     /// Receive a burst of stanzas within a single runtime entry (`block_on`),
     /// awaiting each `handle_incoming_message` inline and flushing outbound receipts,
     /// matching the exact decrypt, event, and receipt work of [`Self::receive`]

@@ -33,7 +33,10 @@ fn main() {
 
 // Few, large samples: the fixture's flush worker fires on its own 25 ms clock
 // and a coalesced flush that lands mid-sample is amortised over a long sample
-// rather than moving a short one.
+// rather than moving a short one. `dm_receive` and `group_receive` also settle
+// that worker in their untimed input setup, so the first receive of a sample
+// (the only one under CodSpeed, which measures one iteration) never absorbs
+// the flush armed by an earlier receive.
 #[allow(dead_code)]
 const SAMPLE_COUNT: u32 = 20;
 #[allow(dead_code)]
@@ -54,7 +57,11 @@ fn dm_receive(bencher: divan::Bencher) {
     let before = harness.messages_delivered();
     let mut received = 0u64;
     bencher
-        .with_inputs(|| harness.dm_stanza())
+        .with_inputs(|| {
+            let node = harness.dm_stanza();
+            harness.settle_signal_flush();
+            node
+        })
         .bench_local_values(|node| {
             received += 1;
             harness.receive(black_box(node));
@@ -70,7 +77,11 @@ fn group_receive(bencher: divan::Bencher) {
     let before = harness.messages_delivered();
     let mut received = 0u64;
     bencher
-        .with_inputs(|| harness.group_stanza())
+        .with_inputs(|| {
+            let node = harness.group_stanza();
+            harness.settle_signal_flush();
+            node
+        })
         .bench_local_values(|node| {
             received += 1;
             harness.receive(black_box(node));
