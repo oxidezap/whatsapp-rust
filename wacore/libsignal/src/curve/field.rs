@@ -5,6 +5,14 @@ pub(super) use super::field51::FieldElement51 as FieldElement;
 #[cfg(not(target_pointer_width = "64"))]
 pub(super) use super::field2625::FieldElement2625 as FieldElement;
 use subtle::{Choice, ConditionallyNegatable, ConditionallySelectable, ConstantTimeEq};
+use zeroize::{Zeroize, Zeroizing};
+
+impl Zeroize for FieldElement {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl PartialEq for FieldElement {
     fn eq(&self, other: &Self) -> bool {
         self.ct_eq(other).into()
@@ -71,6 +79,25 @@ impl FieldElement {
 
         (t19, t3)
     }
+    pub(super) fn invert_batch<const N: usize>(inputs: &mut [Self; N]) {
+        // Montgomery's trick, skipping zero denominators without branching.
+        let mut prefix = Zeroizing::new([Self::ONE; N]);
+        let mut product = Zeroizing::new(Self::ONE);
+        for (input, previous) in inputs.iter().zip(prefix.iter_mut()) {
+            *previous = *product;
+            let next = &*product * input;
+            product.conditional_assign(&next, !input.is_zero());
+        }
+
+        *product = product.invert();
+        for (input, previous) in inputs.iter_mut().zip(prefix.iter()).rev() {
+            let nonzero = !input.is_zero();
+            let next = &*product * input;
+            input.conditional_assign(&(&*product * previous), nonzero);
+            product.conditional_assign(&next, nonzero);
+        }
+    }
+
     pub(crate) fn invert(&self) -> FieldElement {
         // The bits of p-2 = 2^255 -19 -2 are 11010111111...11.
         //
@@ -150,4 +177,18 @@ pub(super) const fn from_radix51(mut limbs: [u64; 5]) -> FieldElement {
         (limbs[4] & LOW_26_BITS) as u32,
         (limbs[4] >> 26) as u32,
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FieldElement;
+
+    #[test]
+    fn batch_inversion_matches_independent_inversion_with_zeros() {
+        let two = &FieldElement::ONE + &FieldElement::ONE;
+        let mut batch = [FieldElement::ZERO, two, FieldElement::ZERO, two.square()];
+        let expected = batch.map(|value| value.invert());
+        FieldElement::invert_batch(&mut batch);
+        assert_eq!(batch, expected);
+    }
 }

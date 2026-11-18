@@ -234,12 +234,39 @@ impl KeyPair {
         }
     }
     pub fn generate<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+        use crate::curve::montgomery::MontgomeryPoint;
         let mut raw = zeroize::Zeroizing::new([0; 32]);
-        rng.fill_bytes(raw.as_mut_slice());
+        Self::fill_private_key(rng, &mut raw);
+        let public = MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
+        Self::new(PublicKey(public), PrivateKey::from_raw(*raw))
+    }
+
+    /// Generates independent key pairs in RNG order with one field inversion per batch.
+    /// The returned keys and intermediate buffers use stack space proportional to `N`.
+    /// Generate large key pools with repeated small batches to bound stack usage.
+    pub fn generate_batch<const N: usize>(rng: &mut impl CryptoRng) -> [Self; N] {
+        use crate::curve::montgomery::MontgomeryPoint;
+        if N < 2 {
+            return core::array::from_fn(|_| Self::generate(rng));
+        }
+        let mut private = zeroize::Zeroizing::new([[0; 32]; N]);
+        for raw in private.iter_mut() {
+            Self::fill_private_key(rng, raw);
+        }
+
+        let public = MontgomeryPoint::mul_base_clamped_batch(&private);
+        core::array::from_fn(|i| {
+            Self::new(
+                PublicKey(public[i].to_bytes()),
+                PrivateKey::from_raw(private[i]),
+            )
+        })
+    }
+
+    fn fill_private_key(rng: &mut impl CryptoRng, raw: &mut [u8; 32]) {
+        rng.fill_bytes(raw);
         raw[0] &= 248;
         raw[31] = (raw[31] & 127) | 64;
-        let public = crate::curve::montgomery::MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
-        Self::new(PublicKey(public), PrivateKey::from_raw(*raw))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -407,6 +434,26 @@ impl From<KeyPair> for IdentityKeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_generation_matches_single_key_generation() {
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut batch_rng = StdRng::from_seed([37; 32]);
+        let mut single_rng = StdRng::from_seed([37; 32]);
+        assert_eq!(KeyPair::generate_batch::<0>(&mut batch_rng), []);
+        assert_eq!(
+            KeyPair::generate_batch::<1>(&mut batch_rng),
+            [KeyPair::generate(&mut single_rng)]
+        );
+        for _ in 0..16 {
+            let batch = KeyPair::generate_batch::<8>(&mut batch_rng);
+            assert_eq!(
+                batch,
+                core::array::from_fn(|_| KeyPair::generate(&mut single_rng))
+            );
+        }
+    }
+
     fn signed_fixture() -> (PublicKey, [u8; 64]) {
         use rand::SeedableRng;
         let private = PrivateKey::deserialize(&[7; 32]).unwrap();

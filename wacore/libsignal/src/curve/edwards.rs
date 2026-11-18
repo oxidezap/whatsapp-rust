@@ -80,10 +80,11 @@ impl EdwardsPoint {
         // The denominator is zero only when y=1, the identity point of
         // the Edwards curve.  Since 0.invert() = 0, in this case we
         // compute the 2-torsion point (0,0).
-        let U = &self.Z + &self.Y;
-        let W = &self.Z - &self.Y;
-        let u = &U * &W.invert();
-        MontgomeryPoint(u.to_bytes())
+        let (u, w) = self.montgomery_coordinates();
+        MontgomeryPoint((&u * &w.invert()).to_bytes())
+    }
+    pub(super) fn montgomery_coordinates(self) -> (FieldElement, FieldElement) {
+        (&self.Z + &self.Y, &self.Z - &self.Y)
     }
     pub(super) fn mul_by_pow_2(&self, k: u32) -> EdwardsPoint {
         debug_assert!(k > 0);
