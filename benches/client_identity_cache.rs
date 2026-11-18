@@ -170,3 +170,15 @@ fn lid_pn_warm_up(bencher: divan::Bencher, n: usize) {
             black_box(cache)
         });
 }
+
+#[divan::bench(args = ENTRY_COUNTS)]
+fn lid_pn_update_existing(bencher: divan::Bencher, n: usize) {
+    let cache = LidPnCache::new();
+    let entries: Vec<_> = (0..n).map(entry).collect();
+    block_on(cache.warm_up(entries.iter().cloned()));
+    bencher.counter(ItemsCount::new(n)).bench(|| {
+        for entry in &entries {
+            block_on(cache.add(black_box(entry)));
+        }
+    });
+}
