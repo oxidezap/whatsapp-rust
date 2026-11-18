@@ -52,6 +52,24 @@ pub fn decode_record(
     key_id: &[u8],
     validate_macs: bool,
 ) -> Result<(Mutation, RecordMacs), AppStateError> {
+    decode_record_into(
+        operation,
+        record,
+        keys,
+        key_id,
+        validate_macs,
+        &mut Vec::new(),
+    )
+}
+
+pub(crate) fn decode_record_into(
+    operation: wa::syncd_mutation::SyncdOperation,
+    record: &wa::SyncdRecord,
+    keys: &ExpandedAppStateKeys,
+    key_id: &[u8],
+    validate_macs: bool,
+    plaintext: &mut Vec<u8>,
+) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
         .blob
@@ -77,13 +95,9 @@ pub fn decode_record(
         }
     }
 
-    // Sized up front from the ciphertext, which is the plaintext's exact upper
-    // bound (CBC output length minus PKCS7 padding). The bundled provider
-    // reserves this itself, but the trait only promises to clear and fill `out`,
-    // so an external provider that appends block by block reallocates its way up
-    // from an empty buffer on every mutation of every patch.
-    let mut plaintext = Vec::with_capacity(ciphertext.len());
-    aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
+    plaintext.clear();
+    plaintext.reserve_exact(ciphertext.len());
+    aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
     // Owned decode (not a view): the `value` sub-message is needed owned, so a
@@ -229,6 +243,24 @@ mod tests {
                 proto
             });
             proto
+        }
+    }
+
+    #[test]
+    fn reused_plaintext_decodes_long_then_short_record() {
+        let keys = expand_app_state_keys(&[7; 32]);
+        let key_id = b"test-key";
+        let op = wa::syncd_mutation::SyncdOperation::SET;
+        let mut plaintext = Vec::new();
+
+        for component in ["contact".repeat(64), "star".to_owned()] {
+            let mut action = wa::SyncActionData::default();
+            action.index = Some(serde_json::to_vec(&[&component]).unwrap());
+            let record = create_test_record(op, &keys, key_id, &action);
+            let (mutation, _) =
+                decode_record_into(op, &record, &keys, key_id, true, &mut plaintext).unwrap();
+            assert_eq!(mutation.index, [component]);
+            assert_eq!(plaintext, action.encode_to_vec());
         }
     }
 
