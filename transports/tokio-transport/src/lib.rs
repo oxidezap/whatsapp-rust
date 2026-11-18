@@ -75,6 +75,14 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
+#[cfg(not(feature = "danger-skip-tls-verify"))]
+static DEFAULT_WEBPKI_ROOTS: std::sync::LazyLock<Arc<rustls::RootCertStore>> =
+    std::sync::LazyLock::new(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(roots)
+    });
+
 /// rustls 0.23.43 divides this budget by eight to size its server-name queue,
 /// then evicts when the queue reaches capacity. Two slots retain one name;
 /// one slot immediately evicts it. The per-server TLS 1.3 ticket limit stays eight.
@@ -176,12 +184,9 @@ pub fn default_tls_connector() -> Connector {
         use std::sync::Arc as StdArc;
         use tokio_rustls::TlsConnector;
 
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
         let config = size_for_one_host(
             rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
+                .with_root_certificates(Arc::clone(&DEFAULT_WEBPKI_ROOTS))
                 .with_no_client_auth(),
         );
 
