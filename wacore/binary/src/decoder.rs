@@ -365,7 +365,21 @@ impl<'a> Decoder<'a> {
         }
 
         let packed_data = self.read_bytes(len)?;
-        let mut buf = [0u8; 254];
+        // Phone numbers and message IDs usually fit in 24 decoded bytes.
+        if len <= 12 {
+            Self::decode_packed::<24>(tag, packed_data, is_half_byte)
+        } else {
+            Self::decode_packed::<254>(tag, packed_data, is_half_byte)
+        }
+    }
+
+    #[inline(always)]
+    fn decode_packed<const N: usize>(
+        tag: u8,
+        packed_data: &[u8],
+        is_half_byte: bool,
+    ) -> Result<CompactString> {
+        let mut buf = [0u8; N];
         let mut pos = 0;
 
         match tag {
@@ -422,7 +436,8 @@ impl<'a> Decoder<'a> {
             .zip(packed_data)
         {
             let pair = NIBBLE_PAIRS[byte as usize];
-            if pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID {
+            // Valid glyphs are ASCII. An invalid nibble sets the high bit.
+            if (pair[0] | pair[1]) & 0x80 != 0 {
                 // Report the bad half in the order the byte carries it.
                 Self::unpack_nibble((byte & 0xF0) >> 4)?;
                 Self::unpack_nibble(byte & 0x0F)?;
@@ -1031,6 +1046,33 @@ mod tests {
     }
 
     /// Test nibble packed string with odd length
+    #[test]
+    fn packed_scratch_handles_short_long_and_odd_values() {
+        for length in [11, 12, 13, 127] {
+            for odd in [false, true] {
+                let mut wire = vec![0x23; length + 1];
+                wire[0] = length as u8 | if odd { 0x80 } else { 0 };
+                let expected = "23".repeat(length);
+                let expected = &expected[..expected.len() - usize::from(odd)];
+                for tag in [token::HEX_8, token::NIBBLE_8] {
+                    let mut decoder = Decoder::new(&wire);
+                    assert_eq!(decoder.read_packed(tag).unwrap(), expected);
+                    assert!(decoder.is_finished());
+                }
+                wire[1] = 0xcd;
+                assert!(matches!(
+                    Decoder::new(&wire).read_packed(token::NIBBLE_8),
+                    Err(BinaryError::InvalidToken(12))
+                ));
+                wire[1] = 0x3e;
+                assert!(matches!(
+                    Decoder::new(&wire).read_packed(token::NIBBLE_8),
+                    Err(BinaryError::InvalidToken(14))
+                ));
+            }
+        }
+    }
+
     #[test]
     fn test_nibble_packed_odd_length() {
         // Encode "123" as nibble packed (odd length = 3)
