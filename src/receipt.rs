@@ -7,6 +7,7 @@ use std::sync::Arc;
 use wacore::protocol::nack::NackReason;
 use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
+use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 
 use wacore::stanza::wire_tags::StanzaTag;
@@ -248,8 +249,10 @@ fn build_played_receipt_node(
 /// Both builders go through here because writing the marker twice is how it
 /// came to be wrong in both places at once.
 fn with_status_class(builder: NodeBuilder) -> NodeBuilder {
-    builder.attr("class", "status")
+    builder.attr(STATUS_RECEIPT_CLASS.0, STATUS_RECEIPT_CLASS.1)
 }
+
+const STATUS_RECEIPT_CLASS: (&str, &str) = ("class", "status");
 
 fn build_read_receipt_node(
     chat: &Jid,
@@ -312,46 +315,130 @@ fn delivery_receipt_type(info: &MessageInfo, active: bool) -> Option<&'static st
     }
 }
 
-/// Receipt-level attrs shared by the single and aggregate delivery builders
-/// (everything except `id`/`t`/the `<list>` child).
-fn delivery_receipt_builder(info: &MessageInfo, active: bool) -> NodeBuilder {
-    let is_status = info.has_status_receipt_class();
-    // A peer-synced message takes `type="peer_msg"` and carries NO recipient
-    // (WA Web `!l` guard), so the sender-receipt shape applies only off the
-    // peer path.
-    let sender_receipt = info.source.is_self_fanout() && info.category != MessageCategory::Peer;
-    // Mirror whatsmeow `buildBaseReceipt` / WA Web `JID(extractJidFromJidWithType)`:
-    // echo `from` verbatim so the device survives. `chat` strips it via to_non_ad,
-    // which the LID server rejects for multi-device DMs.
-    let to = if info.source.is_group || is_status {
-        &info.source.chat
-    } else {
-        &info.source.sender
-    };
-    let mut builder = NodeBuilder::new("receipt").attr("to", to);
+enum DeliveryAttr<'a> {
+    Jid(&'a Jid),
+    Recipient(&'a Jid),
+    Text(&'a str),
+}
 
-    if let Some(receipt_type) = delivery_receipt_type(info, active) {
-        builder = builder.attr("type", receipt_type);
+struct DeliveryReceipt<'a> {
+    to: &'a Jid,
+    receipt_type: Option<&'static str>,
+    recipient: Option<&'a Jid>,
+    participant: Option<&'a Jid>,
+    status: bool,
+    id: &'a str,
+}
+
+impl<'a> DeliveryReceipt<'a> {
+    fn new(info: &'a MessageInfo, active: bool) -> Self {
+        let status = info.has_status_receipt_class();
+        let group_or_status = info.source.is_group || status;
+        // Peer sync omits recipient. Sender receipts use a device-stripped JID.
+        let recipient = if info.category != MessageCategory::Peer && info.source.is_self_fanout() {
+            info.source.recipient.as_ref()
+        } else {
+            None
+        };
+        Self {
+            // For DMs, echo the sender with its device qualifier.
+            to: if group_or_status {
+                &info.source.chat
+            } else {
+                &info.source.sender
+            },
+            receipt_type: delivery_receipt_type(info, active),
+            recipient,
+            participant: group_or_status.then_some(&info.source.sender),
+            status,
+            id: &info.id,
+        }
     }
 
-    // Device-stripped recipient (WA Web `USER_JID`) so the server can route it.
-    if sender_receipt && let Some(recipient) = &info.source.recipient {
-        builder = builder.attr("recipient", recipient.to_non_ad());
+    fn base_attrs(&self) -> impl Iterator<Item = (&'static str, DeliveryAttr<'_>)> {
+        [
+            Some(("to", DeliveryAttr::Jid(self.to))),
+            self.receipt_type
+                .map(|value| ("type", DeliveryAttr::Text(value))),
+            self.recipient
+                .map(|jid| ("recipient", DeliveryAttr::Recipient(jid))),
+            self.participant
+                .map(|jid| ("participant", DeliveryAttr::Jid(jid))),
+            self.status.then_some((
+                STATUS_RECEIPT_CLASS.0,
+                DeliveryAttr::Text(STATUS_RECEIPT_CLASS.1),
+            )),
+        ]
+        .into_iter()
+        .flatten()
     }
 
-    if info.source.is_group || is_status {
-        builder = builder.attr("participant", &info.source.sender);
+    fn builder(&self) -> NodeBuilder {
+        NodeBuilder::new("receipt").attrs(self.base_attrs().map(|(key, value)| {
+            let value = match value {
+                DeliveryAttr::Jid(jid) => NodeValue::from(jid),
+                DeliveryAttr::Recipient(jid) => NodeValue::from(jid.to_non_ad()),
+                DeliveryAttr::Text(text) => NodeValue::from(text),
+            };
+            (key, value)
+        }))
     }
 
-    if is_status {
-        builder = with_status_class(builder);
+    fn pack(&self) -> wacore_binary::Result<Vec<u8>> {
+        let capacity = if self.participant.is_some() || self.recipient.is_some() {
+            96
+        } else {
+            64
+        };
+        let mut payload = Vec::with_capacity(capacity);
+        Encoder::new_vec(&mut payload)?.write_node(self)?;
+        Ok(payload)
+    }
+}
+
+impl EncodeNode for DeliveryReceipt<'_> {
+    fn tag(&self) -> &str {
+        "receipt"
     }
 
-    builder
+    fn attrs_len(&self) -> usize {
+        2 + usize::from(self.receipt_type.is_some())
+            + usize::from(self.recipient.is_some())
+            + usize::from(self.participant.is_some())
+            + usize::from(self.status)
+    }
+
+    fn has_content(&self) -> bool {
+        false
+    }
+
+    fn encode_attrs<'a, W: ByteWriter>(
+        &self,
+        encoder: &mut Encoder<'a, W>,
+    ) -> wacore_binary::Result<()> {
+        for (key, value) in self.base_attrs() {
+            encoder.write_string(key)?;
+            match value {
+                DeliveryAttr::Jid(jid) => encoder.write_jid_owned(jid)?,
+                DeliveryAttr::Recipient(jid) => encoder.write_jid_owned(&jid.to_non_ad())?,
+                DeliveryAttr::Text(text) => encoder.write_string(text)?,
+            }
+        }
+        encoder.write_string("id")?;
+        encoder.write_string(self.id)
+    }
+
+    fn encode_content<'a, W: ByteWriter>(
+        &self,
+        _: &mut Encoder<'a, W>,
+    ) -> wacore_binary::Result<()> {
+        Ok(())
+    }
 }
 
 fn build_delivery_receipt_node(info: &MessageInfo, active: bool) -> wacore_binary::Node {
-    delivery_receipt_builder(info, active)
+    DeliveryReceipt::new(info, active)
+        .builder()
         .attr("id", &info.id)
         .build()
 }
@@ -461,7 +548,8 @@ fn build_aggregate_delivery_receipt_nodes(
 ) -> Vec<wacore_binary::Node> {
     ids.chunks(MAX_RECEIPT_IDS_PER_STANZA)
         .map(|chunk| {
-            let mut builder = delivery_receipt_builder(rep, active)
+            let mut builder = DeliveryReceipt::new(rep, active)
+                .builder()
                 .attr("id", chunk[0])
                 .attr("t", timestamp);
             if chunk.len() > 1 {
@@ -877,7 +965,7 @@ impl Client {
     }
 
     /// Everything [`Self::send_delivery_receipt`] does short of the send: the
-    /// eligibility gate, node construction, logging and marshalling. Returns
+    /// eligibility, logging and wire encoding. Returns
     /// `None` when no receipt is owed. Split out so the receipt worker can
     /// prepare a whole burst before touching the socket.
     pub(crate) fn prepare_delivery_receipt(&self, info: &MessageInfo) -> Option<Vec<u8>> {
@@ -885,7 +973,7 @@ impl Client {
             return None;
         }
 
-        let receipt_node = build_delivery_receipt_node(info, self.receipts_are_active());
+        let active = self.receipts_are_active();
 
         // Mirror build_delivery_receipt_node's type selection so the log is
         // accurate (a passive companion emits `inactive`, not `delivery`).
@@ -893,7 +981,7 @@ impl Client {
             ReceiptType::PeerMsg
         } else if info.source.is_self_fanout() {
             ReceiptType::Sender
-        } else if !self.receipts_are_active() && !info.source.chat.is_status_broadcast() {
+        } else if !active && !info.source.chat.is_status_broadcast() {
             ReceiptType::Inactive
         } else {
             ReceiptType::Delivered
@@ -901,8 +989,14 @@ impl Client {
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
             receipt_kind.as_wire_str(), info.id, info.source.sender.observe());
 
-        self.marshal_node_for_send(receipt_node)
-            .inspect_err(|e| {
+        let packed = if self.sent_node_observed() {
+            self.marshal_node_for_send(build_delivery_receipt_node(info, active))
+        } else {
+            DeliveryReceipt::new(info, active)
+                .pack()
+                .map_err(|error| crate::socket::SocketError::Marshal(error).into())
+        };
+        packed.inspect_err(|e| {
                 log::warn!(target: "Client/Receipt", "Failed to marshal delivery receipt for message {}: {:?}", info.id, e);
             })
             .ok()
@@ -1321,6 +1415,39 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn packed_delivery_receipt_matches_owned_encoding() {
+        let dm = info_with(
+            "15550000100@s.whatsapp.net",
+            "15550000100:4@s.whatsapp.net",
+            false,
+        );
+        let group = info_with("12345@g.us", "100000000000001:2@lid", true);
+        let status = info_with("status@broadcast", "100000000000001:2@lid", false);
+        let mut group_status = group.clone();
+        group_status.is_status_stanza = true;
+        group_status.meta_info = Some(Box::new(wacore::types::message::MsgMetaInfo {
+            is_group_status: true,
+            ..Default::default()
+        }));
+        assert!(group_status.has_status_receipt_class());
+        let mut sender = dm.clone();
+        sender.source.is_from_me = true;
+        sender.source.recipient = Some("15550000101:3@s.whatsapp.net".parse().unwrap());
+        let mut peer = sender.clone();
+        peer.category = MessageCategory::Peer;
+
+        for info in [dm, group, status, group_status, sender, peer] {
+            for active in [false, true] {
+                let owned = build_delivery_receipt_node(&info, active);
+                assert_eq!(
+                    DeliveryReceipt::new(&info, active).pack().unwrap(),
+                    wacore_binary::marshal::marshal_shallow(&owned).unwrap()
+                );
+            }
         }
     }
 

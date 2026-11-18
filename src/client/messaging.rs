@@ -177,6 +177,11 @@ impl Client {
         Ok(())
     }
 
+    pub(crate) fn sent_node_observed(&self) -> bool {
+        self.sent_node_waiter_count.load(Ordering::Acquire) > 0
+            || log::log_enabled!(target: "Client/Send", log::Level::Debug)
+    }
+
     /// Everything [`send_node`](Client::send_node) does short of the send:
     /// logging, waiter resolution and marshalling. Split out so a burst can
     /// marshal its whole batch before touching the socket, which is what keeps
