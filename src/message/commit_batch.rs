@@ -1589,11 +1589,9 @@ impl Client {
         const MAX_COMPARED_PER_ID: usize = 8;
         /// A kept payload, with its wire form filled in only if some later
         /// item in the batch turns out to share its identity.
-        struct Kept {
-            info: Arc<MessageInfo>,
-            message: Arc<waproto::whatsapp::Message>,
+        struct Kept<'a> {
+            item: &'a PendingDelivery,
             encoded: Option<Vec<u8>>,
-            origin: Option<raw_pending::DeliveryOrigin>,
         }
         /// Compare the wire form rather than the decoded proto. `wa::Message`
         /// derives `PartialEq`, but nothing else calls it, so one `==` here
@@ -1605,8 +1603,8 @@ impl Client {
             waproto::codec::message_encode_into(msg, &mut buf);
             buf
         }
-        type Seen = std::collections::HashMap<DispatchKey, Vec<Kept>>;
-        fn keep(seen: &mut Seen, item: &PendingDelivery) -> bool {
+        type Seen<'a> = std::collections::HashMap<DispatchKey, smallvec::SmallVec<[Kept<'a>; 1]>>;
+        fn keep<'a>(seen: &mut Seen<'a>, item: &'a PendingDelivery) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
             if kept.len() >= MAX_COMPARED_PER_ID {
                 return true;
@@ -1623,24 +1621,24 @@ impl Client {
                 // separate stanzas always allocate separate infos, so this
                 // never exempts a genuine resend, while a part whose info was
                 // copied on write falls through to the content compare.
-                if let (Some(left), Some(right)) = (k.origin, item.origin) {
+                if let (Some(left), Some(right)) = (k.item.origin, item.origin) {
                     if left.stanza == right.stanza && left.position != right.position {
                         continue;
                     }
-                } else if Arc::ptr_eq(&k.info, &item.info) {
+                } else if Arc::ptr_eq(&k.item.info, &item.info) {
                     continue;
                 }
-                if Arc::ptr_eq(&k.message, &item.message) {
+                if Arc::ptr_eq(&k.item.message, &item.message) {
                     return false;
                 }
                 let candidate = candidate.get_or_insert_with(|| wire(&item.message));
-                let existing = k.encoded.get_or_insert_with(|| wire(&k.message));
+                let existing = k.encoded.get_or_insert_with(|| wire(&k.item.message));
                 if *existing == *candidate
-                    || (k.message.sender_key_distribution_message.is_set()
+                    || (k.item.message.sender_key_distribution_message.is_set()
                         || item.message.sender_key_distribution_message.is_set())
                         && MessageDispatch::fingerprint_encoded(
                             existing,
-                            k.message.sender_key_distribution_message.is_set(),
+                            k.item.message.sender_key_distribution_message.is_set(),
                         ) == MessageDispatch::fingerprint_encoded(
                             candidate,
                             item.message.sender_key_distribution_message.is_set(),
@@ -1650,15 +1648,14 @@ impl Client {
                 }
             }
             kept.push(Kept {
-                info: Arc::clone(&item.info),
-                message: Arc::clone(&item.message),
+                item,
                 encoded: candidate,
-                origin: item.origin,
             });
             true
         }
         let mut seen = Seen::with_capacity(items.len());
         if items.iter().all(|item| keep(&mut seen, item)) {
+            drop(seen);
             return items;
         }
         seen.clear();
