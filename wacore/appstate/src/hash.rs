@@ -512,7 +512,13 @@ pub(crate) fn content_mac_with(
 }
 
 fn index_mac_array(index_json_bytes: &[u8], key: &[u8; 32]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    index_mac_with(
+        index_json_bytes,
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length"),
+    )
+}
+
+fn index_mac_with(index_json_bytes: &[u8], mut mac: Hmac<Sha256>) -> [u8; 32] {
     mac.update(index_json_bytes);
     mac.finalize().into_bytes().into()
 }
@@ -536,11 +542,14 @@ pub fn validate_index_mac(
 pub(crate) fn validate_index_mac_with(
     index_json_bytes: &[u8],
     expected_mac: &[u8],
-    mut mac: Hmac<Sha256>,
+    mac: Hmac<Sha256>,
 ) -> Result<(), AppStateError> {
     // Compare against the stack array: no heap allocation per validated record.
-    mac.update(index_json_bytes);
-    if !bool::from(mac.finalize().into_bytes().as_slice().ct_eq(expected_mac)) {
+    if !bool::from(
+        index_mac_with(index_json_bytes, mac)
+            .as_slice()
+            .ct_eq(expected_mac),
+    ) {
         Err(AppStateError::MismatchingIndexMAC)
     } else {
         Ok(())

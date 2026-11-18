@@ -329,6 +329,44 @@ mod tests {
     }
 
     #[test]
+    fn batch_decoder_reuses_key_for_distinct_records_and_rejects_bad_index_mac() {
+        let keys = Arc::new(expand_app_state_keys(&[7; 32]));
+        let key_id = b"shared-key";
+        let op = wa::syncd_mutation::SyncdOperation::SET;
+        let mut decoder = BatchRecordDecoder::default();
+
+        for (component, timestamp) in [("first", 1), ("second", 2)] {
+            let mut action = wa::SyncActionData::default();
+            action.index = Some(serde_json::to_vec(&[component]).unwrap());
+            let mut value = wa::SyncActionValue::default();
+            value.timestamp = Some(timestamp);
+            action.value = value.into();
+            let record = create_test_record(op, &keys, key_id, &action);
+            let (expected, expected_macs) =
+                decode_record(op, &record, &keys, key_id, true).unwrap();
+            let (actual, actual_macs) = decoder.decode(op, &record, &keys, key_id, true).unwrap();
+            assert_eq!(actual.index, [component]);
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.action_value, expected.action_value);
+            assert_eq!(actual_macs.index_mac, expected_macs.index_mac);
+            assert_eq!(actual_macs.value_mac, expected_macs.value_mac);
+
+            if component == "second" {
+                let mut tampered = record;
+                let mut index = wa::SyncdIndex::default();
+                let mut mac = actual_macs.index_mac;
+                mac[0] ^= 1;
+                index.blob = Some(mac);
+                tampered.index = index.into();
+                assert!(matches!(
+                    decoder.decode(op, &tampered, &keys, key_id, true),
+                    Err(AppStateError::MismatchingIndexMAC)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn reused_plaintext_decodes_long_then_short_record() {
         let keys = expand_app_state_keys(&[7; 32]);
         let key_id = b"test-key";
