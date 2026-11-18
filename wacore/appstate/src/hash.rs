@@ -477,6 +477,20 @@ pub fn generate_content_mac(
     key_id: &[u8],
     key: &[u8],
 ) -> [u8; 32] {
+    content_mac_with(
+        operation,
+        data,
+        key_id,
+        Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length"),
+    )
+}
+
+pub(crate) fn content_mac_with(
+    operation: wa::syncd_mutation::SyncdOperation,
+    data: &[u8],
+    key_id: &[u8],
+    mut mac: Hmac<Sha512>,
+) -> [u8; 32] {
     let op_byte = [operation as u8 + 1];
     // WA Web (WAWebSyncdMutationKeyApi.Crypto) packs the associated-data length as
     // a single u8 at the low byte of an 8-byte zero buffer:
@@ -487,7 +501,6 @@ pub fn generate_content_mac(
     // Typed HMACs rather than `CryptographicMac::new("...")`: these two run per
     // decoded record, and the string-dispatched enum costs a name compare chain
     // plus a Sha512-sized stack object on every call. Output is byte-identical.
-    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(&op_byte);
     mac.update(key_id);
     mac.update(data);
@@ -499,7 +512,13 @@ pub fn generate_content_mac(
 }
 
 fn index_mac_array(index_json_bytes: &[u8], key: &[u8; 32]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    index_mac_with(
+        index_json_bytes,
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length"),
+    )
+}
+
+fn index_mac_with(index_json_bytes: &[u8], mut mac: Hmac<Sha256>) -> [u8; 32] {
     mac.update(index_json_bytes);
     mac.finalize().into_bytes().into()
 }
@@ -513,9 +532,21 @@ pub fn validate_index_mac(
     expected_mac: &[u8],
     key: &[u8; 32],
 ) -> Result<(), AppStateError> {
+    validate_index_mac_with(
+        index_json_bytes,
+        expected_mac,
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length"),
+    )
+}
+
+pub(crate) fn validate_index_mac_with(
+    index_json_bytes: &[u8],
+    expected_mac: &[u8],
+    mac: Hmac<Sha256>,
+) -> Result<(), AppStateError> {
     // Compare against the stack array: no heap allocation per validated record.
     if !bool::from(
-        index_mac_array(index_json_bytes, key)
+        index_mac_with(index_json_bytes, mac)
             .as_slice()
             .ct_eq(expected_mac),
     ) {
