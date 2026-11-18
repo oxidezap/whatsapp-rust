@@ -28,8 +28,20 @@ const CONTACT_NOTIFICATION_HASH_SUFFIX: &[u8] = b"WA_ADD_NOTIF";
 
 /// The contact identifier carried by `<notification type="devices">
 /// <update hash="..."/></notification>`, base64-encoded on the wire. `user` is
-/// the contact's bare user part. Fed incrementally to avoid a concat buffer.
+/// the contact's bare user part.
 pub fn contact_notification_hash(user: &str) -> [u8; 3] {
+    if user.len() <= 55 - CONTACT_NOTIFICATION_HASH_SUFFIX.len() {
+        let mut block = [0u8; 64];
+        let len = user.len() + CONTACT_NOTIFICATION_HASH_SUFFIX.len();
+        block[..user.len()].copy_from_slice(user.as_bytes());
+        block[user.len()..len].copy_from_slice(CONTACT_NOTIFICATION_HASH_SUFFIX);
+        block[len] = 0x80;
+        block[56..].copy_from_slice(&(len as u64 * 8).to_le_bytes());
+        let mut state = MD5_INITIAL_STATE;
+        Md5::process_block(&mut state, &block);
+        let [a, b, c, _] = state[0].to_le_bytes();
+        return [a, b, c];
+    }
     let mut context = Md5::new();
     context.consume(user.as_bytes());
     context.consume(CONTACT_NOTIFICATION_HASH_SUFFIX);
@@ -50,6 +62,7 @@ pub struct Md5 {
     total_len: u64,
 }
 
+const MD5_INITIAL_STATE: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
 const MD5_SHIFTS: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
 
 const MD5_K: [u32; 64] = [
@@ -129,7 +142,7 @@ impl Md5 {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+            state: MD5_INITIAL_STATE,
             buffer: [0u8; 64],
             buf_len: 0,
             total_len: 0,
@@ -290,6 +303,22 @@ mod tests {
                 Some(contact_notification_hash(user)),
                 "wire hash for {user} must round-trip"
             );
+        }
+    }
+
+    #[test]
+    fn contact_hash_matches_streaming_md5_across_padding_boundary() {
+        let max_single_block_user_len = 55 - CONTACT_NOTIFICATION_HASH_SUFFIX.len();
+        for user in [
+            String::new(),
+            "1".repeat(max_single_block_user_len - 1),
+            "2".repeat(max_single_block_user_len),
+            "3".repeat(max_single_block_user_len + 1),
+            "é".repeat(max_single_block_user_len),
+        ] {
+            let expected =
+                md5_digest(&[user.as_bytes(), CONTACT_NOTIFICATION_HASH_SUFFIX].concat());
+            assert_eq!(contact_notification_hash(&user), expected[..3]);
         }
     }
 
