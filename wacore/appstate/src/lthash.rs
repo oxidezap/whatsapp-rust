@@ -44,14 +44,30 @@ impl LTHash {
         self.multiple_op(base, add, false);
     }
 
-    fn multiple_op<T: AsRef<[u8]>>(&self, base: &mut [u8], input: &[T], subtract: bool) {
+    pub(crate) fn add_from_iter<T: AsRef<[u8]>>(
+        &self,
+        base: &mut [u8],
+        input: impl IntoIterator<Item = T>,
+    ) -> usize {
+        self.multiple_op(base, input, false)
+    }
+
+    fn multiple_op<T: AsRef<[u8]>>(
+        &self,
+        base: &mut [u8],
+        input: impl IntoIterator<Item = T>,
+        subtract: bool,
+    ) -> usize {
         // Reuse one stack buffer instead of a per-operand HKDF heap alloc.
         let mut derived = [0u8; u8::MAX as usize + 1];
         let derived = &mut derived[..self.hkdf_size as usize];
+        let mut applied = 0;
         for item in input {
             hkdf_sha256_into(item.as_ref(), self.hkdf_info, derived);
             perform_pointwise_with_overflow(base, derived, subtract);
+            applied += 1;
         }
+        applied
     }
 }
 
