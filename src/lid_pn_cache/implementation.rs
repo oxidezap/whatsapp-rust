@@ -621,7 +621,8 @@ impl LidPnCache {
         let start = wacore::time::Instant::now();
         let mut count = 0;
         let guard = self.lock_mutation().await;
-        let mut touched: Vec<Arc<str>> = Vec::new();
+        let topology = self.topology.get();
+        let mut touched = topology.map(|_| crate::client::member_index::MemberIndex::builder(0));
 
         // Validate only this instance's startup writes, not every stored row.
         // Best-effort failures can leave an occupied but stale predecessor.
@@ -657,8 +658,10 @@ impl LidPnCache {
                 live_pn_created_at: live_phones.get(&entry.phone_number).copied(),
             };
             self.add_guarded_impl(&entry, &guard, write).await;
-            touched.push(Arc::clone(&entry.lid));
-            touched.push(Arc::clone(&entry.phone_number));
+            if let Some(touched) = &mut touched {
+                touched.insert(&entry.lid);
+                touched.insert(&entry.phone_number);
+            }
             // `warm_up` only accepts durable rows. Mark the pair that won the
             // PN-side timestamp resolution so a live re-learn neither writes
             // it again nor repeats discovery migrations.
@@ -682,10 +685,10 @@ impl LidPnCache {
         // exactly what per-entry records would have done. An empty batch
         // changed nothing and records nothing: a generation bump with no
         // users would still send every memo through a restamp.
-        if !touched.is_empty()
-            && let Some(topology) = self.topology.get()
+        if count != 0
+            && let (Some(topology), Some(touched)) = (topology, touched)
         {
-            topology.record(touched.iter().map(|id| &**id));
+            topology.record_index(touched.build());
         }
 
         log::debug!(
@@ -1346,6 +1349,8 @@ mod tests {
         let topology = crate::client::device_topology::DeviceTopology::new();
         cache.attach_topology(Arc::clone(&topology));
         let before = topology.current();
+        cache.warm_up(std::iter::empty()).await;
+        assert_eq!(topology.current(), before);
 
         cache
             .warm_up([LidPnEntry::with_timestamp(
@@ -1356,6 +1361,7 @@ mod tests {
             )])
             .await;
 
+        assert_eq!(topology.current(), before + 1);
         use crate::client::member_index::MemberIndex;
         let members = |user: &str| MemberIndex::from_users([user]);
         assert!(topology.unchanged_for(before, &members("unrelated")));

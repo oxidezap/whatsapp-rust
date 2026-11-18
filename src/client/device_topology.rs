@@ -148,7 +148,10 @@ impl DeviceTopology {
         // Fingerprinted before taking the lock: a refresh for a large group
         // records hundreds of identifiers in one change, and hashing them is
         // the bulk of the work.
-        let touched = MemberIndex::from_users(users);
+        self.record_index(MemberIndex::from_users(users));
+    }
+
+    pub(crate) fn record_index(&self, touched: MemberIndex) {
         let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.generation.load(Ordering::Acquire) + 1;
         // A change that touched nobody cannot invalidate a memo, so it needs
