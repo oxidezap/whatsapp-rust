@@ -307,7 +307,6 @@ impl HashState {
     /// restating the rule, which is how a count and a fold drift apart.
     pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) -> FoldReport {
         // Borrow the MAC tails; no Vec<u8> allocation per MAC.
-        let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
         let mut indexed: Vec<(&[u8], &[u8])> = Vec::with_capacity(records.len());
         // Counted here rather than recomputed by a caller, for the reason the
         // fold reports its own total: an unkeyed record is what a snapshot
@@ -346,34 +345,37 @@ impl HashState {
             indexed.push((index_mac, value_mac));
         }
 
-        if indexed.len() <= MAC_DEDUP_SCAN_LIMIT {
+        let folded = if indexed.len() <= MAC_DEDUP_SCAN_LIMIT {
             // Index MACs are HMAC outputs (uniformly random), so at these sizes a
             // linear scan beats a SipHash set — the same trade-off as
             // collect_unique_index_macs (#856). Walking backwards makes the first
             // hit the last record, which is the one WA Web's Map keeps.
             let mut seen: Vec<&[u8]> = Vec::with_capacity(indexed.len());
-            for (index_mac, value_mac) in indexed.iter().rev() {
-                if !seen.contains(index_mac) {
-                    seen.push(index_mac);
-                    added.push(value_mac);
-                }
-            }
+            let winners = indexed
+                .into_iter()
+                .rev()
+                .filter_map(|(index_mac, value_mac)| {
+                    if !seen.contains(&index_mac) {
+                        seen.push(index_mac);
+                        Some(value_mac)
+                    } else {
+                        None
+                    }
+                });
+            WAPATCH_INTEGRITY.add_from_iter(&mut self.hash, winners)
         } else {
             // Above the scan limit the sort wins despite ordering every entry.
             // `sort_by` is stable, so within one index the encounter order — and
             // therefore which record is last — survives.
             indexed.sort_by(|a, b| a.0.cmp(b.0));
-            let mut rest = indexed.as_slice();
-            while let Some((index_mac, _)) = rest.first() {
-                let run = rest.partition_point(|(candidate, _)| candidate == index_mac);
-                added.push(rest[run - 1].1);
-                rest = &rest[run..];
-            }
-        }
+            let winners = indexed
+                .chunk_by(|a, b| a.0 == b.0)
+                .map(|run| run[run.len() - 1].1);
+            WAPATCH_INTEGRITY.add_from_iter(&mut self.hash, winners)
+        };
 
-        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
         FoldReport {
-            folded: added.len(),
+            folded,
             unkeyed,
             valueless,
         }
