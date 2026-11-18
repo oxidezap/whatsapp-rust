@@ -77,6 +77,23 @@ fn squaring_matches_multiplication_at_limb_bounds() {
     }
 }
 
+#[cfg(not(target_pointer_width = "64"))]
+#[test]
+fn ladder_constant_matches_multiplication_at_limb_bounds() {
+    use super::field2625::FieldElement2625;
+
+    let factor = FieldElement2625::from_limbs([121666, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let bounds = core::array::from_fn(|i| (1u32 << if i.is_multiple_of(2) { 27 } else { 26 }) - 1);
+    for (index, max) in bounds.into_iter().enumerate() {
+        for value in [0, 1, max - 1, max] {
+            let mut limbs = bounds;
+            limbs[index] = value;
+            let element = FieldElement2625::from_limbs(limbs);
+            assert_eq!(element.mul121666().0, (&element * &factor).0);
+        }
+    }
+}
+
 #[test]
 fn field_predicates_match_canonical_encoding() {
     use super::field::FieldElement;

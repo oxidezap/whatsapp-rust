@@ -151,11 +151,3 @@ pub(super) const fn from_radix51(mut limbs: [u64; 5]) -> FieldElement {
         (limbs[4] >> 26) as u32,
     ])
 }
-
-#[cfg(not(target_pointer_width = "64"))]
-impl FieldElement {
-    pub(super) fn mul121666(&self) -> Self {
-        const FACTOR: FieldElement = from_radix51([121666, 0, 0, 0, 0]);
-        self * &FACTOR
-    }
-}

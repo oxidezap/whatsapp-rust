@@ -119,6 +119,12 @@ impl ConditionallySelectable for ProjectivePoint {
             W: FieldElement::conditional_select(&a.W, &b.W, choice),
         }
     }
+
+    #[inline]
+    fn conditional_swap(a: &mut Self, b: &mut Self, choice: Choice) {
+        FieldElement::conditional_swap(&mut a.U, &mut b.U, choice);
+        FieldElement::conditional_swap(&mut a.W, &mut b.W, choice);
+    }
 }
 
 impl ProjectivePoint {
