@@ -4068,7 +4068,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
             ChatLane {
                 generation: 0,
                 enqueue_lock: Arc::new(Mutex::new(())),
-                queue_tx,
+                queue_tx: queue_tx.into(),
                 byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
                     crate::inbound_queue::CHAT_BYTES,
                 )),
@@ -5669,7 +5669,7 @@ async fn memory_report_sums_chat_lane_backlog() {
     let lane = ChatLane {
         generation: 0,
         enqueue_lock: Arc::new(Mutex::new(())),
-        queue_tx,
+        queue_tx: queue_tx.into(),
         byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
             crate::inbound_queue::CHAT_BYTES,
         )),
@@ -9658,7 +9658,7 @@ fn detached_chat_lane(
     (
         ChatLane {
             generation: client.connection_generation.load(Ordering::Acquire),
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(

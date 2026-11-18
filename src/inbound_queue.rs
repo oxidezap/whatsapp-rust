@@ -87,6 +87,93 @@ impl<T> Drop for DrainingReceiver<T> {
     }
 }
 
+type ChatSender = async_channel::Sender<Box<crate::client::QueuedChatMessage>>;
+type SharedChatSender = std::sync::Mutex<Option<ChatSender>>;
+
+/// The cached lane keeps its ordering locks after the worker exits. The
+/// worker retires this sender separately so those locks cannot pin the queue.
+#[derive(Clone)]
+pub(crate) struct ChatQueueSender(Arc<SharedChatSender>);
+
+impl From<ChatSender> for ChatQueueSender {
+    fn from(sender: ChatSender) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+}
+
+impl ChatQueueSender {
+    pub(crate) fn bounded(capacity: usize) -> (Self, ChatQueueReceiver) {
+        let (sender, receiver) = async_channel::bounded(capacity);
+        let sender = Self::from(sender);
+        let receiver = ChatQueueReceiver {
+            receiver: DrainingReceiver(receiver),
+            sender: Arc::downgrade(&sender.0),
+        };
+        (sender, receiver)
+    }
+
+    pub(crate) fn active_sender(&self) -> Option<ChatSender> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn close(&self) -> bool {
+        self.active_sender().is_some_and(|sender| sender.close())
+    }
+
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, ChatSender::len)
+    }
+
+    #[cfg(any(test, feature = "bench-harness"))]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_none_or(ChatSender::is_closed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> Option<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(ChatSender::capacity)
+    }
+}
+
+pub(crate) struct ChatQueueReceiver {
+    receiver: DrainingReceiver<Box<crate::client::QueuedChatMessage>>,
+    sender: std::sync::Weak<SharedChatSender>,
+}
+
+impl std::ops::Deref for ChatQueueReceiver {
+    type Target = async_channel::Receiver<Box<crate::client::QueuedChatMessage>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl Drop for ChatQueueReceiver {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Some(shared) = self.sender.upgrade() {
+            let sender = shared.lock().unwrap_or_else(|p| p.into_inner()).take();
+            drop(sender);
+        }
+    }
+}
+
 // Offline delivery is pulled in batches of `offline_resume::BATCH_SIZE`, and a
 // continuation is only reserved while the stanzas requested and not yet
 // finished fit one batch. That gate makes two batches the most one busy chat
@@ -421,6 +508,15 @@ mod tests {
     use async_lock::Mutex;
     use wacore_binary::builder::NodeBuilder;
 
+    #[test]
+    fn a_dropped_chat_receiver_releases_the_cached_sender() {
+        let (cached, worker) = ChatQueueSender::bounded(8);
+        let outstanding_producer = cached.active_sender().unwrap();
+        drop(worker);
+        assert!(outstanding_producer.is_closed());
+        assert!(cached.active_sender().is_none());
+    }
+
     fn lane(
         global: &Arc<ByteBudget>,
         bytes: usize,
@@ -430,7 +526,7 @@ mod tests {
         (
             ChatLane {
                 generation: 0,
-                queue_tx,
+                queue_tx: queue_tx.into(),
                 enqueue_lock: Arc::new(Mutex::new(())),
                 worker_running: Arc::new(Mutex::new(())),
                 byte_budget: Arc::new(ByteBudget::new(bytes)),
@@ -834,7 +930,7 @@ mod overload_tests {
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: budget,
@@ -957,7 +1053,7 @@ mod overload_tests {
         let (queue_tx, rx) = async_channel::bounded(1);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
@@ -1001,7 +1097,7 @@ mod overload_tests {
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),

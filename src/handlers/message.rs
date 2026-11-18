@@ -218,8 +218,7 @@ fn create_chat_lane(
     // Keep the offline-resume item bound without reserving each full entry
     // for idle chats. Only accepted messages allocate their payload wrapper.
     let (tx, rx) =
-        async_channel::bounded::<Box<QueuedChatMessage>>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
-    let rx = crate::inbound_queue::DrainingReceiver(rx);
+        crate::inbound_queue::ChatQueueSender::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -550,12 +549,17 @@ mod tests {
         // Paused time: the sleep advances the clock instead of waiting.
         tokio::time::sleep(LANE_IDLE_TIMEOUT + Duration::from_secs(1)).await;
         for _ in 0..100 {
-            if first_tx.is_closed() {
+            if first_tx.capacity().is_none() {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert!(first_tx.is_closed(), "idle worker must close its queue");
+        assert_eq!(
+            first_tx.capacity(),
+            None,
+            "cached lane must release its channel"
+        );
         assert!(
             first.worker_running.try_lock().is_some(),
             "an exited worker must release its running lock"
