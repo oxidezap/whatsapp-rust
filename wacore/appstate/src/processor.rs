@@ -885,6 +885,36 @@ pub fn validate_patch_macs(
 /// and this decides what we then decrypt, so a disagreement means accepting a
 /// snapshot on one set of records and storing another.
 fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
+    fn index_mac(record: &wa::SyncdRecord) -> &[u8] {
+        record
+            .index
+            .as_option()
+            .and_then(|idx| idx.blob.as_deref())
+            .unwrap_or_default()
+    }
+
+    if records.len() > crate::hash::MAC_DEDUP_SCAN_LIMIT {
+        let mut positions = Vec::with_capacity(records.len());
+        positions.extend(
+            records
+                .iter()
+                .enumerate()
+                .filter_map(|(position, record)| record.value.blob.is_some().then_some(position)),
+        );
+        // Within an index, put the last record first for deduplication.
+        positions.sort_unstable_by(|&a, &b| {
+            index_mac(&records[a])
+                .cmp(index_mac(&records[b]))
+                .then_with(|| b.cmp(&a))
+        });
+        positions.dedup_by(|a, b| index_mac(&records[*a]) == index_mac(&records[*b]));
+        positions.sort_unstable();
+        return positions
+            .into_iter()
+            .map(|position| &records[position])
+            .collect();
+    }
+
     let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
     let mut seen: Vec<&[u8]> = Vec::new();
     // Backwards, so the first hit for an index is its last record.
@@ -897,11 +927,7 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
         if rec.value.blob.is_none() {
             continue;
         }
-        let index_mac = rec
-            .index
-            .as_option()
-            .and_then(|idx| idx.blob.as_deref())
-            .unwrap_or_default();
+        let index_mac = index_mac(rec);
         if !seen.contains(&index_mac) {
             seen.push(index_mac);
             winners.push(rec);
@@ -1043,7 +1069,7 @@ mod tests {
 
         // One ordinary index carrying a run of two, and three records with no
         // index at all: five records describing two things.
-        let records = vec![
+        let records = [
             record(Some(&[0x01; 32]), 0x11),
             record(None, 0x22),
             record(Some(&[0x01; 32]), 0x33),
@@ -1051,30 +1077,26 @@ mod tests {
             record(None, 0x55),
         ];
 
-        let mut state = HashState::default();
-        let fold = state.update_hash_from_records(&records);
-        let winners = last_record_per_index(&records);
-
-        assert_eq!(fold.folded, 2, "one index and one empty key");
-        assert_eq!(
-            winners.len(),
-            fold.folded,
-            "the decode walks the records the fold folded, or the MAC we accepted \
-             was computed over a different snapshot than the one we store"
-        );
-        assert_eq!(
-            fold.unkeyed, 3,
-            "and it still says how many arrived unkeyed"
-        );
-
-        // Last wins in both, and on the same records.
-        let last_of = |mac: u8| {
-            winners
+        for copies in [1, 20] {
+            let records: Vec<_> = records
                 .iter()
-                .any(|rec| rec.value.blob.as_ref().is_some_and(|b| b[16] == mac))
-        };
-        assert!(last_of(0x33), "the run's last record, not its first");
-        assert!(last_of(0x55), "the last unkeyed record, not the first");
+                .cloned()
+                .cycle()
+                .take(records.len() * copies)
+                .collect();
+            let mut state = HashState::default();
+            let fold = state.update_hash_from_records(&records);
+            let winners = last_record_per_index(&records);
+
+            assert_eq!(fold.folded, 2);
+            assert_eq!(winners.len(), fold.folded);
+            assert_eq!(fold.unkeyed, 3 * copies);
+            let winner_macs: Vec<_> = winners
+                .iter()
+                .map(|record| record.value.blob.as_ref().unwrap()[16])
+                .collect();
+            assert_eq!(winner_macs, [0x33, 0x55]);
+        }
     }
 
     /// The regression the invariant above did not catch on its own: a record
