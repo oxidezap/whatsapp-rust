@@ -569,7 +569,15 @@ impl MessageUtils {
         // only bought a string match and a per-`update` enum dispatch, plus two
         // fallible steps that could not fail once the name was a literal.
         let mut h = Sha256::new();
-        for &(start, end) in ranges.iter() {
+        if let Some((&(mut start, mut end), rest)) = ranges.split_first() {
+            // Adjacent ranges already form one slice in the sorted byte stream.
+            for &(next_start, next_end) in rest {
+                if next_start != end {
+                    h.update(&arena[start as usize..end as usize]);
+                    start = next_start;
+                }
+                end = next_end;
+            }
             h.update(&arena[start as usize..end as usize]);
         }
 
@@ -2472,7 +2480,7 @@ mod parse_message_info_tests {
             }
         }
 
-        let devices = vec![
+        let mut devices = vec![
             dev("5511999990000", 0, 14, wacore_binary::Server::Pn),
             dev("111", 0, 0, wacore_binary::Server::Pn),
             dev("1110", 0, 0, wacore_binary::Server::Pn),
@@ -2505,6 +2513,20 @@ mod parse_message_info_tests {
         assert_eq!(
             MessageUtils::participant_list_hash(devices.iter().rev()).unwrap(),
             expected
+        );
+        devices.sort_by_cached_key(Jid::to_phash_form_string);
+        assert_eq!(
+            MessageUtils::participant_list_hash(&devices).unwrap(),
+            expected
+        );
+        devices.rotate_left(2);
+        assert_eq!(
+            MessageUtils::participant_list_hash(&devices).unwrap(),
+            expected
+        );
+        assert_eq!(
+            MessageUtils::participant_list_hash(std::iter::empty()).unwrap(),
+            "2:47DEQpj8"
         );
     }
 
