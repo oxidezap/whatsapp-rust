@@ -34,6 +34,14 @@ const TTI_RENEWAL_DIVISOR: u32 = 16;
 /// Coordination entries may all be pinned. Bound each insertion's scan work
 /// rather than repeatedly walking the growing map without finding a victim.
 const GUARDED_EVICTION_PROBES: usize = 64;
+fn expiry_cutoff(now: Instant, duration: Option<Duration>) -> Option<Instant> {
+    let duration = duration?;
+    if duration.is_zero() {
+        // Zero also expires stamps ahead of the clock because elapsed time saturates.
+        return Some(Instant::ZERO + Duration::MAX);
+    }
+    (now.saturating_duration_since(Instant::ZERO) >= duration).then(|| now - duration)
+}
 
 /// One table slot: the key, its hash, and the entry fields inline.
 ///
@@ -2015,7 +2023,14 @@ where
             let Storage::Managed(managed) = &mut *guard else {
                 return;
             };
-            managed.retain_unexpired(|entry| self.is_expired(entry, now));
+            let ttl_cutoff = expiry_cutoff(now, self.ttl);
+            let tti_cutoff = expiry_cutoff(now, self.tti);
+            if ttl_cutoff.is_some() || tti_cutoff.is_some() {
+                managed.retain_unexpired(|entry| {
+                    ttl_cutoff.is_some_and(|cutoff| entry.inserted_at <= cutoff)
+                        || tti_cutoff.is_some_and(|cutoff| entry.last_accessed_at <= cutoff)
+                });
+            }
         }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
@@ -2801,6 +2816,41 @@ mod tests {
             idle_free.is_expired(&entry, inserted + ttl),
             "TTL is inclusive"
         );
+    }
+
+    #[test]
+    fn sweep_cutoff_matches_elapsed_expiry() {
+        let ns = Duration::from_nanos;
+        let stamps = [
+            Instant::ZERO,
+            Instant::ZERO + ns(1),
+            Instant::ZERO + ns(100),
+            Instant::ZERO + Duration::MAX,
+        ];
+        let durations = [
+            None,
+            Some(Duration::ZERO),
+            Some(ns(1)),
+            Some(ns(99)),
+            Some(ns(100)),
+            Some(ns(u64::MAX)),
+            Some(Duration::MAX),
+        ];
+
+        for now in stamps {
+            for duration in durations {
+                let cutoff = expiry_cutoff(now, duration);
+                for stamp in stamps {
+                    assert_eq!(
+                        cutoff.is_some_and(|cutoff| stamp <= cutoff),
+                        duration.is_some_and(|duration| {
+                            now.saturating_duration_since(stamp) >= duration
+                        }),
+                        "{now:?} {stamp:?} {duration:?}",
+                    );
+                }
+            }
+        }
     }
 
     /// The renewal tolerance is a hard boundary, pinned against a supplied
