@@ -3990,7 +3990,7 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let rows: Vec<(String, String, i64, String, i64)> = lid_pn_mapping::table
+            let rows = lid_pn_mapping::table
                 .select((
                     lid_pn_mapping::lid,
                     lid_pn_mapping::phone_number,
@@ -3999,22 +3999,20 @@ impl ProtocolStore for SqliteStore {
                     lid_pn_mapping::updated_at,
                 ))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
-                .load(&mut *conn)
+                .load_iter::<(String, String, i64, String, i64), diesel::connection::DefaultLoadingMode>(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(rows
-                .into_iter()
-                .map(
-                    |(lid, phone_number, created_at, learning_source, updated_at)| {
-                        LidPnMappingEntry {
-                            lid,
-                            phone_number,
-                            created_at,
-                            updated_at,
-                            learning_source,
-                        }
-                    },
-                )
-                .collect())
+            rows.map(|row| {
+                let (lid, phone_number, created_at, learning_source, updated_at) = row?;
+                Ok(LidPnMappingEntry {
+                    lid,
+                    phone_number,
+                    created_at,
+                    updated_at,
+                    learning_source,
+                })
+            })
+            .collect::<QueryResult<Vec<_>>>()
+            .map_err(|e| StoreError::Database(Box::new(e)))
         })
         .await
     }
@@ -9873,7 +9871,7 @@ mod read_routing_tests {
                 lid: "111@lid".to_string(),
                 phone_number: "559990000002".to_string(),
                 created_at: 1,
-                updated_at: 1,
+                updated_at: 2,
                 learning_source: "test".to_string(),
             })
             .await
@@ -9886,7 +9884,15 @@ mod read_routing_tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(store.get_all_lid_mappings().await.unwrap().len(), 1);
+        let mappings = store.get_all_lid_mappings().await.unwrap();
+        let [mapping] = mappings.as_slice() else {
+            panic!("expected exactly one stored LID-PN mapping");
+        };
+        assert_eq!(mapping.lid, "111@lid");
+        assert_eq!(mapping.phone_number, "559990000002");
+        assert_eq!(mapping.created_at, 1);
+        assert_eq!(mapping.updated_at, 2);
+        assert_eq!(mapping.learning_source, "test");
 
         store.save_base_key(ADDR, "m1", &[1, 2, 3]).await.unwrap();
         assert!(
