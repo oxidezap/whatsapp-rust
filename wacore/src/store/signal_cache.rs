@@ -4121,7 +4121,7 @@ mod sender_key_lock_tests {
 
     #[tokio::test]
     async fn the_user_index_survives_eviction_and_defers_to_the_backend_when_cold() {
-        let cache = SignalStoreCache::with_max_entries(4);
+        let cache = SignalStoreCache::with_max_entries(8);
         let backend = crate::store::in_memory::InMemoryBackend::new();
 
         // A dirty entry is never evicted, so this user must stay answerable
@@ -4148,6 +4148,7 @@ mod sender_key_lock_tests {
         for i in 100..400 {
             let addr = ProtocolAddress::new(&format!("1999555{i:04}@s.whatsapp.net"), 0.into());
             cache.has_session(&addr, &backend).await.unwrap();
+            assert!(cache.sessions.lock().await.cache.len() <= high_watermark(8));
         }
 
         assert!(
