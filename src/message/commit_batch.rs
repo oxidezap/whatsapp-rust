@@ -446,11 +446,19 @@ impl PendingCommitOutcome {
     };
 }
 
+struct PendingWriteGroup<'a> {
+    chat: String,
+    sender: String,
+    id: &'a str,
+    deliveries: smallvec::SmallVec<[&'a PendingDelivery; 1]>,
+    lookup_group_sender: bool,
+}
+
 #[derive(Clone)]
 struct StoredPendingGroup {
     chat: String,
     sender: String,
-    id: String,
+    id: wacore_binary::MessageId,
     revision: PendingInboundRevision,
     complete: bool,
 }
@@ -596,12 +604,13 @@ impl Client {
                 arrived_keys.push((chat, sender, info.id.to_string()));
             }
         }
-        let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>, bool)> = Vec::new();
+        let mut groups: Vec<PendingWriteGroup<'_>> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
+            let item_id = item.info.id.as_str();
             let arrived = arrived_keys.iter().find(|(candidate_chat, sender, id)| {
                 candidate_chat == &chat
-                    && id == item.info.id
+                    && id == item_id
                     && sender == &item.info.source.sender.to_string()
             });
             let explicit = item.storage_sender.is_some() || arrived.is_some();
@@ -615,12 +624,12 @@ impl Client {
                 |sender| sender.to_string(),
             );
             let group = groups.iter_mut().find(|group| {
-                group.0 == chat
-                    && group.2 == item.info.id
-                    && (group.1 == sender
+                group.chat == chat
+                    && group.id == item_id
+                    && (group.sender == sender
                         || item.info.source.chat.is_group()
-                            && (!explicit || group.4)
-                            && group.3.first().is_some_and(|first| {
+                            && (!explicit || group.lookup_group_sender)
+                            && group.deliveries.first().is_some_and(|first| {
                                 let first = &first.info.source.sender;
                                 let next = &item.info.source.sender;
                                 first.user == next.user
@@ -629,19 +638,19 @@ impl Client {
                             }))
             });
             if let Some(group) = group {
-                if explicit && group.4 {
-                    group.1 = sender;
-                    group.4 = false;
+                if explicit && group.lookup_group_sender {
+                    group.sender = sender;
+                    group.lookup_group_sender = false;
                 }
-                group.3.push(item);
+                group.deliveries.push(item);
             } else {
-                groups.push((
+                groups.push(PendingWriteGroup {
                     chat,
                     sender,
-                    item.info.id.to_string(),
-                    vec![item],
-                    item.info.source.chat.is_group() && !explicit,
-                ));
+                    id: item_id,
+                    deliveries: smallvec::smallvec![item],
+                    lookup_group_sender: item.info.source.chat.is_group() && !explicit,
+                });
             }
         }
         // Known physical aliases cannot use the ambiguity-rejecting lookup
@@ -649,12 +658,11 @@ impl Client {
         // live admission budget before the first mutation, through hook and
         // cleanup completion. Unknown on-disk alias pairs still fail closed.
         let mut alias_charges = Vec::new();
-        for (chat, sender, id, deliveries, _) in &groups {
-            if groups
-                .iter()
-                .any(|other| other.0 == *chat && other.2 == *id && other.1 != *sender)
-            {
-                for delivery in deliveries {
+        for group in &groups {
+            if groups.iter().any(|other| {
+                other.chat == group.chat && other.id == group.id && other.sender != group.sender
+            }) {
+                for delivery in &group.deliveries {
                     let mut retained = (**delivery).clone();
                     self.inbound_commit_batch
                         .live_retention
@@ -669,16 +677,23 @@ impl Client {
             PendingInboundLease::new(Arc::new((lease, alias_charges)))
         };
         let mut stored = Vec::with_capacity(groups.len());
-        for (chat, mut sender, id, deliveries, lookup) in groups {
+        for PendingWriteGroup {
+            chat,
+            mut sender,
+            id,
+            deliveries,
+            lookup_group_sender,
+        } in groups
+        {
             let key = PendingInboundKey {
                 chat: &chat,
                 sender: &sender,
-                id: &id,
+                id,
             };
             // Resolve a fresh group's unique legacy physical key through the
             // same bounded lookup as replay. Reuse its backing here, and never
             // create a bare sibling beside an existing device-qualified row.
-            let record = if lookup {
+            let record = if lookup_group_sender {
                 match lookup_pending_record(&backend, key, true, lease.clone()).await? {
                     Some((physical, record)) => {
                         sender = physical;
@@ -694,7 +709,7 @@ impl Client {
             let key = PendingInboundKey {
                 chat: &chat,
                 sender: &sender,
-                id: &id,
+                id,
             };
             let expected = record
                 .as_ref()
@@ -722,7 +737,7 @@ impl Client {
             stored.push(StoredPendingGroup {
                 chat,
                 sender,
-                id,
+                id: id.into(),
                 revision,
                 complete,
             });
@@ -736,11 +751,13 @@ impl Client {
     fn encode_pending_deliveries(
         &self,
         mut journal: PendingJournal,
-        deliveries: Vec<&PendingDelivery>,
+        deliveries: smallvec::SmallVec<[&PendingDelivery; 1]>,
         is_drain: bool,
         owner: &PendingStorage,
     ) -> anyhow::Result<(bytes::Bytes, bool)> {
-        let mut covered = Vec::with_capacity(deliveries.len());
+        // A fresh journal can only contain occurrences from this write.
+        let mut covered =
+            (!journal.occurrences.is_empty()).then(|| Vec::with_capacity(deliveries.len()));
         for delivery in deliveries {
             let projection = if let Some(encoded) = self
                 .inbound_commit_batch
@@ -767,15 +784,19 @@ impl Client {
                 original,
                 projection,
             };
-            covered.push(occurrence.clone());
+            if let Some(covered) = &mut covered {
+                covered.push(occurrence.clone());
+            }
             journal.merge(occurrence)?;
         }
-        let complete = journal.occurrences.iter().all(|entry| {
-            covered.iter().any(|incoming| {
-                incoming.producer == entry.producer
-                    && incoming.index == entry.index
-                    && incoming.original == entry.original
-                    && incoming.projection == entry.projection
+        let complete = covered.is_none_or(|covered| {
+            journal.occurrences.iter().all(|entry| {
+                covered.iter().any(|incoming| {
+                    incoming.producer == entry.producer
+                        && incoming.index == entry.index
+                        && incoming.original == entry.original
+                        && incoming.projection == entry.projection
+                })
             })
         });
         let encoded = journal.encode()?;
