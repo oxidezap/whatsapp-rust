@@ -1860,7 +1860,7 @@ impl InboundQueueHarness {
         let rx = crate::inbound_queue::DrainingReceiver(rx);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(

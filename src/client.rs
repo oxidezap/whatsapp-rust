@@ -557,7 +557,7 @@ impl MessagePermitSemaphore {
 pub(crate) struct ChatLane {
     pub generation: u64,
     pub enqueue_lock: Arc<Mutex<()>>,
-    pub queue_tx: async_channel::Sender<Box<QueuedChatMessage>>,
+    pub queue_tx: crate::inbound_queue::ChatQueueSender,
     pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,
     pub global_budget: Arc<crate::inbound_queue::ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
@@ -619,10 +619,13 @@ impl ChatLane {
             work: None,
             offline,
         };
-        if self.queue_tx.is_closed() {
+        let Some(queue_tx) = self.queue_tx.active_sender() else {
+            return Err(async_channel::TrySendError::Closed(queued));
+        };
+        if queue_tx.is_closed() {
             return Err(async_channel::TrySendError::Closed(queued));
         }
-        if self.queue_tx.is_full() {
+        if queue_tx.is_full() {
             return Err(async_channel::TrySendError::Full(queued));
         }
         // Refuse closed admission before compacting/parsing a possibly large
@@ -639,7 +642,7 @@ impl ChatLane {
             return Err(async_channel::TrySendError::Full(queued));
         };
         let original = queued.node;
-        self.queue_tx
+        queue_tx
             .try_send(Box::new(QueuedChatMessage {
                 node: Arc::new(retained),
                 work: Some(work),
