@@ -2182,6 +2182,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn group_devices_maintenance_reclaims_only_unowned_snapshots() {
+        use wacore::client::context::GroupRoutingInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000042@g.us".parse().expect("group jid");
+        let own = Jid::pn("15550100000");
+        setup_device_record(&client, &own.user, &[0, 5]).await;
+        let info = Arc::new(GroupRoutingInfo::new(vec![own.clone()], AddressingMode::Pn));
+        let group_cache = client.get_group_cache();
+        group_cache.insert(group.clone(), Arc::clone(&info)).await;
+        let devices = client
+            .resolve_group_devices_memoized(&group, &info, &own)
+            .await
+            .expect("resolve should succeed");
+
+        group_cache.invalidate(&group).await;
+        client.run_cache_maintenance().await;
+        let repeat = client
+            .resolve_group_devices_memoized(&group, &info, &own)
+            .await
+            .expect("resolve should still hit");
+        assert!(Arc::ptr_eq(&devices, &repeat));
+
+        drop(info);
+        client.run_cache_maintenance().await;
+        assert!(client.group_devices_memo.get(&group).await.is_none());
+        assert_eq!(devices.devices().len(), repeat.devices().len());
+    }
+
     /// Locks the three validity gates of the group-devices memo: a repeat
     /// resolve with the same GroupRoutingInfo Arc + generation is a memo hit (proved
     /// by serving a raw cache change STALE), any topology bump recomputes,

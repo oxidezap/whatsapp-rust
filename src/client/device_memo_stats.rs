@@ -242,7 +242,7 @@ impl DeviceMemoCounters {
 pub struct GroupDevicesMemoStats {
     pub hits: u64,
     pub restamps: u64,
-    /// No entry for the group: first send, or a capacity eviction. The memo
+    /// No entry for the group: first send, eviction, or orphan cleanup. The memo
     /// holds `CacheConfig::group_devices_memo_capacity` groups, least
     /// recently used evicted first, so a client active in more than that
     /// reports its eviction rate here.
