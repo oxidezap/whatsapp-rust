@@ -7,7 +7,7 @@
 use subtle::ConstantTimeEq;
 
 use crate::AppStateError;
-use crate::decode::{Mutation, decode_record};
+use crate::decode::{Mutation, decode_record, decode_record_into};
 use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
 use log::{Level, debug, log_enabled, trace, warn};
@@ -438,17 +438,19 @@ where
     let winners = last_record_per_index(&snapshot.records);
     let mut mutations = Vec::with_capacity(winners.len());
     let mut mutation_macs = Vec::with_capacity(winners.len());
+    let mut plaintext = Vec::new();
 
     for rec in winners {
         let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
-        let (mutation, macs) = decode_record(
+        let (mutation, macs) = decode_record_into(
             wa::syncd_mutation::SyncdOperation::SET,
             rec,
             &keys,
             key_id,
             validate_macs,
+            &mut plaintext,
         )?;
 
         mutation_macs.push(AppStateMutationMAC {
@@ -657,6 +659,7 @@ where
     let mut mutations = Vec::with_capacity(patch.mutations.len());
     let mut added_macs = Vec::with_capacity(sets);
     let mut removed_index_macs = Vec::with_capacity(patch.mutations.len() - sets);
+    let mut plaintext = Vec::new();
 
     for m in &patch.mutations {
         if m.record.is_set() {
@@ -670,7 +673,8 @@ where
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let (mutation, macs) = decode_record(op, &m.record, &keys, key_id, validate_macs)?;
+            let (mutation, macs) =
+                decode_record_into(op, &m.record, &keys, key_id, validate_macs, &mut plaintext)?;
 
             match op {
                 wa::syncd_mutation::SyncdOperation::SET => {
