@@ -100,7 +100,15 @@ enum StoredChainRole {
 }
 fn decode_chain(input: &[u8], role: StoredChainRole) -> Result<Chain> {
     let f = fields(input)?;
-    let ck = data(&f, 3)?.map(fields).transpose()?;
+    let mut chain_index = None;
+    let mut chain_key = None;
+    if let Some(bytes) = data(&f, 3)? {
+        scan_fields(bytes, |(number, value)| match number {
+            1 => chain_index = Some(value),
+            2 => chain_key = Some(value),
+            _ => {}
+        })?;
+    }
     let mut skipped = VecDeque::new();
     for (n, v) in &f {
         if *n == 4 {
@@ -118,21 +126,12 @@ fn decode_chain(input: &[u8], role: StoredChainRole) -> Result<Chain> {
                 .transpose()?,
             StoredChainRole::Receiver => None,
         },
-        index: ck.as_ref().map(|f| number(f, 1)).transpose()?.unwrap_or(0),
-        key: ck
-            .as_ref()
-            .map(|f| data(f, 2))
+        index: chain_index.map(as_u32).transpose()?.unwrap_or_default(),
+        key: chain_key
+            .map(|value| array(as_bytes(value)?))
             .transpose()?
-            .flatten()
-            .map(array)
-            .transpose()?
-            .unwrap_or([0; 32]),
-        exhausted: ck
-            .as_ref()
-            .map(|f| data(f, 2))
-            .transpose()?
-            .flatten()
-            .is_none(),
+            .unwrap_or_default(),
+        exhausted: chain_key.is_none(),
         skipped: skipped.into(),
         message_key_limit: one(&f, 100).map(as_u32).transpose()?,
     })
@@ -529,6 +528,26 @@ mod parser_budget_tests {
         bytes(&mut signing, 1, &tagged_key(&[7; 32]));
         bytes(&mut out, 3, &signing);
         out
+    }
+
+    #[test]
+    fn stored_chain_key_uses_the_last_values() {
+        let mut blob = receiver();
+        let mut position = Vec::new();
+        bytes(&mut position, 1, b"ignored earlier index");
+        uint(&mut position, 2, 1);
+        uint(&mut position, 1, 13);
+        bytes(&mut position, 2, &[9; 32]);
+        bytes(&mut blob, 3, &position);
+
+        let decoded = decode_chain(&blob, StoredChainRole::Receiver).unwrap();
+        assert_eq!(decoded.index, 13);
+        assert_eq!(decoded.key, [9; 32]);
+        assert!(!decoded.exhausted);
+
+        uint(&mut position, 2, 1);
+        bytes(&mut blob, 3, &position);
+        assert!(decode_chain(&blob, StoredChainRole::Receiver).is_err());
     }
 
     #[test]
