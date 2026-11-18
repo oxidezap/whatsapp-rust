@@ -604,6 +604,33 @@ fn compact_skipped_keys_survive_persistence() {
     );
 }
 #[test]
+fn warm_ratchets_keep_exactly_five_receiver_slots() {
+    let mut rng = Deterministic(144);
+    let mut engine = Engine::new(&RustCrypto, &mut rng);
+    let (mut alice, mut bob, parameters) = peers(&mut engine, true);
+    let first = engine.encrypt(&mut alice, b"init").unwrap();
+    engine
+        .decrypt_pre_key(&mut bob, &first, &parameters)
+        .unwrap();
+
+    for turn in 0u8..16 {
+        let (sender, receiver) = if turn % 2 == 0 {
+            (&mut bob, &mut alice)
+        } else {
+            (&mut alice, &mut bob)
+        };
+        reserve(sender);
+        let message = engine.encrypt(sender, &[turn]).unwrap();
+        assert_eq!(engine.decrypt(receiver, &message).unwrap(), [turn]);
+    }
+
+    for record in [alice, bob] {
+        let receivers = &record.current.as_ref().unwrap().receivers;
+        assert_eq!(receivers.len(), MAX_RECEIVER_CHAINS);
+        assert_eq!(receivers.capacity(), MAX_RECEIVER_CHAINS);
+    }
+}
+#[test]
 fn alternating_ratchets_survive_every_turn_reload() {
     let mut rng = Deterministic(143);
     let mut e = Engine::new(&RustCrypto, &mut rng);
