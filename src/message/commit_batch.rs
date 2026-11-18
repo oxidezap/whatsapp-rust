@@ -1791,7 +1791,7 @@ impl Client {
         // Persist every arrived physical key before collapsing consumer aliases.
         // Cleanup then compares each retained revision, including spellings
         // whose identical projection is represented by another hook item.
-        let pending = Arc::clone(&arrived);
+        let pending = arrived;
         let deliveries = items;
         let producers: smallvec::SmallVec<[Option<DispatchKey>; 1]> =
             if self.dispatch_gate_enabled() {
@@ -1804,8 +1804,6 @@ impl Client {
             };
         let items: Arc<[InboundMessage]> =
             deliveries.iter().map(|entry| entry.item.clone()).collect();
-        let arrived: Arc<[InboundMessage]> =
-            arrived.iter().map(|entry| entry.item.clone()).collect();
 
         // Rides on the dispatched event so a consumer that the hook already
         // fed can skip re-materializing the batch.
@@ -1984,15 +1982,17 @@ impl Client {
         }
         // The no-hook path still schedules receipts before synchronous
         // consumer code can block or panic.
-        let mut acknowledged = std::collections::HashSet::with_capacity(arrived.len());
-        for item in pending.iter() {
-            // The scope belongs to this arrival, including after cancellation.
-            // Never redirect a late commit into another attempt's scope.
-            if acknowledge && acknowledged.insert(Arc::as_ptr(&item.info) as usize) {
-                match &item.receipt {
-                    Some(scope) if scope.defer() => {}
-                    Some(_) => self.ack_received_message_unscoped(&item.info),
-                    None => self.ack_received_message(&item.info),
+        if acknowledge {
+            match pending.as_ref() {
+                [] => {}
+                [item] => self.acknowledge_pending_delivery(item),
+                entries => {
+                    let mut acknowledged = std::collections::HashSet::with_capacity(entries.len());
+                    for item in entries {
+                        if acknowledged.insert(Arc::as_ptr(&item.info)) {
+                            self.acknowledge_pending_delivery(item);
+                        }
+                    }
                 }
             }
         }
@@ -2008,6 +2008,16 @@ impl Client {
             false,
         );
         PendingCommitOutcome::DELIVERED
+    }
+
+    fn acknowledge_pending_delivery(self: &Arc<Self>, item: &PendingDelivery) {
+        // The scope belongs to this arrival, including after cancellation.
+        // Never redirect a late commit into another attempt's scope.
+        match &item.receipt {
+            Some(scope) if scope.defer() => {}
+            Some(_) => self.ack_received_message_unscoped(&item.info),
+            None => self.ack_received_message(&item.info),
+        }
     }
 
     #[inline(never)]
