@@ -613,7 +613,10 @@ impl Client {
             id_counter: Arc::new(AtomicU64::new(0)),
             unified_session: crate::unified_session::UnifiedSessionManager::new(),
 
-            signal_cache: Arc::new(crate::store::signal_cache::SignalStoreCache::new()),
+            signal_cache: Arc::new(cache_config.signal_cache_max_entries.map_or_else(
+                crate::store::signal_cache::SignalStoreCache::new,
+                crate::store::signal_cache::SignalStoreCache::with_max_entries,
+            )),
             message_processing_semaphore: std::sync::Mutex::new(MessagePermitSemaphore::drain(
                 offline_drain_permits,
             )),

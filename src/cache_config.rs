@@ -310,6 +310,9 @@ pub struct CacheConfig {
     /// of candidates per insertion, so subsequent inserts retire excess idle entries
     /// incrementally after a concurrent burst.
     pub session_locks_capacity: u64,
+    /// Soft target per Signal cache table. None uses the SDK default. Dirty and
+    /// checked-out entries remain resident until they can be safely evicted.
+    pub signal_cache_max_entries: Option<usize>,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     /// Uses the soft-cap reclamation policy of [`Self::session_locks_capacity`].
     pub chat_lanes_capacity: u64,
@@ -464,6 +467,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
             .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
+            .field("signal_cache_max_entries", &self.signal_cache_max_entries)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field(
                 "group_distribution_locks_capacity",
@@ -537,6 +541,7 @@ impl Default for CacheConfig {
             // while a reference is held creates a second lock for the same key,
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
+            signal_cache_max_entries: None,
             chat_lanes_capacity: 5_000,
             group_distribution_locks_capacity: 512,
             // 64 was a hard cliff: the memo evicted oldest-first, so an
