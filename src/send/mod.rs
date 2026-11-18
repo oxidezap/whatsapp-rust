@@ -5848,6 +5848,12 @@ mod tests {
         // 4. A write touching a stranger is the re-stamp: the generation
         //    moved, and the log proves the change missed this group.
         fixture.send_text("re-warm").await;
+        let memo = fixture
+            .client
+            .group_devices_memo
+            .get(&fixture.group)
+            .await
+            .unwrap();
         let before = fixture.client.device_memo_stats();
         fixture.client.device_topology.record(["12025550111"]);
         fixture.send_text("after an unrelated user changed").await;
@@ -5865,6 +5871,13 @@ mod tests {
             "a re-stamp serves the same device Arc, so the SKDM memo still \
              hits behind it: {window}"
         );
+        let restamped = fixture
+            .client
+            .group_devices_memo
+            .get(&fixture.group)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&memo, &restamped));
     }
 
     /// The counterpart: a forgotten device (a retry receipt's
