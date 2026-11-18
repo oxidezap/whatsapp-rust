@@ -232,6 +232,7 @@ fn create_chat_lane(
             // Queue behind the worker this lane replaced, if it is still
             // draining the messages that raced its idle exit.
             let _running = running.lock_arc().await;
+            let mut retired_for_idle = false;
             loop {
                 // A burst is served straight off the queue; the idle timer is
                 // only armed once the queue is empty, so it costs nothing per
@@ -255,19 +256,8 @@ fn create_chat_lane(
                                 // that lands after it is told `Closed` and
                                 // replaces this lane.
                                 rx.close();
-                                while let Ok(queued) = rx.try_recv() {
-                                    if !process_queued(
-                                        &client_for_worker,
-                                        *queued,
-                                        spawn_generation,
-                                    )
-                                    .await
-                                    {
-                                        break;
-                                    }
-                                }
-                                client_for_worker.reclaim_idle_delivery_capacity();
-                                break;
+                                retired_for_idle = true;
+                                continue;
                             }
                         }
                     }
@@ -275,6 +265,9 @@ fn create_chat_lane(
                 if !process_queued(&client_for_worker, *next, spawn_generation).await {
                     break;
                 }
+            }
+            if retired_for_idle {
+                client_for_worker.reclaim_idle_delivery_capacity();
             }
         }))
         .detach();
