@@ -91,6 +91,10 @@ impl Sink for VecSink<'_> {
             self.0.push(value as u8);
             return;
         }
+        if value < (1 << 14) {
+            self.raw(&[(value as u8 & 127) | 128, (value >> 7) as u8]);
+            return;
+        }
         let mut encoded = [0; 10];
         let mut used = 0;
         while value >= 128 {
