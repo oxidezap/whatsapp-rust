@@ -944,30 +944,22 @@ fn dedupe_lid_mappings(mappings: &mut Vec<HistoryLidMapping>) {
     let mut drop = vec![false; mappings.len()];
 
     for i in 0..mappings.len() {
-        let mut conflicts: Vec<usize> = Vec::new();
-        if let Some(&kept) = by_lid.get(&mappings[i].lid) {
-            conflicts.push(kept);
-        }
-        if let Some(&kept) = by_phone.get(&mappings[i].phone_number)
-            && !conflicts.contains(&kept)
-        {
-            conflicts.push(kept);
-        }
+        let lid_match = by_lid.get(&mappings[i].lid).copied();
+        let phone_match = by_phone
+            .get(&mappings[i].phone_number)
+            .copied()
+            .filter(|&kept| Some(kept) != lid_match);
+        let conflicts = [lid_match, phone_match];
 
-        // A bulk pair displaces conflicting conversation pairs and nothing
-        // else, so a bulk entry is never removed by a conversation one and the
-        // first occurrence wins within a source.
-        let incoming_wins = !conflicts.is_empty()
-            && mappings[i].source == HistoryLidMappingSource::Bulk
-            && conflicts
-                .iter()
-                .all(|&k| mappings[k].source == HistoryLidMappingSource::Conversation);
-
-        if !conflicts.is_empty() && !incoming_wins {
+        // Resolve both indexes before removing either incumbent.
+        if conflicts.into_iter().flatten().any(|kept| {
+            mappings[i].source != HistoryLidMappingSource::Bulk
+                || mappings[kept].source != HistoryLidMappingSource::Conversation
+        }) {
             drop[i] = true;
             continue;
         }
-        for &kept in &conflicts {
+        for kept in conflicts.into_iter().flatten() {
             drop[kept] = true;
             by_lid.remove(&mappings[kept].lid);
             by_phone.remove(&mappings[kept].phone_number);
@@ -2920,6 +2912,37 @@ mod tests {
     }
 
     /// Independent pairs must survive the conflict pass untouched.
+    #[test]
+    fn bulk_mapping_resolves_two_conflicts_as_a_unit() {
+        let lid_match = HistoryLidMapping {
+            phone_number: "15550000001".into(),
+            lid: "100000000000001".into(),
+            source: HistoryLidMappingSource::Conversation,
+        };
+        let phone_match = HistoryLidMapping {
+            phone_number: "15550000002".into(),
+            lid: "100000000000002".into(),
+            source: HistoryLidMappingSource::Conversation,
+        };
+        let replacement = HistoryLidMapping {
+            phone_number: phone_match.phone_number.clone(),
+            lid: lid_match.lid.clone(),
+            source: HistoryLidMappingSource::Bulk,
+        };
+
+        let mut mappings = vec![lid_match.clone(), phone_match.clone(), replacement.clone()];
+        dedupe_lid_mappings(&mut mappings);
+        assert_eq!(mappings, [replacement.clone()]);
+
+        let bulk_lid_match = HistoryLidMapping {
+            source: HistoryLidMappingSource::Bulk,
+            ..lid_match
+        };
+        let mut mappings = vec![bulk_lid_match.clone(), phone_match.clone(), replacement];
+        dedupe_lid_mappings(&mut mappings);
+        assert_eq!(mappings, [bulk_lid_match, phone_match]);
+    }
+
     #[test]
     fn non_conflicting_mappings_are_all_kept() {
         let hs = {
