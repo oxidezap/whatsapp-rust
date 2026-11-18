@@ -598,6 +598,11 @@ impl ArchivedSessions {
     pub fn insert(&mut self, index: usize, value: ArchivedSession) {
         Arc::make_mut(self.0.get_or_insert_with(|| Arc::new(Vec::new()))).insert(index, value);
     }
+    pub(crate) fn push_latest(&mut self, value: ArchivedSession) {
+        let items = Arc::make_mut(self.0.get_or_insert_with(|| Arc::new(Vec::new())));
+        items.truncate(MAX_ARCHIVED_SESSIONS - 1);
+        items.insert(0, value);
+    }
     pub fn remove(&mut self, index: usize) -> ArchivedSession {
         let value = Arc::make_mut(self.0.as_mut().expect("archive index must exist")).remove(index);
         if self.is_empty() {
@@ -676,13 +681,9 @@ impl SessionRecord {
     }
     pub fn install(&mut self, state: SessionState) {
         if let Some(old) = self.current.replace(state) {
-            self.previous.insert(
-                0,
-                ArchivedSession {
-                    bytes: crate::engine::codec::encode_session_state(&old).into(),
-                },
-            );
-            self.previous.truncate(MAX_ARCHIVED_SESSIONS);
+            self.previous.push_latest(ArchivedSession {
+                bytes: crate::engine::codec::encode_session_state(&old).into(),
+            });
         }
         self.reservation.reset_chain();
     }
@@ -885,6 +886,27 @@ mod shared_storage_tests {
         let cloned = archive.clone();
         assert!(Arc::ptr_eq(&archive.bytes, &cloned.bytes));
         assert_eq!(archive.encoded(), cloned.encoded());
+    }
+
+    #[test]
+    fn full_archive_reuses_the_oldest_slot_without_changing_the_snapshot() {
+        let make = |tag| ArchivedSession {
+            bytes: Arc::from([8u8, tag].as_slice()),
+        };
+        let original: ArchivedSessions = (0..MAX_ARCHIVED_SESSIONS as u8)
+            .map(make)
+            .collect::<Vec<_>>()
+            .into();
+        let mut updated = original.clone();
+        updated.push_latest(make(255));
+
+        assert_eq!(updated.capacity(), MAX_ARCHIVED_SESSIONS);
+        assert_eq!(updated.first().unwrap().encoded(), &[8, 255]);
+        assert!(updated[1..] == original[..MAX_ARCHIVED_SESSIONS - 1]);
+        assert_eq!(
+            original.last().unwrap().encoded()[1] as usize,
+            MAX_ARCHIVED_SESSIONS - 1
+        );
     }
 
     #[test]
