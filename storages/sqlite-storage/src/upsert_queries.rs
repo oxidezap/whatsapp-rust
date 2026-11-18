@@ -712,6 +712,7 @@ mod tests {
                 "CREATE TABLE sessions (address TEXT, record BLOB CHECK(length(record) > 0), device_id INTEGER, PRIMARY KEY(address, device_id));
                  CREATE TABLE identities (address TEXT, key BLOB, device_id INTEGER, PRIMARY KEY(address, device_id));
                  CREATE TABLE sender_keys (address TEXT, record BLOB, device_id INTEGER, PRIMARY KEY(address, device_id));
+                 CREATE TABLE sender_key_devices (group_jid TEXT, device_jid TEXT, has_key INTEGER, device_id INTEGER, updated_at INTEGER, PRIMARY KEY(group_jid, device_jid, device_id));
                  CREATE TABLE device_registry (user_id TEXT, devices_json TEXT, timestamp INTEGER, phash TEXT, device_id INTEGER, updated_at INTEGER, raw_id INTEGER, PRIMARY KEY(user_id, device_id));"
             ).unwrap();
             let cached = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -745,6 +746,15 @@ mod tests {
                     }
                     .execute(&mut conn)
                     .unwrap();
+                    UpsertSenderKeyStatus {
+                        group_jid: "fixture@g.us",
+                        device_jid: "15550000000:1@lid",
+                        has_key: i32::from(turn % 2),
+                        device_id,
+                        updated_at: i64::from(turn),
+                    }
+                    .execute(&mut conn)
+                    .unwrap();
                     UpsertDeviceRegistry {
                         user_id: "fictional",
                         devices_json: "[]",
@@ -761,7 +771,7 @@ mod tests {
             let queries = cached.lock().unwrap().clone();
             assert_eq!(
                 queries.len(),
-                4,
+                5,
                 "exactly one cache insertion per query shape"
             );
             for table in ["sessions", "identities", "sender_keys", "device_registry"] {
@@ -773,6 +783,13 @@ mod tests {
                     1
                 );
             }
+            assert_eq!(
+                queries
+                    .iter()
+                    .filter(|sql| sql.starts_with("INSERT INTO sender_key_devices "))
+                    .count(),
+                1
+            );
 
             let failed: QueryResult<()> = conn.transaction(|conn| {
                 UpsertSession {
@@ -802,7 +819,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 cached.lock().unwrap().len(),
-                4,
+                5,
                 "failed execution must not evict/reprepare the statement"
             );
 
