@@ -1042,14 +1042,17 @@ enum State {
 
 enum OutgoingCapture {
     Messages(async_channel::Sender<Node>),
-    OfflineReplay(async_channel::Sender<Node>),
+    OfflineReplay {
+        sender: async_channel::Sender<offline_replay::CapturedNode>,
+        measure_wall: bool,
+    },
 }
 
 impl OutgoingCapture {
     fn accepts(&self, node: &Node) -> bool {
         match self {
             Self::Messages(_) => node.tag == "message",
-            Self::OfflineReplay(_) => {
+            Self::OfflineReplay { .. } => {
                 node.tag == "receipt"
                     || node.tag == "ib"
                         && node
@@ -1060,9 +1063,20 @@ impl OutgoingCapture {
         }
     }
 
-    fn sender(&self) -> &async_channel::Sender<Node> {
+    fn record(&self, node: Node) -> Result<()> {
         match self {
-            Self::Messages(sender) | Self::OfflineReplay(sender) => sender,
+            Self::Messages(sender) => sender
+                .try_send(node)
+                .context("fixture outgoing message queue"),
+            Self::OfflineReplay {
+                sender,
+                measure_wall,
+            } => sender
+                .try_send(offline_replay::CapturedNode {
+                    node,
+                    timestamp: measure_wall.then(wacore::time::Instant::now),
+                })
+                .context("fixture outgoing replay queue"),
         }
     }
 }
@@ -1274,10 +1288,7 @@ impl Transport for Wire {
             if let Some(capture) = &self.outgoing_capture
                 && capture.accepts(&node)
             {
-                capture
-                    .sender()
-                    .try_send(node)
-                    .context("fixture outgoing message queue")?;
+                capture.record(node)?;
             } else if node.tag == "iq" {
                 let nr = node.as_node_ref();
                 let active = nr.get_optional_child("active").is_some();

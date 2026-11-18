@@ -277,7 +277,9 @@ The native timing example reports the interval between the first and last
 pull requests, first and last durable publication, and arrival of the final
 receipt. Publication and receipt timestamps start at the preview. The
 request interval includes the seven production 100 ms continuations. Use the
-separate CodSpeed Simulation result for CPU work. Divide its total by eight
+separate CodSpeed Simulation result for CPU work. The replay releases the
+post-login startup tasks at the end of the backlog, so the simulation also
+includes that ready transition and its initialization work. Divide its total by eight
 for the mean work per requested page, including the partial page.
 
 ```sh

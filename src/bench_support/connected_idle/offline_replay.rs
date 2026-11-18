@@ -102,10 +102,15 @@ impl Receipts {
     }
 }
 
+pub(super) struct CapturedNode {
+    pub node: Node,
+    pub timestamp: Option<Instant>,
+}
+
 pub struct Replay {
     session: Session,
     stanzas: Vec<Node>,
-    outgoing: async_channel::Receiver<Node>,
+    outgoing: async_channel::Receiver<CapturedNode>,
     publications: Arc<Publications>,
     _publication_subscription: Subscription,
 }
@@ -120,9 +125,14 @@ pub struct WallTimings {
 impl Replay {
     pub async fn prepare(backend: Arc<dyn Backend>, measure_wall: bool) -> Result<Self> {
         let (tx, outgoing) = async_channel::bounded(REPLAY_MESSAGES + REPLAY_PAGES);
-        let session =
-            Session::connect_with_capture(backend, Some(OutgoingCapture::OfflineReplay(tx)))
-                .await?;
+        let session = Session::connect_with_capture(
+            backend,
+            Some(OutgoingCapture::OfflineReplay {
+                sender: tx,
+                measure_wall,
+            }),
+        )
+        .await?;
         let (mut stanzas, groups, _, _) = session
             .prepare_encrypted_texts(REPLAY_MESSAGES, REPLAY_TEXT_BYTES)
             .await?;
@@ -158,6 +168,7 @@ impl Replay {
         };
         let start = self.publications.measure_wall.then(Instant::now);
         let mut request_times = [None; REPLAY_PAGES];
+        let mut final_receipt = None;
         self.session
             .wire
             .reply(
@@ -171,7 +182,7 @@ impl Replay {
 
         for (page, request_time) in request_times.iter_mut().enumerate() {
             loop {
-                let node = self.next_outgoing().await?;
+                let CapturedNode { node, timestamp } = self.next_outgoing().await?;
                 if node.tag == "receipt" {
                     receipts.record(&node)?;
                     continue;
@@ -181,7 +192,7 @@ impl Replay {
                     .get_optional_child("offline_batch")
                     .context("expected offline pull")?;
                 ensure!(batch.attrs().optional_u64("count") == Some(PAGE_ITEMS as u64));
-                *request_time = start.map(|_| Instant::now());
+                *request_time = timestamp;
                 break;
             }
             let items = (REPLAY_MESSAGES - page * PAGE_ITEMS).min(PAGE_ITEMS);
@@ -201,16 +212,18 @@ impl Replay {
             .context("messages did not reach the last offline batch")?;
         self.session.finish_offline(REPLAY_MESSAGES).await?;
         while receipts.count < REPLAY_MESSAGES {
-            let node = self.next_outgoing().await?;
+            let CapturedNode { node, timestamp } = self.next_outgoing().await?;
             ensure!(
                 node.tag == "receipt",
                 "offline pull beyond the declared backlog"
             );
             receipts.record(&node)?;
+            if receipts.count == REPLAY_MESSAGES {
+                final_receipt = timestamp;
+            }
         }
-        let all_receipts = start.map(|t| t.elapsed());
         self.session.settle().await?;
-        while let Ok(node) = self.outgoing.try_recv() {
+        while let Ok(CapturedNode { node, .. }) = self.outgoing.try_recv() {
             ensure!(node.tag == "receipt", "offline pull after completion");
             receipts.record(&node)?;
         }
@@ -227,17 +240,24 @@ impl Replay {
             "unexpected commit batches: {:?}",
             state.sizes
         );
-        Ok(start.map(|start| WallTimings {
-            request_span: request_times[REPLAY_PAGES - 1]
-                .unwrap()
-                .saturating_duration_since(request_times[0].unwrap()),
-            first_publication: state.first.unwrap().saturating_duration_since(start),
-            last_publication: state.last.unwrap().saturating_duration_since(start),
-            all_receipts: all_receipts.unwrap(),
+        let Some(start) = start else {
+            return Ok(None);
+        };
+        let first_request = request_times[0].context("missing first pull timestamp")?;
+        let last_request =
+            request_times[REPLAY_PAGES - 1].context("missing last pull timestamp")?;
+        let first_publication = state.first.context("missing first publication timestamp")?;
+        let last_publication = state.last.context("missing last publication timestamp")?;
+        let all_receipts = final_receipt.context("missing final receipt timestamp")?;
+        Ok(Some(WallTimings {
+            request_span: last_request.saturating_duration_since(first_request),
+            first_publication: first_publication.saturating_duration_since(start),
+            last_publication: last_publication.saturating_duration_since(start),
+            all_receipts: all_receipts.saturating_duration_since(start),
         }))
     }
 
-    async fn next_outgoing(&self) -> Result<Node> {
+    async fn next_outgoing(&self) -> Result<CapturedNode> {
         Ok(tokio::time::timeout(DEADLINE, self.outgoing.recv()).await??)
     }
 
