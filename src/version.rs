@@ -110,7 +110,7 @@ pub async fn fetch_latest_app_version(
 
     // A body that will not decode still came from a source that answered, so
     // it is the source's shape being wrong, not the source being out of reach.
-    let body_str = response.body_string().map_err(|e| {
+    let body_str = String::from_utf8(response.body).map_err(|e| {
         anyhow::Error::new(VersionShapeError::Body {
             url: source.url,
             detail: e.to_string(),
@@ -365,6 +365,30 @@ mod tests {
             err.to_string().contains("403"),
             "the error must name the status, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_version_reports_invalid_utf8_as_a_body_error() {
+        struct InvalidUtf8HttpClient;
+
+        #[async_trait::async_trait]
+        impl HttpClient for InvalidUtf8HttpClient {
+            async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+                Ok(HttpResponse::new(
+                    200,
+                    b"client_revision:12345;\xff".to_vec(),
+                ))
+            }
+        }
+
+        let http_client: Arc<dyn HttpClient> = Arc::new(InvalidUtf8HttpClient);
+        let error = fetch_latest_app_version(&http_client)
+            .await
+            .expect_err("invalid UTF-8 must reject the version document");
+        assert!(matches!(
+            error.downcast_ref::<VersionShapeError>(),
+            Some(VersionShapeError::Body { .. })
+        ));
     }
 
     /// The header is the whole saving, so pin both halves: that the fetch

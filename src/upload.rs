@@ -93,7 +93,7 @@ fn build_resume_check_request(
 
 fn upload_error_from_response(response: HttpResponse) -> anyhow::Error {
     let status = response.status_code;
-    let context = match response.body_string() {
+    let context = match String::from_utf8(response.body) {
         Ok(body) => format!("Upload failed {status} body={body}"),
         Err(body_err) => {
             format!("Upload failed {status} and failed to read response body: {body_err}")
@@ -798,6 +798,20 @@ mod tests {
         assert!(
             format!("{err}").contains("507"),
             "the message should still name the status, got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_upload_body_preserves_http_status() {
+        use crate::error::ErrorChainExt;
+
+        let error = upload_error_from_response(HttpResponse::new(507, vec![0xff]));
+        let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+        assert_eq!(cause.http_status(), Some(507));
+        assert!(
+            error
+                .to_string()
+                .starts_with("Upload failed 507 and failed to read response body: invalid utf-8")
         );
     }
 
