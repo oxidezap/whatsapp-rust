@@ -57,6 +57,32 @@ struct BatchState {
     timer_armed: bool,
 }
 
+#[derive(Clone)]
+enum PendingDeliveries<'a> {
+    Single(&'a PendingDelivery),
+    Shared(Arc<[PendingDelivery]>),
+}
+
+impl std::ops::Deref for PendingDeliveries<'_> {
+    type Target = [PendingDelivery];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Single(item) => std::slice::from_ref(*item),
+            Self::Shared(items) => items,
+        }
+    }
+}
+
+impl PendingDeliveries<'_> {
+    fn share(&self) -> Arc<[PendingDelivery]> {
+        match self {
+            Self::Single(item) => Arc::from(std::slice::from_ref(*item)),
+            Self::Shared(items) => Arc::clone(items),
+        }
+    }
+}
+
 struct PendingInboundBatch {
     entries: Vec<PendingDelivery>,
     commit_ticket: Option<InboundCommitTicket>,
@@ -1099,8 +1125,8 @@ impl Client {
             return InboundCommitState::Failed;
         }
         if !self.inbound_commit_batch.is_active() {
-            let owned = if durable {
-                match self
+            let items = if durable {
+                let owned = match self
                     .inbound_commit_batch
                     .live_retention
                     .for_message(&item.info)
@@ -1110,12 +1136,8 @@ impl Client {
                         log::warn!("Retained projection decode failed: {error:?}");
                         return InboundCommitState::Failed;
                     }
-                }
-            } else {
-                Vec::new()
-            };
-            let items: Arc<[PendingDelivery]> =
-                match self.live_pending_retry_batch(&owned, false).await {
+                };
+                let shared = match self.live_pending_retry_batch(&owned, false).await {
                     Ok(Some(retained)) => retained.into(),
                     Ok(None) => Arc::from([item]),
                     Err(error) => {
@@ -1123,8 +1145,12 @@ impl Client {
                         return InboundCommitState::Failed;
                     }
                 };
+                PendingDeliveries::Shared(shared)
+            } else {
+                PendingDeliveries::Single(&item)
+            };
             let outcome = self
-                .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
+                .commit_pending_deliveries(items.clone(), BatchOrigin::Live, None, true)
                 .await;
             if durable && !outcome.delivered {
                 for item in items.iter() {
@@ -1734,6 +1760,22 @@ impl Client {
         commit_ticket: Option<InboundCommitTicket>,
         acknowledge: bool,
     ) -> PendingCommitOutcome {
+        self.commit_pending_deliveries(
+            PendingDeliveries::Shared(items),
+            origin,
+            commit_ticket,
+            acknowledge,
+        )
+        .await
+    }
+
+    async fn commit_pending_deliveries(
+        self: &Arc<Self>,
+        items: PendingDeliveries<'_>,
+        origin: BatchOrigin,
+        commit_ticket: Option<InboundCommitTicket>,
+        acknowledge: bool,
+    ) -> PendingCommitOutcome {
         let future =
             self.commit_pending_batch_result_inner(items, origin, commit_ticket, acknowledge);
         let mut future = std::pin::pin!(future);
@@ -1742,7 +1784,7 @@ impl Client {
 
     async fn commit_pending_batch_result_inner(
         self: &Arc<Self>,
-        items: Arc<[PendingDelivery]>,
+        items: PendingDeliveries<'_>,
         origin: BatchOrigin,
         commit_ticket: Option<InboundCommitTicket>,
         acknowledge: bool,
@@ -1758,7 +1800,7 @@ impl Client {
         // collapse has to happen here too. Every stanza that arrived is still
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
-        let arrived = Arc::clone(&items);
+        let arrived = items.clone();
         // A later part of a producer can share a completed payload fingerprint.
         // Keep its original occurrence until publication, so a failed hook
         // cannot turn its replay into cleanup of the earlier part.
@@ -1779,22 +1821,25 @@ impl Client {
         // Already delivered entries still need persistence and cleanup, but
         // must not hide an equivalent entry that the consumer has not seen.
         let items = if items.iter().any(|entry| entry.consumer_claimed) {
-            items
-                .iter()
-                .filter(|entry| !entry.consumer_claimed)
-                .cloned()
-                .collect()
+            PendingDeliveries::Shared(
+                items
+                    .iter()
+                    .filter(|entry| !entry.consumer_claimed)
+                    .cloned()
+                    .collect(),
+            )
         } else {
             items
         };
-        let items = if self.dispatch_gate_enabled() {
-            self.dedup_batch_by_message(items)
-        } else {
-            items
+        let items = match items {
+            PendingDeliveries::Shared(items) if self.dispatch_gate_enabled() => {
+                PendingDeliveries::Shared(self.dedup_batch_by_message(items))
+            }
+            items => items,
         };
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
-            items: is_drain.then(|| Arc::clone(&arrived)),
+            items: is_drain.then(|| arrived.share()),
             commit_ticket,
         };
         #[cfg(test)]
@@ -1993,7 +2038,7 @@ impl Client {
                 false,
             );
             self.inbound_commit_batch.live_retention.published(&pending);
-            if let Err(error) = self.cleanup_pending_group(rows, Arc::clone(&pending)).await {
+            if let Err(error) = self.cleanup_pending_group(rows, pending.share()).await {
                 log::warn!("Pending occurrence cleanup conflict; suppressing ACK: {error:?}");
                 return PendingCommitOutcome::BUFFERED;
             }
@@ -2001,7 +2046,7 @@ impl Client {
         // The no-hook path still schedules receipts before synchronous
         // consumer code can block or panic.
         if acknowledge {
-            match pending.as_ref() {
+            match &*pending {
                 [] => {}
                 [item] => self.acknowledge_pending_delivery(item),
                 entries => {
