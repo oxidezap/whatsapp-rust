@@ -604,17 +604,15 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
 
     pub(crate) fn run_pending_tasks(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let now = self.entry_time();
-        let expired: Vec<_> = inner
-            .iter()
-            .filter(|(_, entry)| {
-                self.ttl
-                    .is_some_and(|ttl| now.saturating_duration_since(entry.inserted_at) >= ttl)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in expired {
-            inner.remove_key(&key);
+        if let Some(cutoff) = expiry_cutoff(self.entry_time(), self.ttl) {
+            let CacheInner { table, order, .. } = &mut *inner;
+            table.retain(|slot| {
+                if slot.inserted_at > cutoff {
+                    return true;
+                }
+                order.remove(&slot.seq);
+                false
+            });
         }
         inner.shrink_if_empty();
     }
@@ -3986,6 +3984,30 @@ fn instance_clock_policy_keeps_default_config_footprint() {
 mod instance_clock_tests {
     use super::*;
     use wacore::time::{Clock, VirtualClock};
+
+    #[test]
+    fn sync_ttl_sweep_keeps_live_order_records() {
+        let clock = Arc::new(VirtualClock::new(0, Instant::ZERO).unwrap());
+        let mut cache = SyncTtlCache::new(256, Some(Duration::from_secs(5)));
+        cache.clock = Some(clock.clone());
+        for key in 0..224 {
+            cache.insert(key, key);
+        }
+        clock.advance(Duration::from_secs(4)).unwrap();
+        for key in 224..256 {
+            cache.insert(key, key);
+        }
+
+        clock.advance(Duration::from_secs(1)).unwrap();
+        cache.run_pending_tasks();
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.table.len(), 32);
+        assert_eq!(inner.order.len(), 32);
+        for key in 224..256 {
+            let slot = inner.get(&key).unwrap();
+            assert_eq!(inner.order.get(&slot.seq), Some(&slot.hash));
+        }
+    }
 
     #[tokio::test]
     async fn independent_cache_clocks_expire_only_their_own_entries() {
