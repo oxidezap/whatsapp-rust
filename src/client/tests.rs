@@ -4062,7 +4062,7 @@ async fn held_group_distribution_lane_survives_capacity_pressure() {
 
 #[tokio::test]
 async fn active_chat_lane_survives_capacity_pressure() {
-    fn test_lane() -> (ChatLane, async_channel::Receiver<Box<QueuedChatMessage>>) {
+    fn test_lane() -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
         let (queue_tx, queue_rx) = async_channel::unbounded();
         (
             ChatLane {
@@ -4072,8 +4072,6 @@ async fn active_chat_lane_survives_capacity_pressure() {
                 byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
                     crate::inbound_queue::CHAT_BYTES,
                 )),
-                global_budget: crate::inbound_queue::QueueBudgets::default().chat,
-                work: Arc::default(),
                 worker_running: Arc::new(Mutex::new(())),
             },
             queue_rx,
@@ -4102,7 +4100,9 @@ async fn active_chat_lane_survives_capacity_pressure() {
         .attr("from", first.clone())
         .attr("id", "ACTIVE-LANE-1")
         .build();
-    first_lane.try_enqueue(node_to_owned_ref(node)).unwrap();
+    first_lane
+        .try_enqueue(client.inbound_queues(), node_to_owned_ref(node))
+        .unwrap();
     drop(first_lane);
     let active_message = first_rx.recv().await.unwrap();
 
@@ -4121,7 +4121,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
         .attr("id", "ACTIVE-LANE-2")
         .build();
     first_again
-        .try_enqueue(node_to_owned_ref(next_node))
+        .try_enqueue(client.inbound_queues(), node_to_owned_ref(next_node))
         .unwrap();
     drop(first_again);
     drop(active_message);
@@ -5673,8 +5673,6 @@ async fn memory_report_sums_chat_lane_backlog() {
         byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
             crate::inbound_queue::CHAT_BYTES,
         )),
-        global_budget: Arc::clone(&client.inbound_queues().chat),
-        work: Arc::clone(&client.inbound_queues().work),
         worker_running: Arc::new(Mutex::new(())),
     };
     client.chat_lanes.insert(chat.clone(), lane.clone()).await;
@@ -5683,7 +5681,7 @@ async fn memory_report_sums_chat_lane_backlog() {
             .attr("from", chat.clone())
             .attr("id", id)
             .build();
-        lane.try_enqueue(node_to_owned_ref(node))
+        lane.try_enqueue(client.inbound_queues(), node_to_owned_ref(node))
             .expect("three messages fit the bounded lane");
     }
 
@@ -9653,7 +9651,7 @@ async fn reconnect_success_publishes_connected_while_prekey_upload_is_blocked() 
 fn detached_chat_lane(
     client: &Arc<Client>,
     items: usize,
-) -> (ChatLane, async_channel::Receiver<Box<QueuedChatMessage>>) {
+) -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
     let (queue_tx, queue_rx) = async_channel::bounded(items);
     (
         ChatLane {
@@ -9664,8 +9662,6 @@ fn detached_chat_lane(
             byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
                 crate::inbound_queue::CHAT_BYTES,
             )),
-            global_budget: Arc::clone(&client.inbound_queues().chat),
-            work: Arc::default(),
         },
         queue_rx,
     )
@@ -9920,8 +9916,11 @@ async fn offline_admissions_are_settled_by_every_way_a_queued_message_ends() {
     let node = offline_message(&chat, 4);
     let offline = client.offline_batch.admit(generation, &node);
     assert_eq!(client.offline_batch.admitted(), 3);
+    let enqueue = lane.enqueue_lock.lock().await;
     match lane
         .enqueue_scoped(
+            client.inbound_queues(),
+            &enqueue,
             node,
             client.connection_shutdown_signal(),
             &*client.runtime,
@@ -9933,6 +9932,7 @@ async fn offline_admissions_are_settled_by_every_way_a_queued_message_ends() {
         Err(async_channel::TrySendError::Closed(_)) => panic!("the queue is still open"),
         Ok(()) => panic!("a full lane must refuse the message"),
     }
+    drop(enqueue);
     assert_eq!(
         (
             client.offline_batch.admitted(),

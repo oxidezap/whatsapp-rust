@@ -1871,24 +1871,28 @@ impl InboundQueueHarness {
     /// The receiver deliberately never polls. Admission must finish without it.
     pub fn saturate(&self) -> usize {
         let budgets = crate::inbound_queue::QueueBudgets::default();
-        let (queue_tx, rx) = async_channel::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
-        let rx = crate::inbound_queue::DrainingReceiver(rx);
+        let (queue_tx, rx) =
+            crate::inbound_queue::ChatQueueSender::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
         let lane = ChatLane {
             generation: 0,
-            queue_tx: queue_tx.into(),
+            queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
                 crate::inbound_queue::CHAT_BYTES,
             )),
-            global_budget: Arc::clone(&budgets.chat),
-            work: Arc::clone(&budgets.work),
         };
+        let enqueue = lane
+            .enqueue_lock
+            .try_lock()
+            .expect("exclusive benchmark enqueue");
         let accepted = self
             .nodes
             .iter()
             .filter(|node| {
                 lane.try_enqueue_scoped(
+                    &budgets,
+                    &enqueue,
                     Arc::clone(node),
                     wacore::runtime::ShutdownSignal::never(),
                     None,
