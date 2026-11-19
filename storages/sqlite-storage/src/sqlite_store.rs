@@ -2986,20 +2986,20 @@ impl SignalStore for SqliteStore {
             return Ok(Vec::new());
         }
         let device_id = self.device_id;
-        let items = Arc::new(addresses.to_vec());
+        let items = addresses.to_vec();
         self.read_query(move |conn| {
             let mut out = Vec::with_capacity(items.len());
             for chunk in items.chunks(ID_PARAM_CHUNK) {
-                let rows: Vec<(String, Vec<u8>)> = sessions::table
+                let rows = sessions::table
                     .select((sessions::address, sessions::record))
                     .filter(sessions::address.eq_any(chunk.iter().map(|a| a.as_ref())))
                     .filter(sessions::device_id.eq(device_id))
-                    .load(conn)
+                    .load_iter::<(Arc<str>, Vec<u8>), diesel::connection::DefaultLoadingMode>(conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
-                out.extend(
-                    rows.into_iter()
-                        .map(|(address, record)| (Arc::from(address), Bytes::from(record))),
-                );
+                for row in rows {
+                    let (address, record) = row.map_err(|e| StoreError::Database(Box::new(e)))?;
+                    out.push((address, Bytes::from(record)));
+                }
             }
             Ok(out)
         })
