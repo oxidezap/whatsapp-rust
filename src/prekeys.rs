@@ -1399,45 +1399,23 @@ impl Client {
             }
         };
 
-        // Build a lookup so we preserve the server-requested order.
-        // Dedupe the expected count since the server may send duplicate IDs.
-        let loaded_map: std::collections::HashMap<u32, bytes::Bytes> = loaded.into_iter().collect();
-        let unique_requested: std::collections::HashSet<&u32> =
-            response.prekey_ids.iter().collect();
-
-        if loaded_map.len() < unique_requested.len() {
-            log::warn!(
-                "digestKey: missing {} local prekeys, skipping",
-                unique_requested.len() - loaded_map.len()
-            );
-            return Ok(());
-        }
-
-        // Extract public keys directly from stored protobuf bytes without full decode
-        let mut prekey_pubkeys = Vec::with_capacity(response.prekey_ids.len());
-        for prekey_id in &response.prekey_ids {
-            let Some(record_bytes) = loaded_map.get(prekey_id) else {
-                log::warn!("digestKey: missing local prekey {}, skipping", prekey_id);
-                return Ok(());
-            };
-            match wacore::prekeys::extract_prekey_public_key(record_bytes) {
-                Some(pk) => prekey_pubkeys.push(pk),
-                None => {
-                    log::warn!(
-                        "digestKey: prekey {} has no public key, skipping",
-                        prekey_id
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        let local_hash = wacore::prekeys::compute_key_bundle_digest(
+        let local_hash = match digest_prekey_records(
             identity_bytes,
             skey_pub_bytes,
             skey_sig_bytes,
-            &prekey_pubkeys,
-        );
+            &response.prekey_ids,
+            loaded,
+        ) {
+            Ok(hash) => hash,
+            Err(PrekeyDigestError::Missing(id)) => {
+                log::warn!("digestKey: missing local prekey {id}, skipping");
+                return Ok(());
+            }
+            Err(PrekeyDigestError::Invalid(id)) => {
+                log::warn!("digestKey: prekey {id} has no public key, skipping");
+                return Ok(());
+            }
+        };
 
         if local_hash.as_slice() != response.hash.as_slice() {
             log::warn!(
@@ -1450,6 +1428,96 @@ impl Client {
 
         log::debug!("digestKey: key bundle validation successful");
         Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrekeyDigestError {
+    Missing(u32),
+    Invalid(u32),
+}
+
+fn digest_prekey_records(
+    identity: &[u8],
+    signed: &[u8],
+    signature: &[u8],
+    requested: &[u32],
+    loaded: Vec<(u32, bytes::Bytes)>,
+) -> Result<[u8; 20], PrekeyDigestError> {
+    use wacore::prekeys::{extract_prekey_public_key, try_compute_key_bundle_digest};
+
+    if requested.len() == loaded.len()
+        && requested.windows(2).all(|pair| pair[0] < pair[1])
+        && requested
+            .iter()
+            .zip(&loaded)
+            .all(|(&id, (stored, _))| id == *stored)
+    {
+        return try_compute_key_bundle_digest(
+            identity,
+            signed,
+            signature,
+            loaded.iter().map(|(id, record)| {
+                extract_prekey_public_key(record).ok_or(PrekeyDigestError::Invalid(*id))
+            }),
+        );
+    }
+
+    let by_id: std::collections::HashMap<_, _> = loaded.into_iter().collect();
+    try_compute_key_bundle_digest(
+        identity,
+        signed,
+        signature,
+        requested.iter().map(|&id| {
+            let record = by_id.get(&id).ok_or(PrekeyDigestError::Missing(id))?;
+            extract_prekey_public_key(record).ok_or(PrekeyDigestError::Invalid(id))
+        }),
+    )
+}
+
+#[cfg(test)]
+mod digest_record_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn record(value: u8) -> Bytes {
+        Bytes::from(vec![0x12, 2, 0x05, value])
+    }
+
+    #[test]
+    fn preserves_digest_order_and_duplicate_ids() {
+        for (requested, loaded, expected) in [
+            (vec![1, 2], vec![(1, record(1)), (2, record(2))], vec![1, 2]),
+            (vec![2, 1], vec![(1, record(1)), (2, record(2))], vec![2, 1]),
+            (vec![1, 1], vec![(1, record(1)), (1, record(2))], vec![2, 2]),
+        ] {
+            let public_keys: Vec<_> = expected.into_iter().map(|value| [0x05, value]).collect();
+            let keys: Vec<_> = public_keys.iter().map(|key| key.as_slice()).collect();
+            assert_eq!(
+                digest_prekey_records(b"identity", b"signed", b"sig", &requested, loaded)
+                    .unwrap()
+                    .as_slice(),
+                wacore::prekeys::compute_key_bundle_digest(b"identity", b"signed", b"sig", &keys)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_and_malformed_records() {
+        assert_eq!(
+            digest_prekey_records(b"", b"", b"", &[1, 2], vec![(1, record(1))]),
+            Err(PrekeyDigestError::Missing(2))
+        );
+        assert_eq!(
+            digest_prekey_records(
+                b"",
+                b"",
+                b"",
+                &[1],
+                vec![(1, Bytes::from_static(&[0x12, 8]))]
+            ),
+            Err(PrekeyDigestError::Invalid(1))
+        );
     }
 }
 
