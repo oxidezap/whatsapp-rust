@@ -2032,7 +2032,7 @@ impl SignalStoreCache {
             let missing: Vec<_> = addresses
                 .iter()
                 .map(ProtocolAddress::as_str)
-                .filter(|key| state.cache.get(*key).is_none())
+                .filter(|key| state.cache.get(key).is_none())
                 .map(Arc::from)
                 .collect();
             (missing, state.cache.removal_seq())
