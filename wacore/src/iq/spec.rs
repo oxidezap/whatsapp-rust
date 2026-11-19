@@ -11,6 +11,12 @@ pub trait IqSpec {
     /// Build the IQ stanza for this spec.
     fn build_iq(&self) -> InfoQuery<'static>;
 
+    /// Extra attributes on the IQ root when using the structured encoder.
+    /// Standard envelope attributes take precedence.
+    fn additional_iq_attributes(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Optionally encode the IQ stanza directly into a pre-sized buffer,
     /// bypassing the Node intermediate representation. Returns `true` if
     /// the fast path was used; `false` falls back to `build_iq()` + marshal.

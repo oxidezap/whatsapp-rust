@@ -26,19 +26,23 @@
 //! opposite case and are handled: `variant_info.variant_properties` comes back
 //! on a plain order query, so [`OrderProduct::variant_properties`] carries it.
 
+use crate::NodeFilter;
 use crate::client::{CatalogOwnerToken, Client};
 use crate::features::mex::{MexError, mex_request};
 use crate::http::{HttpRequest, HttpStatusError};
 use crate::request::IqError;
-use crate::{NodeBuilder, NodeFilter};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use wacore::WireEnum;
-use wacore::iq::business::{BusinessProfileUpdateSpec, RemoveCoverPhotoSpec, SetCoverPhotoSpec};
+use wacore::iq::business::{
+    BusinessProfileUpdateSpec, CatalogNonceRequestSpec, CatalogNonceStatus,
+    CatalogTokenExchangeSpec, RemoveCoverPhotoSpec, SetCoverPhotoSpec,
+    parse_catalog_nonce_notification,
+};
 use wacore::iq::mex_operations::{biz_query_order, query_catalog, query_product_collections};
-use wacore_binary::{Jid, NodeContentRef, NodeRef};
+use wacore_binary::Jid;
 
 // The profile types are protocol types and live in wacore, but they are the
 // arguments, results and error of this feature's public methods, so they belong
@@ -640,17 +644,11 @@ impl<'a> Business<'a> {
                 .attr("from", "s.whatsapp.net")
                 .with_child("wa_ad_account_nonce"),
         );
-        let response = self
-            .client
-            .send_iq_node(catalog_owner_iq("118").build(), None)
-            .await?;
-        let status = response
-            .get()
-            .get_optional_child("result")
-            .and_then(|node| node.attrs().optional_string("status"));
-        match status.as_deref() {
-            Some("Success") => {}
-            Some("RecoveryRequired") => return Err(BusinessError::CatalogOwnerRecoveryRequired),
+        match self.client.execute(CatalogNonceRequestSpec).await? {
+            Some(CatalogNonceStatus::Success) => {}
+            Some(CatalogNonceStatus::RecoveryRequired) => {
+                return Err(BusinessError::CatalogOwnerRecoveryRequired);
+            }
             _ => {
                 return Err(BusinessError::CatalogOwnerAuthentication {
                     stage: "nonce request",
@@ -668,35 +666,23 @@ impl<'a> Business<'a> {
         .ok_or(BusinessError::CatalogOwnerAuthentication {
             stage: "nonce notification",
         })?;
-        let nonce = push
-            .get()
-            .get_optional_child("wa_ad_account_nonce")
-            .and_then(catalog_auth_content)
-            .ok_or(BusinessError::CatalogOwnerAuthentication {
+        let nonce = parse_catalog_nonce_notification(push.get()).ok_or(
+            BusinessError::CatalogOwnerAuthentication {
                 stage: "nonce decoding",
-            })?;
+            },
+        )?;
         if self.client.connection_generation.load(Ordering::SeqCst) != generation
             || !self.client.can_reach_server()
         {
             return Err(IqError::NotConnected.into());
         }
-        let request = catalog_owner_iq("104")
-            .children([NodeBuilder::new("parameters")
-                .children([NodeBuilder::new("code").string_content(nonce).build()])
-                .build()])
-            .build();
-        let response = self.client.send_iq_node(request, None).await?;
+        let token = self.client.execute(CatalogTokenExchangeSpec(nonce)).await?;
         if self.client.connection_generation.load(Ordering::SeqCst) != generation {
             return Err(IqError::NotConnected.into());
         }
-        response
-            .get()
-            .get_optional_child("access_token")
-            .and_then(catalog_auth_content)
-            .map(Arc::from)
-            .ok_or(BusinessError::CatalogOwnerAuthentication {
-                stage: "token decoding",
-            })
+        token.ok_or(BusinessError::CatalogOwnerAuthentication {
+            stage: "token decoding",
+        })
     }
 
     /// Look up an order's line items and totals.
@@ -752,23 +738,6 @@ impl<'a> Business<'a> {
     }
 }
 
-fn catalog_owner_iq(id: &'static str) -> NodeBuilder {
-    NodeBuilder::new("iq")
-        .attr("type", "get")
-        .attr("to", "s.whatsapp.net")
-        .attr("xmlns", "fb:thrift_iq")
-        .attr("smax_id", id)
-}
-
-fn catalog_auth_content(node: &NodeRef<'_>) -> Option<String> {
-    let value: &str = match node.content.as_ref()? {
-        NodeContentRef::String(value) => value,
-        NodeContentRef::Bytes(value) => std::str::from_utf8(value).ok()?,
-        NodeContentRef::Nodes(_) => return None,
-    };
-    (!value.trim().is_empty()).then(|| value.to_owned())
-}
-
 fn add_visitor_thumbnail_fields(variables: &mut Value) {
     variables["variant_thumbnail_width"] = Value::Null;
     variables["variant_thumbnail_height"] = Value::Null;
@@ -779,21 +748,29 @@ fn parse_catalog_http_response(
     operation: &'static str,
 ) -> Result<Value, BusinessError> {
     let payload = serde_json::from_slice::<Value>(&response.body);
-    if let Ok(ref envelope) = payload
-        && let Some(error) = envelope
+    if let Ok(ref envelope) = payload {
+        let mut errors = envelope
             .get("error")
             .filter(|value| !value.is_null())
-            .or_else(|| {
-                envelope["errors"]
-                    .as_array()
-                    .and_then(|errors| errors.first())
-            })
-    {
-        return Err(BusinessError::CatalogGraphQl {
-            code: error["code"]
-                .as_i64()
-                .or_else(|| error["extensions"]["error_code"].as_i64()),
-        });
+            .into_iter()
+            .chain(envelope["errors"].as_array().into_iter().flatten())
+            .map(|error| {
+                let direct = error["code"].as_i64();
+                let extension = error["extensions"]["error_code"].as_i64();
+                if extension == Some(190) {
+                    extension
+                } else {
+                    direct.or(extension)
+                }
+            });
+        if let Some(first_code) = errors.next() {
+            let code = if first_code == Some(190) || errors.any(|code| code == Some(190)) {
+                Some(190)
+            } else {
+                first_code
+            };
+            return Err(BusinessError::CatalogGraphQl { code });
+        }
     }
     if !(200..300).contains(&response.status_code) {
         return Err(HttpStatusError {
@@ -1285,6 +1262,33 @@ mod tests {
         let catalog =
             parse_catalog(&parse_catalog_http_response(empty, "catalog").unwrap()).unwrap();
         assert!(catalog.products.is_empty());
+    }
+
+    #[test]
+    fn catalog_http_prefers_authentication_error_even_with_partial_data() {
+        for payload in [
+            br#"{"data":{},"errors":[{"code":1},{"extensions":{"error_code":190}}]}"#.as_slice(),
+            br#"{"error":{"code":1},"errors":[{"code":190}]}"#.as_slice(),
+            br#"{"errors":[{"code":1,"extensions":{"error_code":190}}]}"#.as_slice(),
+        ] {
+            let response = crate::http::HttpResponse::new(200, payload.to_vec());
+            assert!(matches!(
+                parse_catalog_http_response(response, "catalog"),
+                Err(BusinessError::CatalogGraphQl { code: Some(190) })
+            ));
+        }
+    }
+
+    #[test]
+    fn catalog_http_rejects_partial_data_for_other_errors() {
+        let response = crate::http::HttpResponse::new(
+            200,
+            br#"{"data":{},"errors":[{"code":100},{"code":101}]}"#.to_vec(),
+        );
+        assert!(matches!(
+            parse_catalog_http_response(response, "catalog"),
+            Err(BusinessError::CatalogGraphQl { code: Some(100) })
+        ));
     }
 
     #[tokio::test]

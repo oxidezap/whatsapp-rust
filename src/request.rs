@@ -23,6 +23,18 @@ pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 pub(crate) const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
 const IQ_ID_ATTR: &str = "id";
 const IQ_TAG: &str = "iq";
+type IqAttributes = &'static [(&'static str, &'static str)];
+
+fn with_iq_attributes(mut node: Node, attributes: IqAttributes) -> Node {
+    for &(name, value) in attributes {
+        if !matches!(name, "id" | "xmlns" | "type" | "to" | "target")
+            && !node.attrs.contains_key(name)
+        {
+            node.attrs.insert(name, value);
+        }
+    }
+    node
+}
 
 /// Type-erased send future handed to [`Client::send_and_wait_iq`]. Boxing it
 /// keeps that function non-generic so it isn't re-monomorphized per `IqSpec`.
@@ -412,7 +424,7 @@ impl Client {
         &self,
         query: InfoQuery<'_>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
-        self.send_iq_inner(query, IqResponsePolicy::Raw).await
+        self.send_iq_inner(query, IqResponsePolicy::Raw, &[]).await
     }
 
     // Typed execution defers only the outcome counter until its parser finishes;
@@ -439,6 +451,7 @@ impl Client {
         &self,
         query: InfoQuery<'_>,
         policy: IqResponsePolicy,
+        attributes: IqAttributes,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.iq", module_path!());
@@ -450,7 +463,10 @@ impl Client {
             .unwrap_or_else(|| self.generate_request_id());
 
         let request_utils = self.get_request_utils();
-        let node = request_utils.build_iq_node(query, Some(req_id.clone()));
+        let node = with_iq_attributes(
+            request_utils.build_iq_node(query, Some(req_id.clone())),
+            attributes,
+        );
 
         self.send_and_wait_iq(
             req_id,
@@ -550,12 +566,16 @@ impl Client {
             Err(e) => return Err(IqError::EncodeError(e)),
         };
 
+        let attributes = spec.additional_iq_attributes();
         let request = if spec.uses_contextual_response() {
             Some(match &mut prepared {
                 PreparedIq::Query(iq) => {
                     req_id = iq.id.get_or_insert(req_id).clone();
-                    self.get_request_utils()
-                        .build_iq_node((**iq).clone(), Some(req_id.clone()))
+                    with_iq_attributes(
+                        self.get_request_utils()
+                            .build_iq_node((**iq).clone(), Some(req_id.clone())),
+                        attributes,
+                    )
                 }
                 PreparedIq::Encoded(bytes) => {
                     let node = wacore_binary::marshal::unmarshal_packed_ref(bytes)
@@ -581,7 +601,7 @@ impl Client {
             IqResponsePolicy::LegacySpec
         };
         let result = self
-            .execute_prepared(req_id, prepared, policy)
+            .execute_prepared(req_id, prepared, policy, attributes)
             .await
             .and_then(|response| {
                 let parsed = match &request {
@@ -642,6 +662,7 @@ impl Client {
             Err(e) => return Err(IqError::EncodeError(e)),
         };
 
+        let attributes = spec.additional_iq_attributes();
         let (tx, rx) = futures::channel::oneshot::channel::<Result<S::Response, IqError>>();
         let request_utils = self.get_request_utils();
         let sink: StreamSink = Box::new(move |response| {
@@ -679,9 +700,11 @@ impl Client {
                 let mut iq = *iq;
                 let timeout = iq.timeout.unwrap_or(DEFAULT_IQ_TIMEOUT);
                 iq.id = Some(req_id.clone());
-                let node = self
-                    .get_request_utils()
-                    .build_iq_node(iq, Some(req_id.clone()));
+                let node = with_iq_attributes(
+                    self.get_request_utils()
+                        .build_iq_node(iq, Some(req_id.clone())),
+                    attributes,
+                );
                 (timeout, Box::pin(async move { self.send_node(node).await }))
             }
         };
@@ -708,6 +731,7 @@ impl Client {
         req_id: String,
         prepared: PreparedIq,
         policy: IqResponsePolicy,
+        attributes: IqAttributes,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         match prepared {
             // Direct-encode fast path: skip the Node tree for hot IQ specs
@@ -730,7 +754,7 @@ impl Client {
                 if iq.id.is_none() {
                     iq.id = Some(req_id);
                 }
-                self.send_iq_inner(iq, policy).await
+                self.send_iq_inner(iq, policy, attributes).await
             }
         }
     }
@@ -921,11 +945,48 @@ fn record_iq_outcome<T>(result: &Result<T, IqError>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IQ_ID_ATTR, IQ_TAG, IqError, ResponseWaiterGuard};
+    use super::{Duration, IQ_ID_ATTR, IQ_TAG, IqError, ResponseWaiterGuard};
     use crate::client::{ResponseWaiter, ResponseWaiterMap};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn typed_catalog_iq_sends_smax_id_on_the_root() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore::iq::business::{CatalogNonceRequestSpec, CatalogNonceStatus};
+
+        let (client, transport) = create_iq_test_client().await;
+        let request = async {
+            let result = client.execute(CatalogNonceRequestSpec).await.unwrap();
+            assert!(matches!(result, Some(CatalogNonceStatus::Success)));
+        };
+        let server = async {
+            let sent = decode_sent_iq(&transport, 0).await;
+            let mut attrs = sent.attrs();
+            assert_eq!(attrs.optional_string("smax_id").as_deref(), Some("118"));
+            assert_eq!(
+                attrs.optional_string("xmlns").as_deref(),
+                Some("fb:thrift_iq")
+            );
+            assert_eq!(
+                attrs.optional_string("to").as_deref(),
+                Some("s.whatsapp.net")
+            );
+            let id = attrs.optional_string("id").unwrap();
+            let reply = NodeBuilder::new("iq")
+                .attr("id", id.as_ref())
+                .attr("type", "result")
+                .children([NodeBuilder::new("result").attr("status", "Success").build()])
+                .build();
+            answer_iq(&client, id.as_ref(), &reply).await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(request, server)
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn streaming_rejects_contextual_or_error_handling_specs_before_sending() {
