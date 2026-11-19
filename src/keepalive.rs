@@ -382,7 +382,8 @@ impl Client {
                 }
             }
         }
-        self.reconnect_immediately().await;
+        // Idle connections retain this task, and only the watchdog needs the teardown future.
+        Box::pin(self.reconnect_immediately()).await;
     }
 
     /// Sweep expired entries out of the in-process caches.
