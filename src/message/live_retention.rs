@@ -552,23 +552,18 @@ impl LiveRetention {
             .clone()
             .map(|raw| raw.plaintext.len())
             .sum::<usize>();
-        let slots = reservation.entries.len() + remaining_raw.count() + 1;
-        let mut metadata = 0usize;
+        let slots = reservation.entries.len() + remaining_raw.clone().count() + 1;
+        let mut metadata = info_bytes(&item.info);
         let mut seen: Vec<&Arc<MessageInfo>> = Vec::new();
         for info in reservation
             .entries
             .iter()
             .map(|entry| &entry.info)
-            .chain(
-                reservation
-                    .raw
-                    .iter()
-                    .filter(|raw| Some(raw.origin) != item.origin)
-                    .map(|raw| &raw.info),
-            )
-            .chain(std::iter::once(&item.info))
+            .chain(remaining_raw.map(|raw| &raw.info))
         {
-            if !seen.iter().any(|previous| Arc::ptr_eq(previous, info)) {
+            if !Arc::ptr_eq(info, &item.info)
+                && !seen.iter().any(|previous| Arc::ptr_eq(previous, info))
+            {
                 metadata = metadata
                     .checked_add(info_bytes(info))
                     .ok_or_else(|| anyhow::anyhow!("live metadata overflow"))?;
