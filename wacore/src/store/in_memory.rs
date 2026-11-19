@@ -4,7 +4,7 @@
 //! All data lives in RAM behind a single [`async_lock::Mutex`] and is lost
 //! when the struct is dropped.
 
-use hashbrown::hash_map::Entry;
+use hashbrown::hash_map::{Entry, EntryRef};
 use hashbrown::{Equivalent, HashMap as HbHashMap, HashSet as HbHashSet};
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -30,6 +30,20 @@ type SentMessageKey = (String, String);
 struct SentMessageEntry {
     payload: Vec<u8>,
     timestamp: i64,
+}
+
+type PendingInboundOwnedKey = (String, String, String);
+
+impl Hash for PendingInboundKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.chat, self.sender, self.id).hash(state);
+    }
+}
+
+impl Equivalent<PendingInboundOwnedKey> for PendingInboundKey<'_> {
+    fn equivalent(&self, key: &PendingInboundOwnedKey) -> bool {
+        self.chat == key.0 && self.sender == key.1 && self.id == key.2
+    }
 }
 
 // Only this backend can write these bytes. Conditional writes retain their
@@ -197,7 +211,7 @@ struct InMemoryState {
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
     /// Pending inbound durability buffer keyed by (chat, sender, id).
-    pending_inbound: HashMap<(String, String, String), PendingInboundEntry>,
+    pending_inbound: HbHashMap<PendingInboundOwnedKey, PendingInboundEntry, RandomState>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -1304,7 +1318,7 @@ impl ProtocolStore for InMemoryBackend {
         sender: &str,
         id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let key = (chat.to_string(), sender.to_string(), id.to_string());
+        let key = PendingInboundKey { chat, sender, id };
         Ok(self
             .state
             .lock()
@@ -1315,7 +1329,7 @@ impl ProtocolStore for InMemoryBackend {
     }
 
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
-        let key = (chat.to_string(), sender.to_string(), id.to_string());
+        let key = PendingInboundKey { chat, sender, id };
         self.state.lock().await.pending_inbound.remove(&key);
         Ok(())
     }
@@ -1326,11 +1340,6 @@ impl ProtocolStore for InMemoryBackend {
         max_bytes: usize,
         lease: PendingInboundLease,
     ) -> Result<Option<PendingInboundRecord>> {
-        let key = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
         let state = self.state.lock().await;
         state
             .pending_inbound
@@ -1360,7 +1369,10 @@ impl ProtocolStore for InMemoryBackend {
         };
         let entry = state
             .pending_inbound
-            .get(&(key.chat.to_owned(), sender.clone(), key.id.to_owned()))
+            .get(&PendingInboundKey {
+                sender: &sender,
+                ..key
+            })
             .ok_or_else(|| {
                 crate::store::error::StoreError::Validation(
                     "pending group row disappeared under owner".into(),
@@ -1381,15 +1393,11 @@ impl ProtocolStore for InMemoryBackend {
         max_bytes: usize,
     ) -> Result<PendingInboundMutation> {
         validate_pending_length(replacement.bytes().len(), max_bytes)?;
-        let key = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
         let mut state = self.state.lock().await;
-        let revision = match state.pending_inbound.get(&key) {
-            Some(entry) => entry.bounded_revision(max_bytes)?,
-            None => PendingInboundRevision::missing(),
+        let slot = state.pending_inbound.entry_ref(&key);
+        let revision = match &slot {
+            EntryRef::Occupied(entry) => entry.get().bounded_revision(max_bytes)?,
+            EntryRef::Vacant(_) => PendingInboundRevision::missing(),
         };
         let installed = replacement.revision();
         if revision == installed {
@@ -1398,14 +1406,26 @@ impl ProtocolStore for InMemoryBackend {
         if revision != expected {
             return Ok(PendingInboundMutation::Conflict);
         }
-        state.pending_inbound.insert(
-            key,
-            PendingInboundEntry {
-                bytes: replacement.bytes().to_vec(),
-                inserted_at: self.wall_time_secs(),
-                revision: Some(installed),
-            },
-        );
+        let entry = PendingInboundEntry {
+            bytes: replacement.bytes().to_vec(),
+            inserted_at: self.wall_time_secs(),
+            revision: Some(installed),
+        };
+        match slot {
+            EntryRef::Occupied(mut current) => {
+                current.insert(entry);
+            }
+            EntryRef::Vacant(vacant) => {
+                vacant.insert_with_key(
+                    (
+                        key.chat.to_owned(),
+                        key.sender.to_owned(),
+                        key.id.to_owned(),
+                    ),
+                    entry,
+                );
+            }
+        }
         #[cfg(any(test, feature = "test-util"))]
         if self
             .fail_pending_replace_after_commit
@@ -1425,15 +1445,11 @@ impl ProtocolStore for InMemoryBackend {
         max_bytes: usize,
         _lease: PendingInboundLease,
     ) -> Result<PendingInboundMutation> {
-        let key = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
         let mut state = self.state.lock().await;
-        let revision = match state.pending_inbound.get(&key) {
-            Some(entry) => entry.bounded_revision(max_bytes)?,
-            None => PendingInboundRevision::missing(),
+        let slot = state.pending_inbound.entry_ref(&key);
+        let revision = match &slot {
+            EntryRef::Occupied(entry) => entry.get().bounded_revision(max_bytes)?,
+            EntryRef::Vacant(_) => PendingInboundRevision::missing(),
         };
         if revision != expected {
             return Ok(PendingInboundMutation::Conflict);
@@ -1475,7 +1491,9 @@ impl ProtocolStore for InMemoryBackend {
                 "injected pending delete failure",
             )));
         }
-        state.pending_inbound.remove(&key);
+        if let EntryRef::Occupied(entry) = slot {
+            entry.remove();
+        }
         #[cfg(any(test, feature = "test-util"))]
         if fail == 2 {
             return Err(crate::store::error::StoreError::Io(std::io::Error::other(
@@ -1789,12 +1807,11 @@ impl DeviceStore for InMemoryBackend {
                 k.0.capacity() + k.1.capacity() + v.payload.capacity()
             }
         );
-        account!(
-            state.pending_inbound,
-            |k: &(String, String, String), v: &PendingInboundEntry| {
-                k.0.capacity() + k.1.capacity() + k.2.capacity() + v.bytes.capacity()
-            }
-        );
+        bytes += hb_table_bytes(&state.pending_inbound);
+        rows += state.pending_inbound.len() as u64;
+        for (k, v) in &state.pending_inbound {
+            bytes += k.0.capacity() + k.1.capacity() + k.2.capacity() + v.bytes.capacity();
+        }
 
         // `chat` and `sender` are deliberately one `Arc<str>` shared by every
         // row of a conversation, and `sender` often aliases `chat` outright, so
