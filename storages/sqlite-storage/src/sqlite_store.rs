@@ -3735,8 +3735,6 @@ fn insert_missing_pending_inbound_row(
 
 #[derive(QueryableByName)]
 struct BoundedPendingPayload<T = Vec<u8>> {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    storage_type: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     byte_len: Option<i64>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
@@ -3800,7 +3798,7 @@ where
     .optional()?;
     Ok(match row {
         None => Ok(None),
-        Some(row) if row.storage_type != "blob" => Err(StoreError::Validation(
+        Some(row) if row.byte_len.is_none() => Err(StoreError::Validation(
             "pending inbound payload is not a BLOB".to_owned(),
         )),
         Some(row) => match row.payload {
@@ -6354,7 +6352,6 @@ mod tests {
             }
             .get_result(&mut conn)
             .unwrap();
-            assert_eq!(row.storage_type, "blob");
             assert_eq!(row.byte_len, Some(3));
             assert_eq!(
                 row.payload.as_deref(),
@@ -6790,11 +6787,21 @@ mod tests {
                 .await
                 .is_err()
         );
-        store.with_read_retry("verify_malformed_pending_unchanged", || Box::new(|conn| {
-            let row: BoundedPendingPayload = diesel::sql_query("SELECT typeof(message) AS storage_type, NULL AS byte_len, NULL AS payload FROM pending_inbound_messages WHERE id = 'oversized'").get_result(conn)?;
-            assert_eq!(row.storage_type, "text");
-            Ok(())
-        })).await.unwrap();
+        store
+            .with_read_retry("verify_malformed_pending_unchanged", || {
+                Box::new(|conn| {
+                    let storage_type = pending_inbound_messages::table
+                        .filter(pending_inbound_messages::id.eq("oversized"))
+                        .select(diesel::dsl::sql::<diesel::sql_types::Text>(
+                            "typeof(message)",
+                        ))
+                        .get_result::<String>(conn)?;
+                    assert_eq!(storage_type, "text");
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
