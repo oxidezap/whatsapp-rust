@@ -168,18 +168,15 @@ impl OfflineBatchCoordinator {
     /// Every stanza the message handler receives is bound for a lane (messages,
     /// status broadcasts and durable group notifications alike), so the tag is
     /// not checked here; the receive path decides which stanzas come here.
-    ///
-    /// Boxed because it travels in the queued message, where a word is what
-    /// the queue's layout budget has room for.
     pub(crate) fn admit(
         &self,
         generation: u64,
         node: &wacore_binary::OwnedNodeRef,
-    ) -> Option<Box<OfflinePendingGuard>> {
+    ) -> Option<OfflinePendingGuard> {
         node.get().get_attr("offline")?;
         let pacing = self.current_pacing(generation)?;
         pacing.admit_lane_bound();
-        Some(Box::new(OfflinePendingGuard { pacing }))
+        Some(OfflinePendingGuard { pacing })
     }
 
     #[cfg(test)]

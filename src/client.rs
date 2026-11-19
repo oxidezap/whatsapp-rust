@@ -585,7 +585,7 @@ impl ChatLane {
         mut node: Arc<wacore_binary::OwnedNodeRef>,
         mut shutdown: wacore::runtime::ShutdownSignal,
         runtime: &dyn Runtime,
-        mut offline: Option<Box<offline_resume::OfflinePendingGuard>>,
+        mut offline: Option<offline_resume::OfflinePendingGuard>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         let mut turns = crate::inbound_queue::SATURATION_RETRY_TURNS;
         loop {
@@ -633,7 +633,7 @@ impl ChatLane {
         enqueue: &async_lock::MutexGuard<'_, ()>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: wacore::runtime::ShutdownSignal,
-        offline: Option<Box<offline_resume::OfflinePendingGuard>>,
+        offline: Option<offline_resume::OfflinePendingGuard>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         assert!(std::ptr::eq(
             async_lock::MutexGuard::source(enqueue),
@@ -693,9 +693,7 @@ pub(crate) struct QueuedChatMessage {
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
     pub work: Option<crate::flush_scope::FlushGuard>,
-    /// This message's claim on the offline resume's gate, boxed so a queued
-    /// item pays one word for it; see `OfflinePendingGuard`.
-    pub offline: Option<Box<offline_resume::OfflinePendingGuard>>,
+    pub offline: Option<offline_resume::OfflinePendingGuard>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
