@@ -1,4 +1,4 @@
-//! Business profile IQ specification (namespace `w:biz`).
+//! IQ specifications for business profiles and catalog authentication.
 
 use crate::WireEnum;
 use crate::iq::node::optional_attr;
@@ -657,9 +657,132 @@ impl IqSpec for RemoveCoverPhotoSpec {
     }
 }
 
+#[derive(WireEnum)]
+pub enum CatalogNonceStatus {
+    #[wire = "Success"]
+    Success,
+    #[wire = "RecoveryRequired"]
+    RecoveryRequired,
+}
+
+pub struct CatalogNonceRequestSpec;
+
+impl IqSpec for CatalogNonceRequestSpec {
+    type Response = Option<CatalogNonceStatus>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get("fb:thrift_iq", Jid::new("", Server::Pn), None)
+    }
+
+    fn additional_iq_attributes(&self) -> &'static [(&'static str, &'static str)] {
+        &[("smax_id", "118")]
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> anyhow::Result<Self::Response> {
+        Ok(response
+            .get_optional_child("result")
+            .and_then(|node| node.attrs().optional_string("status"))
+            .and_then(|status| CatalogNonceStatus::try_from(status.as_ref()).ok()))
+    }
+}
+
+pub struct CatalogTokenExchangeSpec<'a>(pub &'a str);
+
+impl IqSpec for CatalogTokenExchangeSpec<'_> {
+    type Response = Option<std::sync::Arc<str>>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let parameters = NodeBuilder::new("parameters")
+            .children([NodeBuilder::new("code").string_content(self.0).build()])
+            .build();
+        InfoQuery::get(
+            "fb:thrift_iq",
+            Jid::new("", Server::Pn),
+            Some(NodeContent::Nodes(vec![parameters])),
+        )
+    }
+
+    fn additional_iq_attributes(&self) -> &'static [(&'static str, &'static str)] {
+        &[("smax_id", "104")]
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> anyhow::Result<Self::Response> {
+        Ok(catalog_auth_content(response, "access_token").map(std::sync::Arc::from))
+    }
+}
+
+pub fn parse_catalog_nonce_notification<'a>(response: &'a NodeRef<'_>) -> Option<&'a str> {
+    catalog_auth_content(response, "wa_ad_account_nonce")
+}
+
+fn catalog_auth_content<'a>(response: &'a NodeRef<'_>, child: &str) -> Option<&'a str> {
+    let node = response.get_optional_child(child)?;
+    let value = node
+        .content_str()
+        .or_else(|| std::str::from_utf8(node.content_bytes()?).ok())?;
+    (!value.trim().is_empty()).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_auth_specs_preserve_request_and_response_contracts() {
+        let nonce = CatalogNonceRequestSpec;
+        assert_eq!(nonce.build_iq().namespace, "fb:thrift_iq");
+        assert_eq!(nonce.additional_iq_attributes(), &[("smax_id", "118")]);
+        assert!(nonce.build_iq().content.is_none());
+        for (status, expected) in [
+            ("Success", Some("Success")),
+            ("RecoveryRequired", Some("RecoveryRequired")),
+            ("unexpected", None),
+        ] {
+            let reply = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("result").attr("status", status).build()])
+                .build();
+            assert_eq!(
+                nonce
+                    .parse_response(&reply.as_node_ref())
+                    .unwrap()
+                    .map(|value| value.as_str()),
+                expected,
+            );
+        }
+
+        let exchange = CatalogTokenExchangeSpec("fixture-nonce");
+        let request = exchange.build_iq();
+        assert_eq!(request.namespace, "fb:thrift_iq");
+        assert_eq!(exchange.additional_iq_attributes(), &[("smax_id", "104")]);
+        let Some(NodeContent::Nodes(children)) = request.content else {
+            panic!("missing token exchange parameters");
+        };
+        assert_eq!(children[0].tag, "parameters");
+        assert_eq!(
+            children[0]
+                .get_optional_child("code")
+                .unwrap()
+                .content_as_string()
+                .as_deref(),
+            Some("fixture-nonce"),
+        );
+        for (bytes, expected) in [
+            (b"fixture-token".as_slice(), Some("fixture-token")),
+            (b" ".as_slice(), None),
+            (b"\xff".as_slice(), None),
+        ] {
+            let reply = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("access_token").bytes(bytes).build()])
+                .build();
+            assert_eq!(
+                exchange
+                    .parse_response(&reply.as_node_ref())
+                    .unwrap()
+                    .as_deref(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn preserves_absent_business_hour_times() {
