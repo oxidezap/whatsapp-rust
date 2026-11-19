@@ -3853,37 +3853,17 @@ impl ProtocolStore for SqliteStore {
                     return Ok(());
                 }
 
-                let values: Vec<_> = owned_entries
-                    .iter()
-                    .map(|(device_jid, has_key)| {
-                        (
-                            sender_key_devices::group_jid.eq(&group_jid),
-                            sender_key_devices::device_jid.eq(device_jid),
-                            sender_key_devices::has_key.eq(i32::from(*has_key)),
-                            sender_key_devices::device_id.eq(device_id),
-                            sender_key_devices::updated_at.eq(now),
-                        )
-                    })
-                    .collect();
-
-                const CHUNK_SIZE: usize = 190;
-
+                // Three shared binds plus two per device, within SQLite's 999-variable limit.
+                const CHUNK_SIZE: usize = (999 - 3) / 2;
                 conn.transaction(|conn| {
-                    for chunk in values.chunks(CHUNK_SIZE) {
-                        diesel::insert_into(sender_key_devices::table)
-                            .values(chunk)
-                            .on_conflict((
-                                sender_key_devices::group_jid,
-                                sender_key_devices::device_jid,
-                                sender_key_devices::device_id,
-                            ))
-                            .do_update()
-                            .set((
-                                sender_key_devices::has_key
-                                    .eq(excluded(sender_key_devices::has_key)),
-                                sender_key_devices::updated_at.eq(now),
-                            ))
-                            .execute(conn)?;
+                    for chunk in owned_entries.chunks(CHUNK_SIZE) {
+                        crate::upsert_queries::UpsertSenderKeyStatusBatch {
+                            group_jid: &group_jid,
+                            entries: chunk,
+                            device_id,
+                            updated_at: now,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -7682,6 +7662,43 @@ mod tests {
             .expect("get failed");
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0], ("user1:5@lid".to_string(), true));
+    }
+
+    #[tokio::test]
+    async fn sender_key_status_batch_keeps_scope_and_last_duplicate_across_chunks() {
+        let store = create_test_store().await;
+        let sibling = store.share_for_device(2);
+        let group = "120363000000000042@g.us";
+        let devices: Vec<_> = (0..512)
+            .map(|i| format!("155500{i:06}@s.whatsapp.net"))
+            .collect();
+        let mut entries: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, jid)| (jid.as_str(), i % 2 != 0))
+            .collect();
+        entries.push((&devices[0], true));
+
+        sibling
+            .set_sender_key_status(group, &[(&devices[0], false)])
+            .await
+            .unwrap();
+        store.set_sender_key_status(group, &entries).await.unwrap();
+
+        let loaded: std::collections::HashMap<_, _> = store
+            .get_sender_key_devices(group)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(loaded.len(), devices.len());
+        for (i, device) in devices.iter().enumerate() {
+            assert_eq!(loaded.get(device), Some(&(i == 0 || i % 2 != 0)));
+        }
+        assert_eq!(
+            sibling.get_sender_key_devices(group).await.unwrap(),
+            vec![(devices[0].clone(), false)]
+        );
     }
 
     #[tokio::test]

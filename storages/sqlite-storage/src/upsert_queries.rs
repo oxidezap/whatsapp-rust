@@ -198,6 +198,43 @@ impl QueryFragment<Sqlite> for UpsertSenderKeyStatus<'_> {
     }
 }
 
+#[derive(Debug, QueryId)]
+pub(crate) struct UpsertSenderKeyStatusBatch<'a> {
+    pub group_jid: &'a str,
+    pub entries: &'a [(String, bool)],
+    pub device_id: i32,
+    pub updated_at: i64,
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertSenderKeyStatusBatch<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertSenderKeyStatusBatch<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.unsafe_to_cache_prepared();
+        out.push_sql("INSERT INTO sender_key_devices (group_jid, device_id, updated_at, device_jid, has_key) VALUES ");
+        for (index, (device_jid, has_key)) in self.entries.iter().enumerate() {
+            if index == 0 {
+                out.push_sql("(");
+                out.push_bind_param::<Text, _>(&self.group_jid)?;
+                out.push_sql(", ");
+                out.push_bind_param::<Integer, _>(&self.device_id)?;
+                out.push_sql(", ");
+                out.push_bind_param::<BigInt, _>(&self.updated_at)?;
+                out.push_sql(", ");
+            } else {
+                // SQLite reuses the first row's group, scope and timestamp.
+                out.push_sql(", (?1, ?2, ?3, ");
+            }
+            out.push_bind_param::<Text, _>(device_jid)?;
+            out.push_sql(", ");
+            out.push_bind_param::<Bool, _>(has_key)?;
+            out.push_sql(")");
+        }
+        out.push_sql(" ON CONFLICT (group_jid, device_jid, device_id) DO UPDATE SET has_key = excluded.has_key, updated_at = excluded.updated_at");
+        Ok(())
+    }
+}
+
 /// Static query identifier for `UpsertDeviceRegistry`.
 #[derive(Debug, Clone, Copy)]
 pub struct UpsertDeviceRegistryQuery;
