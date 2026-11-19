@@ -605,6 +605,15 @@ pub trait SignalStore: Send + Sync {
     /// Load an identity key for a remote address (always 32 bytes).
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>>;
 
+    /// Load only the stored identities for the requested addresses.
+    /// Returns `None` when the backend does not provide a batch read.
+    async fn load_identities_batch(
+        &self,
+        _addresses: &[Arc<str>],
+    ) -> Result<Option<Vec<(Arc<str>, [u8; 32])>>> {
+        Ok(None)
+    }
+
     /// Delete an identity key.
     async fn delete_identity(&self, address: &str) -> Result<()>;
 
