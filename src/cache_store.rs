@@ -16,6 +16,16 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub use wacore::store::cache::CacheStore;
 
+// Share JSON decoding independently of the cache's key and borrowed-key types.
+#[inline(never)]
+fn decode_cached_value<V: DeserializeOwned>(namespace: &str, key: &str, bytes: &[u8]) -> Option<V> {
+    serde_json::from_slice(bytes)
+        .inspect_err(|e| {
+            log::warn!("TypedCache[{namespace}]: deserialise failed for {key}: {e}");
+        })
+        .ok()
+}
+
 // ── Internal storage variant ──────────────────────────────────────────────────
 
 enum Inner<K, V> {
@@ -120,13 +130,7 @@ where
             } => {
                 let key_str = key.to_string();
                 match store.get(namespace, &key_str).await {
-                    Ok(Some(bytes)) => serde_json::from_slice(&bytes)
-                        .inspect_err(|e| {
-                            log::warn!(
-                                "TypedCache[{namespace}]: deserialise failed for {key_str}: {e}"
-                            );
-                        })
-                        .ok(),
+                    Ok(Some(bytes)) => decode_cached_value(namespace, &key_str, &bytes),
                     Ok(None) => None,
                     Err(e) => {
                         log::warn!("TypedCache[{namespace}]: get({key_str}) error: {e}");
