@@ -475,10 +475,12 @@ impl LiveRetention {
         // Legacy replay has no producer origin. Reuse its existing charge
         // instead of adding another reservation on each failed alias retry.
         if let Some(reservation) = state.reservations.iter().find(|reservation| {
-            reservation
-                .entries
-                .iter()
-                .any(|entry| same_entry(entry, item))
+            item.origin
+                .is_none_or(|origin| reservation.origin == origin.stanza)
+                && reservation
+                    .entries
+                    .iter()
+                    .any(|entry| same_entry(entry, item))
         }) {
             anyhow::ensure!(
                 item.retention
