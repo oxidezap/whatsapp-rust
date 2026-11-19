@@ -794,11 +794,15 @@ fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
         }
 }
 
-#[inline(never)]
+#[inline]
 fn same_entry(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
+    Arc::ptr_eq(&first.info, &second.info) && same_entry_details(first, second)
+}
+
+#[inline(never)]
+fn same_entry_details(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
     first.origin == second.origin
         && first.storage_sender == second.storage_sender
-        && Arc::ptr_eq(&first.info, &second.info)
         && match (&first.carrier, &second.carrier) {
             (None, None) => true,
             (Some((first_index, first_bytes)), Some((second_index, second_bytes))) => {
