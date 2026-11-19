@@ -207,12 +207,10 @@ pub trait MessageExt {
             let mut image = image.clone();
             image.caption = Some(caption.to_owned());
             message.image_message = buffa::MessageField::some(image);
-        } else if let Some(video) = base.video_message.as_option() {
-            let mut video = video.clone();
+        } else {
+            let mut video = base.video_message.as_option()?.clone();
             video.caption = Some(caption.to_owned());
             message.video_message = buffa::MessageField::some(video);
-        } else {
-            return None;
         }
         Some(message)
     }
