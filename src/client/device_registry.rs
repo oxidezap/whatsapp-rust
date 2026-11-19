@@ -128,7 +128,7 @@ impl wacore::stats::HeapSize for GroupDevicesMemo {
 /// generation is unchanged (or every change since it provably missed
 /// [`members`](Self::members)).
 pub(crate) struct DmDevicesMemo {
-    pub(crate) generation: u64,
+    generation: AtomicU64,
     /// The sending identity the fan-out was built for. It decides self-DM
     /// detection, which device is excluded as the sender, and the PN->LID
     /// realignment of our own devices, so a re-pair or a first-time-known
@@ -139,7 +139,7 @@ pub(crate) struct DmDevicesMemo {
     /// BOTH namespaces (recipient, self, and every resolved device user, each
     /// with its mapped counterpart): the scoped-invalidation check tests the
     /// topology log's touched users against this set.
-    pub(crate) members: Arc<MemberIndex>,
+    pub(crate) members: MemberIndex,
     pub(crate) devices: Arc<wacore::send::ResolvedDmDevices>,
 }
 
@@ -487,8 +487,10 @@ impl Client {
             // is exactly the missed-device case this memo must never cause.
             // The store below deliberately keeps the earlier snapshot, so a
             // racing write leaves the stored entry stale by its own stamp.
+            use std::sync::atomic::Ordering;
+            let memo_generation = memo.generation.load(Ordering::Acquire);
             let observed = self.device_topology.current();
-            if memo.generation == observed {
+            if memo_generation == observed {
                 // Refcount bump: the snapshot is immutable, so a hit shares
                 // it (and its warm phash) instead of rebuilding.
                 return Ok(Arc::clone(&memo.devices));
@@ -499,20 +501,9 @@ impl Client {
             // (log overflow, member touched) falls through to the recompute.
             if self
                 .device_topology
-                .unchanged_for(memo.generation, &memo.members)
+                .unchanged_for(memo_generation, &memo.members)
             {
-                self.dm_devices_memo
-                    .insert(
-                        recipient_bare.clone(),
-                        Arc::new(DmDevicesMemo {
-                            generation: observed,
-                            own_pn: memo.own_pn.clone(),
-                            own_lid: memo.own_lid.clone(),
-                            members: Arc::clone(&memo.members),
-                            devices: Arc::clone(&memo.devices),
-                        }),
-                    )
-                    .await;
+                memo.generation.fetch_max(observed, Ordering::AcqRel);
                 return Ok(Arc::clone(&memo.devices));
             }
         }
@@ -535,10 +526,10 @@ impl Client {
                 .insert(
                     recipient_bare.clone(),
                     Arc::new(DmDevicesMemo {
-                        generation,
+                        generation: AtomicU64::new(generation),
                         own_pn: own_jid.clone(),
                         own_lid: own_lid.cloned(),
-                        members: Arc::new(members),
+                        members,
                         devices: Arc::clone(&resolved),
                     }),
                 )
@@ -4570,6 +4561,38 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "a hit shares the snapshot instead of rebuilding it"
         );
+    }
+
+    #[tokio::test]
+    async fn dm_devices_memo_restamps_in_place_after_an_unrelated_write() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+        let freshness = crate::cache::Freshness::CachePreferred;
+        let first = resolve_dm(&client, &recipient, freshness).await.unwrap();
+        let memo = client.dm_devices_memo.get(&recipient).await.unwrap();
+
+        publish_device_record(&client, "15550103177", &[0, 7]).await;
+        let reused = resolve_dm(&client, &recipient, freshness).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(Arc::ptr_eq(
+            &memo,
+            &client.dm_devices_memo.get(&recipient).await.unwrap()
+        ));
+        assert_eq!(
+            memo.generation.load(std::sync::atomic::Ordering::Acquire),
+            client.device_topology.current()
+        );
+        assert_eq!(dm_recomputes(&client), 1);
+
+        publish_device_record(&client, DM_RECIPIENT_PN, &[0, 3, 9]).await;
+        let updated = resolve_dm(&client, &recipient, freshness).await.unwrap();
+        assert_eq!(
+            device_ids_of(updated.devices(), DM_RECIPIENT_PN),
+            vec![0, 3, 9]
+        );
+        assert_eq!(dm_recomputes(&client), 2);
     }
 
     /// `Freshness::Refresh` must never be answered from the memo: it enters the
