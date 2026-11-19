@@ -53,6 +53,7 @@ struct Reservation {
     origin: StanzaOrigin,
     charge: Arc<Charge>,
     receiving: bool,
+    single_slot: bool,
     entries: Vec<RetainedDelivery>,
     raw: Vec<RawRetained>,
 }
@@ -412,6 +413,7 @@ impl LiveRetention {
             origin,
             charge,
             receiving: true,
+            single_slot: slots == 1,
             entries: Vec::new(),
             raw: Vec::new(),
         });
@@ -513,6 +515,7 @@ impl LiveRetention {
                         .map_or_else(StanzaOrigin::new, |origin| origin.stanza),
                     charge,
                     receiving: false,
+                    single_slot: false,
                     entries: Vec::new(),
                     raw: Vec::new(),
                 });
@@ -587,6 +590,9 @@ impl LiveRetention {
         reservation
             .raw
             .retain(|raw| Some(raw.origin) != item.origin);
+        if reservation.single_slot && reservation.entries.capacity() == 0 {
+            reservation.entries.reserve_exact(1);
+        }
         reservation
             .entries
             .push(RetainedDelivery::new(item, &reservation.charge));
@@ -651,6 +657,9 @@ impl LiveRetention {
         };
         if reservation.raw.iter().any(|raw| raw.origin == origin) {
             return;
+        }
+        if reservation.single_slot && reservation.raw.capacity() == 0 {
+            reservation.raw.reserve_exact(1);
         }
         reservation.raw.push(RawRetained {
             info: Arc::clone(info),
