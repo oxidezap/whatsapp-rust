@@ -1618,9 +1618,9 @@ impl SqliteStore {
         mutation: OwnedPendingMutation,
     ) -> Result<PendingInboundMutation> {
         let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
+            Arc::<str>::from(key.chat),
+            Arc::<str>::from(key.sender),
+            Arc::<str>::from(key.id),
         );
         let device_id = self.device_id;
         let timestamp = self.insertion_time();
@@ -4826,9 +4826,9 @@ impl ProtocolStore for SqliteStore {
         lease: PendingInboundLease,
     ) -> Result<Option<PendingInboundRecord>> {
         let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
+            Arc::<str>::from(key.chat),
+            Arc::<str>::from(key.sender),
+            Arc::<str>::from(key.id),
         );
         let device_id = self.device_id;
         self.with_read_retry("read_pending_inbound_bounded", || {
@@ -4861,9 +4861,9 @@ impl ProtocolStore for SqliteStore {
             ));
         }
         let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
+            Arc::<str>::from(key.chat),
+            Arc::<str>::from(key.sender),
+            Arc::<str>::from(key.id),
         );
         let device_id = self.device_id;
         self.with_read_retry("read_pending_inbound_group_bounded", || {
