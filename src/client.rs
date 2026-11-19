@@ -737,9 +737,9 @@ pub struct MemoryReport {
     /// cache it indexes, and rebuilt from warm-up each process.
     pub lid_pn_contact_hash_entries: CollectionStats,
     /// PN → LID pairs this process has durably persisted, the dedup that lets
-    /// the learn path skip a re-persist. Bytes are the table alone (both
-    /// strings are the entry's). One entry per persisted contact for the
-    /// process lifetime.
+    /// the learn path skip a re-persist. With the default cache, marker bytes
+    /// are included in the mapping entries. Other cache configurations
+    /// report the separate marker table here.
     pub lid_pn_persisted_entries: CollectionStats,
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,
