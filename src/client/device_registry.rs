@@ -685,7 +685,7 @@ impl Client {
             // Probe BOTH directions instead of trusting the jid's namespace:
             // a hosted or unmapped identity can be keyed either way, and a
             // mapping missed here is a change we could not prove unrelated.
-            if let Some(pn) = self.lid_pn_cache.get_phone_number(user).await {
+            if let Some(pn) = self.lid_pn_cache.get_phone_number_compact(user).await {
                 members.insert(pn.as_str());
             }
             if let Some(lid) = self.lid_pn_cache.get_current_lid(user).await {
@@ -714,10 +714,10 @@ impl Client {
         // Check if user is a LID (has a phone number mapping). The `user`-derived
         // key is built inline via CompactString (LID/PN are short), avoiding a
         // heap String per member on every group send.
-        if let Some(pn) = self.lid_pn_cache.get_phone_number(user).await {
+        if let Some(pn) = self.lid_pn_cache.get_phone_number_compact(user).await {
             return UserLookupKeys::LidWithPn {
                 lid: user.into(),
-                pn: pn.into(),
+                pn,
             };
         }
 
@@ -740,10 +740,10 @@ impl Client {
     /// group send). Other namespaces keep the two-probe fallback.
     async fn resolve_lookup_keys_for_jid(&self, jid: &Jid) -> UserLookupKeys {
         if jid.server == Server::Lid {
-            if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
+            if let Some(pn) = self.lid_pn_cache.get_phone_number_compact(&jid.user).await {
                 return UserLookupKeys::LidWithPn {
                     lid: jid.user.as_str().into(),
-                    pn: pn.into(),
+                    pn,
                 };
             }
             return UserLookupKeys::Unknown {
