@@ -959,14 +959,13 @@ impl Client {
                 // on the tighter 24-bit id cap.
                 const MAX_RECORD_LEN: usize = 74;
                 let mut pubkeys = Vec::with_capacity(gen_count);
-                let mut offsets = Vec::with_capacity(gen_count);
+                let mut ends = Vec::with_capacity(gen_count);
                 let mut buf = Vec::with_capacity(gen_count * MAX_RECORD_LEN);
                 const KEY_BATCH: usize = 8;
                 let mut encode = |i: usize, key_pair: KeyPair| {
                     let pre_key_id = gen_start + i as u32;
-                    let start = buf.len();
                     encode_pre_key_record_to(pre_key_id, &key_pair, &mut buf);
-                    offsets.push((pre_key_id, start..buf.len()));
+                    ends.push(buf.len());
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 };
                 let full = gen_count / KEY_BATCH * KEY_BATCH;
@@ -982,9 +981,15 @@ impl Client {
                     encode(i, KeyPair::generate(&mut rng));
                 }
                 let shared = bytes::Bytes::from(buf);
-                let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets
+                let mut start = 0;
+                let encoded_batch: Vec<(u32, bytes::Bytes)> = ends
                     .into_iter()
-                    .map(|(id, range)| (id, shared.slice(range)))
+                    .enumerate()
+                    .map(|(index, end)| {
+                        let record = shared.slice(start..end);
+                        start = end;
+                        (gen_start + index as u32, record)
+                    })
                     .collect();
                 (encoded_batch, pubkeys)
             })
@@ -1052,7 +1057,9 @@ impl Client {
             anyhow::bail!("no prekey available to upload");
         }
 
-        let pre_key_pairs = {
+        let pre_key_pairs = if leftover_rows.is_empty() {
+            fresh_pre_keys
+        } else {
             let mut pairs: Vec<(u32, PublicKey)> =
                 Vec::with_capacity(leftover_rows.len() + fresh_pre_keys.len());
             // Leftover keys live only in the store, so decode them in full — the same
@@ -1076,11 +1083,11 @@ impl Client {
             // Fresh ids exceed every leftover id and were generated in ascending
             // order, so appending keeps `pairs` sorted (last_id reads the tail).
             pairs.extend(fresh_pre_keys);
-            if pairs.is_empty() {
-                anyhow::bail!("no decodable prekey available to upload");
-            }
             pairs
         };
+        if pre_key_pairs.is_empty() {
+            anyhow::bail!("no decodable prekey available to upload");
+        }
         let last_id = pre_key_pairs
             .last()
             .map(|(id, _)| *id)
