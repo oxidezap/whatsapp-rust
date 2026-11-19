@@ -850,6 +850,15 @@ impl Fixture {
                 ) {
                     this.session = Some(SessionRecord::deserialize(&this.stored).unwrap());
                 }
+                // Building the backlog frees thousands of small chunks into
+                // glibc's fastbins, which glibc only merges
+                // (`malloc_consolidate`) on the next request too large for the
+                // small bins. Without this, that request is whichever large
+                // allocation the measured decode happens to make first, so the
+                // row swings by about 20% with unrelated heap-layout changes.
+                // 100 KiB is above the small-bin and tcache limits and below
+                // the 128 KiB mmap threshold pinned in the CodSpeed workflow.
+                drop(black_box(Vec::<u8>::with_capacity(100 * 1024)));
             }
             #[cfg(feature = "legacy-session-interop")]
             Case::ImportDefault0
