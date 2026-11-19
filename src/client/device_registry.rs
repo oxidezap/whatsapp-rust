@@ -263,18 +263,17 @@ impl Client {
                 .await?,
             )));
         }
-        // Load the generation BEFORE resolving (do NOT move this after
-        // get_user_devices): a write racing the resolve bumps it afterwards,
-        // so the memo we store is already stale by its own stamp and the next
-        // read revalidates. Loading after would stamp racing writes as seen
-        // and serve their effects stale.
+        let memo = self.group_devices_memo.get(group).await;
+        // Include updates that landed while the cache read was waiting.
+        // Sample before any registry reads so updates during a resolve leave
+        // a stale stamp on the result and force revalidation next time.
         let generation = self.device_topology.current();
 
         // Each exit records the term that decided it, on the branch that
         // decided it, rather than classifying into a value and dispatching on
         // it twice — the counter is meant to be free on the hit path, and a
         // second dispatch is not free.
-        if let Some(memo) = self.group_devices_memo.get(group).await {
+        if let Some(memo) = memo {
             use std::sync::atomic::Ordering;
             let memo_generation = memo.generation.load(Ordering::Acquire);
             if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
@@ -2257,6 +2256,56 @@ mod tests {
         client.run_cache_maintenance().await;
         assert!(client.group_devices_memo.get(&group).await.is_none());
         assert_eq!(devices.devices().len(), repeat.devices().len());
+    }
+
+    #[tokio::test]
+    async fn group_device_memo_observes_topology_write_while_lookup_waits() {
+        use wacore::client::context::GroupRoutingInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000042@g.us".parse().unwrap();
+        let own = Jid::pn("15550103021");
+        let member = Jid::pn("15550103022");
+        setup_device_record(&client, &own.user, &[0]).await;
+        setup_device_record(&client, &member.user, &[0, 3]).await;
+        let info = Arc::new(GroupRoutingInfo::new(
+            vec![own.clone(), member.clone()],
+            AddressingMode::Pn,
+        ));
+        client
+            .resolve_group_devices_memoized(&group, &info, &own)
+            .await
+            .unwrap();
+
+        let (locked, entered) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let locker = client.clone();
+        let cache_key = group.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let writer = tokio::task::spawn_blocking(move || {
+            runtime.block_on(
+                locker
+                    .group_devices_memo
+                    .upsert_with_by_ref(&cache_key, move |_| {
+                        locked.send(()).unwrap();
+                        wait.recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        (None, ())
+                    }),
+            );
+        });
+        entered.await.unwrap();
+
+        let mut resolve =
+            std::pin::pin!(client.resolve_group_devices_memoized(&group, &info, &own));
+        assert!(futures::poll!(resolve.as_mut()).is_pending());
+        publish_device_record(&client, &member.user, &[0, 7]).await;
+        release.send(()).unwrap();
+        writer.await.unwrap();
+
+        let fresh = resolve.await.unwrap();
+        assert_eq!(device_ids_of(fresh.devices(), &member.user), vec![0, 7]);
     }
 
     /// Locks the three validity gates of the group-devices memo: a repeat
