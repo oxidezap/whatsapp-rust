@@ -1,6 +1,7 @@
 //! Carrier-preserving journal used by the existing inbound batch pipeline.
 
 use bytes::Bytes;
+use smallvec::{SmallVec, smallvec};
 use wacore::types::events::InboundMessage;
 
 const MAGIC: &[u8; 6] = b"\0WRPD\x04";
@@ -113,14 +114,14 @@ pub(super) struct Occurrence {
 }
 pub(super) struct PendingJournal {
     generation: [u8; 16],
-    pub occurrences: Vec<Occurrence>,
+    pub occurrences: SmallVec<[Occurrence; 1]>,
     backing: Option<Bytes>,
 }
 impl Default for PendingJournal {
     fn default() -> Self {
         Self {
             generation: rand::random(),
-            occurrences: Vec::new(),
+            occurrences: SmallVec::new(),
             backing: None,
         }
     }
@@ -137,7 +138,7 @@ impl PendingJournal {
             let message = waproto::codec::message_decode(&bytes)?;
             return Ok(Self {
                 generation: rand::random(),
-                occurrences: vec![Occurrence {
+                occurrences: smallvec![Occurrence {
                     producer: None,
 
                     index: None,
@@ -170,7 +171,7 @@ impl PendingJournal {
                 .is_some_and(|retained| retained <= MAX_PENDING_BYTES),
             "pending journal backing and metadata exceed admission"
         );
-        let mut occurrences = Vec::with_capacity(count);
+        let mut occurrences = SmallVec::with_capacity(count);
         for _ in 0..count {
             let producer = if grouped {
                 let present = cursor.take(1)?[0];
