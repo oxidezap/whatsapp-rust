@@ -2024,19 +2024,16 @@ fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
     // Skipping a group that does not fit rather than stopping outright lets a
     // smaller one still use the remainder. Falling a row or two short of the
     // target is fine: the next insert re-enters through the length guard.
-    let mut doomed: HbHashSet<MsgGroupKey, RandomState> = HbHashSet::default();
-    for (group, rows) in bucket {
-        if remaining == 0 {
-            break;
+    bucket.retain(|_, rows| {
+        if *rows > remaining {
+            return false;
         }
-        if rows <= remaining {
-            remaining -= rows;
-            doomed.insert(group);
-        }
-    }
+        remaining -= *rows;
+        true
+    });
     map.retain(|key, (_, expires_at, _)| {
         *expires_at != cutoff
-            || !doomed.contains(&MsgGroupKeyRef {
+            || !bucket.contains_key(&MsgGroupKeyRef {
                 chat: &key.chat,
                 msg_id: &key.msg_id,
             })
