@@ -3236,6 +3236,7 @@ mod sender_key_lock_tests {
     struct BlockingSessionLookup {
         started: async_lock::Barrier,
         release: async_lock::Barrier,
+        batch_rows: Vec<(Arc<str>, Bytes)>,
     }
 
     impl BlockingSessionLookup {
@@ -3243,6 +3244,7 @@ mod sender_key_lock_tests {
             Self {
                 started: async_lock::Barrier::new(2),
                 release: async_lock::Barrier::new(2),
+                batch_rows: Vec::new(),
             }
         }
     }
@@ -3265,6 +3267,10 @@ mod sender_key_lock_tests {
             self.started.wait().await;
             self.release.wait().await;
             Ok(None)
+        }
+
+        async fn get_sessions_batch(&self, _: &[Arc<str>]) -> StoreResult<Vec<(Arc<str>, Bytes)>> {
+            Ok(self.batch_rows.clone())
         }
 
         async fn has_session(&self, _: &str) -> StoreResult<bool> {
@@ -4703,6 +4709,53 @@ mod sender_key_lock_tests {
             .await
             .expect("warm prefetch");
         assert_eq!(cache.try_has_session(&missing), Some(false));
+    }
+
+    #[tokio::test]
+    async fn prefetch_preserves_distinct_records_for_ordered_reordered_and_duplicate_rows() {
+        let first = ProtocolAddress::new("15550001000", 1.into());
+        let second = ProtocolAddress::new("15550001001", 1.into());
+        let first_record = super::lease_reload_tests::leased_session();
+        let second_record = super::lease_reload_tests::leased_session();
+        let replacement = super::lease_reload_tests::leased_session();
+        let row = |address: &ProtocolAddress, record: &SessionRecord| {
+            (
+                Arc::from(address.as_str()),
+                Bytes::from(record.serialize().unwrap()),
+            )
+        };
+        let ordered = [row(&first, &first_record), row(&second, &second_record)];
+        let first_key = first_record.alice_base_key().unwrap();
+        let second_key = second_record.alice_base_key().unwrap();
+        let replacement_key = replacement.alice_base_key().unwrap();
+        assert_ne!(first_key, second_key);
+        assert_ne!(first_key, replacement_key);
+        for (request, rows, expected_first) in [
+            ([first.clone(), second.clone()], ordered.clone(), &first_key),
+            (
+                [first.clone(), second.clone()],
+                [ordered[1].clone(), ordered[0].clone()],
+                &first_key,
+            ),
+            (
+                [first.clone(), first.clone()],
+                [ordered[0].clone(), row(&first, &replacement)],
+                &replacement_key,
+            ),
+        ] {
+            let cache = SignalStoreCache::new();
+            let mut backend = BlockingSessionLookup::new();
+            backend.batch_rows = rows.to_vec();
+            cache.prefetch_sessions(&request, &backend).await.unwrap();
+            let (actual, generation) = cache.try_checkout_session(&first).unwrap().unwrap();
+            assert_eq!(&actual.unwrap().alice_base_key().unwrap(), expected_first);
+            cache.cancel_session_checkout(&first, generation);
+            if request[1] == second {
+                let (actual, generation) = cache.try_checkout_session(&second).unwrap().unwrap();
+                assert_eq!(actual.unwrap().alice_base_key().unwrap(), second_key);
+                cache.cancel_session_checkout(&second, generation);
+            }
+        }
     }
 
     #[tokio::test]
