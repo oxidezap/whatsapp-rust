@@ -1,12 +1,11 @@
 //! WhatsApp Business catalog, collections, orders and business-profile writes.
 //!
-//! Two transports, split the way WhatsApp Web splits them:
+//! Catalog and collection lookups through this client support other businesses.
+//! WhatsApp Web uses a separate Facebook GraphQL endpoint with an ad-account
+//! token for the linked account's own catalog and collections.
 //!
-//! - **Catalog, collections and order lookup go over MEX** (persisted GraphQL).
-//!   WhatsApp Web has no IQ fallback for these — a failed
-//!   `xwa_product_catalog_get_product_catalog` raises `CatalogUnknownError`
-//!   rather than retrying over `w:biz:catalog`. The only catalog IQ left in the
-//!   bundle is `product_list` (a by-id status query) plus `signed_user_info`.
+//! - **Catalog, collections and order lookup in this crate go over MEX**
+//!   (persisted GraphQL).
 //! - **Business-profile writes stay on IQ** `w:biz`, as a `business_profile`
 //!   node with `v="3"` and `mutation_type="delta"`. Those builders live in
 //!   [`wacore::iq::business`].
@@ -75,6 +74,13 @@ const DEFAULT_COLLECTION_LIMIT: u32 = 51;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BusinessError {
+    /// The linked account's catalog and collections require the authenticated
+    /// catalog management API.
+    #[error(
+        "reading the linked account's catalog or collections requires catalog management authentication"
+    )]
+    OwnCatalogUnsupported,
+
     #[error("MEX request failed")]
     Mex(#[from] MexError),
 
@@ -445,11 +451,14 @@ impl<'a> Business<'a> {
     ///
     /// Paginate by feeding [`Catalog::after_cursor`] back through
     /// [`CatalogOptions::after`] until it comes back `None`.
+    ///
+    /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
     pub async fn get_catalog(
         &self,
         jid: &Jid,
         options: &CatalogOptions,
     ) -> Result<Catalog, BusinessError> {
+        self.require_external_catalog(jid)?;
         let response = self
             .client
             .mex()
@@ -464,11 +473,14 @@ impl<'a> Business<'a> {
     ///
     /// Paginate by feeding [`Collections::after_cursor`] back through
     /// [`CollectionOptions::after`] until it comes back `None`.
+    ///
+    /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
     pub async fn get_collections(
         &self,
         jid: &Jid,
         options: &CollectionOptions,
     ) -> Result<Collections, BusinessError> {
+        self.require_external_catalog(jid)?;
         let response = self
             .client
             .mex()
@@ -479,6 +491,15 @@ impl<'a> Business<'a> {
             .await?;
 
         parse_collections(&response_data(response.data, "collections")?)
+    }
+
+    fn require_external_catalog(&self, jid: &Jid) -> Result<(), BusinessError> {
+        // WAWebQueryCatalog and WAWebQueryProductCollections route the owner
+        // to the management API before issuing any visitor query.
+        if self.client.is_own_jid(jid) {
+            return Err(BusinessError::OwnCatalogUnsupported);
+        }
+        Ok(())
     }
 
     /// Look up an order's line items and totals.
@@ -988,6 +1009,38 @@ mod tests {
 
     fn biz_jid() -> Jid {
         "12025550111@s.whatsapp.net".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_catalog_and_collections_do_not_send_visitor_queries() {
+        use crate::store::commands::DeviceCommand;
+        use crate::test_utils::create_iq_test_client;
+
+        let (client, transport) = create_iq_test_client().await;
+        let pn = biz_jid();
+        let lid: Jid = "123456789012345@lid".parse().unwrap();
+        for command in [
+            DeviceCommand::SetId(Some(pn.clone())),
+            DeviceCommand::SetLid(Some(lid.clone())),
+        ] {
+            client.persistence_manager.process_command(command).await;
+        }
+
+        let business = client.business();
+        let sent_count = transport.sent_count();
+        for jid in [&pn, &lid] {
+            assert!(matches!(
+                business.get_catalog(jid, &CatalogOptions::default()).await,
+                Err(BusinessError::OwnCatalogUnsupported)
+            ));
+            assert!(matches!(
+                business
+                    .get_collections(jid, &CollectionOptions::default())
+                    .await,
+                Err(BusinessError::OwnCatalogUnsupported)
+            ));
+        }
+        assert_eq!(transport.sent_count(), sent_count);
     }
 
     /// Every numeric catalog variable is a *string* on the wire. Sending JSON
