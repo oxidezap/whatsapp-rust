@@ -63,9 +63,120 @@ impl PendingInboundEntry {
     }
 }
 
-/// Key for pre-keys: `id`.
-struct PreKeyEntry {
-    record: Bytes,
+#[derive(Default)]
+struct PreKeyTable {
+    run: Option<Box<PreKeyRun>>,
+    sparse: HashMap<u32, Bytes>,
+}
+
+struct PreKeyRun {
+    first: u32,
+    records: Box<[Option<Bytes>]>,
+    occupied: usize,
+}
+
+impl PreKeyRun {
+    fn index(&self, id: u32) -> Option<usize> {
+        let index = id.checked_sub(self.first)? as usize;
+        (index < self.records.len()).then_some(index)
+    }
+}
+
+impl PreKeyTable {
+    fn len(&self) -> usize {
+        self.sparse.len() + self.run.as_ref().map_or(0, |run| run.occupied)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn get(&self, id: u32) -> Option<&Bytes> {
+        if let Some(run) = &self.run
+            && let Some(index) = run.index(id)
+        {
+            return run.records[index].as_ref();
+        }
+        self.sparse.get(&id)
+    }
+
+    fn insert(&mut self, id: u32, value: Bytes) {
+        if let Some(run) = &mut self.run
+            && let Some(index) = run.index(id)
+        {
+            run.occupied += usize::from(run.records[index].replace(value).is_none());
+        } else {
+            self.sparse.insert(id, value);
+        }
+    }
+
+    fn insert_batch(&mut self, keys: &[(u32, Bytes)]) {
+        if self.is_empty()
+            && keys.len() >= 64
+            && keys
+                .windows(2)
+                .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0))
+        {
+            self.sparse = HashMap::new();
+            self.run = Some(Box::new(PreKeyRun {
+                first: keys[0].0,
+                records: keys.iter().map(|(_, bytes)| Some(bytes.clone())).collect(),
+                occupied: keys.len(),
+            }));
+            return;
+        }
+
+        // A distinct batch can overwrite at most the number of existing rows.
+        // Exclude ids covered by the dense run before reserving the sparse map.
+        if keys.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            let sparse_keys = match &self.run {
+                Some(run) => keys
+                    .iter()
+                    .filter(|(id, _)| run.index(*id).is_none())
+                    .count(),
+                None => keys.len(),
+            };
+            self.sparse
+                .reserve(sparse_keys.saturating_sub(self.sparse.len()));
+        }
+        for (id, record) in keys {
+            self.insert(*id, record.clone());
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(run) = &mut self.run
+            && let Some(index) = run.index(id)
+        {
+            run.occupied -= usize::from(run.records[index].take().is_some());
+            if run.occupied == 0 {
+                self.run = None;
+            }
+        } else {
+            self.sparse.remove(&id);
+        }
+    }
+
+    fn max_id(&self) -> u32 {
+        let dense = self.run.as_ref().and_then(|run| {
+            run.records
+                .iter()
+                .rposition(Option::is_some)
+                .map(|i| run.first + i as u32)
+        });
+        self.sparse.keys().copied().chain(dense).max().unwrap_or(0)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        table_bytes(&self.sparse)
+            + self.sparse.values().map(Bytes::len).sum::<usize>()
+            + self.run.as_ref().map_or(0, |run| {
+                size_of::<PreKeyRun>()
+                    + size_of_val(run.records.as_ref())
+                    + run.records.iter().flatten().map(Bytes::len).sum::<usize>()
+            })
+    }
 }
 
 /// Key for the mutation-MAC store: `(collection_name, index_mac)`.
@@ -184,7 +295,7 @@ struct InMemoryState {
     // --- Signal ---
     identities: HashMap<String, [u8; 32]>,
     sessions: HashMap<String, Bytes>,
-    prekeys: HashMap<u32, PreKeyEntry>,
+    prekeys: PreKeyTable,
     signed_prekeys: HashMap<u32, Vec<u8>>,
     sender_keys: HashMap<String, Vec<u8>>,
 
@@ -583,12 +694,11 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn store_prekey(&self, id: u32, record: &[u8], _uploaded: bool) -> Result<()> {
-        self.state.lock().await.prekeys.insert(
-            id,
-            PreKeyEntry {
-                record: Bytes::copy_from_slice(record),
-            },
-        );
+        self.state
+            .lock()
+            .await
+            .prekeys
+            .insert(id, Bytes::copy_from_slice(record));
         Ok(())
     }
 
@@ -600,86 +710,32 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
-        let mut state = self.state.lock().await;
-        // Growing one insert at a time allocates and copies a whole table per
-        // rehash, and a connect-sized batch arriving at an empty map crosses
-        // the load factor eight times. The batch length is known, so the table
-        // can reach its final size in one allocation instead.
-        //
-        // Two things stop that reservation from over-growing a table, because a
-        // table grown for rows that were never added does not shrink back and
-        // this is meant to cost no retained bytes:
-        //
-        // 1. Subtract the rows already stored. A batch may legally overwrite
-        //    ids, and no batch can overwrite more rows than exist, so
-        //    `keys.len() - len()` is the floor on how many ids must be new.
-        // 2. Only reserve at all when the batch is strictly ascending, which
-        //    proves its ids are distinct. Without that, 812 entries sharing one
-        //    id would reserve a 1024-bucket table to hold a single row. Testing
-        //    the order costs one pass of integer compares and no allocation;
-        //    deduplicating properly would need a set, whose own allocation and
-        //    812 hashes cost more than the eight allocations being saved.
-        //
-        // Both are one-sided: they can only under-reserve and fall back to
-        // incremental growth, never inflate the resident table. The connect path
-        // satisfies both — the map is empty and `upload_pre_keys_pass` emits
-        // `gen_start + i`, so the whole batch is reserved and gets the full win.
-        //
-        // This does NOT shrink the table that stays resident: the final
-        // capacity is the same either way, so it buys allocator traffic and
-        // in-call headroom, not retained bytes.
-        let ascending = keys.windows(2).all(|pair| pair[0].0 < pair[1].0);
-        if ascending {
-            let at_least_new = keys.len().saturating_sub(state.prekeys.len());
-            state.prekeys.reserve(at_least_new);
-        }
-        for (id, record) in keys {
-            state.prekeys.insert(
-                *id,
-                PreKeyEntry {
-                    record: record.clone(),
-                },
-            );
-        }
+        self.state.lock().await.prekeys.insert_batch(keys);
         Ok(())
     }
 
     async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .prekeys
-            .get(&id)
-            .map(|e| e.record.clone()))
+        Ok(self.state.lock().await.prekeys.get(id).cloned())
     }
 
     async fn load_prekeys_batch(&self, ids: &[u32]) -> Result<Vec<(u32, Bytes)>> {
         let state = self.state.lock().await;
         let mut result = Vec::with_capacity(ids.len());
         for &id in ids {
-            if let Some(entry) = state.prekeys.get(&id) {
-                result.push((id, entry.record.clone()));
+            if let Some(entry) = state.prekeys.get(id) {
+                result.push((id, entry.clone()));
             }
         }
         Ok(result)
     }
 
     async fn remove_prekey(&self, id: u32) -> Result<()> {
-        self.state.lock().await.prekeys.remove(&id);
+        self.state.lock().await.prekeys.remove(id);
         Ok(())
     }
 
     async fn get_max_prekey_id(&self) -> Result<u32> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .prekeys
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(0))
+        Ok(self.state.lock().await.prekeys.max_id())
     }
 
     async fn store_signed_prekey(&self, id: u32, record: &[u8]) -> Result<()> {
@@ -1751,7 +1807,8 @@ impl DeviceStore for InMemoryBackend {
             + v.len());
         // The batch encoder hands every record a slice of one shared buffer, so
         // summing the slice lengths reproduces that buffer exactly once.
-        account!(state.prekeys, |_: &u32, v: &PreKeyEntry| v.record.len());
+        bytes += state.prekeys.heap_bytes();
+        rows += state.prekeys.len() as u64;
         account!(state.signed_prekeys, |_: &u32, v: &Vec<u8>| v.capacity());
         account!(state.sender_keys, |k: &String, v: &Vec<u8>| k.capacity()
             + v.capacity());
@@ -2495,6 +2552,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dense_prekeys_handle_holes_reinsertion_and_sparse_ids() {
+        let backend = InMemoryBackend::new();
+        let first = u32::MAX - 63;
+        let batch: Vec<_> = (first..=u32::MAX)
+            .map(|id| (id, Bytes::from_static(b"original")))
+            .collect();
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+        backend.store_prekey(1, b"sparse", false).await.unwrap();
+        backend.remove_prekey(u32::MAX).await.unwrap();
+        assert_eq!(backend.get_max_prekey_id().await.unwrap(), u32::MAX - 1);
+        backend.store_prekey(u32::MAX, b"", false).await.unwrap();
+        assert_eq!(
+            backend.load_prekeys_batch(&[u32::MAX, 2, 1]).await.unwrap(),
+            [(u32::MAX, Bytes::new()), (1, Bytes::from_static(b"sparse"))]
+        );
+        for (id, _) in batch {
+            backend.remove_prekey(id).await.unwrap();
+        }
+        assert!(backend.state.lock().await.prekeys.run.is_none());
+        assert_eq!(backend.get_max_prekey_id().await.unwrap(), 1);
+    }
+
     /// Reserving for the batch length must leave the table exactly the size the
     /// row count alone demands — the point of the reserve is to reach that size
     /// in one allocation, not to reach a bigger one. The control map is grown
@@ -2512,17 +2592,17 @@ mod tests {
         for pass in 0..2u32 {
             let first = pass * COUNT + 1;
             let batch: Vec<(u32, Bytes)> = (first..first + COUNT)
-                .map(|id| (id, Bytes::from_static(b"record")))
+                .map(|id| (id * 2, Bytes::from_static(b"record")))
                 .collect();
             backend.store_prekeys_batch(&batch, false).await.unwrap();
             for id in first..first + COUNT {
-                control.insert(id, ());
+                control.insert(id * 2, ());
             }
 
             let state = backend.state.lock().await;
             assert_eq!(state.prekeys.len(), control.len());
             assert_eq!(
-                state.prekeys.capacity(),
+                state.prekeys.sparse.capacity(),
                 control.capacity(),
                 "pass {pass}: the reserved table must match an incrementally grown one"
             );
@@ -2543,7 +2623,7 @@ mod tests {
             .collect();
 
         backend.store_prekeys_batch(&batch, false).await.unwrap();
-        let settled = backend.state.lock().await.prekeys.capacity();
+        let settled = backend.state.lock().await.prekeys.sparse.capacity();
 
         // Same ids twice more: every row is an overwrite, so nothing is added.
         backend.store_prekeys_batch(&batch, true).await.unwrap();
@@ -2552,7 +2632,7 @@ mod tests {
         let state = backend.state.lock().await;
         assert_eq!(state.prekeys.len(), COUNT as usize, "no rows were added");
         assert_eq!(
-            state.prekeys.capacity(),
+            state.prekeys.sparse.capacity(),
             settled,
             "an all-overwrite batch must not enlarge the table"
         );
@@ -2580,7 +2660,7 @@ mod tests {
         let state = backend.state.lock().await;
         assert_eq!(state.prekeys.len(), 1, "last write wins per id");
         assert_eq!(
-            state.prekeys.capacity(),
+            state.prekeys.sparse.capacity(),
             control.capacity(),
             "a repeated-id batch must not size the table by its length"
         );
