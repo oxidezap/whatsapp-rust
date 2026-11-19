@@ -252,7 +252,7 @@ impl Client {
         // clients do not synchronise their pings.
         let mut interval_rng = rand::make_rng::<rand::rngs::StdRng>();
 
-        loop {
+        'keepalive: loop {
             // Fresh listener each iteration (event_listener is edge-triggered);
             // the Weak underneath stays pinned to this connection's notifier.
             let shutdown = wacore::runtime::wait_for_shutdown(&shutdown_signal);
@@ -319,8 +319,7 @@ impl Client {
                         }
                         HealthAction::Reconnect => {
                             client_log!(self, warn, target: "Client/Keepalive", "Watchdog expired after a failed keepalive attempt, forcing reconnect.");
-                            self.reconnect_immediately().await;
-                            return;
+                            break 'keepalive;
                         }
                         HealthAction::Probe => {}
                         HealthAction::Stop => return,
@@ -352,8 +351,7 @@ impl Client {
                             client_log!(self, warn, target: "Client/Keepalive", "Keepalive timeout, error count: {error_count}");
                             if keepalive_failures_are_terminal(error_count) {
                                 client_log!(self, warn, target: "Client/Keepalive", "{error_count} consecutive unanswered pings, forcing reconnect.");
-                                self.reconnect_immediately().await;
-                                return;
+                                break 'keepalive;
                             }
                         }
                     }
@@ -375,8 +373,7 @@ impl Client {
                             "No inbound data for {:.1}s after first send; pending response waiters: {pending}; watchdog expired after keepalive attempt, forcing reconnect.",
                             elapsed.as_secs_f64()
                         );
-                        self.reconnect_immediately().await;
-                        return;
+                        break 'keepalive;
                     }
                 },
                 _ = shutdown.fuse() => {
@@ -385,6 +382,7 @@ impl Client {
                 }
             }
         }
+        self.reconnect_immediately().await;
     }
 
     /// Sweep expired entries out of the in-process caches.
