@@ -443,6 +443,13 @@ impl LidPnCache {
             .map(|e| e.phone_number.to_string())
     }
 
+    pub(crate) async fn get_phone_number_compact(&self, lid: &str) -> Option<CompactString> {
+        self.lid_to_entry
+            .get(lid)
+            .await
+            .map(|entry| CompactString::from(entry.phone_number.as_ref()))
+    }
+
     /// Get the full entry for a LID.
     pub async fn get_entry_by_lid(&self, lid: &str) -> Option<LidPnEntry> {
         self.lid_to_entry.get(lid).await.map(|e| e.to_entry())
