@@ -39,15 +39,37 @@ pub fn compute_key_bundle_digest(
     signed_prekey_signature: &[u8],
     prekey_pubkeys: &[&[u8]],
 ) -> Vec<u8> {
+    let digest = try_compute_key_bundle_digest(
+        identity_pub_key,
+        signed_prekey_pub,
+        signed_prekey_signature,
+        prekey_pubkeys
+            .iter()
+            .copied()
+            .map(Ok::<_, std::convert::Infallible>),
+    );
+    match digest {
+        Ok(digest) => digest.to_vec(),
+        Err(error) => match error {},
+    }
+}
+
+/// Hash the bundle in order, stopping at the first unavailable public key.
+pub fn try_compute_key_bundle_digest<'a, E>(
+    identity_pub_key: &[u8],
+    signed_prekey_pub: &[u8],
+    signed_prekey_signature: &[u8],
+    prekey_pubkeys: impl IntoIterator<Item = Result<&'a [u8], E>>,
+) -> Result<[u8; 20], E> {
     use sha1::Digest;
     let mut hasher = sha1::Sha1::new();
     hasher.update(identity_pub_key);
     hasher.update(signed_prekey_pub);
     hasher.update(signed_prekey_signature);
     for pk in prekey_pubkeys {
-        hasher.update(pk);
+        hasher.update(pk?);
     }
-    hasher.finalize().to_vec()
+    Ok(hasher.finalize().into())
 }
 
 /// Extract the `publicKey` field (tag 2) from a protobuf-encoded
