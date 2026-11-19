@@ -476,9 +476,9 @@ impl IqSpec for PreKeyUploadSpec {
     }
 
     fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
-        // Pre-size: each prekey ~40 bytes on the wire, plus ~200 bytes for
-        // the outer IQ, registration, type, identity, and skey nodes.
-        out.reserve(self.pre_keys.len() * 40 + 256);
+        // Each key uses four short list headers, three tokens, two length
+        // headers, and 35 bytes of payload.
+        out.reserve(self.pre_keys.len() * 50 + 256);
 
         let node = PreKeyUploadIqNode {
             request_id,
