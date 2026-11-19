@@ -744,6 +744,8 @@ where
 // Keep the storage choice out of the download future. The idle sync worker
 // retains the history download future inline through process_sync_task.
 trait StoreBufferedBody<W> {
+    const ASYNC_SINK: bool = false;
+
     fn store(
         writer: &mut W,
         body: Vec<u8>,
@@ -773,6 +775,8 @@ impl<W: DownloadWriter> StoreBufferedBody<W> for WriteBufferedBody {
 struct AdoptBufferedBody;
 
 impl StoreBufferedBody<MemoryWriter> for AdoptBufferedBody {
+    const ASYNC_SINK: bool = true;
+
     fn store(
         writer: &mut MemoryWriter,
         body: Vec<u8>,
@@ -1525,6 +1529,27 @@ where
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
     StoreBody: StoreBufferedBody<W>,
 {
+    if StoreBody::ASYNC_SINK
+        && http_client.supports_async_streaming()
+        && let MediaDecryption::Encrypted {
+            media_key,
+            media_type,
+        } = &request.decryption
+        && let Some(response) =
+            http_client.execute_async_streaming(crate::http::HttpRequest::get(request.url.clone()))
+    {
+        return Ok(Box::pin(async_streamed_download(
+            http_client,
+            response,
+            media_key,
+            *media_type,
+            hashes,
+            writer,
+            finish,
+        ))
+        .await);
+    }
+
     if !http_client.supports_streaming() {
         if hashes
             .budget
@@ -1586,6 +1611,56 @@ where
         ),
     )
     .await)
+}
+
+async fn async_streamed_download<W, T>(
+    http_client: &Arc<dyn HttpClient>,
+    response: wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
+    media_key: &[u8],
+    media_type: MediaType,
+    hashes: ExpectedMediaHashes,
+    mut writer: W,
+    finish: impl FnOnce(W) -> T,
+) -> WriterAttempt<W, T>
+where
+    W: DownloadWriter,
+{
+    let result = async {
+        let budget = hashes
+            .budget
+            .clone()
+            .unwrap_or_else(|| DownloadBudget::new(DownloadLimits::unlimited()));
+        budget
+            .check_cancelled()
+            .map_err(DownloadRequestError::ResourcePolicy)?;
+        let _admission = match http_client.streaming_admission() {
+            Some(admission) => Some(admission.await.map_err(DownloadRequestError::other)?),
+            None => None,
+        };
+        clear_writer(&mut writer).map_err(DownloadRequestError::writer_io)?;
+        let response = response.await.map_err(DownloadRequestError::other)?;
+        validate_download_status(response.status_code)?;
+        let reader = budget.async_reader(response.body);
+        DownloadUtils::decrypt_async_stream_to_writer_with_hashes(
+            reader,
+            media_key,
+            media_type,
+            hashes.encrypted(),
+            hashes.plaintext(),
+            &mut budget.writer(WriterIoOrigin(&mut writer)),
+        )
+        .await
+        .map_err(DownloadRequestError::streamed)?;
+        budget
+            .check_cancelled()
+            .map_err(DownloadRequestError::ResourcePolicy)?;
+        finish_verified_write(&mut writer)
+    }
+    .await;
+    match result {
+        Ok(()) => WriterAttempt::Verified(finish(writer)),
+        Err(error) => WriterAttempt::Failed(writer, error),
+    }
 }
 
 fn streamed_download_job<W, T, Finish>(
@@ -3144,6 +3219,288 @@ mod tests {
             "invalid MAC must not invoke CBC"
         );
         assert_eq!(provider.macs.load(Ordering::Relaxed), 3);
+    }
+
+    struct AsyncBodyHttp(std::sync::Mutex<Option<wacore::net::AsyncHttpBody>>);
+
+    #[async_trait::async_trait]
+    impl HttpClient for AsyncBodyHttp {
+        async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+            panic!("unexpected buffered fallback")
+        }
+
+        fn supports_async_streaming(&self) -> bool {
+            true
+        }
+
+        fn execute_async_streaming(
+            &self,
+            _: crate::http::HttpRequest,
+        ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>>
+        {
+            Some(Box::pin(async {
+                let body = self.0.lock().unwrap().take().unwrap();
+                Ok(wacore::net::AsyncStreamingHttpResponse::new(200, body))
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn async_memory_download_distinguishes_exact_wire_limit_from_overflow() {
+        let plaintext = b"synthetic media";
+        let (params, encrypted) = encrypted_params(plaintext);
+        let request =
+            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                .unwrap()
+                .remove(0);
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        for overflow in [false, true] {
+            let mut body = encrypted.clone();
+            if overflow {
+                body.push(0);
+            }
+            let http: Arc<dyn HttpClient> = Arc::new(AsyncBodyHttp(std::sync::Mutex::new(Some(
+                Box::pin(futures::io::Cursor::new(body)),
+            ))));
+            let result = streaming_download_and_decrypt_mapped::<_, _, _, AdoptBufferedBody>(
+                &http,
+                &runtime,
+                &request,
+                ExpectedMediaHashes {
+                    budget: Some(DownloadBudget::cancellable(DownloadLimits::new(
+                        encrypted.len() as u64,
+                        plaintext.len() as u64,
+                    ))),
+                    ..ExpectedMediaHashes::from_downloadable(&params)
+                },
+                MemoryWriter::new(0, None),
+                |writer| writer.into_parts().0,
+            )
+            .await
+            .unwrap();
+            match (overflow, result) {
+                (false, WriterAttempt::Verified(data)) => assert_eq!(data, plaintext),
+                (
+                    true,
+                    WriterAttempt::Failed(
+                        _,
+                        DownloadRequestError::ResourcePolicy(DownloadPolicyError::LimitExceeded {
+                            domain: MediaByteDomain::Wire,
+                            ..
+                        }),
+                    ),
+                ) => {}
+                _ => panic!("unexpected async download outcome"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn async_memory_download_drops_waiting_body_on_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WaitingBody(Arc<AtomicBool>);
+
+        impl futures::io::AsyncRead for WaitingBody {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for WaitingBody {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let http: Arc<dyn HttpClient> = Arc::new(AsyncBodyHttp(std::sync::Mutex::new(Some(
+            Box::pin(WaitingBody(released.clone())),
+        ))));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let (params, _) = encrypted_params(b"synthetic media");
+        let request =
+            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                .unwrap()
+                .remove(0);
+        let mut attempt = Box::pin(streaming_download_and_decrypt_mapped::<
+            _,
+            _,
+            _,
+            AdoptBufferedBody,
+        >(
+            &http,
+            &runtime,
+            &request,
+            ExpectedMediaHashes::from_downloadable(&params),
+            MemoryWriter::new(0, None),
+            std::convert::identity,
+        ));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+        assert!(!released.load(Ordering::Acquire));
+        drop(attempt);
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn async_memory_download_authenticates_fragmented_loopback_body() {
+        loopback_media_download(false).await;
+    }
+
+    #[tokio::test]
+    async fn async_memory_download_closes_loopback_socket_on_cancellation() {
+        loopback_media_download(true).await;
+    }
+
+    async fn loopback_media_download(cancel: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct LoopbackHttp(std::net::SocketAddr, Arc<tokio::sync::Notify>);
+        struct LoopbackBody(tokio::net::TcpStream, Arc<tokio::sync::Notify>);
+
+        impl futures::io::AsyncRead for LoopbackBody {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                use std::task::{Poll, ready};
+                let this = self.get_mut();
+                this.1.notify_one();
+                let mut read = tokio::io::ReadBuf::new(buf);
+                ready!(tokio::io::AsyncRead::poll_read(
+                    std::pin::Pin::new(&mut this.0),
+                    cx,
+                    &mut read,
+                ))?;
+                Poll::Ready(Ok(read.filled().len()))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl HttpClient for LoopbackHttp {
+            async fn execute(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<crate::http::HttpResponse> {
+                panic!("unexpected buffered fallback")
+            }
+
+            fn supports_async_streaming(&self) -> bool {
+                true
+            }
+
+            fn execute_async_streaming(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Option<
+                wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
+            > {
+                Some(Box::pin(async {
+                    let mut stream = tokio::net::TcpStream::connect(self.0).await?;
+                    stream
+                        .write_all(b"GET /media HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await?;
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        anyhow::ensure!(header.len() < 256, "unexpected fixture response");
+                        header.push(stream.read_u8().await?);
+                    }
+                    anyhow::ensure!(
+                        header.starts_with(b"HTTP/1.1 200 OK\r\n"),
+                        "expected HTTP 200"
+                    );
+                    Ok(wacore::net::AsyncStreamingHttpResponse::new(
+                        200,
+                        Box::pin(LoopbackBody(stream, self.1.clone())),
+                    ))
+                }))
+            }
+        }
+
+        let plaintext = vec![0x42; 20_000];
+        let (params, ciphertext) = encrypted_params(&plaintext);
+        let wire_len = ciphertext.len() as u64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 256);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {wire_len}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            if cancel {
+                let mut byte = [0; 1];
+                let n =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut byte))
+                        .await
+                        .expect("client closed its waiting socket")
+                        .unwrap();
+                assert_eq!(n, 0);
+                return;
+            }
+            for chunk in ciphertext.chunks(127) {
+                stream.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let request =
+            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                .unwrap()
+                .remove(0);
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let reading = Arc::new(tokio::sync::Notify::new());
+        let http: Arc<dyn HttpClient> = Arc::new(LoopbackHttp(address, reading.clone()));
+        let mut attempt = Box::pin(streaming_download_and_decrypt_mapped::<
+            _,
+            _,
+            _,
+            AdoptBufferedBody,
+        >(
+            &http,
+            &runtime,
+            &request,
+            ExpectedMediaHashes {
+                budget: Some(DownloadBudget::cancellable(DownloadLimits::new(
+                    wire_len,
+                    plaintext.len() as u64,
+                ))),
+                ..ExpectedMediaHashes::from_downloadable(&params)
+            },
+            MemoryWriter::new(0, None),
+            |writer| writer.into_parts().0,
+        ));
+        let timeout = std::time::Duration::from_secs(5);
+        if cancel {
+            tokio::time::timeout(timeout, async {
+                tokio::select! {
+                    _ = attempt.as_mut() => panic!("response should still be waiting for data"),
+                    _ = reading.notified() => {}
+                }
+            })
+            .await
+            .unwrap();
+            drop(attempt);
+        } else {
+            let result = tokio::time::timeout(timeout, attempt)
+                .await
+                .unwrap()
+                .unwrap();
+            let WriterAttempt::Verified(actual) = result else {
+                panic!("expected verified media");
+            };
+            assert_eq!(actual, plaintext);
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

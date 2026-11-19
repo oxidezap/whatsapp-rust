@@ -389,15 +389,34 @@ pub struct StreamingHttpResponse {
     pub body: Box<dyn std::io::Read + Send>,
 }
 
-/// An adapter-owned lease held through a streaming request's blocking I/O.
-/// Acquisition happens before a blocking worker is occupied; dropping this
-/// value releases the adapter's resource reservation.
+/// An adapter-owned lease held while a streaming response is active.
+/// Callers acquire it before starting the request, including before
+/// dispatching any blocking worker.
 pub type StreamingRequestPermit = Box<dyn crate::sync_marker::MaybeSend>;
 
 impl StreamingHttpResponse {
     /// Return a response's status and body reader, including for 4xx/5xx.
     /// Errors encountered while reading the body remain reader errors.
     pub fn new(status_code: u16, body: Box<dyn std::io::Read + Send>) -> Self {
+        Self { status_code, body }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub type AsyncHttpBody = std::pin::Pin<Box<dyn futures::io::AsyncRead + Send>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type AsyncHttpBody = std::pin::Pin<Box<dyn futures::io::AsyncRead>>;
+
+/// HTTP status and a pull-based asynchronous response body.
+#[non_exhaustive]
+pub struct AsyncStreamingHttpResponse {
+    pub status_code: u16,
+    pub body: AsyncHttpBody,
+}
+
+impl AsyncStreamingHttpResponse {
+    pub fn new(status_code: u16, body: AsyncHttpBody) -> Self {
         Self { status_code, body }
     }
 }
@@ -456,8 +475,8 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
 
     /// Optional asynchronous resource admission before streaming I/O.
     /// The default returns no future and allocates nothing. Download callers
-    /// await this before entering a blocking worker, then keep the permit until
-    /// the response body and connection are released, including cancellation.
+    /// await this before starting the request and retain the permit until the
+    /// response body is released, including on cancellation.
     fn streaming_admission(
         &self,
     ) -> Option<crate::runtime::BoxFuture<'_, Result<StreamingRequestPermit>>> {
@@ -470,6 +489,21 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
         Err(anyhow::anyhow!(
             "Streaming not supported by this HTTP client"
         ))
+    }
+
+    /// Whether this client provides a pull-based asynchronous response body.
+    fn supports_async_streaming(&self) -> bool {
+        false
+    }
+
+    /// Start a streaming download without occupying a blocking worker.
+    /// Return `None` to retain the synchronous or buffered path. Implementations
+    /// must surface redirects and release the response when its body is dropped.
+    fn execute_async_streaming(
+        &self,
+        _request: HttpRequest,
+    ) -> Option<crate::runtime::BoxFuture<'_, Result<AsyncStreamingHttpResponse>>> {
+        None
     }
 
     /// Whether this client can stream a request body from a reader (upload).

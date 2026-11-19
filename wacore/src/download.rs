@@ -643,6 +643,136 @@ fn same_media_host(left: &str, right: &str) -> bool {
     matches!((parse(left), parse(right)), (Some(left), Some(right)) if left == right)
 }
 
+struct MediaDecryptStream {
+    encrypted_hasher: Option<Sha256>,
+    plaintext_hasher: Option<Sha256>,
+    hmac: Hmac<Sha256>,
+    cbc: cbc::Decryptor<aes::Aes256>,
+    bytes_written: u64,
+    buf: [u8; STREAM_CHUNK_SIZE],
+    filled: usize,
+}
+
+impl MediaDecryptStream {
+    fn new(
+        media_key: &[u8],
+        app_info: MediaType,
+        check_encrypted: bool,
+        check_plaintext: bool,
+    ) -> Result<Self> {
+        use aes::cipher::{KeyInit, KeyIvInit};
+        use sha2::Digest;
+
+        let (iv, cipher_key, mac_key) = DownloadUtils::get_media_keys(media_key, app_info)?;
+        let mut hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key)
+            .map_err(|_| anyhow!("Failed to init HMAC"))?;
+        hmac.update(&iv);
+        Ok(Self {
+            encrypted_hasher: check_encrypted.then(Sha256::new),
+            plaintext_hasher: check_plaintext.then(Sha256::new),
+            hmac,
+            cbc: cbc::Decryptor::new(&cipher_key.into(), &iv.into()),
+            bytes_written: 0,
+            buf: [0; STREAM_CHUNK_SIZE],
+            filled: 0,
+        })
+    }
+
+    fn input(&mut self) -> &mut [u8] {
+        &mut self.buf[self.filled..]
+    }
+
+    fn advance(&mut self, count: usize, writer: &mut impl std::io::Write) -> Result<()> {
+        use sha2::Digest;
+        if let Some(hasher) = &mut self.encrypted_hasher {
+            hasher.update(&self.buf[self.filled..self.filled + count]);
+        }
+        self.filled += count;
+        // The carry may contain the terminal MAC. Process only complete
+        // SHA-256 blocks, which also contain complete AES blocks.
+        let available = self.filled.saturating_sub(WITHHELD);
+        let processable = available - available % SHA256_BLOCK_SIZE;
+        if processable == 0 {
+            return Ok(());
+        }
+        let blocks = &mut self.buf[..processable];
+        self.hmac.update(blocks);
+        cbc_decrypt_blocks(&mut self.cbc, blocks);
+        if let Some(hasher) = &mut self.plaintext_hasher {
+            hasher.update(&*blocks);
+        }
+        writer.write_all(blocks)?;
+        self.bytes_written += processable as u64;
+        self.buf.copy_within(processable..self.filled, 0);
+        self.filled -= processable;
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+        writer: &mut impl std::io::Write,
+    ) -> Result<u64> {
+        use sha2::Digest;
+        let Self {
+            encrypted_hasher,
+            mut plaintext_hasher,
+            mut hmac,
+            mut cbc,
+            mut bytes_written,
+            mut buf,
+            filled,
+        } = self;
+        let tail = &mut buf[..filled];
+        if tail.len() < WITHHELD || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE) {
+            return Err(anyhow!("Invalid final media size"));
+        }
+        let mac_index = tail.len() - MEDIA_MAC_SIZE;
+        let (final_ciphertext, mac_bytes) = tail.split_at_mut(mac_index);
+        hmac.update(final_ciphertext);
+        let expected_mac_full = hmac.finalize().into_bytes();
+        let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
+        if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
+            return Err(MediaDecryptionError::InvalidMac.into());
+        }
+        if let Some((hasher, expected)) = encrypted_hasher.zip(expected_enc_sha256)
+            && hasher.finalize().as_slice() != expected
+        {
+            return Err(MediaDecryptionError::EncryptedSha256Mismatch.into());
+        }
+
+        cbc_decrypt_blocks(&mut cbc, final_ciphertext);
+        let pad_len = match final_ciphertext.last() {
+            Some(&v) => v as usize,
+            None => return Err(anyhow!("Empty plaintext after decrypt")),
+        };
+        if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_ciphertext.len() {
+            return Err(anyhow!("Invalid PKCS7 padding"));
+        }
+        if !final_ciphertext[final_ciphertext.len() - pad_len..]
+            .iter()
+            .all(|&b| b as usize == pad_len)
+        {
+            return Err(anyhow!("Bad PKCS7 padding bytes"));
+        }
+        let final_plain = &final_ciphertext[..final_ciphertext.len() - pad_len];
+        if let Some(hasher) = &mut plaintext_hasher {
+            hasher.update(final_plain);
+        }
+        writer.write_all(final_plain)?;
+        bytes_written += final_plain.len() as u64;
+
+        if let Some((hasher, expected)) = plaintext_hasher.zip(expected_sha256)
+            && hasher.finalize().as_slice() != expected
+        {
+            return Err(MediaDecryptionError::PlaintextSha256Mismatch.into());
+        }
+
+        Ok(bytes_written)
+    }
+}
+
 impl DownloadUtils {
     /// Checks transport metadata before acquiring a CDN route or sending HTTP.
     /// Optional hashes remain optional; present hashes must be SHA-256 digests.
@@ -928,118 +1058,50 @@ impl DownloadUtils {
         expected_sha256: Option<&[u8]>,
         writer: &mut W,
     ) -> Result<u64> {
-        use aes::Aes256;
-        use aes::cipher::{KeyInit, KeyIvInit};
-        use sha2::Digest;
-
-        let mut encrypted_hasher = expected_enc_sha256.map(|_| Sha256::new());
-        let mut plaintext_hasher = expected_sha256.map(|_| Sha256::new());
-
-        let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
-
-        let mut hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key)
-            .map_err(|_| anyhow!("Failed to init HMAC"))?;
-        hmac.update(&iv);
-
-        // Holds the AES key schedule and the CBC chaining block across refills.
-        let mut cbc = cbc::Decryptor::<Aes256>::new(&cipher_key.into(), &iv.into());
-
-        let mut bytes_written: u64 = 0;
-
-        // Single buffer: refilled from `reader` after the retained bytes, then
-        // decrypted in place so the whole batch reaches `writer` in one call.
-        // It replaces the separate read buffer and `tail`/`final_plain` vectors,
-        // and is kept to exactly `STREAM_CHUNK_SIZE` rather than that plus the
-        // carry, so the stack this holds on an embedded target is no more than
-        // the read buffer alone used to be. A refill after a carry just reads
-        // that much less; the carry is at most 89 bytes, so a whole number of
-        // blocks is always processable and the loop always advances.
-        let mut buf = [0u8; STREAM_CHUNK_SIZE];
-        let mut filled = 0usize;
-
+        let mut stream = MediaDecryptStream::new(
+            media_key,
+            app_info,
+            expected_enc_sha256.is_some(),
+            expected_sha256.is_some(),
+        )?;
         loop {
-            let n = reader.read(&mut buf[filled..])?;
+            let n = reader.read(stream.input())?;
             if n == 0 {
-                break;
+                return stream.finish(expected_enc_sha256, expected_sha256, writer);
             }
-            if let Some(hasher) = &mut encrypted_hasher {
-                // Only new bytes: the carry was hashed before it was moved.
-                hasher.update(&buf[filled..filled + n]);
+            stream.advance(n, writer)?;
+        }
+    }
+
+    /// Authenticate and decrypt media from an asynchronous reader into a
+    /// synchronous sink. Use a nonblocking sink such as an in-memory buffer.
+    /// Discard the sink's contents on any error or cancellation.
+    pub async fn decrypt_async_stream_to_writer_with_hashes<R, W>(
+        mut reader: R,
+        media_key: &[u8],
+        app_info: MediaType,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+        writer: &mut W,
+    ) -> Result<u64>
+    where
+        R: futures::io::AsyncRead + Unpin,
+        W: std::io::Write,
+    {
+        use futures::io::AsyncReadExt;
+        let mut stream = MediaDecryptStream::new(
+            media_key,
+            app_info,
+            expected_enc_sha256.is_some(),
+            expected_sha256.is_some(),
+        )?;
+        loop {
+            let n = reader.read(stream.input()).await?;
+            if n == 0 {
+                return stream.finish(expected_enc_sha256, expected_sha256, writer);
             }
-            filled += n;
-
-            // The trailing `WITHHELD` bytes can't be processed yet: until EOF we
-            // don't know whether they are ciphertext or the final MAC.
-            if filled <= WITHHELD {
-                continue;
-            }
-            // SHA-256 blocks also contain whole AES blocks. Keeping both hash
-            // streams block-aligned avoids buffering partial blocks on every refill.
-            let processable = (filled - WITHHELD) - ((filled - WITHHELD) % SHA256_BLOCK_SIZE);
-            if processable == 0 {
-                continue;
-            }
-
-            // MAC covers ciphertext, so hash before decrypting over it in place.
-            hmac.update(&buf[..processable]);
-            cbc_decrypt_blocks(&mut cbc, &mut buf[..processable]);
-            if let Some(hasher) = &mut plaintext_hasher {
-                hasher.update(&buf[..processable]);
-            }
-            writer.write_all(&buf[..processable])?;
-            bytes_written += processable as u64;
-
-            // Only the bounded carry moves, rather than the whole buffer.
-            buf.copy_within(processable..filled, 0);
-            filled -= processable;
+            stream.advance(n, writer)?;
         }
-
-        let tail = &mut buf[..filled];
-        if tail.len() < WITHHELD || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE) {
-            return Err(anyhow!("Invalid final media size"));
-        }
-        let mac_index = tail.len() - MEDIA_MAC_SIZE;
-        let (final_ciphertext, mac_bytes) = tail.split_at_mut(mac_index);
-        hmac.update(final_ciphertext);
-        let expected_mac_full = hmac.finalize().into_bytes();
-        let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
-        if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
-            return Err(MediaDecryptionError::InvalidMac.into());
-        }
-        if let Some((hasher, expected)) = encrypted_hasher.zip(expected_enc_sha256)
-            && hasher.finalize().as_slice() != expected
-        {
-            return Err(MediaDecryptionError::EncryptedSha256Mismatch.into());
-        }
-
-        cbc_decrypt_blocks(&mut cbc, final_ciphertext);
-        let pad_len = match final_ciphertext.last() {
-            Some(&v) => v as usize,
-            None => return Err(anyhow!("Empty plaintext after decrypt")),
-        };
-        if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_ciphertext.len() {
-            return Err(anyhow!("Invalid PKCS7 padding"));
-        }
-        if !final_ciphertext[final_ciphertext.len() - pad_len..]
-            .iter()
-            .all(|&b| b as usize == pad_len)
-        {
-            return Err(anyhow!("Bad PKCS7 padding bytes"));
-        }
-        let final_plain = &final_ciphertext[..final_ciphertext.len() - pad_len];
-        if let Some(hasher) = &mut plaintext_hasher {
-            hasher.update(final_plain);
-        }
-        writer.write_all(final_plain)?;
-        bytes_written += final_plain.len() as u64;
-
-        if let Some((hasher, expected)) = plaintext_hasher.zip(expected_sha256)
-            && hasher.finalize().as_slice() != expected
-        {
-            return Err(MediaDecryptionError::PlaintextSha256Mismatch.into());
-        }
-
-        Ok(bytes_written)
     }
 
     /// Decrypt a media stream, returning the plaintext as a `Vec<u8>`.
@@ -1895,6 +1957,31 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn async_streaming_decrypt_checks_complete_authenticated_input() {
+        let plaintext = vec![0x59; 20_000];
+        let encrypted = crate::upload::encrypt_media(&plaintext, MediaType::Image).unwrap();
+        let decode = |ciphertext: &[u8]| {
+            let mut output = Vec::new();
+            let result = futures::executor::block_on(
+                DownloadUtils::decrypt_async_stream_to_writer_with_hashes(
+                    futures::io::Cursor::new(ciphertext),
+                    &encrypted.media_key,
+                    MediaType::Image,
+                    Some(&encrypted.file_enc_sha256),
+                    Some(&encrypted.file_sha256),
+                    &mut output,
+                ),
+            );
+            (result, output)
+        };
+        let (result, output) = decode(&encrypted.data_to_upload);
+        assert_eq!(result.unwrap(), plaintext.len() as u64);
+        assert_eq!(output, plaintext);
+        let (result, _) = decode(&encrypted.data_to_upload[..encrypted.data_to_upload.len() - 1]);
+        assert!(result.is_err());
     }
 
     #[test]
