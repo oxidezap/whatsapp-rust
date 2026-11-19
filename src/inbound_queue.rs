@@ -9,16 +9,26 @@
 //! Saturation freezes chat admission and drains accepted work with the reader
 //! still serving IQs, then recycles the connection. Drain deadlines are finite;
 //! permanently stalled processing cannot be promised progress or delivery.
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type BudgetRegistry = std::sync::Mutex<
-    std::collections::HashMap<wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>>,
->;
+type BudgetRegistry = std::sync::Mutex<BudgetEntries>;
+
+#[derive(Default)]
+struct BudgetEntries {
+    hasher: RandomState,
+    table: hashbrown::HashTable<BudgetEntry>,
+}
+
+struct BudgetEntry {
+    chat: wacore_binary::jid::Jid,
+    budget: std::sync::Weak<ByteBudget>,
+}
 
 struct BudgetRegistration {
     registry: std::sync::Weak<BudgetRegistry>,
-    chat: wacore_binary::jid::Jid,
+    hash: u64,
 }
 
 /// A non-waiting byte counter. One lease is the only way to return a charge.
@@ -50,11 +60,11 @@ impl Drop for ByteBudget {
         let mut entries = registry.lock().unwrap_or_else(|p| p.into_inner());
         // A failed Weak::upgrade can install a replacement while this destructor
         // waits for the lock. Never remove that new budget's registration.
-        if entries
-            .get(&registration.chat)
-            .is_some_and(|entry| entry.as_ptr() == address)
+        if let Ok(entry) = entries
+            .table
+            .find_entry(registration.hash, |entry| entry.budget.as_ptr() == address)
         {
-            entries.remove(&registration.chat);
+            entry.remove();
         }
     }
 }
@@ -320,14 +330,14 @@ impl QueueBudgets {
         use wacore::stats::HeapSize;
         let entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
         let registry_bytes = wacore::stats::hash_table_bytes(
-            entries.capacity(),
-            size_of::<(wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>)>(),
+            entries.table.capacity(),
+            size_of::<BudgetEntry>(),
         ) + entries
-            .keys()
-            .map(|chat| {
-                // The map and live budget each own the chat key. Include the budget
-                // allocation and Arc header without upgrading/dropping under this lock.
-                2 * chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
+            .table
+            .iter()
+            .map(|entry| {
+                // Count the budget allocation without upgrading its weak reference.
+                entry.chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
             })
             .sum::<usize>()
             + size_of::<BudgetRegistry>()
@@ -344,7 +354,7 @@ impl QueueBudgets {
                         .map_or(0, |registry| registry.retained_bytes())
             });
         (
-            wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
+            wacore::stats::CollectionStats::new(entries.table.len() as u64, registry_bytes as u64),
             GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,
             ACK_BYTES.saturating_sub(self.ack.available()) as u64,
         )
@@ -360,7 +370,10 @@ impl QueueBudgets {
         bytes: usize,
     ) -> Arc<ByteBudget> {
         let mut entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(budget) = entries.get(chat).and_then(std::sync::Weak::upgrade) {
+        let BudgetEntries { hasher, table } = &mut *entries;
+        let hash = hasher.hash_one(chat);
+        let slot = table.find_mut(hash, |entry| &entry.chat == chat);
+        if let Some(budget) = slot.as_ref().and_then(|entry| entry.budget.upgrade()) {
             return budget;
         }
         // Only live lanes/byte leases own a strong reference. Their final drop
@@ -369,10 +382,22 @@ impl QueueBudgets {
             available: AtomicUsize::new(bytes),
             registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&self.per_chat),
-                chat: chat.clone(),
+                hash,
             }),
         });
-        entries.insert(chat.clone(), Arc::downgrade(&budget));
+        let weak = Arc::downgrade(&budget);
+        if let Some(slot) = slot {
+            slot.budget = weak;
+        } else {
+            table.insert_unique(
+                hash,
+                BudgetEntry {
+                    chat: chat.clone(),
+                    budget: weak,
+                },
+                |entry| hasher.hash_one(&entry.chat),
+            );
+        }
         budget
     }
 }
@@ -767,13 +792,13 @@ mod tests {
         let retained = retain_node(&node(1, 4), &budgets.chat, &budget, Arc::default()).unwrap();
         drop(budget);
         drop(same);
-        assert_eq!(budgets.per_chat.lock().unwrap().len(), 1);
+        assert_eq!(budgets.per_chat.lock().unwrap().table.len(), 1);
         drop(retained);
-        assert!(budgets.per_chat.lock().unwrap().is_empty());
+        assert!(budgets.per_chat.lock().unwrap().table.is_empty());
         for id in 0..128 {
             let chat = format!("12036300000{id:04}@g.us").parse().unwrap();
             drop(budgets.chat_budget(&chat));
-            assert!(budgets.per_chat.lock().unwrap().is_empty());
+            assert!(budgets.per_chat.lock().unwrap().table.is_empty());
         }
     }
 
@@ -789,21 +814,26 @@ mod tests {
         while weak.strong_count() != 0 {
             std::thread::yield_now();
         }
+        let hash = entries.hasher.hash_one(&chat);
         let replacement = Arc::new(ByteBudget {
             available: AtomicUsize::new(CHAT_BYTES),
             registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&registry),
-                chat: chat.clone(),
+                hash,
             }),
         });
-        entries.insert(chat.clone(), Arc::downgrade(&replacement));
+        entries
+            .table
+            .find_mut(hash, |entry| entry.chat == chat)
+            .unwrap()
+            .budget = Arc::downgrade(&replacement);
         drop(entries);
         dropping.join().unwrap();
         let found = budgets.chat_budget(&chat);
         assert!(Arc::ptr_eq(&found, &replacement));
         drop(found);
         drop(replacement);
-        assert!(registry.lock().unwrap().is_empty());
+        assert!(registry.lock().unwrap().table.is_empty());
     }
 
     #[test]
