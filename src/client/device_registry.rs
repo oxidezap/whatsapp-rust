@@ -111,7 +111,7 @@ pub(crate) struct GroupDevicesMemo {
     /// Member identifiers in BOTH namespaces (participant users, their mapped
     /// counterparts, resolved device users): the scoped-invalidation check
     /// tests the topology log's touched users against this set.
-    pub(crate) members: Arc<MemberIndex>,
+    pub(crate) members: MemberIndex,
     pub(crate) devices: Arc<wacore::send::ResolvedGroupDevices>,
 }
 
@@ -350,7 +350,7 @@ impl Client {
                 Arc::new(GroupDevicesMemo {
                     group_info: Arc::downgrade(group_info),
                     generation: AtomicU64::new(generation),
-                    members: Arc::new(members),
+                    members,
                     devices: Arc::clone(&devices),
                 }),
             )
@@ -4944,7 +4944,7 @@ mod tests {
         GroupDevicesMemo {
             group_info: Arc::downgrade(&group_info),
             generation: AtomicU64::new(0),
-            members: Arc::new(member_index.build()),
+            members: member_index.build(),
             devices: Arc::new(wacore::send::ResolvedGroupDevices::new(devices)),
         }
         // `group_info` drops here on purpose: the memo retains only the
