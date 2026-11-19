@@ -199,7 +199,7 @@ fn offline_replay(bencher: divan::Bencher, sqlite: bool) {
         }
     }
 
-    let runtime = runtime();
+    let runtime = paused_runtime();
     bencher
         .with_inputs(|| {
             runtime.block_on(async {
