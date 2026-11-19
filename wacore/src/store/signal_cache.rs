@@ -2019,6 +2019,44 @@ impl SignalStoreCache {
         self.save_identity_locked(&mut state, address, identity)
     }
 
+    pub async fn prefetch_identities(
+        &self,
+        addresses: &[ProtocolAddress],
+        backend: &dyn SignalStore,
+    ) -> Result<()> {
+        if addresses.len() < 2 {
+            return Ok(());
+        }
+        let (missing, since) = {
+            let state = self.identities.lock().await;
+            let missing: Vec<_> = addresses
+                .iter()
+                .map(ProtocolAddress::as_str)
+                .filter(|key| state.cache.get(*key).is_none())
+                .map(Arc::from)
+                .collect();
+            (missing, state.cache.removal_seq())
+        };
+        if missing.len() < 2 {
+            return Ok(());
+        }
+        let Some(loaded) = backend.load_identities_batch(&missing).await? else {
+            return Ok(());
+        };
+        let mut found: HashMap<_, _> = loaded.into_iter().collect();
+        // A replacement can be flushed and evicted before the read returns.
+        let mut state = self.identities.lock().await;
+        for key in missing {
+            if state.cache.get(key.as_ref()).is_some() || state.cache.removed_since(&key, since) {
+                continue;
+            }
+            let value = found.remove(key.as_ref()).map(Arc::from);
+            state.cache.insert(key, value);
+        }
+        state.evict_if_needed(self.max_entries);
+        Ok(())
+    }
+
     pub async fn get_identity(
         &self,
         address: &ProtocolAddress,
@@ -3237,6 +3275,7 @@ mod sender_key_lock_tests {
         started: async_lock::Barrier,
         release: async_lock::Barrier,
         batch_rows: Vec<(Arc<str>, Bytes)>,
+        identity_rows: Vec<(Arc<str>, [u8; 32])>,
     }
 
     impl BlockingSessionLookup {
@@ -3245,6 +3284,7 @@ mod sender_key_lock_tests {
                 started: async_lock::Barrier::new(2),
                 release: async_lock::Barrier::new(2),
                 batch_rows: Vec::new(),
+                identity_rows: Vec::new(),
             }
         }
     }
@@ -3257,6 +3297,15 @@ mod sender_key_lock_tests {
 
         async fn load_identity(&self, _: &str) -> StoreResult<Option<[u8; 32]>> {
             unreachable!()
+        }
+
+        async fn load_identities_batch(
+            &self,
+            _: &[Arc<str>],
+        ) -> StoreResult<Option<Vec<(Arc<str>, [u8; 32])>>> {
+            self.started.wait().await;
+            self.release.wait().await;
+            Ok(Some(self.identity_rows.clone()))
         }
 
         async fn delete_identity(&self, _: &str) -> StoreResult<()> {
@@ -4756,6 +4805,34 @@ mod sender_key_lock_tests {
                 cache.cancel_session_checkout(&second, generation);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn identity_prefetch_leaves_concurrent_replacements_and_evictions_intact() {
+        let cache = SignalStoreCache::new();
+        let first = ProtocolAddress::new("15550001000", 1.into());
+        let second = ProtocolAddress::new("15550001001", 1.into());
+        let missing = ProtocolAddress::new("15550001002", 1.into());
+        let addresses = [first.clone(), second.clone(), missing.clone()];
+        let mut backend = BlockingSessionLookup::new();
+        backend.identity_rows = vec![
+            (Arc::from(first.as_str()), [1; 32]),
+            (Arc::from(second.as_str()), [2; 32]),
+        ];
+        let (result, ()) = tokio::join!(cache.prefetch_identities(&addresses, &backend), async {
+            backend.started.wait().await;
+            assert!(cache.try_put_identity(&first, &[3; 32]));
+            assert!(cache.try_put_identity(&second, &[4; 32]));
+            cache.drop_clean_identity_for_test(second.as_str()).await;
+            backend.release.wait().await;
+        });
+        result.unwrap();
+        assert_eq!(
+            cache.try_get_identity(&first).flatten().as_deref(),
+            Some([3; 32].as_slice())
+        );
+        assert_eq!(cache.try_get_identity(&second), None);
+        assert_eq!(cache.try_get_identity(&missing), Some(None));
     }
 
     #[tokio::test]

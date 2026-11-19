@@ -2934,6 +2934,44 @@ impl SignalStore for SqliteStore {
         }
     }
 
+    async fn load_identities_batch(
+        &self,
+        addresses: &[Arc<str>],
+    ) -> Result<Option<Vec<(Arc<str>, [u8; 32])>>> {
+        if addresses.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let device_id = self.device_id;
+        let addresses = addresses.to_vec();
+        self.read_query(move |conn| {
+            let mut out = Vec::with_capacity(addresses.len());
+            for chunk in addresses.chunks(ID_PARAM_CHUNK) {
+                let rows = identities::table
+                    .select((identities::address, identities::key))
+                    .filter(
+                        identities::address.eq_any(chunk.iter().map(|address| address.as_ref())),
+                    )
+                    .filter(identities::device_id.eq(device_id))
+                    .load_iter::<(Arc<str>, Vec<u8>), diesel::connection::DefaultLoadingMode>(conn)
+                    .map_err(|error| StoreError::Database(Box::new(error)))?;
+                for row in rows {
+                    let (address, key) =
+                        row.map_err(|error| StoreError::Database(Box::new(error)))?;
+                    let key = key.try_into().map_err(|key: Vec<u8>| {
+                        StoreError::Validation(format!(
+                            "identity key for '{}' has invalid length {} (expected 32)",
+                            address,
+                            key.len()
+                        ))
+                    })?;
+                    out.push((address, key));
+                }
+            }
+            Ok(Some(out))
+        })
+        .await
+    }
+
     async fn delete_identity(&self, address: &str) -> Result<()> {
         self.delete_identity_for_device(address, self.device_id)
             .await
@@ -7331,6 +7369,45 @@ mod tests {
         store.put_sessions_batch(&[]).await.unwrap();
         store.put_identities_batch(&[]).await.unwrap();
         store.put_sender_keys_batch(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_batch_reads_only_scoped_hits_and_rejects_invalid_lengths() {
+        let store = create_test_store().await;
+        let sibling = store.share_for_device(2);
+        let hits: Arc<str> = Arc::from("15550001000.1");
+        let missing: Arc<str> = Arc::from("15550001001.1");
+        let invalid: Arc<str> = Arc::from("15550001002.1");
+        store.put_identity(&hits, [1; 32]).await.unwrap();
+        sibling.put_identity(&hits, [2; 32]).await.unwrap();
+        sibling.put_identity(&missing, [3; 32]).await.unwrap();
+        assert_eq!(
+            store
+                .load_identities_batch(&[missing, hits.clone()])
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![(hits.clone(), [1; 32])],
+        );
+        let key = invalid.clone();
+        let device_id = store.device_id;
+        store
+            .write_blocking(move |conn| {
+                crate::upsert_queries::UpsertIdentity {
+                    address: &key,
+                    key: &[1; 4],
+                    device_id,
+                }
+                .execute(conn)
+                .map_err(|error| StoreError::Database(Box::new(error)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_identities_batch(&[hits, invalid]).await,
+            Err(StoreError::Validation(_))
+        ));
     }
 
     /// The batch read is one query for the whole fan-out: hits come back keyed

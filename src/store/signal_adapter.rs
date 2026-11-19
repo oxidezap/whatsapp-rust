@@ -230,6 +230,11 @@ impl SessionStore for SessionAdapter {
             .cache
             .prefetch_sessions(addresses, &*device.backend)
             .await
+            .map_err(signal_err("backend"))?;
+        self.0
+            .cache
+            .prefetch_identities(addresses, &*device.backend)
+            .await
             .map_err(signal_err("backend"))
     }
 
