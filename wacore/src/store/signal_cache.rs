@@ -4715,9 +4715,9 @@ mod sender_key_lock_tests {
     async fn prefetch_preserves_distinct_records_for_ordered_reordered_and_duplicate_rows() {
         let first = ProtocolAddress::new("15550001000", 1.into());
         let second = ProtocolAddress::new("15550001001", 1.into());
-        let first_record = super::lease_reload_tests::leased_session();
-        let second_record = super::lease_reload_tests::leased_session();
-        let replacement = super::lease_reload_tests::leased_session();
+        let first_record = lease_reload_tests::leased_session();
+        let second_record = lease_reload_tests::leased_session();
+        let replacement = lease_reload_tests::leased_session();
         let row = |address: &ProtocolAddress, record: &SessionRecord| {
             (
                 Arc::from(address.as_str()),
