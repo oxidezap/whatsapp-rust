@@ -4,8 +4,8 @@
 //! WhatsApp Web uses a separate Facebook GraphQL endpoint with an ad-account
 //! token for the linked account's own catalog and collections.
 //!
-//! - **Catalog, collections and order lookup in this crate go over MEX**
-//!   (persisted GraphQL).
+//! Visitor catalog and collection reads use the WhatsApp HTTP GraphQL endpoint.
+//! Order lookup uses MEX.
 //! - **Business-profile writes stay on IQ** `w:biz`, as a `business_profile`
 //!   node with `v="3"` and `mutation_type="delta"`. Those builders live in
 //!   [`wacore::iq::business`].
@@ -35,6 +35,7 @@
 
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
+use crate::http::{HttpRequest, HttpStatusError};
 use crate::request::IqError;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -80,6 +81,18 @@ pub enum BusinessError {
         "reading the linked account's catalog or collections requires catalog management authentication"
     )]
     OwnCatalogUnsupported,
+
+    #[error("visitor catalog reads require a WhatsApp catalog application token")]
+    CatalogVisitorTokenRequired,
+
+    #[error("catalog HTTP transport failed")]
+    CatalogTransport,
+
+    #[error("catalog HTTP request failed")]
+    CatalogHttp(#[from] HttpStatusError),
+
+    #[error("catalog GraphQL request was rejected (code: {code:?})")]
+    CatalogGraphQl { code: Option<i64> },
 
     #[error("MEX request failed")]
     Mex(#[from] MexError),
@@ -433,6 +446,7 @@ impl Default for CollectionOptions {
 /// Feature handle for business catalog and profile operations.
 pub struct Business<'a> {
     client: &'a Client,
+    catalog_visitor_token: Option<&'a str>,
 }
 
 impl Client {
@@ -444,7 +458,16 @@ impl Client {
 
 impl<'a> Business<'a> {
     pub(crate) fn new(client: &'a Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            catalog_visitor_token: None,
+        }
+    }
+
+    /// Use a WhatsApp catalog application token for visitor catalog and collection reads.
+    pub fn with_catalog_visitor_token(mut self, token: &'a str) -> Self {
+        self.catalog_visitor_token = Some(token);
+        self
     }
 
     /// Fetch one page of a business's product catalog.
@@ -453,19 +476,19 @@ impl<'a> Business<'a> {
     /// [`CatalogOptions::after`] until it comes back `None`.
     ///
     /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
+    /// Visitor reads require [`Business::with_catalog_visitor_token`].
     pub async fn get_catalog(
         &self,
         jid: &Jid,
         options: &CatalogOptions,
     ) -> Result<Catalog, BusinessError> {
         self.require_external_catalog(jid)?;
-        let response = self
-            .client
-            .mex()
-            .execute(mex_request!(query_catalog, catalog_variables(jid, options)))
+        let mut variables = catalog_variables(&jid.to_non_ad(), options);
+        add_visitor_thumbnail_fields(&mut variables["request"]["product_catalog"]);
+        let data = self
+            .execute_visitor_catalog(query_catalog::DOC_ID, variables, "catalog")
             .await?;
-
-        parse_catalog(&response_data(response.data, "catalog")?)
+        parse_catalog(&data)
     }
 
     /// Fetch one page of a business's product collections, each with its
@@ -475,22 +498,48 @@ impl<'a> Business<'a> {
     /// [`CollectionOptions::after`] until it comes back `None`.
     ///
     /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
+    /// Visitor reads require [`Business::with_catalog_visitor_token`].
     pub async fn get_collections(
         &self,
         jid: &Jid,
         options: &CollectionOptions,
     ) -> Result<Collections, BusinessError> {
         self.require_external_catalog(jid)?;
+        let mut variables = collection_variables(&jid.to_non_ad(), options);
+        add_visitor_thumbnail_fields(&mut variables["request"]["collections"]);
+        let data = self
+            .execute_visitor_catalog(query_product_collections::DOC_ID, variables, "collections")
+            .await?;
+        parse_collections(&data)
+    }
+
+    async fn execute_visitor_catalog(
+        &self,
+        doc_id: &'static str,
+        variables: Value,
+        operation: &'static str,
+    ) -> Result<Value, BusinessError> {
+        let token = self
+            .catalog_visitor_token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or(BusinessError::CatalogVisitorTokenRequired)?;
+        let body = json!({
+            "access_token": token,
+            "doc_id": doc_id,
+            "variables": variables,
+            "lang": "en_US"
+        });
+        let request = HttpRequest::post("https://graph.whatsapp.com/graphql/catalog")
+            .with_header("Accept", "application/json")
+            .with_header("Content-Type", "application/json")
+            .with_body(body.to_string());
         let response = self
             .client
-            .mex()
-            .execute(mex_request!(
-                query_product_collections,
-                collection_variables(jid, options)
-            ))
-            .await?;
-
-        parse_collections(&response_data(response.data, "collections")?)
+            .http_client()
+            .execute(request)
+            .await
+            .map_err(|_| BusinessError::CatalogTransport)?;
+        parse_visitor_response(response, operation)
     }
 
     fn require_external_catalog(&self, jid: &Jid) -> Result<(), BusinessError> {
@@ -553,6 +602,49 @@ impl<'a> Business<'a> {
         self.client.execute(RemoveCoverPhotoSpec::new(id)).await?;
         Ok(())
     }
+}
+
+fn add_visitor_thumbnail_fields(variables: &mut Value) {
+    variables["variant_thumbnail_width"] = Value::Null;
+    variables["variant_thumbnail_height"] = Value::Null;
+}
+
+fn parse_visitor_response(
+    response: crate::http::HttpResponse,
+    operation: &'static str,
+) -> Result<Value, BusinessError> {
+    let payload = serde_json::from_slice::<Value>(&response.body);
+    if let Ok(ref envelope) = payload
+        && let Some(error) = envelope
+            .get("error")
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                envelope["errors"]
+                    .as_array()
+                    .and_then(|errors| errors.first())
+            })
+    {
+        return Err(BusinessError::CatalogGraphQl {
+            code: error["code"]
+                .as_i64()
+                .or_else(|| error["extensions"]["error_code"].as_i64()),
+        });
+    }
+    if !(200..300).contains(&response.status_code) {
+        return Err(HttpStatusError {
+            status: response.status_code,
+        }
+        .into());
+    }
+    let mut payload = payload
+        .map_err(|_| BusinessError::malformed(operation, "invalid HTTP GraphQL response"))?;
+    response_data(
+        payload
+            .get_mut("data")
+            .map(Value::take)
+            .filter(|data| data.is_object()),
+        operation,
+    )
 }
 
 fn response_data(data: Option<Value>, operation: &'static str) -> Result<Value, BusinessError> {
@@ -1006,6 +1098,100 @@ mod tests {
 
     // Fixtures below are hand-written from the response shapes WhatsApp Web
     // reads, with fictitious ids, names and JIDs.
+
+    #[test]
+    fn visitor_http_graphql_error_differs_from_empty_catalog() {
+        use crate::http::HttpResponse;
+
+        let error = HttpResponse::new(200, br#"{"errors":[{"code":2498052}]}"#.to_vec());
+        assert!(matches!(
+            parse_visitor_response(error, "catalog"),
+            Err(BusinessError::CatalogGraphQl {
+                code: Some(2498052)
+            })
+        ));
+
+        let empty = HttpResponse::new(200, br#"{"data":{"xwa_product_catalog_get_product_catalog":{"product_catalog":{"products":[]}}}}"#.to_vec());
+        let catalog = parse_catalog(&parse_visitor_response(empty, "catalog").unwrap()).unwrap();
+        assert!(catalog.products.is_empty());
+    }
+
+    #[tokio::test]
+    async fn visitor_methods_read_catalog_and_collections_over_http() {
+        use crate::http::{HttpClient, HttpRequest, HttpResponse};
+        use crate::test_utils::create_test_client_with_http;
+        use std::sync::Arc;
+
+        struct CatalogHttp;
+
+        #[async_trait::async_trait]
+        impl HttpClient for CatalogHttp {
+            async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.url, "https://graph.whatsapp.com/graphql/catalog");
+                let body: Value = serde_json::from_slice(request.body.as_deref().unwrap())?;
+                assert_eq!(body["access_token"], "fixture-token");
+                let product = json!({"id": "fixture-product"});
+                let data = match body["doc_id"].as_str().unwrap() {
+                    query_catalog::DOC_ID => {
+                        let input = &body["variables"]["request"]["product_catalog"];
+                        assert_eq!(input["jid"], biz_jid().to_string());
+                        assert!(
+                            input
+                                .get("variant_thumbnail_width")
+                                .is_some_and(Value::is_null)
+                        );
+                        json!({"xwa_product_catalog_get_product_catalog": {"product_catalog": {
+                            "products": [product], "paging": {"after": "fixture-cursor"}
+                        }}})
+                    }
+                    query_product_collections::DOC_ID => {
+                        let input = &body["variables"]["request"]["collections"];
+                        assert_eq!(input["biz_jid"], biz_jid().to_string());
+                        assert!(
+                            input
+                                .get("variant_thumbnail_height")
+                                .is_some_and(Value::is_null)
+                        );
+                        json!({"xwa_product_catalog_get_collections": {"collections": [
+                            {"id": "fixture-collection", "products": [product]}
+                        ]}})
+                    }
+                    _ => panic!("unexpected catalog document"),
+                };
+                Ok(HttpResponse::new(
+                    200,
+                    serde_json::to_vec(&json!({"data": data}))?,
+                ))
+            }
+        }
+
+        let client =
+            create_test_client_with_http("visitor_catalog_http", Arc::new(CatalogHttp)).await;
+        assert!(matches!(
+            client
+                .business()
+                .get_catalog(&biz_jid(), &CatalogOptions::default())
+                .await,
+            Err(BusinessError::CatalogVisitorTokenRequired)
+        ));
+        let business = client
+            .business()
+            .with_catalog_visitor_token("fixture-token");
+        let catalog = business
+            .get_catalog(&biz_jid(), &CatalogOptions::default())
+            .await
+            .unwrap();
+        let collections = business
+            .get_collections(&biz_jid(), &CollectionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(catalog.after_cursor.as_deref(), Some("fixture-cursor"));
+        assert_eq!(
+            catalog.products[0].id,
+            collections.collections[0].products[0].id
+        );
+    }
 
     fn biz_jid() -> Jid {
         "12025550111@s.whatsapp.net".parse().unwrap()
