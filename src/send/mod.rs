@@ -361,6 +361,15 @@ where
     Box::pin(future)
 }
 
+// Keep the large send state machine out of its callers under fat LTO.
+#[inline(never)]
+fn poll_send_pipeline<F: Future<Output = anyhow::Result<Option<RecipientFanout>>>>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<F::Output> {
+    future.poll(cx)
+}
+
 /// Sort and deduplicate session lock keys into the one acquisition order.
 /// INVARIANT: every caller of `session_guards_for` passes keys that went
 /// through here, which is what keeps two sends overlapping on a device from
@@ -2815,7 +2824,8 @@ impl Client {
         message: &wa::Message,
         options: SendPipelineOptions<'_>,
     ) -> Result<Option<RecipientFanout>, anyhow::Error> {
-        Box::pin(self.send_message_impl_inner(to, message, options)).await
+        let mut pipeline = Box::pin(self.send_message_impl_inner(to, message, options));
+        std::future::poll_fn(move |cx| poll_send_pipeline(pipeline.as_mut(), cx)).await
     }
 
     async fn send_message_impl_inner(
