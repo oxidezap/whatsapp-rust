@@ -9327,7 +9327,7 @@ attribute whatsapp::ConsumerApplicationView # [derive (Clone , Debug , Default)]
 attribute whatsapp::ConsumerApplicationView # [non_exhaustive]
 attribute whatsapp::ContextInfo # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::ContextInfo # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::ContextInfo # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::ContextInfo # [derive (PartialEq , Default)]
 attribute whatsapp::ContextInfo # [derive (serde :: Serialize)]
 attribute whatsapp::ContextInfo # [non_exhaustive]
 attribute whatsapp::ContextInfoOwnedView # [derive (Clone , Debug)]
@@ -34889,6 +34889,7 @@ impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningPublicKeyInput
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningPublicKeyResult 
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningSecretKeyInput 
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningSecretKeyResult 
+impl whatsapp:: :: core :: clone :: Clone for ContextInfo 
 impl whatsapp:: :: core :: clone :: Clone for Message 
 impl whatsapp:: :: core :: convert :: AsRef < :: buffa :: OwnedView < ACP2SettingView < 'static > > > for ACP2SettingOwnedView 
 impl whatsapp:: :: core :: convert :: AsRef < :: buffa :: OwnedView < ADVDeviceIdentityView < 'static > > > for ADVDeviceIdentityOwnedView 

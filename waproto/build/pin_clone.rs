@@ -1,23 +1,25 @@
-//! Keep the recursive Message clone in one crate. Rust's derived Clone is
+//! Keep large recursive clones in one crate. Rust's derived Clone is
 //! inline, so downstream callers otherwise carry separate copies of this large
 //! tree even with LTO. Derive the replacement from the generated Rust fields,
 //! not a second hand-maintained schema, and keep every other derive unchanged.
 
-pub fn generate(source: &str) -> Result<String, String> {
+pub fn generate(source: &str, targets: &[&str]) -> Result<String, String> {
     let mut file = syn::parse_file(source).map_err(|error| error.to_string())?;
-    let mut implementation = None;
+    let mut implementations: Vec<Option<syn::Item>> = targets.iter().map(|_| None).collect();
     for item in &mut file.items {
         let syn::Item::Struct(message) = item else {
             continue;
         };
-        if message.ident != "Message" {
+        let Some(index) = targets.iter().position(|&name| message.ident == name) else {
             continue;
-        }
+        };
+        let name = &message.ident;
+        let implementation = &mut implementations[index];
         if implementation.is_some() || !message.generics.params.is_empty() {
-            return Err("expected one non-generic generated Message struct".into());
+            return Err(format!("expected one non-generic generated {name} struct"));
         }
         let syn::Fields::Named(fields) = &message.fields else {
-            return Err("expected named fields in generated Message".into());
+            return Err(format!("expected named fields in generated {name}"));
         };
         let names = fields
             .named
@@ -48,11 +50,13 @@ pub fn generate(source: &str) -> Result<String, String> {
             attribute.meta = syn::parse_quote!(derive(#(#paths),*));
         }
         if removed != 1 {
-            return Err("expected exactly one derived Clone on generated Message".into());
+            return Err(format!(
+                "expected exactly one derived Clone on generated {name}"
+            ));
         }
-        implementation = Some(syn::parse_quote! {
+        *implementation = Some(syn::parse_quote! {
             #[automatically_derived]
-            impl ::core::clone::Clone for Message {
+            impl ::core::clone::Clone for #name {
                 #[inline(never)]
                 fn clone(&self) -> Self {
                     Self { #(#names: ::core::clone::Clone::clone(&self.#names)),* }
@@ -60,7 +64,9 @@ pub fn generate(source: &str) -> Result<String, String> {
             }
         });
     }
-    file.items
-        .push(implementation.ok_or("generated Message struct is missing")?);
+    for (target, implementation) in targets.iter().zip(implementations) {
+        file.items
+            .push(implementation.ok_or_else(|| format!("generated {target} struct is missing"))?);
+    }
     Ok(prettyplease::unparse(&file))
 }

@@ -305,7 +305,8 @@ fn main() -> std::io::Result<()> {
 
     let generated = out_path.join("whatsapp.rs");
     let source = std::fs::read_to_string(&generated)?;
-    let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
+    let source =
+        pin_clone::generate(&source, &["Message", "ContextInfo"]).map_err(std::io::Error::other)?;
     std::fs::write(generated, source)?;
 
     let mut api = emission::finish(&out_path, "whatsapp", &fds)?;
