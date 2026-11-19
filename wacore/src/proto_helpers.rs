@@ -197,6 +197,26 @@ pub trait MessageExt {
     /// hands back as `SendResult::message` instead of re-homing a `Box`.
     fn prepare_for_forward(&self) -> wa::Message;
 
+    /// Build an image or video message with a new caption while reusing its CDN reference.
+    ///
+    /// Returns `None` for other message types. This does not upload media.
+    fn media_with_caption(&self, caption: &str) -> Option<wa::Message> {
+        let base = self.get_base_message();
+        let mut message = wa::Message::default();
+        if let Some(image) = base.image_message.as_option() {
+            let mut image = image.clone();
+            image.caption = Some(caption.to_owned());
+            message.image_message = buffa::MessageField::some(image);
+        } else if let Some(video) = base.video_message.as_option() {
+            let mut video = video.clone();
+            video.caption = Some(caption.to_owned());
+            message.video_message = buffa::MessageField::some(video);
+        } else {
+            return None;
+        }
+        Some(message)
+    }
+
     /// Sets context_info on the first supported message field.
     ///
     /// Returns `true` if context was set, otherwise `false`.
@@ -922,6 +942,39 @@ mod tests {
     }
 
     /// Test: prepare_for_quote strips nested mentions and preserves content.
+    #[test]
+    fn media_caption_helper_keeps_the_cdn_reference() {
+        let mut message = wa::Message::default();
+        let mut image = wa::message::ImageMessage::default();
+        image.direct_path = Some("/synthetic/image".into());
+        image.media_key = Some(vec![7; 32]);
+        image.caption = Some("original".into());
+        message.image_message = buffa::MessageField::some(image.clone());
+        let updated = message.media_with_caption("replacement").unwrap();
+        image.caption = Some("replacement".into());
+        assert_eq!(updated.image_message.as_option(), Some(&image));
+        assert_eq!(message.image_message.caption.as_deref(), Some("original"));
+
+        let mut video = wa::message::VideoMessage::default();
+        video.direct_path = Some("/synthetic/video".into());
+        message.image_message = Default::default();
+        message.video_message = buffa::MessageField::some(video.clone());
+        video.caption = Some("updated".into());
+        assert_eq!(
+            message
+                .media_with_caption("updated")
+                .unwrap()
+                .video_message
+                .as_option(),
+            Some(&video)
+        );
+        assert!(
+            wa::Message::text("plain")
+                .media_with_caption("ignored")
+                .is_none()
+        );
+    }
+
     #[test]
     fn test_prepare_for_quote_strips_mentions_preserves_content() {
         use wa::message::extended_text_message::{FontType, PreviewType};
