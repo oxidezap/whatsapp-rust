@@ -1650,7 +1650,7 @@ async fn async_streamed_download<W, T>(
     _admission: Option<wacore::net::StreamingRequestPermit>,
     response: wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
     (media_key, media_type): (&[u8], MediaType),
-    hashes: ExpectedMediaHashes,
+    mut hashes: ExpectedMediaHashes,
     writer: W,
     finish: impl FnOnce(W) -> T,
 ) -> WriterAttempt<W, T>
@@ -1696,40 +1696,41 @@ where
                 }
                 filled += read;
             }
-            if filled == 0 {
-                break;
-            }
+            let expected = (filled < ciphertext.len()).then(|| std::mem::take(&mut hashes));
             let budget_for_job = budget.clone();
             let mut writer = current_writer.take().expect("media writer");
-            let result;
-            (decryptor, ciphertext, writer, result) =
+            let (next_decryptor, next_ciphertext, writer, result) =
                 wacore::runtime::blocking(runtime, move || {
-                    let result = decryptor.push(
-                        &ciphertext[..filled],
-                        &mut budget_for_job.writer(WriterIoOrigin(&mut writer)),
-                    );
-                    (decryptor, ciphertext, writer, result)
+                    let (next, result) = {
+                        let mut sink = budget_for_job.writer(WriterIoOrigin(&mut writer));
+                        let pushed = decryptor.push(&ciphertext[..filled], &mut sink);
+                        match expected {
+                            Some(hashes) => (
+                                None,
+                                pushed.and_then(|()| {
+                                    decryptor
+                                        .finish(hashes.encrypted(), hashes.plaintext(), &mut sink)
+                                        .map(|_| ())
+                                }),
+                            ),
+                            None => (Some(decryptor), pushed),
+                        }
+                    };
+                    (next, ciphertext, writer, result)
                 })
                 .await;
             current_writer = Some(writer);
             result.map_err(DownloadRequestError::streamed)?;
-            if filled < ciphertext.len() {
+            let Some(next_decryptor) = next_decryptor else {
                 break;
-            }
+            };
+            decryptor = next_decryptor;
+            ciphertext = next_ciphertext;
             #[cfg(target_arch = "wasm32")]
             if let Some(yield_now) = runtime.yield_now() {
                 yield_now.await;
             }
         }
-        decryptor
-            .finish(
-                hashes.encrypted(),
-                hashes.plaintext(),
-                &mut budget.writer(WriterIoOrigin(
-                    current_writer.as_mut().expect("media writer"),
-                )),
-            )
-            .map_err(DownloadRequestError::streamed)?;
         budget
             .check_cancelled()
             .map_err(DownloadRequestError::ResourcePolicy)?;
@@ -3397,6 +3398,66 @@ mod tests {
         drop(permit);
         assert_eq!(download.await.unwrap(), plaintext);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn async_memory_download_writes_verified_tail_on_blocking_worker() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        #[derive(Default)]
+        struct ThreadCheckedWriter {
+            cursor: Cursor<Vec<u8>>,
+            last_write: Option<std::thread::ThreadId>,
+        }
+
+        impl Write for ThreadCheckedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.last_write = Some(std::thread::current().id());
+                self.cursor.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.cursor.flush()
+            }
+        }
+
+        impl Seek for ThreadCheckedWriter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+
+        impl DownloadWriter for ThreadCheckedWriter {
+            fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+                self.cursor.truncate(len)
+            }
+        }
+
+        let caller = std::thread::current().id();
+        let plaintext = vec![0x37; 300_017];
+        let (params, encrypted) = encrypted_params(&plaintext);
+        let response = Box::pin(async move {
+            Ok(wacore::net::AsyncStreamingHttpResponse::new(
+                200,
+                Box::pin(futures::io::Cursor::new(encrypted)),
+            ))
+        });
+        let result = async_streamed_download(
+            &crate::TokioRuntime,
+            None,
+            response,
+            (params.media_key().unwrap(), params.app_info()),
+            ExpectedMediaHashes::from_downloadable(&params),
+            ThreadCheckedWriter::default(),
+            std::convert::identity,
+        )
+        .await;
+
+        let WriterAttempt::Verified(writer) = result else {
+            panic!("valid media must be verified");
+        };
+        assert_eq!(writer.cursor.into_inner(), plaintext);
+        assert_ne!(writer.last_write.unwrap(), caller);
     }
 
     #[tokio::test]
