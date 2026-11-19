@@ -1,6 +1,6 @@
 use hkdf::Hkdf;
-use hmac::digest::{FixedOutput, KeyInit};
-use hmac::{Hmac, Mac};
+use hmac::digest::{FixedOutputReset, KeyInit};
+use hmac::{Hmac, HmacReset, Mac};
 use sha2::Sha256;
 use std::sync::LazyLock;
 
@@ -153,10 +153,9 @@ fn hkdf_sha256_into(key: &[u8], info: &[u8], out: &mut [u8]) {
         return;
     }
 
-    let expand = Hmac::<Sha256>::new_from_slice(&prk).expect("PRK is a valid HMAC key");
+    let mut round = HmacReset::<Sha256>::new_from_slice(&prk).expect("PRK is a valid HMAC key");
     for block in 0..out.len() / BLOCK {
         let (written, rest) = out.split_at_mut(block * BLOCK);
-        let mut round = expand.clone();
         // T(0) is empty; every later round feeds back the block just written.
         if let Some(previous) = written.last_chunk::<BLOCK>() {
             round.update(previous);
@@ -164,7 +163,7 @@ fn hkdf_sha256_into(key: &[u8], info: &[u8], out: &mut [u8]) {
         round.update(info);
         round.update(&[block as u8 + 1]);
         let target: &mut [u8; BLOCK] = (&mut rest[..BLOCK]).try_into().expect("whole block");
-        round.finalize_into(target.into());
+        round.finalize_into_reset(target.into());
     }
 }
 
