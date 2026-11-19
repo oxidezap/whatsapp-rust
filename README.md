@@ -20,9 +20,11 @@ The [support qualification matrix](agent_docs/support.md) records maintained tar
 
 ## Quick start
 
+This example targets the pinned Git revision. For the published crate, use the [0.7.0 quickstart](https://docs.rs/whatsapp-rust/0.7.0/whatsapp_rust/#quick-start).
+
 ```toml
 [dependencies]
-whatsapp-rust = "0.7"
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "7e5c198e1a25ea405faa7a69a47bc727ea15484c" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
