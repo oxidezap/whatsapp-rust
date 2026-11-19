@@ -338,8 +338,14 @@ impl Client {
             }
         }
         members.insert(&own_sending_jid.user);
-        for device in &devices {
-            members.insert(&device.user);
+        if devices.len() / 2 >= group_info.participants.len().max(1) {
+            for devices_for_user in devices.chunk_by(|left, right| left.user == right.user) {
+                members.insert(&devices_for_user[0].user);
+            }
+        } else {
+            for device in &devices {
+                members.insert(&device.user);
+            }
         }
         let members = members.build();
 
