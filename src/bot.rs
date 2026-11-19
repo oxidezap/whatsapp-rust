@@ -328,6 +328,76 @@ pub struct BotShutdownReport {
     pub run: BotRunOutcome,
 }
 
+impl BotShutdownReport {
+    /// Whether local cleanup was clean and the supervisor observed terminal shutdown.
+    pub fn is_clean(&self) -> bool {
+        self.shutdown.is_clean()
+            && matches!(
+                self.run,
+                BotRunOutcome::Completed(crate::RunCompletionReason::ShutdownRequested)
+            )
+    }
+
+    /// Return an error containing the original report if shutdown was incomplete.
+    pub fn into_result(self) -> Result<(), BotShutdownError> {
+        if self.is_clean() {
+            Ok(())
+        } else {
+            Err(BotShutdownError(Box::new(self)))
+        }
+    }
+}
+
+/// An incomplete bot shutdown with its original observations.
+#[derive(Debug, thiserror::Error)]
+#[error("bot shutdown was incomplete: {0:?}")]
+pub struct BotShutdownError(pub Box<BotShutdownReport>);
+
+#[cfg(test)]
+mod shutdown_report_tests {
+    use super::*;
+    use crate::DrainOutcome;
+
+    fn clean_report() -> BotShutdownReport {
+        BotShutdownReport {
+            shutdown: crate::ShutdownReport {
+                inbound: DrainOutcome::Completed,
+                outbound: DrainOutcome::Completed,
+                device: Ok(()),
+                signal_settle: DrainOutcome::Completed,
+                message_secrets: Default::default(),
+            },
+            run: BotRunOutcome::Completed(crate::RunCompletionReason::ShutdownRequested),
+        }
+    }
+
+    #[test]
+    fn shutdown_report_distinguishes_cleanup_from_supervisor_completion() {
+        assert!(clean_report().into_result().is_ok());
+        let mut report = clean_report();
+        report.run = BotRunOutcome::AbortRequested;
+        assert!(report.shutdown.is_clean());
+        assert!(matches!(
+            report.into_result().unwrap_err().0.run,
+            BotRunOutcome::AbortRequested
+        ));
+    }
+
+    #[test]
+    fn shutdown_report_preserves_cleanup_failure() {
+        let mut report = clean_report();
+        report.shutdown.outbound = DrainOutcome::TimedOut;
+        assert_eq!(
+            report.into_result().unwrap_err().0.shutdown.outbound,
+            DrainOutcome::TimedOut
+        );
+
+        let mut report = clean_report();
+        report.shutdown.message_secrets.failed_batches = 1;
+        assert!(!report.is_clean());
+    }
+}
+
 // Builder callbacks belong to the driver, not the Client's event bus lifetime.
 // Either guard can close this shared registration, including an unpolled driver.
 // Take it out of the mutex before bus removal or worker aborts (both can reenter).
