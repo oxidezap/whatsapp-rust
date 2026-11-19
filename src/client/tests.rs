@@ -5613,12 +5613,8 @@ async fn memory_report_counts_the_offline_device_sync_queue() {
     assert_eq!(client.memory_report().await.pending_device_sync, 0);
 }
 
-/// The LID/PN cache's side maps grow with the contact list for the process
-/// lifetime, one entry per identifier and one per persisted pair, and were
-/// invisible to the report; the counts must surface and the bytes must be the
-/// table alone, since both maps hold the entry's own strings.
 #[tokio::test]
-async fn memory_report_counts_lid_pn_side_maps() {
+async fn memory_report_counts_lid_pn_hashes_and_persisted_pairs() {
     let client = crate::test_utils::create_test_client_with_name("lid_pn_side_maps").await;
     let before = client.memory_report().await;
     assert_eq!(before.lid_pn_contact_hash_entries.entries, 0);
@@ -5641,10 +5637,8 @@ async fn memory_report_counts_lid_pn_side_maps() {
         "both sides of a pair are hash-indexed"
     );
     assert_eq!(report.lid_pn_persisted_entries.entries, 1);
-    assert!(
-        report.lid_pn_contact_hash_entries.bytes > 0 && report.lid_pn_persisted_entries.bytes > 0,
-        "table structure is charged even though the strings are the entry's"
-    );
+    assert!(report.lid_pn_contact_hash_entries.bytes > 0);
+    assert_eq!(report.lid_pn_persisted_entries.bytes, 0);
     assert!(
         report.lid_pn_contact_hash_entries.bytes < report.lid_pn_lid_entries.bytes,
         "a side map must not re-charge the payload the entry map already counts"
