@@ -1380,7 +1380,10 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let (value, renew_at) = {
-            let guard = self.inner.read().await;
+            let guard = match self.inner.try_read() {
+                Some(guard) => guard,
+                None => self.inner.read().await,
+            };
             match &*guard {
                 Storage::Plain(inner) => {
                     return inner.get(key).cloned();
