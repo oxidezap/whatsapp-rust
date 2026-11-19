@@ -942,7 +942,7 @@ impl Client {
         if plan.gen_count > 0 {
             let gen_start = plan.gen_start;
             let gen_count = plan.gen_count as usize;
-            // Per-key X25519 generation and prost encoding are CPU-bound, and the
+            // Per-key X25519 generation and protobuf encoding are CPU-bound, and the
             // batch size is caller-configurable, so offload the whole batch to keep
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
@@ -961,10 +961,18 @@ impl Client {
                 let mut pubkeys = Vec::with_capacity(gen_count);
                 let mut ends = Vec::with_capacity(gen_count);
                 let mut buf = Vec::with_capacity(gen_count * MAX_RECORD_LEN);
+                let mut record = waproto::whatsapp::PreKeyRecordStructure::default();
                 const KEY_BATCH: usize = 8;
                 let mut encode = |i: usize, key_pair: KeyPair| {
                     let pre_key_id = gen_start + i as u32;
-                    encode_pre_key_record_to(pre_key_id, &key_pair, &mut buf);
+                    record.id = Some(pre_key_id);
+                    let public = record.public_key.get_or_insert_default();
+                    public.clear();
+                    public.extend_from_slice(key_pair.public_key.public_key_bytes());
+                    let private = record.private_key.get_or_insert_default();
+                    private.clear();
+                    private.extend_from_slice(key_pair.private_key.serialize());
+                    waproto::codec::pre_key_record_encode_into(&record, &mut buf);
                     ends.push(buf.len());
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 };

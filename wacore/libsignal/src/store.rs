@@ -133,10 +133,26 @@ pub mod record_helpers {
         }
     }
     pub fn encode_pre_key_record_to(id: u32, key: &KeyPair, out: &mut Vec<u8>) {
-        out.extend_from_slice(&waproto::codec::pre_key_record_to_vec(&new_pre_key_record(
-            id, key,
-        )));
+        waproto::codec::pre_key_record_encode_into(&new_pre_key_record(id, key), out);
     }
+    #[cfg(test)]
+    #[test]
+    fn prekey_record_encoder_appends_without_replacing_the_prefix() {
+        use rand::SeedableRng;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let key = KeyPair::generate(&mut rng);
+        let mut encoded = vec![0xa5];
+        let mut expected = encoded.clone();
+        for id in [0, 127, 128, 16_383, 16_384, u32::MAX] {
+            encode_pre_key_record_to(id, &key, &mut encoded);
+            expected.extend(waproto::codec::pre_key_record_to_vec(&new_pre_key_record(
+                id, &key,
+            )));
+        }
+        assert_eq!(encoded, expected);
+    }
+
     pub fn prekey_structure_to_record(record: PreKeyRecordStructure) -> Result<PreKeyRecord> {
         PreKeyRecord::deserialize(&waproto::codec::pre_key_record_to_vec(&record))
     }
