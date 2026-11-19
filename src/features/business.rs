@@ -4,18 +4,12 @@
 //! issued to the authenticated session.
 //!
 //! Visitor catalog and collection reads use the WhatsApp HTTP GraphQL endpoint.
-//! Order lookup uses MEX.
-//! - **Business-profile writes stay on IQ** `w:biz`, as a `business_profile`
-//!   node with `v="3"` and `mutation_type="delta"`. Those builders live in
-//!   [`wacore::iq::business`].
+//! Order lookup uses MEX. Business-profile writes use the `w:biz` IQ
+//! defined in [`wacore::iq::business`].
 //!
-//! Numbers on the MEX side are not JSON numbers. WhatsApp Web stringifies
-//! `limit`, `width`, `height`, `collection_limit` and `item_limit`, and sends
-//! `allow_shop_source` as `ALLOWSHOPSOURCE_TRUE`/`_FALSE`. The generated
-//! `Variables` mirrors in [`wacore::iq::mex_operations`] type these as `i64`
-//! and `bool`, so the catalog and collection queries build their variables with
-//! `json!` instead; the order query, whose dimensions really are numbers, uses
-//! the generated type.
+//! WhatsApp Web sends catalog limits and dimensions as strings. The visitor
+//! query uses `ALLOWSHOPSOURCE_TRUE` or `ALLOWSHOPSOURCE_FALSE` while the
+//! management query uses a boolean. The order query uses numeric dimensions.
 //!
 //! **Catalog-side variant data is not requested, and so is never returned.**
 //! `variant_info` on a catalog or collection product is opt-in: the server
@@ -1007,7 +1001,7 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
     let media = object(operation, value, "media")?;
     let sale = object(operation, value, "sale_price")?;
     // The window is both dates or neither, the way WhatsApp Web reads it:
-    // `start_date != null && end_date != null ? {...} : null` on the MEX path,
+    // `start_date != null && end_date != null ? {...} : null` in GraphQL,
     // and `hasChild("start_date") && hasChild("end_date")` on the IQ one. A lone
     // endpoint is not a period, and surfacing one would invite a caller to
     // schedule a promotion the official client does not consider scheduled.
