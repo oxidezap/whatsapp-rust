@@ -1970,6 +1970,7 @@ fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
     *rescan_at = 0;
     let drop_count = deadlines.len() - MAX_MSG_SECRETS * 3 / 4;
     let (_, &mut cutoff, _) = deadlines.select_nth_unstable(drop_count - 1);
+    drop(deadlines);
     // Two passes apply the cutoff, because map iteration order is arbitrary and
     // a single pass could evict a row AT the cutoff while keeping one below it.
     // `cutoff` is never 0, so the never-expire rows stay out of both passes.
