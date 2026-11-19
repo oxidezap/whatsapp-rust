@@ -489,6 +489,48 @@ struct StoredPendingGroup {
     complete: bool,
 }
 
+#[derive(Default)]
+struct FreshPendingWrites {
+    rows: Vec<(StoredPendingGroup, PendingInboundPayload)>,
+    bytes: usize,
+}
+
+impl FreshPendingWrites {
+    async fn flush(
+        &mut self,
+        backend: &dyn wacore::store::traits::Backend,
+        stored: &mut Vec<StoredPendingGroup>,
+    ) -> anyhow::Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<_> = self
+            .rows
+            .iter()
+            .map(|(row, payload)| {
+                (
+                    PendingInboundKey {
+                        chat: &row.chat,
+                        sender: &row.sender,
+                        id: &row.id,
+                    },
+                    payload,
+                )
+            })
+            .collect();
+        anyhow::ensure!(
+            backend
+                .insert_pending_batch_if_missing(&batch, MAX_PENDING_BYTES)
+                .await?
+                == PendingInboundMutation::Applied,
+            "pending occurrence revision conflict"
+        );
+        stored.extend(self.rows.drain(..).map(|(row, _)| row));
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
 fn has_physical_aliases(rows: &[StoredPendingGroup]) -> bool {
     rows.iter().any(|row| {
         rows.iter()
@@ -716,6 +758,10 @@ impl Client {
         } else {
             PendingInboundLease::new(Arc::new((lease, alias_charges)))
         };
+        const FRESH_BATCH_BYTES: usize = 4 * 1024;
+        const FRESH_BATCH_ROWS: usize = 4;
+        let batch_fresh = is_drain && unique_ids && backend.supports_pending_insert_batch();
+        let mut fresh = FreshPendingWrites::default();
         let mut stored = Vec::with_capacity(groups.len());
         for PendingWriteGroup {
             chat,
@@ -746,11 +792,6 @@ impl Client {
                     .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
                     .await?
             };
-            let key = PendingInboundKey {
-                chat: &chat,
-                sender: &sender,
-                id,
-            };
             let expected = record
                 .as_ref()
                 .map_or(PendingInboundRevision::missing(), |record| {
@@ -766,7 +807,33 @@ impl Client {
             let (encoded, complete) =
                 self.encode_pending_deliveries(journal, deliveries, is_drain, &owner)?;
             let payload = PendingInboundPayload::new(encoded, lease.clone());
-            let revision = payload.revision();
+            let row = StoredPendingGroup {
+                chat,
+                sender,
+                id: id.into(),
+                revision: payload.revision(),
+                complete,
+            };
+            let payload_bytes = payload.bytes().len();
+            if batch_fresh
+                && expected == PendingInboundRevision::missing()
+                && payload_bytes <= FRESH_BATCH_BYTES
+            {
+                if fresh.rows.len() == FRESH_BATCH_ROWS
+                    || fresh.bytes + payload_bytes > FRESH_BATCH_BYTES
+                {
+                    fresh.flush(backend.as_ref(), &mut stored).await?;
+                }
+                fresh.bytes += payload_bytes;
+                fresh.rows.push((row, payload));
+                continue;
+            }
+            fresh.flush(backend.as_ref(), &mut stored).await?;
+            let key = PendingInboundKey {
+                chat: &row.chat,
+                sender: &row.sender,
+                id: &row.id,
+            };
             anyhow::ensure!(
                 backend
                     .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)
@@ -774,14 +841,9 @@ impl Client {
                     == PendingInboundMutation::Applied,
                 "pending occurrence revision conflict"
             );
-            stored.push(StoredPendingGroup {
-                chat,
-                sender,
-                id: id.into(),
-                revision,
-                complete,
-            });
+            stored.push(row);
         }
+        fresh.flush(backend.as_ref(), &mut stored).await?;
         Ok(stored)
     }
 
