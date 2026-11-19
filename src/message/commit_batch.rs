@@ -622,7 +622,7 @@ impl Client {
         &self,
         items: &[PendingDelivery],
         is_drain: bool,
-    ) -> anyhow::Result<Vec<StoredPendingGroup>> {
+    ) -> anyhow::Result<(Vec<StoredPendingGroup>, bool)> {
         // Workers retain this mutation owner after receive cancellation. It
         // covers only storage; never hold it while invoking consumer code.
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
@@ -844,7 +844,7 @@ impl Client {
             stored.push(row);
         }
         fresh.flush(backend.as_ref(), &mut stored).await?;
-        Ok(stored)
+        Ok((stored, unique_ids))
     }
 
     // Scratch journal/coverage vectors must finish before the detached backend
@@ -1981,7 +1981,7 @@ impl Client {
             if dispatch_gate {
                 fingerprints.reserve_exact(items.len());
             }
-            let stored = match self.persist_pending_group(&pending, is_drain).await {
+            let (stored, unique_ids) = match self.persist_pending_group(&pending, is_drain).await {
                 Ok(stored) => stored,
                 Err(error) => {
                     log::error!("Failed to buffer inbound occurrence group: {error:?}");
@@ -2016,7 +2016,7 @@ impl Client {
             // future must not restore the entries — redelivery replays from
             // the rows.
             reinsert.mark_durable();
-            if !producer_recovery && !has_physical_aliases(&stored) {
+            if !producer_recovery && (unique_ids || !has_physical_aliases(&stored)) {
                 self.inbound_commit_batch.live_retention.stored(&pending);
             }
 
