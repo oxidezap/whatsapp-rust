@@ -3254,16 +3254,16 @@ impl SignalStore for SqliteStore {
             // more ids than SQLite's host-parameter limit.
             let mut out = Vec::with_capacity(ids.len());
             for chunk in ids.chunks(ID_PARAM_CHUNK) {
-                let rows: Vec<(i32, Vec<u8>)> = prekeys::table
+                let rows = prekeys::table
                     .select((prekeys::id, prekeys::key))
                     .filter(prekeys::id.eq_any(chunk))
                     .filter(prekeys::device_id.eq(device_id))
-                    .load(conn)
+                    .load_iter::<(i32, Vec<u8>), diesel::connection::DefaultLoadingMode>(conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
-                out.extend(
-                    rows.into_iter()
-                        .map(|(id, key)| (id as u32, Bytes::from(key))),
-                );
+                for row in rows {
+                    let (id, key) = row.map_err(|e| StoreError::Database(Box::new(e)))?;
+                    out.push((id as u32, Bytes::from(key)));
+                }
             }
             Ok(out)
         })
