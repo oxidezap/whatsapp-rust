@@ -956,6 +956,17 @@ impl ReceiveHarness {
     pub fn settle_signal_flush(&self) {
         self.runtime
             .block_on(settle_signal_flush_worker(&self.client));
+        // The settled flush frees many small chunks into glibc's fastbins, and
+        // glibc only merges them (`malloc_consolidate`) and sorts the merged
+        // chunks into bins on the next request too large for the small bins.
+        // Without this, that request is the measured receive's spawn of a new
+        // flush worker, which then pays for cleaning up the previous flush's
+        // garbage: up to +250 µs on `dm_receive` under the MALLOC_* settings
+        // pinned in the CodSpeed workflow. A 100 KiB request is above the
+        // small-bin and tcache limits, below the 128 KiB mmap threshold, and
+        // matches no free chunk exactly, so glibc consolidates and walks the
+        // whole unsorted bin here, outside the measured region.
+        drop(std::hint::black_box(Vec::<u8>::with_capacity(100 * 1024)));
     }
 
     /// Receive a burst of stanzas within a single runtime entry (`block_on`),
