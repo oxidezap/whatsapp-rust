@@ -58,6 +58,7 @@ pub fn generate(source: &str, targets: &[&str]) -> Result<String, String> {
             #[automatically_derived]
             impl ::core::clone::Clone for #name {
                 #[inline(never)]
+                #[allow(clippy::clone_on_copy)]
                 fn clone(&self) -> Self {
                     Self { #(#names: ::core::clone::Clone::clone(&self.#names)),* }
                 }
