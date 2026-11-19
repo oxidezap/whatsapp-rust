@@ -669,8 +669,8 @@ mod tests {
     }
 
     // Exact and width independent: node, shutdown, lane liveness, drain guard
-    // and the boxed resume-admission guard (one word; see
-    // `OfflinePendingGuard`). Rebaseline per [layout asserts](../../agent_docs/testing.md).
+    // and the resume-admission guard (one word through its Arc's niche).
+    // Rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[test]
     fn queued_chat_message_keeps_five_handles() {
         assert_eq!(size_of::<QueuedChatMessage>(), 5 * size_of::<usize>());
