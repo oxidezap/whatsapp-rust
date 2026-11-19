@@ -868,6 +868,32 @@ impl Client {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner.clone());
         let backend = self.persistence_manager.backend();
+        if rows.len() > 1 {
+            let batch: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        PendingInboundKey {
+                            chat: &row.chat,
+                            sender: &row.sender,
+                            id: &row.id,
+                        },
+                        row.revision,
+                    )
+                })
+                .collect();
+            match backend
+                .delete_pending_inbound_batch_if(&batch, MAX_PENDING_BYTES, lease.clone())
+                .await
+            {
+                Ok(Some(PendingInboundMutation::Applied)) => return Ok(()),
+                Ok(Some(_)) => anyhow::bail!("pending occurrence cleanup revision conflict"),
+                Ok(None) => {}
+                Err(error) => {
+                    log::debug!("Pending cleanup batch failed, retrying individual rows: {error:?}")
+                }
+            }
+        }
         let mut failure = None;
         for row in rows {
             let key = PendingInboundKey {
@@ -3163,9 +3189,9 @@ mod tests {
     #[tokio::test]
     async fn raw_pending_partial_cleanup_conflict_preserves_successor_and_event() {
         use wacore::store::in_memory::InMemoryBackend;
-        use wacore::store::traits::ProtocolStore;
+        use wacore::store::traits::Backend;
         struct ReplacingHook {
-            backend: Arc<InMemoryBackend>,
+            backend: Arc<dyn Backend>,
             id: &'static str,
         }
         #[async_trait::async_trait]
@@ -3183,8 +3209,15 @@ mod tests {
             }
         }
         let ids = ["CAS_FIRST", "CAS_SECOND", "CAS_THIRD"];
-        for failed_index in [1, 2, 0] {
-            let backend = Arc::new(InMemoryBackend::new());
+        for (sqlite, failed_index) in [false, true]
+            .into_iter()
+            .flat_map(|sqlite| [1, 2, 0].map(|failed_index| (sqlite, failed_index)))
+        {
+            let backend: Arc<dyn Backend> = if sqlite {
+                crate::test_utils::create_test_backend().await
+            } else {
+                Arc::new(InMemoryBackend::new())
+            };
             let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
             let transport = capture_pending_receipts(&client).await;
             client

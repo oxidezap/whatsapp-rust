@@ -4964,6 +4964,56 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
+    async fn delete_pending_inbound_batch_if(
+        &self,
+        rows: &[(PendingInboundKey<'_>, PendingInboundRevision)],
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Option<PendingInboundMutation>> {
+        // Keep per-row recovery for external commit acknowledgements, which
+        // can fail after a deletion has reached the database.
+        if self.commit_barrier.is_some() || rows.len() < 2 {
+            return Ok(None);
+        }
+        let rows = Arc::new(
+            rows.iter()
+                .map(|(key, revision)| {
+                    (
+                        key.chat.to_owned(),
+                        key.sender.to_owned(),
+                        key.id.to_owned(),
+                        *revision,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let device_id = self.device_id;
+        self.with_retry("delete_pending_inbound_batch_if", || {
+            let rows = rows.clone();
+            let lease = lease.clone();
+            Box::new(move |conn| {
+                let _lease = lease;
+                conn.immediate_transaction(|conn| {
+                    let mut outcome = PendingInboundMutation::Applied;
+                    for (chat, sender, id, expected) in &*rows {
+                        let revision = read_pending_inbound_payload::<HashedPendingPayload>(
+                            conn, device_id, chat, sender, id, max_bytes,
+                        )?
+                        .map_err(|error| DieselError::DeserializationError(Box::new(error)))?
+                        .map_or(PendingInboundRevision::missing(), |row| row.0);
+                        if revision != *expected {
+                            outcome = PendingInboundMutation::Conflict;
+                            continue;
+                        }
+                        delete_pending_inbound_row(conn, device_id, chat, sender, id)?;
+                    }
+                    Ok(Some(outcome))
+                })
+            })
+        })
+        .await
+    }
+
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
         let device_id = self.device_id;
         self.with_retry("delete_expired_pending_inbound", || {
@@ -6200,6 +6250,142 @@ mod tests {
             );
         }
         assert_eq!(cached.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_batch_cleanup_keeps_conflicts_and_deletes_matching_rows() {
+        let store = create_test_store().await;
+        let first = PendingInboundKey {
+            chat: "group@g.us",
+            sender: "200@lid",
+            id: "first",
+        };
+        let second = PendingInboundKey {
+            id: "second",
+            ..first
+        };
+        store
+            .store_pending_inbound(first.chat, first.sender, first.id, b"current")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound(second.chat, second.sender, second.id, b"owned")
+            .await
+            .unwrap();
+
+        let rows = [
+            (first, PendingInboundRevision::for_bytes(b"old")),
+            (second, PendingInboundRevision::for_bytes(b"owned")),
+        ];
+        assert_eq!(
+            store
+                .delete_pending_inbound_batch_if(&rows, 16, pending_test_lease())
+                .await
+                .unwrap(),
+            Some(PendingInboundMutation::Conflict)
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(first.chat, first.sender, first.id)
+                .await
+                .unwrap(),
+            Some(b"current".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(second.chat, second.sender, second.id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_batch_cleanup_defers_to_per_row_with_commit_barrier() {
+        let mut store = create_test_store().await;
+        let first = PendingInboundKey {
+            chat: "group@g.us",
+            sender: "200@lid",
+            id: "first",
+        };
+        let second = PendingInboundKey {
+            id: "second",
+            ..first
+        };
+        for key in [first, second] {
+            store
+                .store_pending_inbound(key.chat, key.sender, key.id, b"owned")
+                .await
+                .unwrap();
+        }
+        store.commit_barrier = Some(Arc::new(|| Box::pin(async { unreachable!() })));
+        let revision = PendingInboundRevision::for_bytes(b"owned");
+        assert_eq!(
+            store
+                .delete_pending_inbound_batch_if(
+                    &[(first, revision), (second, revision)],
+                    16,
+                    pending_test_lease(),
+                )
+                .await
+                .unwrap(),
+            None,
+        );
+        for key in [first, second] {
+            assert!(
+                store
+                    .get_pending_inbound(key.chat, key.sender, key.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_batch_cleanup_rolls_back_on_oversized_row() {
+        let store = create_test_store().await;
+        let first = PendingInboundKey {
+            chat: "group@g.us",
+            sender: "200@lid",
+            id: "first",
+        };
+        let second = PendingInboundKey {
+            id: "second",
+            ..first
+        };
+        store
+            .store_pending_inbound(first.chat, first.sender, first.id, b"a")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound(second.chat, second.sender, second.id, b"oversized")
+            .await
+            .unwrap();
+        let rows = [
+            (first, PendingInboundRevision::for_bytes(b"a")),
+            (second, PendingInboundRevision::for_bytes(b"oversized")),
+        ];
+        assert!(
+            store
+                .delete_pending_inbound_batch_if(&rows, 1, pending_test_lease())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(first.chat, first.sender, first.id)
+                .await
+                .unwrap(),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(second.chat, second.sender, second.id)
+                .await
+                .unwrap(),
+            Some(b"oversized".to_vec())
+        );
     }
 
     #[tokio::test]
