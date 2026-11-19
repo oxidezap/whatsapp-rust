@@ -54,7 +54,13 @@ fn main() {
         })
         .init();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        // The demo drives one session, so use a small default and honor Tokio's override.
+        let available = std::thread::available_parallelism().map_or(1, |count| count.get());
+        runtime.worker_threads(available.min(2));
+    }
+    let rt = runtime
         .enable_all()
         .build()
         .expect("Failed to build tokio runtime");
