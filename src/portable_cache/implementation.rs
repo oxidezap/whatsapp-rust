@@ -75,29 +75,16 @@ struct Slot<K, V> {
     hash: u64,
 }
 
-/// One table slot for a cache that can neither evict nor expire: only the key,
-/// its hash, and the value. Chosen at construction (see `assemble`), never per
-/// entry, so the managed path pays nothing for it and this path stores no
-/// timestamps, sequence numbers, or CLOCK bits.
-///
-/// Field order follows the flattened [`Slot`]: payload first, then the key so a
-/// narrow key reuses the tail padding ahead of `hash`.
-struct PlainSlot<K, V> {
-    value: V,
-    key: K,
-    hash: u64,
-}
-
+/// An unbounded cache needs neither eviction metadata nor stored hashes.
+/// HashMap rehashes existing keys when rebuilding its table.
 struct PlainInner<K, V, S> {
-    hasher: S,
-    table: HashTable<PlainSlot<K, V>>,
+    table: HashMap<K, V, S>,
 }
 
 impl<K, V, S> PlainInner<K, V, S> {
     fn new(hasher: S) -> Self {
         Self {
-            hasher,
-            table: HashTable::new(),
+            table: HashMap::with_hasher(hasher),
         }
     }
 
@@ -107,11 +94,11 @@ impl<K, V, S> PlainInner<K, V, S> {
     }
 
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.table.iter().map(|slot| (&slot.key, &slot.value))
+        self.table.iter()
     }
 
     fn structural_bytes(&self) -> usize {
-        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<PlainSlot<K, V>>())
+        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<(K, V)>())
     }
 
     fn clear(&mut self) {
@@ -124,26 +111,15 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    #[inline]
-    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
-        self.hasher.hash_one(key)
-    }
-
-    /// Table probes below stay out of line: under fat LTO they would otherwise
-    /// inline into every [`PortableCache`] future that dispatches on [`Storage`]
-    /// (`get`, `insert`, `upsert_with_by_ref`, `insert_and_return`, `remove`),
-    /// stamping the hashbrown probe per caller instead of per table. Same
-    /// reason [`expiry_walk`] stays out of line.
+    // Leave each table probe out of line so fat LTO does not stamp it into
+    // every PortableCache future that dispatches on Storage.
     #[inline(never)]
     fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = self.hash_of(key);
-        self.table
-            .find(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &slot.value)
+        self.table.get(key)
     }
 
     #[inline(never)]
@@ -152,10 +128,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = self.hash_of(key);
-        self.table
-            .find_mut(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &mut slot.value)
+        self.table.get_mut(key)
     }
 
     #[inline(never)]
@@ -164,30 +137,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = self.hash_of(key);
-        let (slot, _) = self
-            .table
-            .find_entry(hash, |slot| slot.key.borrow() == key)
-            .ok()?
-            .remove();
-        Some(slot.value)
+        self.table.remove(key)
     }
 
     #[inline(never)]
-    fn insert_new(&mut self, key: K, value: V) {
-        let hash = self.hash_of(&key);
-        insert_slot(&mut self.table, hash, PlainSlot { value, key, hash });
-    }
-
-    /// Replace-or-insert shared by `insert` and `insert_and_return` so the
-    /// get-then-insert sequence compiles once per table, not per caller.
-    #[inline(never)]
-    fn insert_or_replace(&mut self, key: K, value: V) {
-        if let Some(slot) = self.get_mut(&key) {
-            *slot = value;
-        } else {
-            self.insert_new(key, value);
-        }
+    fn insert(&mut self, key: K, value: V) {
+        self.table.insert(key, value);
     }
 }
 
@@ -234,37 +189,10 @@ where
     }
 }
 
-/// The hash a table slot was inserted with, read back when its table grows so
-/// growth never re-hashes a key. Both slot kinds carry it; the shared
-/// [`insert_slot`] tail reads it through this trait so the two `insert_unique`
-/// call sites compile from one definition instead of one per insert path.
-trait StoredHash {
-    fn stored_hash(&self) -> u64;
-}
-
-impl<K, V> StoredHash for Slot<K, V> {
-    #[inline]
-    fn stored_hash(&self) -> u64 {
-        self.hash
-    }
-}
-
-impl<K, V> StoredHash for PlainSlot<K, V> {
-    #[inline]
-    fn stored_hash(&self) -> u64 {
-        self.hash
-    }
-}
-
-/// Growth tail shared by [`PlainInner::insert_new`] and
-/// [`CacheInner::insert_new`]: grow the table when needed and insert the slot.
-/// Out of line so each `<K, V>` table carries its hashbrown growth chain once,
-/// not once per insert entry point (`insert`, `upsert_with_by_ref`,
-/// `insert_and_return`); a new cache instantiates one copy for its slot type
-/// however many paths insert into it.
+// Keep the hashbrown growth path out of each managed insert call site.
 #[inline(never)]
-fn insert_slot<T: StoredHash>(table: &mut HashTable<T>, hash: u64, slot: T) {
-    table.insert_unique(hash, slot, |existing| existing.stored_hash());
+fn insert_slot<K, V>(table: &mut HashTable<Slot<K, V>>, hash: u64, slot: Slot<K, V>) {
+    table.insert_unique(hash, slot, |existing| existing.hash);
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -676,17 +604,15 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
 
     pub(crate) fn run_pending_tasks(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let now = self.entry_time();
-        let expired: Vec<_> = inner
-            .iter()
-            .filter(|(_, entry)| {
-                self.ttl
-                    .is_some_and(|ttl| now.saturating_duration_since(entry.inserted_at) >= ttl)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in expired {
-            inner.remove_key(&key);
+        if let Some(cutoff) = expiry_cutoff(self.entry_time(), self.ttl) {
+            let CacheInner { table, order, .. } = &mut *inner;
+            table.retain(|slot| {
+                if slot.inserted_at > cutoff {
+                    return true;
+                }
+                order.remove(&slot.seq);
+                false
+            });
         }
         inner.shrink_if_empty();
     }
@@ -902,11 +828,8 @@ where
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
     ///
-    /// Stays out of line like [`PlainInner::insert_new`]: under fat LTO this
-    /// would otherwise inline into every managed insert path (`insert`,
-    /// `upsert_with_by_ref`, `insert_and_return`, plus the synchronous
-    /// [`SyncTtlGuard::insert_absent`](SyncTtlGuard::insert_absent)), stamping the eviction
-    /// prologue and the hashbrown growth call per caller instead of per table.
+    /// Keep this out of line under fat LTO so the eviction code and hashbrown
+    /// growth call compile once per table.
     #[inline(never)]
     fn insert_new(
         &mut self,
@@ -1535,7 +1458,7 @@ where
         };
         match &mut *guard {
             Storage::Plain(inner) => {
-                inner.insert_or_replace(key, value);
+                inner.insert(key, value);
             }
             Storage::Managed(inner) => {
                 if let Some(entry) = inner.get_mut(&key) {
@@ -1584,7 +1507,7 @@ where
                 if let Some(slot) = current {
                     *slot = next;
                 } else if self.capacity_limit() != Some(0) {
-                    inner.insert_new(key.to_owned(), next);
+                    inner.insert(key.to_owned(), next);
                 }
                 result
             }
@@ -1632,7 +1555,7 @@ where
         match &mut *guard {
             Storage::Plain(inner) => {
                 let ret = value.clone();
-                inner.insert_or_replace(key, value);
+                inner.insert(key, value);
                 ret
             }
             Storage::Managed(inner) => {
@@ -3374,16 +3297,16 @@ mod tests {
         assert!(plain.get("k1").await.is_none());
         plain.clear().await;
         assert_eq!(plain.entry_count(), 0);
-        // Budget: key + hash + value with no metadata tail. Smaller still
+        // Budget: key and value with no stored hash or metadata tail. Smaller still
         // satisfies that; larger means metadata crept in. Rebaseline per
         // [layout asserts](../agent_docs/testing.md).
         assert!(
-            size_of::<PlainSlot<String, u32>>() <= 40,
-            "plain slot grew to {} B (budget 40)",
-            size_of::<PlainSlot<String, u32>>()
+            size_of::<(String, u32)>() <= 32,
+            "plain slot grew to {} B (budget 32)",
+            size_of::<(String, u32)>()
         );
         assert!(
-            size_of::<Slot<String, u32>>() > size_of::<PlainSlot<String, u32>>(),
+            size_of::<Slot<String, u32>>() > size_of::<(String, u32)>(),
             "managed slot must cost more than the plain slot"
         );
     }
@@ -4061,6 +3984,30 @@ fn instance_clock_policy_keeps_default_config_footprint() {
 mod instance_clock_tests {
     use super::*;
     use wacore::time::{Clock, VirtualClock};
+
+    #[test]
+    fn sync_ttl_sweep_keeps_live_order_records() {
+        let clock = Arc::new(VirtualClock::new(0, Instant::ZERO).unwrap());
+        let mut cache = SyncTtlCache::new(256, Some(Duration::from_secs(5)));
+        cache.clock = Some(clock.clone());
+        for key in 0..224 {
+            cache.insert(key, key);
+        }
+        clock.advance(Duration::from_secs(4)).unwrap();
+        for key in 224..256 {
+            cache.insert(key, key);
+        }
+
+        clock.advance(Duration::from_secs(1)).unwrap();
+        cache.run_pending_tasks();
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.table.len(), 32);
+        assert_eq!(inner.order.len(), 32);
+        for key in 224..256 {
+            let slot = inner.get(&key).unwrap();
+            assert_eq!(inner.order.get(&slot.seq), Some(&slot.hash));
+        }
+    }
 
     #[tokio::test]
     async fn independent_cache_clocks_expire_only_their_own_entries() {

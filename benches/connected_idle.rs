@@ -175,3 +175,52 @@ fn first_inbound_dm(bencher: divan::Bencher) {
             .expect("first DM committed, dispatched and receipted");
         });
 }
+
+#[divan::bench(args = [false, true], sample_count = 4, sample_size = 1)]
+fn offline_replay(bencher: divan::Bencher, sqlite: bool) {
+    use whatsapp_rust::bench_support::connected_idle::offline_replay::Replay;
+
+    struct Input<'a> {
+        runtime: &'a tokio::runtime::Runtime,
+        replay: Option<Replay>,
+        backend: Option<BackendFixture>,
+    }
+
+    impl Drop for Input<'_> {
+        fn drop(&mut self) {
+            if let Some(replay) = self.replay.take() {
+                self.runtime
+                    .block_on(replay.shutdown())
+                    .expect("replay shutdown");
+            }
+            if let Some(backend) = self.backend.take() {
+                backend.cleanup().expect("replay database cleanup");
+            }
+        }
+    }
+
+    let runtime = runtime();
+    bencher
+        .with_inputs(|| {
+            runtime.block_on(async {
+                let backend = if sqlite {
+                    BackendFixture::sqlite().await.expect("real SQLite backend")
+                } else {
+                    BackendFixture::memory()
+                };
+                let replay = Replay::prepare(backend.backend(), false)
+                    .await
+                    .expect("replay fixture");
+                Input {
+                    runtime: &runtime,
+                    replay: Some(replay),
+                    backend: Some(backend),
+                }
+            })
+        })
+        .bench_local_refs(|input| {
+            runtime
+                .block_on(input.replay.as_mut().expect("replay fixture").receive())
+                .expect("offline replay committed and acknowledged in order");
+        });
+}

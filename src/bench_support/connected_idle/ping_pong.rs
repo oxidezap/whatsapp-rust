@@ -54,7 +54,7 @@ impl PingPong {
                 let (outgoing_tx, outgoing) = async_channel::bounded(1);
                 let session = Session::connect_with_capture(
                     BackendFixture::memory().backend(),
-                    Some(outgoing_tx),
+                    Some(super::OutgoingCapture::Messages(outgoing_tx)),
                 )
                 .await?;
                 session.finish_control().await?;

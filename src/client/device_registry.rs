@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use portable_atomic::AtomicU64;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wacore_binary::{Jid, JidExt as _, Server};
@@ -106,7 +107,7 @@ pub(crate) struct GroupDevicesMemo {
     /// (participants, maps) is freed as soon as the metadata cache drops its
     /// Arc — the memo retains a struct-sized header, not the whole GroupRoutingInfo.
     pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupRoutingInfo>,
-    pub(crate) generation: u64,
+    generation: AtomicU64,
     /// Member identifiers in BOTH namespaces (participant users, their mapped
     /// counterparts, resolved device users): the scoped-invalidation check
     /// tests the topology log's touched users against this set.
@@ -274,17 +275,19 @@ impl Client {
         // it twice — the counter is meant to be free on the hit path, and a
         // second dispatch is not free.
         if let Some(memo) = self.group_devices_memo.get(group).await {
+            use std::sync::atomic::Ordering;
+            let memo_generation = memo.generation.load(Ordering::Acquire);
             if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
                 self.device_memo_counters
                     .record_group_devices(Outcome::MissGroupInfo);
-            } else if memo.generation == generation {
+            } else if memo_generation == generation {
                 // Refcount bump: the snapshot is immutable, so a hit shares
                 // it instead of cloning the device Vec.
                 self.device_memo_counters.record_group_devices(Outcome::Hit);
                 return Ok(Arc::clone(&memo.devices));
             } else if self
                 .device_topology
-                .unchanged_for(memo.generation, &memo.members)
+                .unchanged_for(memo_generation, &memo.members)
             {
                 // Stale stamp, but every change since it touched only users
                 // outside this group: re-stamp instead of recomputing, so
@@ -293,17 +296,8 @@ impl Client {
                 // the recompute below.
                 self.device_memo_counters
                     .record_group_devices(Outcome::Restamp);
-                self.group_devices_memo
-                    .insert(
-                        group.clone(),
-                        Arc::new(GroupDevicesMemo {
-                            group_info: memo.group_info.clone(),
-                            generation,
-                            members: Arc::clone(&memo.members),
-                            devices: Arc::clone(&memo.devices),
-                        }),
-                    )
-                    .await;
+                // A concurrent validation may have published a later stamp.
+                memo.generation.fetch_max(generation, Ordering::AcqRel);
                 return Ok(Arc::clone(&memo.devices));
             } else {
                 self.device_memo_counters
@@ -355,7 +349,7 @@ impl Client {
                 group.clone(),
                 Arc::new(GroupDevicesMemo {
                     group_info: Arc::downgrade(group_info),
-                    generation,
+                    generation: AtomicU64::new(generation),
                     members: Arc::new(members),
                     devices: Arc::clone(&devices),
                 }),
@@ -1916,8 +1910,8 @@ impl Client {
             let lookup = self.resolve_lookup_keys_for_jid(&jid).await;
             for key in lookup.all_keys() {
                 if let Some(record) = self.device_registry_cache.get(key).await {
-                    let found = Self::reconstruct_device_jids(&jid, &record);
-                    if !found.is_empty() {
+                    let found = Self::device_jids(&jid, &record);
+                    if found.len() != 0 {
                         devices.extend(found);
                         continue 'users;
                     }
@@ -1940,8 +1934,8 @@ impl Client {
             let found = lookup
                 .all_keys()
                 .find_map(|key| rows.get(key))
-                .map(|record| Self::reconstruct_device_jids(&jid, record))
-                .filter(|found| !found.is_empty());
+                .map(|record| Self::device_jids(&jid, record))
+                .filter(|found| found.len() != 0);
             match found {
                 Some(found) => devices.extend(found),
                 None => missing.push(jid),
@@ -2009,14 +2003,20 @@ impl Client {
         query_jid: &Jid,
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
+        Self::device_jids(query_jid, record).collect()
+    }
+
+    fn device_jids<'a>(
+        query_jid: &Jid,
+        record: &'a wacore::store::traits::DeviceListRecord,
+    ) -> impl ExactSizeIterator<Item = Jid> + use<'a> {
         let base = query_jid.to_non_ad();
         // No range check: a registry device id is a `u16`, the width the JID
         // itself carries, so the conversion this used to guard cannot fail.
         record
             .devices
             .iter()
-            .map(|device| base.with_device_hosting(device.device_id(), device.is_hosted()))
-            .collect()
+            .map(move |device| base.with_device_hosting(device.device_id(), device.is_hosted()))
     }
 
     /// Migrate device registry entries from PN key to LID key.
@@ -2186,6 +2186,37 @@ mod tests {
                 .is_some(),
             "unmapped PN must resolve via its own record"
         );
+    }
+
+    #[tokio::test]
+    async fn group_devices_maintenance_reclaims_only_unowned_snapshots() {
+        use wacore::client::context::GroupRoutingInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000042@g.us".parse().expect("group jid");
+        let own = Jid::pn("15550100000");
+        setup_device_record(&client, &own.user, &[0, 5]).await;
+        let info = Arc::new(GroupRoutingInfo::new(vec![own.clone()], AddressingMode::Pn));
+        let group_cache = client.get_group_cache();
+        group_cache.insert(group.clone(), Arc::clone(&info)).await;
+        let devices = client
+            .resolve_group_devices_memoized(&group, &info, &own)
+            .await
+            .expect("resolve should succeed");
+
+        group_cache.invalidate(&group).await;
+        client.run_cache_maintenance().await;
+        let repeat = client
+            .resolve_group_devices_memoized(&group, &info, &own)
+            .await
+            .expect("resolve should still hit");
+        assert!(Arc::ptr_eq(&devices, &repeat));
+
+        drop(info);
+        client.run_cache_maintenance().await;
+        assert!(client.group_devices_memo.get(&group).await.is_none());
+        assert_eq!(devices.devices().len(), repeat.devices().len());
     }
 
     /// Locks the three validity gates of the group-devices memo: a repeat
@@ -4912,7 +4943,7 @@ mod tests {
 
         GroupDevicesMemo {
             group_info: Arc::downgrade(&group_info),
-            generation: 0,
+            generation: AtomicU64::new(0),
             members: Arc::new(member_index.build()),
             devices: Arc::new(wacore::send::ResolvedGroupDevices::new(devices)),
         }

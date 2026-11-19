@@ -27,10 +27,8 @@ pub(crate) struct MemberIndex {
     fingerprints: Box<[u64]>,
 }
 
-/// One `RandomState` for the whole process. The fingerprints of two different
-/// indexes are never compared, so nothing requires a shared seed — but sharing
-/// one keeps `MemberIndex` a single pointer wide, and drawing it randomly once
-/// per process keeps a remote peer from choosing identifiers that collide.
+/// Every index shares a seed so the same user compares equal across indexes.
+/// A random seed keeps a remote peer from choosing colliding identifiers.
 fn fingerprint_hasher() -> &'static RandomState {
     static HASHER: OnceLock<RandomState> = OnceLock::new();
     HASHER.get_or_init(RandomState::new)
@@ -87,6 +85,73 @@ impl MemberIndex {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.fingerprints.is_empty()
+    }
+}
+
+const FILTER_MIN_MEMBERS: usize = 64;
+const FILTER_BITS_PER_MEMBER: usize = 16;
+const FILTER_WORD_BITS: usize = u64::BITS as usize;
+
+pub(crate) enum ChangedMembers {
+    Small(MemberIndex),
+    Large(Box<FilteredMembers>),
+}
+
+pub(crate) struct FilteredMembers {
+    members: MemberIndex,
+    bits: Box<[u64]>,
+}
+
+impl ChangedMembers {
+    pub(crate) fn new(members: MemberIndex) -> Self {
+        if members.len() < FILTER_MIN_MEMBERS {
+            return Self::Small(members);
+        }
+        let words = members.len().next_power_of_two() * FILTER_BITS_PER_MEMBER / FILTER_WORD_BITS;
+        let mut bits = vec![0; words].into_boxed_slice();
+        let mask = words * FILTER_WORD_BITS - 1;
+        for &fingerprint in &members.fingerprints {
+            for hash in [fingerprint as usize, (fingerprint >> 32) as usize] {
+                let bit = hash & mask;
+                bits[bit / FILTER_WORD_BITS] |= 1 << (bit % FILTER_WORD_BITS);
+            }
+        }
+        Self::Large(Box::new(FilteredMembers { members, bits }))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Small(members) => members.len(),
+            Self::Large(filtered) => filtered.members.len(),
+        }
+    }
+
+    pub(crate) fn intersects(&self, members: &MemberIndex) -> bool {
+        match self {
+            Self::Small(touched) if touched.len() <= members.len() / 8 => touched
+                .fingerprints
+                .iter()
+                .any(|value| members.fingerprints.binary_search(value).is_ok()),
+            Self::Small(touched) => touched.intersects(members),
+            Self::Large(filtered) => {
+                let bits = &filtered.bits;
+                let mask = bits.len() * FILTER_WORD_BITS - 1;
+                // A filter hit still needs an exact fingerprint match.
+                members.fingerprints.iter().any(|&fingerprint| {
+                    let x = fingerprint as usize & mask;
+                    let y = (fingerprint >> 32) as usize & mask;
+                    (bits[x / FILTER_WORD_BITS] >> (x % FILTER_WORD_BITS))
+                        & (bits[y / FILTER_WORD_BITS] >> (y % FILTER_WORD_BITS))
+                        & 1
+                        != 0
+                        && filtered
+                            .members
+                            .fingerprints
+                            .binary_search(&fingerprint)
+                            .is_ok()
+                })
+            }
+        }
     }
 }
 
@@ -236,6 +301,23 @@ mod tests {
                 assert!(index.contains(user), "size {size} lost {user}");
             }
         }
+    }
+
+    #[test]
+    fn large_change_filter_verifies_exact_fingerprints() {
+        let touched = MemberIndex {
+            fingerprints: (0..128).map(|i| (i << 16) | (i << 48)).collect(),
+        };
+        let changed = ChangedMembers::new(touched);
+        assert!(matches!(changed, ChangedMembers::Large(_)));
+        let exact = MemberIndex {
+            fingerprints: Box::new([(127 << 16) | (127 << 48)]),
+        };
+        let filter_collision = MemberIndex {
+            fingerprints: Box::new([1 << 15]),
+        };
+        assert!(changed.intersects(&exact));
+        assert!(!changed.intersects(&filter_collision));
     }
 
     #[test]

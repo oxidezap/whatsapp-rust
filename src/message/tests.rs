@@ -19900,7 +19900,7 @@ mod pdo_alias_tests {
     fn pdo_alias_claim_stays_small() {
         let size = size_of::<DispatchClaim>();
         assert!(
-            size <= 56,
+            size <= 48,
             "a dispatch claim grew to {size} bytes; the gate retains one per message identity"
         );
     }

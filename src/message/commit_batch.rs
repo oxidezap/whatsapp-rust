@@ -57,6 +57,32 @@ struct BatchState {
     timer_armed: bool,
 }
 
+#[derive(Clone)]
+enum PendingDeliveries<'a> {
+    Single(&'a PendingDelivery),
+    Shared(Arc<[PendingDelivery]>),
+}
+
+impl std::ops::Deref for PendingDeliveries<'_> {
+    type Target = [PendingDelivery];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Single(item) => std::slice::from_ref(*item),
+            Self::Shared(items) => items,
+        }
+    }
+}
+
+impl PendingDeliveries<'_> {
+    fn share(&self) -> Arc<[PendingDelivery]> {
+        match self {
+            Self::Single(item) => Arc::from(std::slice::from_ref(*item)),
+            Self::Shared(items) => Arc::clone(items),
+        }
+    }
+}
+
 struct PendingInboundBatch {
     entries: Vec<PendingDelivery>,
     commit_ticket: Option<InboundCommitTicket>,
@@ -446,11 +472,19 @@ impl PendingCommitOutcome {
     };
 }
 
+struct PendingWriteGroup<'a> {
+    chat: String,
+    sender: String,
+    id: &'a str,
+    deliveries: smallvec::SmallVec<[&'a PendingDelivery; 1]>,
+    lookup_group_sender: bool,
+}
+
 #[derive(Clone)]
 struct StoredPendingGroup {
     chat: String,
     sender: String,
-    id: String,
+    id: wacore_binary::MessageId,
     revision: PendingInboundRevision,
     complete: bool,
 }
@@ -596,12 +630,13 @@ impl Client {
                 arrived_keys.push((chat, sender, info.id.to_string()));
             }
         }
-        let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>, bool)> = Vec::new();
+        let mut groups: Vec<PendingWriteGroup<'_>> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
+            let item_id = item.info.id.as_str();
             let arrived = arrived_keys.iter().find(|(candidate_chat, sender, id)| {
                 candidate_chat == &chat
-                    && id == item.info.id
+                    && id == item_id
                     && sender == &item.info.source.sender.to_string()
             });
             let explicit = item.storage_sender.is_some() || arrived.is_some();
@@ -615,12 +650,12 @@ impl Client {
                 |sender| sender.to_string(),
             );
             let group = groups.iter_mut().find(|group| {
-                group.0 == chat
-                    && group.2 == item.info.id
-                    && (group.1 == sender
+                group.chat == chat
+                    && group.id == item_id
+                    && (group.sender == sender
                         || item.info.source.chat.is_group()
-                            && (!explicit || group.4)
-                            && group.3.first().is_some_and(|first| {
+                            && (!explicit || group.lookup_group_sender)
+                            && group.deliveries.first().is_some_and(|first| {
                                 let first = &first.info.source.sender;
                                 let next = &item.info.source.sender;
                                 first.user == next.user
@@ -629,19 +664,19 @@ impl Client {
                             }))
             });
             if let Some(group) = group {
-                if explicit && group.4 {
-                    group.1 = sender;
-                    group.4 = false;
+                if explicit && group.lookup_group_sender {
+                    group.sender = sender;
+                    group.lookup_group_sender = false;
                 }
-                group.3.push(item);
+                group.deliveries.push(item);
             } else {
-                groups.push((
+                groups.push(PendingWriteGroup {
                     chat,
                     sender,
-                    item.info.id.to_string(),
-                    vec![item],
-                    item.info.source.chat.is_group() && !explicit,
-                ));
+                    id: item_id,
+                    deliveries: smallvec::smallvec![item],
+                    lookup_group_sender: item.info.source.chat.is_group() && !explicit,
+                });
             }
         }
         // Known physical aliases cannot use the ambiguity-rejecting lookup
@@ -649,12 +684,11 @@ impl Client {
         // live admission budget before the first mutation, through hook and
         // cleanup completion. Unknown on-disk alias pairs still fail closed.
         let mut alias_charges = Vec::new();
-        for (chat, sender, id, deliveries, _) in &groups {
-            if groups
-                .iter()
-                .any(|other| other.0 == *chat && other.2 == *id && other.1 != *sender)
-            {
-                for delivery in deliveries {
+        for group in &groups {
+            if groups.iter().any(|other| {
+                other.chat == group.chat && other.id == group.id && other.sender != group.sender
+            }) {
+                for delivery in &group.deliveries {
                     let mut retained = (**delivery).clone();
                     self.inbound_commit_batch
                         .live_retention
@@ -669,16 +703,23 @@ impl Client {
             PendingInboundLease::new(Arc::new((lease, alias_charges)))
         };
         let mut stored = Vec::with_capacity(groups.len());
-        for (chat, mut sender, id, deliveries, lookup) in groups {
+        for PendingWriteGroup {
+            chat,
+            mut sender,
+            id,
+            deliveries,
+            lookup_group_sender,
+        } in groups
+        {
             let key = PendingInboundKey {
                 chat: &chat,
                 sender: &sender,
-                id: &id,
+                id,
             };
             // Resolve a fresh group's unique legacy physical key through the
             // same bounded lookup as replay. Reuse its backing here, and never
             // create a bare sibling beside an existing device-qualified row.
-            let record = if lookup {
+            let record = if lookup_group_sender {
                 match lookup_pending_record(&backend, key, true, lease.clone()).await? {
                     Some((physical, record)) => {
                         sender = physical;
@@ -694,7 +735,7 @@ impl Client {
             let key = PendingInboundKey {
                 chat: &chat,
                 sender: &sender,
-                id: &id,
+                id,
             };
             let expected = record
                 .as_ref()
@@ -722,7 +763,7 @@ impl Client {
             stored.push(StoredPendingGroup {
                 chat,
                 sender,
-                id,
+                id: id.into(),
                 revision,
                 complete,
             });
@@ -736,11 +777,13 @@ impl Client {
     fn encode_pending_deliveries(
         &self,
         mut journal: PendingJournal,
-        deliveries: Vec<&PendingDelivery>,
+        deliveries: smallvec::SmallVec<[&PendingDelivery; 1]>,
         is_drain: bool,
         owner: &PendingStorage,
     ) -> anyhow::Result<(bytes::Bytes, bool)> {
-        let mut covered = Vec::with_capacity(deliveries.len());
+        // A fresh journal can only contain occurrences from this write.
+        let mut covered =
+            (!journal.occurrences.is_empty()).then(|| Vec::with_capacity(deliveries.len()));
         for delivery in deliveries {
             let projection = if let Some(encoded) = self
                 .inbound_commit_batch
@@ -767,15 +810,19 @@ impl Client {
                 original,
                 projection,
             };
-            covered.push(occurrence.clone());
+            if let Some(covered) = &mut covered {
+                covered.push(occurrence.clone());
+            }
             journal.merge(occurrence)?;
         }
-        let complete = journal.occurrences.iter().all(|entry| {
-            covered.iter().any(|incoming| {
-                incoming.producer == entry.producer
-                    && incoming.index == entry.index
-                    && incoming.original == entry.original
-                    && incoming.projection == entry.projection
+        let complete = covered.is_none_or(|covered| {
+            journal.occurrences.iter().all(|entry| {
+                covered.iter().any(|incoming| {
+                    incoming.producer == entry.producer
+                        && incoming.index == entry.index
+                        && incoming.original == entry.original
+                        && incoming.projection == entry.projection
+                })
             })
         });
         let encoded = journal.encode()?;
@@ -1078,8 +1125,8 @@ impl Client {
             return InboundCommitState::Failed;
         }
         if !self.inbound_commit_batch.is_active() {
-            let owned = if durable {
-                match self
+            let items = if durable {
+                let owned = match self
                     .inbound_commit_batch
                     .live_retention
                     .for_message(&item.info)
@@ -1089,12 +1136,8 @@ impl Client {
                         log::warn!("Retained projection decode failed: {error:?}");
                         return InboundCommitState::Failed;
                     }
-                }
-            } else {
-                Vec::new()
-            };
-            let items: Arc<[PendingDelivery]> =
-                match self.live_pending_retry_batch(&owned, false).await {
+                };
+                let shared = match self.live_pending_retry_batch(&owned, false).await {
                     Ok(Some(retained)) => retained.into(),
                     Ok(None) => Arc::from([item]),
                     Err(error) => {
@@ -1102,8 +1145,12 @@ impl Client {
                         return InboundCommitState::Failed;
                     }
                 };
+                PendingDeliveries::Shared(shared)
+            } else {
+                PendingDeliveries::Single(&item)
+            };
             let outcome = self
-                .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
+                .commit_pending_deliveries(items.clone(), BatchOrigin::Live, None, true)
                 .await;
             if durable && !outcome.delivered {
                 for item in items.iter() {
@@ -1568,11 +1615,9 @@ impl Client {
         const MAX_COMPARED_PER_ID: usize = 8;
         /// A kept payload, with its wire form filled in only if some later
         /// item in the batch turns out to share its identity.
-        struct Kept {
-            info: Arc<MessageInfo>,
-            message: Arc<waproto::whatsapp::Message>,
+        struct Kept<'a> {
+            item: &'a PendingDelivery,
             encoded: Option<Vec<u8>>,
-            origin: Option<raw_pending::DeliveryOrigin>,
         }
         /// Compare the wire form rather than the decoded proto. `wa::Message`
         /// derives `PartialEq`, but nothing else calls it, so one `==` here
@@ -1584,8 +1629,8 @@ impl Client {
             waproto::codec::message_encode_into(msg, &mut buf);
             buf
         }
-        type Seen = std::collections::HashMap<DispatchKey, Vec<Kept>>;
-        fn keep(seen: &mut Seen, item: &PendingDelivery) -> bool {
+        type Seen<'a> = std::collections::HashMap<DispatchKey, smallvec::SmallVec<[Kept<'a>; 1]>>;
+        fn keep<'a>(seen: &mut Seen<'a>, item: &'a PendingDelivery) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
             if kept.len() >= MAX_COMPARED_PER_ID {
                 return true;
@@ -1602,24 +1647,24 @@ impl Client {
                 // separate stanzas always allocate separate infos, so this
                 // never exempts a genuine resend, while a part whose info was
                 // copied on write falls through to the content compare.
-                if let (Some(left), Some(right)) = (k.origin, item.origin) {
+                if let (Some(left), Some(right)) = (k.item.origin, item.origin) {
                     if left.stanza == right.stanza && left.position != right.position {
                         continue;
                     }
-                } else if Arc::ptr_eq(&k.info, &item.info) {
+                } else if Arc::ptr_eq(&k.item.info, &item.info) {
                     continue;
                 }
-                if Arc::ptr_eq(&k.message, &item.message) {
+                if Arc::ptr_eq(&k.item.message, &item.message) {
                     return false;
                 }
                 let candidate = candidate.get_or_insert_with(|| wire(&item.message));
-                let existing = k.encoded.get_or_insert_with(|| wire(&k.message));
+                let existing = k.encoded.get_or_insert_with(|| wire(&k.item.message));
                 if *existing == *candidate
-                    || (k.message.sender_key_distribution_message.is_set()
+                    || (k.item.message.sender_key_distribution_message.is_set()
                         || item.message.sender_key_distribution_message.is_set())
                         && MessageDispatch::fingerprint_encoded(
                             existing,
-                            k.message.sender_key_distribution_message.is_set(),
+                            k.item.message.sender_key_distribution_message.is_set(),
                         ) == MessageDispatch::fingerprint_encoded(
                             candidate,
                             item.message.sender_key_distribution_message.is_set(),
@@ -1629,15 +1674,14 @@ impl Client {
                 }
             }
             kept.push(Kept {
-                info: Arc::clone(&item.info),
-                message: Arc::clone(&item.message),
+                item,
                 encoded: candidate,
-                origin: item.origin,
             });
             true
         }
         let mut seen = Seen::with_capacity(items.len());
         if items.iter().all(|item| keep(&mut seen, item)) {
+            drop(seen);
             return items;
         }
         seen.clear();
@@ -1716,6 +1760,22 @@ impl Client {
         commit_ticket: Option<InboundCommitTicket>,
         acknowledge: bool,
     ) -> PendingCommitOutcome {
+        self.commit_pending_deliveries(
+            PendingDeliveries::Shared(items),
+            origin,
+            commit_ticket,
+            acknowledge,
+        )
+        .await
+    }
+
+    async fn commit_pending_deliveries(
+        self: &Arc<Self>,
+        items: PendingDeliveries<'_>,
+        origin: BatchOrigin,
+        commit_ticket: Option<InboundCommitTicket>,
+        acknowledge: bool,
+    ) -> PendingCommitOutcome {
         let future =
             self.commit_pending_batch_result_inner(items, origin, commit_ticket, acknowledge);
         let mut future = std::pin::pin!(future);
@@ -1724,7 +1784,7 @@ impl Client {
 
     async fn commit_pending_batch_result_inner(
         self: &Arc<Self>,
-        items: Arc<[PendingDelivery]>,
+        items: PendingDeliveries<'_>,
         origin: BatchOrigin,
         commit_ticket: Option<InboundCommitTicket>,
         acknowledge: bool,
@@ -1740,7 +1800,7 @@ impl Client {
         // collapse has to happen here too. Every stanza that arrived is still
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
-        let arrived = Arc::clone(&items);
+        let arrived = items.clone();
         // A later part of a producer can share a completed payload fingerprint.
         // Keep its original occurrence until publication, so a failed hook
         // cannot turn its replay into cleanup of the earlier part.
@@ -1761,22 +1821,25 @@ impl Client {
         // Already delivered entries still need persistence and cleanup, but
         // must not hide an equivalent entry that the consumer has not seen.
         let items = if items.iter().any(|entry| entry.consumer_claimed) {
-            items
-                .iter()
-                .filter(|entry| !entry.consumer_claimed)
-                .cloned()
-                .collect()
+            PendingDeliveries::Shared(
+                items
+                    .iter()
+                    .filter(|entry| !entry.consumer_claimed)
+                    .cloned()
+                    .collect(),
+            )
         } else {
             items
         };
-        let items = if self.dispatch_gate_enabled() {
-            self.dedup_batch_by_message(items)
-        } else {
-            items
+        let items = match items {
+            PendingDeliveries::Shared(items) if self.dispatch_gate_enabled() => {
+                PendingDeliveries::Shared(self.dedup_batch_by_message(items))
+            }
+            items => items,
         };
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
-            items: is_drain.then(|| Arc::clone(&arrived)),
+            items: is_drain.then(|| arrived.share()),
             commit_ticket,
         };
         #[cfg(test)]
@@ -1975,7 +2038,7 @@ impl Client {
                 false,
             );
             self.inbound_commit_batch.live_retention.published(&pending);
-            if let Err(error) = self.cleanup_pending_group(rows, Arc::clone(&pending)).await {
+            if let Err(error) = self.cleanup_pending_group(rows, pending.share()).await {
                 log::warn!("Pending occurrence cleanup conflict; suppressing ACK: {error:?}");
                 return PendingCommitOutcome::BUFFERED;
             }
@@ -1983,7 +2046,7 @@ impl Client {
         // The no-hook path still schedules receipts before synchronous
         // consumer code can block or panic.
         if acknowledge {
-            match pending.as_ref() {
+            match &*pending {
                 [] => {}
                 [item] => self.acknowledge_pending_delivery(item),
                 entries => {

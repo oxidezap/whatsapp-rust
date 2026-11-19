@@ -1700,6 +1700,7 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
     for item in FieldIter::new(msg) {
         let f = item?;
         match f.field {
+            tags::message::CONVERSATION => continue,
             tags::message::MESSAGE_CONTEXT_INFO => {
                 let mci = f.value.ok_or(WalkStop::Malformed)?;
                 let (secret, bot) = scan_context_info(mci)?;
@@ -1707,6 +1708,7 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
                     level.context_secret = Some(s);
                 }
                 level.has_bot_metadata |= bot;
+                continue;
             }
             tags::message::POLL_CREATION_MESSAGE
             | tags::message::POLL_CREATION_MESSAGE_V2
@@ -3094,7 +3096,13 @@ mod tests {
             slots.into_iter().collect::<Vec<_>>(),
             (0..N_CARRIERS).collect::<Vec<_>>()
         );
-        assert!(carrier_slot(tags::message::MESSAGE_CONTEXT_INFO).is_none());
+        for field in [
+            tags::message::CONVERSATION,
+            tags::message::MESSAGE_CONTEXT_INFO,
+        ] {
+            assert!(carrier_slot(field).is_none());
+            assert!(wrapper_slot(field).is_none());
+        }
         assert!(carrier_slot(tags::message::EPHEMERAL_MESSAGE).is_none());
         assert!(carrier_slot(tags::message::POLL_UPDATE_MESSAGE).is_none());
     }

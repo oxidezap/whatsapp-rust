@@ -326,6 +326,65 @@ struct DispatchPayload {
     publication: CachedPublication,
 }
 
+#[derive(Clone)]
+enum DispatchPayloads {
+    Inline(Option<DispatchPayload>),
+    Multiple(Vec<DispatchPayload>),
+}
+
+impl Default for DispatchPayloads {
+    fn default() -> Self {
+        Self::Inline(None)
+    }
+}
+
+impl std::ops::Deref for DispatchPayloads {
+    type Target = [DispatchPayload];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inline(payload) => payload.as_slice(),
+            Self::Multiple(payloads) => payloads,
+        }
+    }
+}
+
+impl DispatchPayloads {
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, DispatchPayload> {
+        match self {
+            Self::Inline(payload) => payload.as_mut_slice().iter_mut(),
+            Self::Multiple(payloads) => payloads.iter_mut(),
+        }
+    }
+
+    fn push(&mut self, payload: DispatchPayload) {
+        match self {
+            Self::Inline(inline) => {
+                if let Some(first) = inline.take() {
+                    *self = Self::Multiple(Vec::from([first, payload]));
+                } else {
+                    *inline = Some(payload);
+                }
+            }
+            Self::Multiple(payloads) => payloads.push(payload),
+        }
+    }
+
+    fn prune(&mut self) {
+        match self {
+            Self::Inline(payload) => {
+                if payload
+                    .as_mut()
+                    .is_some_and(|entry| !entry.publication.compact())
+                {
+                    *payload = None;
+                }
+            }
+            Self::Multiple(payloads) => payloads.retain_mut(|entry| entry.publication.compact()),
+        }
+    }
+}
+
 /// The identity this claim's message carries under the alternate PN/LID
 /// spelling, when its stanza spelled both out.
 ///
@@ -338,7 +397,7 @@ type DispatchAlias = Option<DispatchKey>;
 
 #[derive(Clone, Default)]
 pub(crate) struct DispatchClaim {
-    payloads: smallvec::SmallVec<[DispatchPayload; 1]>,
+    payloads: DispatchPayloads,
     alias: DispatchAlias,
 }
 
@@ -383,8 +442,7 @@ impl Drop for PublicationGuard {
 
 impl DispatchClaim {
     fn prune(&mut self) {
-        self.payloads
-            .retain(|payload| payload.publication.compact());
+        self.payloads.prune();
     }
 
     fn has_deliveries(&self) -> bool {
@@ -489,13 +547,12 @@ const TOKEN_ALLOC_BYTES: usize = 2 * size_of::<usize>() + size_of::<AtomicU8>();
 impl wacore::stats::HeapSize for DispatchClaim {
     /// Heap retained beside the table slot: spilled payloads at their
     /// allocated capacity and tracked publication tokens. Completed payloads
-    /// have no token allocation. The inline
-    /// SmallVec slot and the alias identity live in the slot itself and are
-    /// charged with the table.
+    /// have no token allocation. The inline payload and the alias identity
+    /// live in the slot itself and are charged with the table.
     fn heap_bytes(&self) -> usize {
         let mut bytes = 0;
-        if self.payloads.spilled() {
-            bytes += self.payloads.capacity() * size_of::<DispatchPayload>();
+        if let DispatchPayloads::Multiple(payloads) = &self.payloads {
+            bytes += payloads.capacity() * size_of::<DispatchPayload>();
         }
         bytes += self
             .payloads

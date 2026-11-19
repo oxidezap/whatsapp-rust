@@ -6,10 +6,10 @@
 
 use subtle::ConstantTimeEq;
 
-use crate::AppStateError;
-use crate::decode::{Mutation, decode_record, decode_record_into};
-use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
+use crate::decode::{BatchRecordDecoder, Mutation, decode_record};
+use crate::hash::{FoldReport, HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
+use crate::{AppStateError, WAPATCH_INTEGRITY};
 use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -286,8 +286,8 @@ where
     let version = snapshot.version.version.unwrap_or(0);
     initial_state.version = version;
 
-    // Update hash state directly from records (no cloning needed)
-    let fold = initial_state.update_hash_from_records(&snapshot.records);
+    let winners = last_record_per_index(&snapshot.records);
+    let fold = fold_snapshot_winners(initial_state, &snapshot.records, &winners);
 
     // A record with no value blob is one nobody can agree about: WA Web reads
     // `.byteLength` off the absent buffer and the whole fold throws. Refused
@@ -435,22 +435,20 @@ where
     // default, so the consumer can apply them in either order and end up with a
     // contact, mute or label that the snapshot we just authenticated does not
     // describe.
-    let winners = last_record_per_index(&snapshot.records);
     let mut mutations = Vec::with_capacity(winners.len());
     let mut mutation_macs = Vec::with_capacity(winners.len());
-    let mut plaintext = Vec::new();
+    let mut decoder = BatchRecordDecoder::default();
 
     for rec in winners {
         let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
-        let (mutation, macs) = decode_record_into(
+        let (mutation, macs) = decoder.decode(
             wa::syncd_mutation::SyncdOperation::SET,
             rec,
             &keys,
             key_id,
             validate_macs,
-            &mut plaintext,
         )?;
 
         mutation_macs.push(AppStateMutationMAC {
@@ -659,7 +657,7 @@ where
     let mut mutations = Vec::with_capacity(patch.mutations.len());
     let mut added_macs = Vec::with_capacity(sets);
     let mut removed_index_macs = Vec::with_capacity(patch.mutations.len() - sets);
-    let mut plaintext = Vec::new();
+    let mut decoder = BatchRecordDecoder::default();
 
     for m in &patch.mutations {
         if m.record.is_set() {
@@ -673,8 +671,7 @@ where
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let (mutation, macs) =
-                decode_record_into(op, &m.record, &keys, key_id, validate_macs, &mut plaintext)?;
+            let (mutation, macs) = decoder.decode(op, &m.record, &keys, key_id, validate_macs)?;
 
             match op {
                 wa::syncd_mutation::SyncdOperation::SET => {
@@ -887,6 +884,29 @@ pub fn validate_patch_macs(
 /// and this decides what we then decrypt, so a disagreement means accepting a
 /// snapshot on one set of records and storing another.
 fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
+    if records.len() > crate::hash::MAC_DEDUP_SCAN_LIMIT {
+        let mut positions = Vec::with_capacity(records.len());
+        positions.extend(
+            records
+                .iter()
+                .enumerate()
+                .filter_map(|(position, record)| record.value.blob.is_some().then_some(position)),
+        );
+        // Within an index, put the last record first for deduplication.
+        positions.sort_unstable_by(|&a, &b| {
+            snapshot_index_mac(&records[a])
+                .cmp(snapshot_index_mac(&records[b]))
+                .then_with(|| b.cmp(&a))
+        });
+        positions
+            .dedup_by(|a, b| snapshot_index_mac(&records[*a]) == snapshot_index_mac(&records[*b]));
+        positions.sort_unstable();
+        return positions
+            .into_iter()
+            .map(|position| &records[position])
+            .collect();
+    }
+
     let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
     let mut seen: Vec<&[u8]> = Vec::new();
     // Backwards, so the first hit for an index is its last record.
@@ -899,11 +919,7 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
         if rec.value.blob.is_none() {
             continue;
         }
-        let index_mac = rec
-            .index
-            .as_option()
-            .and_then(|idx| idx.blob.as_deref())
-            .unwrap_or_default();
+        let index_mac = snapshot_index_mac(rec);
         if !seen.contains(&index_mac) {
             seen.push(index_mac);
             winners.push(rec);
@@ -911,6 +927,39 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
     }
     winners.reverse();
     winners
+}
+
+fn snapshot_index_mac(record: &wa::SyncdRecord) -> &[u8] {
+    record
+        .index
+        .as_option()
+        .and_then(|idx| idx.blob.as_deref())
+        .unwrap_or_default()
+}
+
+fn fold_snapshot_winners(
+    state: &mut HashState,
+    records: &[wa::SyncdRecord],
+    winners: &[&wa::SyncdRecord],
+) -> FoldReport {
+    let mut valueless = 0;
+    let mut unkeyed = 0;
+    for record in records {
+        if record.value.blob.is_none() {
+            valueless += 1;
+        } else if snapshot_index_mac(record).is_empty() {
+            unkeyed += 1;
+        }
+    }
+    let operands = winners
+        .iter()
+        .filter_map(|record| record.value.blob.as_deref().map(value_mac_tail));
+    let folded = WAPATCH_INTEGRITY.add_from_iter(&mut state.hash, operands);
+    FoldReport {
+        folded,
+        unkeyed,
+        valueless,
+    }
 }
 
 /// Validate a snapshot MAC.
@@ -1045,7 +1094,7 @@ mod tests {
 
         // One ordinary index carrying a run of two, and three records with no
         // index at all: five records describing two things.
-        let records = vec![
+        let records = [
             record(Some(&[0x01; 32]), 0x11),
             record(None, 0x22),
             record(Some(&[0x01; 32]), 0x33),
@@ -1053,30 +1102,29 @@ mod tests {
             record(None, 0x55),
         ];
 
-        let mut state = HashState::default();
-        let fold = state.update_hash_from_records(&records);
-        let winners = last_record_per_index(&records);
-
-        assert_eq!(fold.folded, 2, "one index and one empty key");
-        assert_eq!(
-            winners.len(),
-            fold.folded,
-            "the decode walks the records the fold folded, or the MAC we accepted \
-             was computed over a different snapshot than the one we store"
-        );
-        assert_eq!(
-            fold.unkeyed, 3,
-            "and it still says how many arrived unkeyed"
-        );
-
-        // Last wins in both, and on the same records.
-        let last_of = |mac: u8| {
-            winners
+        for copies in [1, 20] {
+            let records: Vec<_> = records
                 .iter()
-                .any(|rec| rec.value.blob.as_ref().is_some_and(|b| b[16] == mac))
-        };
-        assert!(last_of(0x33), "the run's last record, not its first");
-        assert!(last_of(0x55), "the last unkeyed record, not the first");
+                .cloned()
+                .cycle()
+                .take(records.len() * copies)
+                .collect();
+            let mut state = HashState::default();
+            let fold = state.update_hash_from_records(&records);
+            let winners = last_record_per_index(&records);
+            let mut reused = HashState::default();
+            assert_eq!(fold_snapshot_winners(&mut reused, &records, &winners), fold);
+            assert_eq!(reused.hash, state.hash);
+
+            assert_eq!(fold.folded, 2);
+            assert_eq!(winners.len(), fold.folded);
+            assert_eq!(fold.unkeyed, 3 * copies);
+            let winner_macs: Vec<_> = winners
+                .iter()
+                .map(|record| record.value.blob.as_ref().unwrap()[16])
+                .collect();
+            assert_eq!(winner_macs, [0x33, 0x55]);
+        }
     }
 
     /// The regression the invariant above did not catch on its own: a record

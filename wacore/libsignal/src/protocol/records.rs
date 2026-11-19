@@ -484,9 +484,8 @@ impl SessionRecord {
                 &engine::codec::encode_session_state(&state.inner),
             );
             let mut archive = engine::codec::decode_session_record(&engine::RustCrypto, &bytes)?;
-            self.inner.previous.insert(0, archive.previous.remove(0));
+            self.inner.previous.push_latest(archive.previous.remove(0));
             self.current = None;
-            self.inner.previous.truncate(engine::MAX_ARCHIVED_SESSIONS);
         }
         let waived = self.inner.reservation.is_waived();
         self.inner.reservation = engine::Reservation::default();

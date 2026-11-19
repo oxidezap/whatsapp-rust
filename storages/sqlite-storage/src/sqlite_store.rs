@@ -21,6 +21,20 @@ use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::*;
 use wacore_binary::Jid;
 
+#[derive(diesel::deserialize::FromSqlRow)]
+#[diesel(sql_type = diesel::sql_types::Binary)]
+struct AppStateIndexMac(Option<[u8; 32]>);
+
+impl diesel::deserialize::FromSql<diesel::sql_types::Binary, diesel::sqlite::Sqlite>
+    for AppStateIndexMac
+{
+    fn from_sql(
+        mut value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        Ok(Self(value.read_blob().try_into().ok()))
+    }
+}
+
 /// Internal error type that preserves the Diesel error for structured matching
 /// before converting to `StoreError`. Used in retry loops where we need to
 /// distinguish retriable SQLite lock errors from other failures.
@@ -1613,25 +1627,19 @@ impl SqliteStore {
         self.with_retry(mutation.operation(), || {
             let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
             let mutation = mutation.clone();
+            let _lease = mutation.lease();
             let timestamp = timestamp.clone();
             Box::new(move |conn| {
+                let _lease = _lease;
                 conn.immediate_transaction(|conn| {
-                    let current = match read_pending_inbound_bounded_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        max_bytes,
-                        mutation.lease(),
+                    let revision = match read_pending_inbound_payload::<HashedPendingPayload>(
+                        conn, device_id, &chat, &sender, &id, max_bytes,
                     )? {
-                        Ok(current) => current,
+                        Ok(current) => {
+                            current.map_or(PendingInboundRevision::missing(), |row| row.0)
+                        }
                         Err(error) => return Ok(Err(error)),
                     };
-                    let revision = current.as_ref().map_or(
-                        PendingInboundRevision::missing(),
-                        PendingInboundRecord::revision,
-                    );
                     // Already-replaced is Applied even if the caller's expected
                     // revision is stale. Delete has no such shortcut.
                     if let OwnedPendingMutation::Replace {
@@ -2849,7 +2857,7 @@ impl SqliteStore {
             const CHUNK_SIZE: usize = 500;
             for chunk in index_macs.chunks(CHUNK_SIZE) {
                 let chunk_slices: Vec<&[u8]> = chunk.iter().map(|m| m.as_slice()).collect();
-                let rows: Vec<(Vec<u8>, Vec<u8>)> = app_state_mutation_macs::table
+                let rows = app_state_mutation_macs::table
                     .select((
                         app_state_mutation_macs::index_mac,
                         app_state_mutation_macs::value_mac,
@@ -2857,15 +2865,16 @@ impl SqliteStore {
                     .filter(app_state_mutation_macs::name.eq(&name))
                     .filter(app_state_mutation_macs::index_mac.eq_any(chunk_slices))
                     .filter(app_state_mutation_macs::device_id.eq(device_id))
-                    .load(conn)
+                    .load_iter::<(AppStateIndexMac, Vec<u8>), diesel::connection::DefaultLoadingMode>(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 // Rows with a non-32-byte index_mac cannot have come from the
                 // 32-byte keys we just queried; skip defensively.
-                out.extend(
-                    rows.into_iter().filter_map(|(k, v)| {
-                        <[u8; 32]>::try_from(k.as_slice()).ok().map(|k| (k, v))
-                    }),
-                );
+                for row in rows {
+                    let (AppStateIndexMac(key), value) = row.map_err(|e| StoreError::Database(Box::new(e)))?;
+                    if let Some(key) = key {
+                        out.insert(key, value);
+                    }
+                }
             }
             Ok(out)
         })
@@ -3647,19 +3656,31 @@ fn insert_pending_inbound_row(
 }
 
 #[derive(QueryableByName)]
-struct BoundedPendingPayload {
+struct BoundedPendingPayload<T = Vec<u8>> {
     #[diesel(sql_type = diesel::sql_types::Text)]
     storage_type: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     byte_len: Option<i64>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
-    payload: Option<Vec<u8>>,
+    payload: Option<T>,
 }
 
 #[derive(QueryableByName)]
 struct BoundedPendingSender {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     sender: Option<String>,
+}
+
+struct HashedPendingPayload(PendingInboundRevision);
+
+impl diesel::deserialize::FromSql<diesel::sql_types::Binary, diesel::sqlite::Sqlite>
+    for HashedPendingPayload
+{
+    fn from_sql(
+        mut value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        Ok(Self(PendingInboundRevision::for_bytes(value.read_blob())))
+    }
 }
 
 fn read_pending_inbound_bounded_row(
@@ -3671,9 +3692,26 @@ fn read_pending_inbound_bounded_row(
     max_bytes: usize,
     lease: PendingInboundLease,
 ) -> QueryResult<Result<Option<PendingInboundRecord>>> {
+    Ok(
+        read_pending_inbound_payload(conn, device_id, chat, sender, id, max_bytes)?
+            .map(|row| row.map(|bytes| PendingInboundRecord::new(bytes, lease))),
+    )
+}
+
+fn read_pending_inbound_payload<T: 'static>(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+    max_bytes: usize,
+) -> QueryResult<Result<Option<T>>>
+where
+    BoundedPendingPayload<T>: QueryableByName<diesel::sqlite::Sqlite>,
+{
     // CASE keeps oversized blobs out of the Diesel value buffer. Both length
     // and payload come from one row snapshot, never separate racing queries.
-    let row: Option<BoundedPendingPayload> = crate::bounded_pending_query::BoundedPendingQuery {
+    let row: Option<BoundedPendingPayload<T>> = crate::bounded_pending_query::BoundedPendingQuery {
         max_bytes: i64::try_from(max_bytes).unwrap_or(i64::MAX),
         device_id,
         chat,
@@ -3688,7 +3726,7 @@ fn read_pending_inbound_bounded_row(
             "pending inbound payload is not a BLOB".to_owned(),
         )),
         Some(row) => match row.payload {
-            Some(bytes) => Ok(Some(PendingInboundRecord::new(bytes, lease))),
+            Some(payload) => Ok(Some(payload)),
             None => Err(StoreError::Validation(format!(
                 "pending inbound payload length {:?} exceeds limit {max_bytes}",
                 row.byte_len,
@@ -3765,6 +3803,18 @@ impl ProtocolStore for SqliteStore {
             let group_jid = group_jid.clone();
             let owned_entries = Arc::clone(&owned_entries);
             Box::new(move |conn: &mut SqliteConnection| {
+                if let [(device_jid, has_key)] = owned_entries.as_slice() {
+                    crate::upsert_queries::UpsertSenderKeyStatus {
+                        group_jid: &group_jid,
+                        device_jid,
+                        has_key: i32::from(*has_key),
+                        device_id,
+                        updated_at: now,
+                    }
+                    .execute(conn)?;
+                    return Ok(());
+                }
+
                 let values: Vec<_> = owned_entries
                     .iter()
                     .map(|(device_jid, has_key)| {

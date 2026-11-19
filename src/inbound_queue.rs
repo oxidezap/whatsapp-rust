@@ -9,16 +9,26 @@
 //! Saturation freezes chat admission and drains accepted work with the reader
 //! still serving IQs, then recycles the connection. Drain deadlines are finite;
 //! permanently stalled processing cannot be promised progress or delivery.
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type BudgetRegistry = std::sync::Mutex<
-    std::collections::HashMap<wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>>,
->;
+type BudgetRegistry = std::sync::Mutex<BudgetEntries>;
+
+#[derive(Default)]
+struct BudgetEntries {
+    hasher: RandomState,
+    table: hashbrown::HashTable<BudgetEntry>,
+}
+
+struct BudgetEntry {
+    chat: wacore_binary::jid::Jid,
+    budget: std::sync::Weak<ByteBudget>,
+}
 
 struct BudgetRegistration {
     registry: std::sync::Weak<BudgetRegistry>,
-    chat: wacore_binary::jid::Jid,
+    hash: u64,
 }
 
 /// A non-waiting byte counter. One lease is the only way to return a charge.
@@ -50,11 +60,11 @@ impl Drop for ByteBudget {
         let mut entries = registry.lock().unwrap_or_else(|p| p.into_inner());
         // A failed Weak::upgrade can install a replacement while this destructor
         // waits for the lock. Never remove that new budget's registration.
-        if entries
-            .get(&registration.chat)
-            .is_some_and(|entry| entry.as_ptr() == address)
+        if let Ok(entry) = entries
+            .table
+            .find_entry(registration.hash, |entry| entry.budget.as_ptr() == address)
         {
-            entries.remove(&registration.chat);
+            entry.remove();
         }
     }
 }
@@ -84,6 +94,152 @@ impl<T> Drop for DrainingReceiver<T> {
     fn drop(&mut self) {
         self.0.close();
         while self.0.try_recv().is_ok() {}
+    }
+}
+
+type ChatSender = async_channel::Sender<crate::client::QueuedChatMessage>;
+type SharedChatSender = std::sync::Mutex<ChatSenderState>;
+
+struct ChatSenderState {
+    sender: Option<ChatSender>,
+    capacity: Option<std::num::NonZeroUsize>,
+    remaining: usize,
+}
+
+pub(crate) enum ChatQueueAdmitError {
+    Closed,
+    Full,
+}
+
+/// The cached lane keeps its ordering locks after the worker exits. The
+/// worker retires this sender separately so those locks cannot pin the queue.
+#[derive(Clone)]
+pub(crate) struct ChatQueueSender(Arc<SharedChatSender>);
+
+impl From<ChatSender> for ChatQueueSender {
+    fn from(sender: ChatSender) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(ChatSenderState {
+            sender: Some(sender),
+            capacity: None,
+            remaining: 0,
+        })))
+    }
+}
+
+impl ChatQueueSender {
+    pub(crate) fn bounded(capacity: usize) -> (Self, ChatQueueReceiver) {
+        let capacity = std::num::NonZeroUsize::new(capacity).expect("chat queue capacity");
+        let (sender, receiver) = async_channel::unbounded();
+        let sender = Self(Arc::new(std::sync::Mutex::new(ChatSenderState {
+            sender: Some(sender),
+            capacity: Some(capacity),
+            remaining: capacity.get(),
+        })));
+        let receiver = ChatQueueReceiver {
+            receiver: DrainingReceiver(receiver),
+            sender: Arc::downgrade(&sender.0),
+        };
+        (sender, receiver)
+    }
+
+    fn active_sender(&self) -> Option<ChatSender> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sender
+            .clone()
+    }
+
+    pub(crate) fn admit_sender(&self) -> Result<ChatSender, ChatQueueAdmitError> {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let ChatSenderState {
+            sender,
+            capacity,
+            remaining,
+        } = &mut *state;
+        let sender = sender.as_ref().ok_or(ChatQueueAdmitError::Closed)?;
+        if sender.is_closed() {
+            return Err(ChatQueueAdmitError::Closed);
+        }
+        if let Some(limit) = capacity {
+            // The producer holds the lane's enqueue lock. A receiver can only
+            // increase spare capacity, and a failed admission spends at most
+            // one credit until the next length check.
+            if *remaining == 0 {
+                *remaining = limit.get().saturating_sub(sender.len());
+            }
+            if *remaining == 0 {
+                return Err(ChatQueueAdmitError::Full);
+            }
+            *remaining -= 1;
+        } else if sender.is_full() {
+            return Err(ChatQueueAdmitError::Full);
+        }
+        Ok(sender.clone())
+    }
+
+    pub(crate) fn close(&self) -> bool {
+        self.active_sender().is_some_and(|sender| sender.close())
+    }
+
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sender
+            .as_ref()
+            .map_or(0, ChatSender::len)
+    }
+
+    #[cfg(any(test, feature = "bench-harness"))]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sender
+            .as_ref()
+            .is_none_or(ChatSender::is_closed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> Option<usize> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = state.sender.as_ref()?;
+        state
+            .capacity
+            .map(std::num::NonZeroUsize::get)
+            .or_else(|| sender.capacity())
+    }
+}
+
+pub(crate) struct ChatQueueReceiver {
+    receiver: DrainingReceiver<crate::client::QueuedChatMessage>,
+    sender: std::sync::Weak<SharedChatSender>,
+}
+
+impl std::ops::Deref for ChatQueueReceiver {
+    type Target = async_channel::Receiver<crate::client::QueuedChatMessage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl Drop for ChatQueueReceiver {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Some(shared) = self.sender.upgrade() {
+            let sender = shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sender
+                .take();
+            drop(sender);
+        }
     }
 }
 
@@ -174,14 +330,14 @@ impl QueueBudgets {
         use wacore::stats::HeapSize;
         let entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
         let registry_bytes = wacore::stats::hash_table_bytes(
-            entries.capacity(),
-            size_of::<(wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>)>(),
+            entries.table.capacity(),
+            size_of::<BudgetEntry>(),
         ) + entries
-            .keys()
-            .map(|chat| {
-                // The map and live budget each own the chat key. Include the budget
-                // allocation and Arc header without upgrading/dropping under this lock.
-                2 * chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
+            .table
+            .iter()
+            .map(|entry| {
+                // Count the budget allocation without upgrading its weak reference.
+                entry.chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
             })
             .sum::<usize>()
             + size_of::<BudgetRegistry>()
@@ -198,7 +354,7 @@ impl QueueBudgets {
                         .map_or(0, |registry| registry.retained_bytes())
             });
         (
-            wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
+            wacore::stats::CollectionStats::new(entries.table.len() as u64, registry_bytes as u64),
             GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,
             ACK_BYTES.saturating_sub(self.ack.available()) as u64,
         )
@@ -214,7 +370,10 @@ impl QueueBudgets {
         bytes: usize,
     ) -> Arc<ByteBudget> {
         let mut entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(budget) = entries.get(chat).and_then(std::sync::Weak::upgrade) {
+        let BudgetEntries { hasher, table } = &mut *entries;
+        let hash = hasher.hash_one(chat);
+        let slot = table.find_mut(hash, |entry| &entry.chat == chat);
+        if let Some(budget) = slot.as_ref().and_then(|entry| entry.budget.upgrade()) {
             return budget;
         }
         // Only live lanes/byte leases own a strong reference. Their final drop
@@ -223,10 +382,22 @@ impl QueueBudgets {
             available: AtomicUsize::new(bytes),
             registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&self.per_chat),
-                chat: chat.clone(),
+                hash,
             }),
         });
-        entries.insert(chat.clone(), Arc::downgrade(&budget));
+        let weak = Arc::downgrade(&budget);
+        if let Some(slot) = slot {
+            slot.budget = weak;
+        } else {
+            table.insert_unique(
+                hash,
+                BudgetEntry {
+                    chat: chat.clone(),
+                    budget: weak,
+                },
+                |entry| hasher.hash_one(&entry.chat),
+            );
+        }
         budget
     }
 }
@@ -421,25 +592,61 @@ mod tests {
     use async_lock::Mutex;
     use wacore_binary::builder::NodeBuilder;
 
+    #[test]
+    fn a_dropped_chat_receiver_releases_the_cached_sender() {
+        let (cached, worker) = ChatQueueSender::bounded(8);
+        let outstanding_producer = cached.active_sender().unwrap();
+        drop(worker);
+        assert!(outstanding_producer.is_closed());
+        assert!(cached.active_sender().is_none());
+    }
+
     fn lane(
         global: &Arc<ByteBudget>,
         bytes: usize,
         items: usize,
-    ) -> (ChatLane, DrainingReceiver<Box<QueuedChatMessage>>) {
+    ) -> (ChatLane, DrainingReceiver<QueuedChatMessage>, QueueBudgets) {
         let (queue_tx, rx) = async_channel::bounded(items);
         (
             ChatLane {
                 generation: 0,
-                queue_tx,
+                queue_tx: queue_tx.into(),
                 enqueue_lock: Arc::new(Mutex::new(())),
                 worker_running: Arc::new(Mutex::new(())),
                 byte_budget: Arc::new(ByteBudget::new(bytes)),
-                global_budget: Arc::clone(global),
-                work: Arc::default(),
             },
             DrainingReceiver(rx),
+            QueueBudgets {
+                chat: Arc::clone(global),
+                ..QueueBudgets::default()
+            },
         )
     }
+    #[test]
+    fn byte_budget_refusals_do_not_exhaust_lazy_queue_capacity() {
+        let global = Arc::new(ByteBudget::new(4096));
+        let (mut lane, _unused_receiver, budgets) = lane(&global, 4096, 1);
+        let (sender, receiver) = ChatQueueSender::bounded(2);
+        lane.queue_tx = sender;
+
+        for id in 0..2 {
+            assert!(matches!(
+                lane.try_enqueue(&budgets, node(id, 4096)),
+                Err(async_channel::TrySendError::Full(_))
+            ));
+        }
+        for id in 0..2 {
+            lane.try_enqueue(&budgets, node(id, 0)).unwrap();
+        }
+        assert!(matches!(
+            lane.try_enqueue(&budgets, node(2, 0)),
+            Err(async_channel::TrySendError::Full(_))
+        ));
+        drop(receiver.try_recv().unwrap());
+        lane.try_enqueue(&budgets, node(2, 0)).unwrap();
+        assert_eq!(receiver.len(), 2);
+    }
+
     fn node(id: usize, bytes: usize) -> Arc<wacore_binary::OwnedNodeRef> {
         crate::test_utils::node_to_owned_ref(
             &NodeBuilder::new("message")
@@ -462,7 +669,8 @@ mod tests {
 
     async fn ready_chat_backlog(reader_yields: bool) {
         let client = crate::test_utils::create_test_client().await;
-        let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, CHAT_QUEUE_ITEMS);
+        let (lane, rx, _lane_queues) =
+            lane(&client.inbound_queues().chat, CHAT_BYTES, CHAT_QUEUE_ITEMS);
         let budget = Arc::clone(&lane.byte_budget);
         client
             .chat_lanes
@@ -504,10 +712,18 @@ mod tests {
     #[tokio::test]
     async fn a_lane_capacity_retry_cannot_admit_work_after_reconnect() {
         let client = crate::test_utils::create_test_client().await;
-        let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
-        lane.try_enqueue(node(0, 0)).unwrap();
+        let (lane, rx, lane_queues) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
+        lane.try_enqueue(&lane_queues, node(0, 0)).unwrap();
         let shutdown = client.connection_shutdown_signal();
-        let mut retry = Box::pin(lane.enqueue_scoped(node(1, 0), shutdown, &*client.runtime, None));
+        let enqueue = lane.enqueue_lock.lock().await;
+        let mut retry = Box::pin(lane.enqueue_scoped(
+            &lane_queues,
+            &enqueue,
+            node(1, 0),
+            shutdown,
+            &*client.runtime,
+            None,
+        ));
         assert!(futures::poll!(&mut retry).is_pending());
         client.reset_connection_shutdown();
         drop(rx.try_recv().unwrap());
@@ -521,13 +737,16 @@ mod tests {
     async fn closed_work_admission_stops_capacity_retries_immediately() {
         let client = crate::test_utils::create_test_client().await;
         for close_before in [true, false] {
-            let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
+            let (lane, rx, lane_queues) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
             if close_before {
-                lane.work.close();
+                lane_queues.work.close();
             } else {
-                lane.try_enqueue(node(0, 0)).unwrap();
+                lane.try_enqueue(&lane_queues, node(0, 0)).unwrap();
             }
+            let enqueue = lane.enqueue_lock.lock().await;
             let mut retry = Box::pin(lane.enqueue_scoped(
+                &lane_queues,
+                &enqueue,
                 node(1, 64 * 1024),
                 client.connection_shutdown_signal(),
                 &*client.runtime,
@@ -535,15 +754,18 @@ mod tests {
             ));
             if !close_before {
                 assert!(futures::poll!(&mut retry).is_pending());
-                lane.work.close();
+                lane_queues.work.close();
                 drop(rx.try_recv().unwrap());
             }
             assert!(matches!(
                 futures::poll!(&mut retry),
                 std::task::Poll::Ready(Err(_))
             ));
-            assert_eq!(lane.work.track_rejections(), usize::from(close_before));
-            assert_eq!(lane.work.pending(), 0);
+            assert_eq!(
+                lane_queues.work.track_rejections(),
+                usize::from(close_before)
+            );
+            assert_eq!(lane_queues.work.pending(), 0);
             assert_eq!(lane.byte_budget.available(), CHAT_BYTES);
             assert!(rx.is_empty());
         }
@@ -570,13 +792,13 @@ mod tests {
         let retained = retain_node(&node(1, 4), &budgets.chat, &budget, Arc::default()).unwrap();
         drop(budget);
         drop(same);
-        assert_eq!(budgets.per_chat.lock().unwrap().len(), 1);
+        assert_eq!(budgets.per_chat.lock().unwrap().table.len(), 1);
         drop(retained);
-        assert!(budgets.per_chat.lock().unwrap().is_empty());
+        assert!(budgets.per_chat.lock().unwrap().table.is_empty());
         for id in 0..128 {
             let chat = format!("12036300000{id:04}@g.us").parse().unwrap();
             drop(budgets.chat_budget(&chat));
-            assert!(budgets.per_chat.lock().unwrap().is_empty());
+            assert!(budgets.per_chat.lock().unwrap().table.is_empty());
         }
     }
 
@@ -592,21 +814,26 @@ mod tests {
         while weak.strong_count() != 0 {
             std::thread::yield_now();
         }
+        let hash = entries.hasher.hash_one(&chat);
         let replacement = Arc::new(ByteBudget {
             available: AtomicUsize::new(CHAT_BYTES),
             registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&registry),
-                chat: chat.clone(),
+                hash,
             }),
         });
-        entries.insert(chat.clone(), Arc::downgrade(&replacement));
+        entries
+            .table
+            .find_mut(hash, |entry| entry.chat == chat)
+            .unwrap()
+            .budget = Arc::downgrade(&replacement);
         drop(entries);
         dropping.join().unwrap();
         let found = budgets.chat_budget(&chat);
         assert!(Arc::ptr_eq(&found, &replacement));
         drop(found);
         drop(replacement);
-        assert!(registry.lock().unwrap().is_empty());
+        assert!(registry.lock().unwrap().table.is_empty());
     }
 
     #[test]
@@ -624,10 +851,10 @@ mod tests {
             "baseline: 128 distinct payloads, {baseline_payload} payload bytes, capacity None"
         );
         let global = Arc::new(ByteBudget::new(1024 * 1024));
-        let (lane, rx) = lane(&global, 256 * 1024, CHAT_QUEUE_ITEMS);
+        let (lane, rx, lane_queues) = lane(&global, 256 * 1024, CHAT_QUEUE_ITEMS);
         let mut accepted = 0;
         for id in 0..128 {
-            if lane.try_enqueue(node(id, 64 * 1024)).is_ok() {
+            if lane.try_enqueue(&lane_queues, node(id, 64 * 1024)).is_ok() {
                 accepted += 1;
             }
         }
@@ -645,8 +872,8 @@ mod tests {
     #[test]
     fn in_flight_nodes_and_escaped_slices_keep_their_charge() {
         let global = Arc::new(ByteBudget::new(2048));
-        let (lane, rx) = lane(&global, 2048, 1);
-        lane.try_enqueue(node(1, 4)).unwrap();
+        let (lane, rx, lane_queues) = lane(&global, 2048, 1);
+        lane.try_enqueue(&lane_queues, node(1, 4)).unwrap();
         let queued = rx.try_recv().unwrap();
         let slice = queued
             .node
@@ -668,26 +895,26 @@ mod tests {
     #[test]
     fn busy_chat_leaves_capacity_for_another_chat_and_recovers_in_order() {
         let global = Arc::new(ByteBudget::new(4096));
-        let (busy, busy_rx) = lane(&global, 2048, 2);
-        let (other, other_rx) = lane(&global, 2048, 2);
-        busy.try_enqueue(node(1, 4)).unwrap();
-        busy.try_enqueue(node(2, 4)).unwrap();
+        let (busy, busy_rx, busy_queues) = lane(&global, 2048, 2);
+        let (other, other_rx, other_queues) = lane(&global, 2048, 2);
+        busy.try_enqueue(&busy_queues, node(1, 4)).unwrap();
+        busy.try_enqueue(&busy_queues, node(2, 4)).unwrap();
         assert!(matches!(
-            busy.try_enqueue(node(3, 4)),
+            busy.try_enqueue(&busy_queues, node(3, 4)),
             Err(async_channel::TrySendError::Full(_))
         ));
-        other.try_enqueue(node(4, 4)).unwrap();
+        other.try_enqueue(&other_queues, node(4, 4)).unwrap();
         let first = busy_rx.try_recv().unwrap();
         assert_eq!(
             first.node.attrs().optional_string("id").as_deref(),
             Some("1")
         );
         assert!(
-            busy.try_enqueue(node(3, 4)).is_err(),
+            busy.try_enqueue(&busy_queues, node(3, 4)).is_err(),
             "in-flight ownership still counts"
         );
         drop(first);
-        busy.try_enqueue(node(3, 4)).unwrap();
+        busy.try_enqueue(&busy_queues, node(3, 4)).unwrap();
         for id in ["2", "3"] {
             let queued = busy_rx.try_recv().unwrap();
             assert_eq!(
@@ -702,13 +929,13 @@ mod tests {
     #[test]
     fn item_limit_and_closed_lane_fail_without_leaking_or_double_charging() {
         let global = Arc::new(ByteBudget::new(4096));
-        let (lane, rx) = lane(&global, 4096, 1);
-        lane.try_enqueue(node(1, 4)).unwrap();
-        assert!(lane.try_enqueue(node(2, 4)).is_err());
+        let (lane, rx, lane_queues) = lane(&global, 4096, 1);
+        lane.try_enqueue(&lane_queues, node(1, 4)).unwrap();
+        assert!(lane.try_enqueue(&lane_queues, node(2, 4)).is_err());
         assert_eq!(global.available(), 3072);
         rx.close();
         assert!(matches!(
-            lane.try_enqueue(node(3, 4)),
+            lane.try_enqueue(&lane_queues, node(3, 4)),
             Err(async_channel::TrySendError::Closed(_))
         ));
         drop(rx);
@@ -718,13 +945,13 @@ mod tests {
     #[test]
     fn global_budget_applies_across_lanes_and_reservation_failure_rolls_back() {
         let global = Arc::new(ByteBudget::new(2048));
-        let (a, a_rx) = lane(&global, 4096, 8);
-        let (b, b_rx) = lane(&global, 4096, 8);
-        a.try_enqueue(node(1, 4)).unwrap();
-        b.try_enqueue(node(2, 4)).unwrap();
-        assert!(a.try_enqueue(node(3, 4)).is_err());
+        let (a, a_rx, a_queues) = lane(&global, 4096, 8);
+        let (b, b_rx, b_queues) = lane(&global, 4096, 8);
+        a.try_enqueue(&a_queues, node(1, 4)).unwrap();
+        b.try_enqueue(&b_queues, node(2, 4)).unwrap();
+        assert!(a.try_enqueue(&a_queues, node(3, 4)).is_err());
         drop(a_rx);
-        b.try_enqueue(node(3, 4)).unwrap();
+        b.try_enqueue(&b_queues, node(3, 4)).unwrap();
         drop(b_rx);
         assert_eq!(global.available(), 2048);
         let empty = Arc::new(ByteBudget::new(0));
@@ -735,8 +962,8 @@ mod tests {
     #[tokio::test]
     async fn worker_cancelled_before_first_poll_drains_its_cached_sender() {
         let global = Arc::new(ByteBudget::new(2048));
-        let (lane, rx) = lane(&global, 2048, 2);
-        lane.try_enqueue(node(1, 4)).unwrap();
+        let (lane, rx, lane_queues) = lane(&global, 2048, 2);
+        lane.try_enqueue(&lane_queues, node(1, 4)).unwrap();
         let task = tokio::spawn(async move {
             let _rx = rx;
             std::future::pending::<()>().await;
@@ -751,8 +978,8 @@ mod tests {
     #[tokio::test]
     async fn cancellation_releases_owned_nodes_but_ack_bytes_follow_the_sender() {
         let global = Arc::new(ByteBudget::new(2048));
-        let (lane, rx) = lane(&global, 2048, 2);
-        lane.try_enqueue(node(1, 4)).unwrap();
+        let (lane, rx, lane_queues) = lane(&global, 2048, 2);
+        lane.try_enqueue(&lane_queues, node(1, 4)).unwrap();
         let queued = rx.try_recv().unwrap();
         let task = tokio::spawn(async move {
             let _queued = queued;
@@ -834,12 +1061,10 @@ mod overload_tests {
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: budget,
-            global_budget: Arc::clone(&client.inbound_queues().chat),
-            work: Arc::clone(&client.inbound_queues().work),
         };
         let message = || {
             crate::test_utils::node_to_owned_ref(
@@ -850,7 +1075,8 @@ mod overload_tests {
                     .build(),
             )
         };
-        lane.try_enqueue(message()).unwrap();
+        lane.try_enqueue(client.inbound_queues(), message())
+            .unwrap();
         client.chat_lanes.insert(chat.clone(), lane).await;
         let queued = rx.try_recv().unwrap();
         let slice = queued
@@ -957,12 +1183,10 @@ mod overload_tests {
         let (queue_tx, rx) = async_channel::bounded(1);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
-            global_budget: Arc::clone(&client.inbound_queues().chat),
-            work: Arc::clone(&client.inbound_queues().work),
         };
         let lock = Arc::clone(&lane.enqueue_lock);
         let guard = lock.lock().await;
@@ -1001,12 +1225,10 @@ mod overload_tests {
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
             generation: 0,
-            queue_tx,
+            queue_tx: queue_tx.into(),
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
-            global_budget: Arc::clone(&client.inbound_queues().chat),
-            work: Arc::clone(&client.inbound_queues().work),
         };
         let node = || {
             crate::test_utils::node_to_owned_ref(
@@ -1016,7 +1238,7 @@ mod overload_tests {
                     .build(),
             )
         };
-        lane.try_enqueue(node()).unwrap();
+        lane.try_enqueue(client.inbound_queues(), node()).unwrap();
         client.chat_lanes.insert(chat, lane).await;
         let mut cancelled = false;
         crate::handlers::message::MessageHandler::handle_inline(

@@ -2033,6 +2033,9 @@ impl Client {
                     // Decrypt succeeded (the ratchet advanced); defer the
                     // plaintext handling until the lock is dropped.
                     outcome.decrypted = true;
+                    if deferred.is_empty() && payloads_iter.as_slice().is_empty() {
+                        deferred.reserve_exact(1);
+                    }
                     defer_plaintext(
                         &mut deferred,
                         enc_type,

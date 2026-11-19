@@ -457,12 +457,14 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             let private = old.private.ok_or(Error::MissingKey)?;
             let (root, receiving) =
                 root_step(self.crypto, &session.root, &private, &message.ratchet)?;
+            if session.receivers.len() >= MAX_RECEIVER_CHAINS {
+                session.receivers.remove(0);
+            } else if session.receivers.len() == MAX_RECEIVER_CHAINS - 1 {
+                session.receivers.reserve_exact(1);
+            }
             session
                 .receivers
                 .push(Chain::new(message.ratchet, None, receiving));
-            if session.receivers.len() > MAX_RECEIVER_CHAINS {
-                session.receivers.remove(0);
-            }
             (
                 session.receivers.len() - 1,
                 Some(zeroize::Zeroizing::new(root)),

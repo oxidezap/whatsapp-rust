@@ -354,6 +354,19 @@ fn sk_device_jid(id: u64) -> String {
 #[divan::bench(args = N)]
 fn sender_key_status_put(bencher: divan::Bencher, n: usize) {
     let d = db(11, "skd-status");
+    if d.next.load(portable_atomic::Ordering::Relaxed) == 0 {
+        // Warm the writer's cached single-device UPSERT outside the measured
+        // call. The store compiles it once per connection, so its compile cost
+        // is not part of the per-call cost this row tracks. Batches use
+        // uncacheable SQL, so this only affects `n = 1`.
+        let jid = sk_device_jid(d.id());
+        d.runtime
+            .block_on(
+                d.store
+                    .set_sender_key_status(BENCH_GROUP, &[(jid.as_str(), true)]),
+            )
+            .expect("warm status statement");
+    }
     bencher
         .with_inputs(|| (0..n).map(|_| sk_device_jid(d.id())).collect::<Vec<_>>())
         .bench_values(|jids| {

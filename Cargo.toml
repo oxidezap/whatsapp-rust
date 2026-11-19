@@ -463,6 +463,10 @@ name = "connected_idle"
 test = true
 required-features = ["bench-harness", "sqlite-storage"]
 
+[[example]]
+name = "offline_replay_timing"
+required-features = ["bench-harness", "sqlite-storage"]
+
 [[bench]]
 name = "client_dm_send"
 harness = false

@@ -82,12 +82,14 @@ impl MessageHandler {
             }
         };
 
+        let budgets = client.inbound_queues();
+
         // Single-flight: get_with_by_ref guarantees exactly one init runs per key,
         // preventing duplicate workers for the same chat (TOCTOU race).
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
-                let budget = client.inbound_queues().chat_budget(&chat_jid);
+                let budget = budgets.chat_budget(&chat_jid);
                 create_chat_lane(
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
@@ -99,7 +101,7 @@ impl MessageHandler {
 
         // Lock serializes enqueue order for this chat, the replacement
         // below included (see `create_chat_lane` for why it outlives the lane).
-        let _guard = lane.enqueue_lock.lock().await;
+        let enqueue = lane.enqueue_lock.lock().await;
 
         // A lane lookup or enqueue lock can resume after reconnection. Do not
         // admit an old notification to a worker created by the new connection.
@@ -121,7 +123,14 @@ impl MessageHandler {
         }
 
         let (node, offline) = match lane
-            .enqueue_scoped(node, shutdown.clone(), &*client.runtime, offline)
+            .enqueue_scoped(
+                budgets,
+                &enqueue,
+                node,
+                shutdown.clone(),
+                &*client.runtime,
+                offline,
+            )
             .await
         {
             Ok(()) => return true,
@@ -170,7 +179,14 @@ impl MessageHandler {
             return true;
         }
         if let Err(e) = fresh
-            .enqueue_scoped(node, shutdown.clone(), &*client.runtime, offline)
+            .enqueue_scoped(
+                budgets,
+                &enqueue,
+                node,
+                shutdown.clone(),
+                &*client.runtime,
+                offline,
+            )
             .await
         {
             warn!("Failed to enqueue message for processing: {e}");
@@ -215,11 +231,8 @@ fn create_chat_lane(
     worker_running: Arc<async_lock::Mutex<()>>,
     byte_budget: Arc<crate::inbound_queue::ByteBudget>,
 ) -> ChatLane {
-    // Keep the offline-resume item bound without reserving each full entry
-    // for idle chats. Only accepted messages allocate their payload wrapper.
     let (tx, rx) =
-        async_channel::bounded::<Box<QueuedChatMessage>>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
-    let rx = crate::inbound_queue::DrainingReceiver(rx);
+        crate::inbound_queue::ChatQueueSender::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -233,6 +246,7 @@ fn create_chat_lane(
             // Queue behind the worker this lane replaced, if it is still
             // draining the messages that raced its idle exit.
             let _running = running.lock_arc().await;
+            let mut retired_for_idle = false;
             loop {
                 // A burst is served straight off the queue; the idle timer is
                 // only armed once the queue is empty, so it costs nothing per
@@ -256,26 +270,18 @@ fn create_chat_lane(
                                 // that lands after it is told `Closed` and
                                 // replaces this lane.
                                 rx.close();
-                                while let Ok(queued) = rx.try_recv() {
-                                    if !process_queued(
-                                        &client_for_worker,
-                                        *queued,
-                                        spawn_generation,
-                                    )
-                                    .await
-                                    {
-                                        break;
-                                    }
-                                }
-                                client_for_worker.reclaim_idle_delivery_capacity();
-                                break;
+                                retired_for_idle = true;
+                                continue;
                             }
                         }
                     }
                 };
-                if !process_queued(&client_for_worker, *next, spawn_generation).await {
+                if !process_queued(&client_for_worker, next, spawn_generation).await {
                     break;
                 }
+            }
+            if retired_for_idle {
+                client_for_worker.reclaim_idle_delivery_capacity();
             }
         }))
         .detach();
@@ -285,8 +291,6 @@ fn create_chat_lane(
         enqueue_lock,
         queue_tx: tx,
         byte_budget,
-        global_budget: Arc::clone(&client.inbound_queues().chat),
-        work: Arc::clone(&client.inbound_queues().work),
         worker_running,
     }
 }
@@ -448,7 +452,7 @@ mod tests {
                     .bytes(vec![id as u8; 16 * 1024])
                     .build(),
             );
-            if lane.try_enqueue(node).is_ok() {
+            if lane.try_enqueue(client.inbound_queues(), node).is_ok() {
                 accepted += 1;
             }
         }
@@ -550,12 +554,17 @@ mod tests {
         // Paused time: the sleep advances the clock instead of waiting.
         tokio::time::sleep(LANE_IDLE_TIMEOUT + Duration::from_secs(1)).await;
         for _ in 0..100 {
-            if first_tx.is_closed() {
+            if first_tx.capacity().is_none() {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert!(first_tx.is_closed(), "idle worker must close its queue");
+        assert_eq!(
+            first_tx.capacity(),
+            None,
+            "cached lane must release its channel"
+        );
         assert!(
             first.worker_running.try_lock().is_some(),
             "an exited worker must release its running lock"
