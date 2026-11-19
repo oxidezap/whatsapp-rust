@@ -592,42 +592,50 @@ impl Client {
             .collect();
         let lease = PendingInboundLease::new(Arc::new((Arc::clone(&owner), charges)));
         let backend = self.persistence_manager.backend();
+        // Every alias check requires the same message ID. Unique IDs cannot
+        // converge on one physical row, so skip the pairwise scans.
+        let unique_ids = items.len() < 2 || {
+            let mut ids = std::collections::HashSet::with_capacity(items.len());
+            items.iter().all(|item| ids.insert(item.info.id.as_str()))
+        };
         // A complete batch can carry both legacy physical spellings. Exact
         // bounded reads establish which arrived keys already exist; a single
         // unknown arrival must still use the ambiguity-rejecting group lookup.
         let mut arrived_keys = Vec::new();
-        for item in items {
-            if item.storage_sender.is_some() || !item.info.source.chat.is_group() {
-                continue;
-            }
-            let info = &item.info;
-            let has_alias = items.iter().any(|other| {
-                other.info.id == info.id
-                    && other.info.source.chat == info.source.chat
-                    && other.info.source.sender != info.source.sender
-                    && other.info.source.sender.user == info.source.sender.user
-                    && other.info.source.sender.server == info.source.sender.server
-                    && other.info.source.sender.integrator == info.source.sender.integrator
-            });
-            if !has_alias {
-                continue;
-            }
-            let chat = info.source.chat.to_string();
-            let sender = info.source.sender.to_string();
-            if backend
-                .read_pending_inbound_bounded(
-                    PendingInboundKey {
-                        chat: &chat,
-                        sender: &sender,
-                        id: &info.id,
-                    },
-                    MAX_PENDING_BYTES,
-                    lease.clone(),
-                )
-                .await?
-                .is_some()
-            {
-                arrived_keys.push((chat, sender, info.id.to_string()));
+        if !unique_ids {
+            for item in items {
+                if item.storage_sender.is_some() || !item.info.source.chat.is_group() {
+                    continue;
+                }
+                let info = &item.info;
+                let has_alias = items.iter().any(|other| {
+                    other.info.id == info.id
+                        && other.info.source.chat == info.source.chat
+                        && other.info.source.sender != info.source.sender
+                        && other.info.source.sender.user == info.source.sender.user
+                        && other.info.source.sender.server == info.source.sender.server
+                        && other.info.source.sender.integrator == info.source.sender.integrator
+                });
+                if !has_alias {
+                    continue;
+                }
+                let chat = info.source.chat.to_string();
+                let sender = info.source.sender.to_string();
+                if backend
+                    .read_pending_inbound_bounded(
+                        PendingInboundKey {
+                            chat: &chat,
+                            sender: &sender,
+                            id: &info.id,
+                        },
+                        MAX_PENDING_BYTES,
+                        lease.clone(),
+                    )
+                    .await?
+                    .is_some()
+                {
+                    arrived_keys.push((chat, sender, info.id.to_string()));
+                }
             }
         }
         let mut groups: Vec<PendingWriteGroup<'_>> = Vec::new();
@@ -649,20 +657,24 @@ impl Client {
                 },
                 |sender| sender.to_string(),
             );
-            let group = groups.iter_mut().find(|group| {
-                group.chat == chat
-                    && group.id == item_id
-                    && (group.sender == sender
-                        || item.info.source.chat.is_group()
-                            && (!explicit || group.lookup_group_sender)
-                            && group.deliveries.first().is_some_and(|first| {
-                                let first = &first.info.source.sender;
-                                let next = &item.info.source.sender;
-                                first.user == next.user
-                                    && first.server == next.server
-                                    && first.integrator == next.integrator
-                            }))
-            });
+            let group = if unique_ids {
+                None
+            } else {
+                groups.iter_mut().find(|group| {
+                    group.chat == chat
+                        && group.id == item_id
+                        && (group.sender == sender
+                            || item.info.source.chat.is_group()
+                                && (!explicit || group.lookup_group_sender)
+                                && group.deliveries.first().is_some_and(|first| {
+                                    let first = &first.info.source.sender;
+                                    let next = &item.info.source.sender;
+                                    first.user == next.user
+                                        && first.server == next.server
+                                        && first.integrator == next.integrator
+                                }))
+                })
+            };
             if let Some(group) = group {
                 if explicit && group.lookup_group_sender {
                     group.sender = sender;
@@ -684,16 +696,18 @@ impl Client {
         // live admission budget before the first mutation, through hook and
         // cleanup completion. Unknown on-disk alias pairs still fail closed.
         let mut alias_charges = Vec::new();
-        for group in &groups {
-            if groups.iter().any(|other| {
-                other.chat == group.chat && other.id == group.id && other.sender != group.sender
-            }) {
-                for delivery in &group.deliveries {
-                    let mut retained = (**delivery).clone();
-                    self.inbound_commit_batch
-                        .live_retention
-                        .retain(&mut retained)?;
-                    alias_charges.extend(retained.retention);
+        if !unique_ids {
+            for group in &groups {
+                if groups.iter().any(|other| {
+                    other.chat == group.chat && other.id == group.id && other.sender != group.sender
+                }) {
+                    for delivery in &group.deliveries {
+                        let mut retained = (**delivery).clone();
+                        self.inbound_commit_batch
+                            .live_retention
+                            .retain(&mut retained)?;
+                        alias_charges.extend(retained.retention);
+                    }
                 }
             }
         }
