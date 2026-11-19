@@ -927,6 +927,25 @@ async fn execute_request_into_memory(
     if let Some(budget) = cancellation {
         hashes.budget = Some(budget);
     }
+    if http_client.supports_async_streaming()
+        && matches!(request.decryption, MediaDecryption::Encrypted { .. })
+    {
+        let writer = MemoryWriter::new(capacity, None);
+        return match streaming_download_and_decrypt_mapped::<_, _, _, AdoptBufferedBody>(
+            http_client,
+            runtime,
+            request,
+            hashes,
+            writer,
+            |writer| writer.into_parts().0,
+        )
+        .await
+        {
+            Ok(WriterAttempt::Verified(data)) => Ok(data),
+            Ok(WriterAttempt::Failed(_, error)) => Err(error),
+            Err(error) => Err(DownloadRequestError::other(error)),
+        };
+    }
     if http_client.supports_streaming() {
         let writer = MemoryWriter::new(capacity, None);
         match streaming_download_and_decrypt(http_client, runtime, request, hashes, writer).await {
@@ -1041,7 +1060,10 @@ impl MediaDownloader {
         downloadable: &dyn Downloadable,
         limits: DownloadLimits,
     ) -> std::result::Result<Vec<u8>, MediaDownloadError> {
-        if limits.is_bounded() && !self.http_client.supports_streaming() {
+        if limits.is_bounded()
+            && !self.http_client.supports_streaming()
+            && !(downloadable.is_encrypted() && self.http_client.supports_async_streaming())
+        {
             return Err(DownloadPolicyError::StreamingRequired.into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
@@ -1170,7 +1192,10 @@ impl Client {
             .media_http_client()
             .map_err(ClientDownloadError::Preparation)?;
         let media_http = &media_http;
-        if limits.is_bounded() && !self.http_client.supports_streaming() {
+        if limits.is_bounded()
+            && !self.http_client.supports_streaming()
+            && !(downloadable.is_encrypted() && self.http_client.supports_async_streaming())
+        {
             return Err(DownloadPolicyError::StreamingRequired.into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
@@ -1529,50 +1554,14 @@ where
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
     StoreBody: StoreBufferedBody<W>,
 {
-    if StoreBody::ASYNC_SINK
+    let async_capable = StoreBody::ASYNC_SINK
         && http_client.supports_async_streaming()
-        && let MediaDecryption::Encrypted {
-            media_key,
-            media_type,
-        } = &request.decryption
-        && let Some(response) =
-            http_client.execute_async_streaming(crate::http::HttpRequest::get(request.url.clone()))
+        && matches!(request.decryption, MediaDecryption::Encrypted { .. });
+    let sync_capable = http_client.supports_streaming();
+    let admission = match (async_capable || sync_capable)
+        .then(|| http_client.streaming_admission())
+        .flatten()
     {
-        return Ok(Box::pin(async_streamed_download(
-            http_client,
-            response,
-            media_key,
-            *media_type,
-            hashes,
-            writer,
-            finish,
-        ))
-        .await);
-    }
-
-    if !http_client.supports_streaming() {
-        if hashes
-            .budget
-            .as_ref()
-            .is_some_and(DownloadBudget::is_bounded)
-        {
-            return Ok(WriterAttempt::Failed(
-                writer,
-                DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
-            ));
-        }
-        return buffered_download_and_decrypt::<_, _, _, StoreBody>(
-            http_client,
-            runtime,
-            request,
-            hashes,
-            writer,
-            finish,
-        )
-        .await;
-    }
-
-    let admission = match http_client.streaming_admission() {
         Some(admission) => {
             if let Some(budget) = &hashes.budget
                 && let Err(error) = budget.check_cancelled()
@@ -1594,6 +1583,49 @@ where
         }
         None => None,
     };
+    if async_capable
+        && let MediaDecryption::Encrypted {
+            media_key,
+            media_type,
+        } = &request.decryption
+        && let Some(response) =
+            http_client.execute_async_streaming(crate::http::HttpRequest::get(request.url.clone()))
+    {
+        return Ok(Box::pin(async_streamed_download(
+            &**runtime,
+            admission,
+            response,
+            (media_key, *media_type),
+            hashes,
+            writer,
+            finish,
+        ))
+        .await);
+    }
+
+    if !sync_capable {
+        drop(admission);
+        if hashes
+            .budget
+            .as_ref()
+            .is_some_and(DownloadBudget::is_bounded)
+        {
+            return Ok(WriterAttempt::Failed(
+                writer,
+                DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
+            ));
+        }
+        return buffered_download_and_decrypt::<_, _, _, StoreBody>(
+            http_client,
+            runtime,
+            request,
+            hashes,
+            writer,
+            finish,
+        )
+        .await;
+    }
+
     let http_client = http_client.clone();
     let url = request.url.clone();
     let decryption = request.decryption.clone();
@@ -1614,17 +1646,18 @@ where
 }
 
 async fn async_streamed_download<W, T>(
-    http_client: &Arc<dyn HttpClient>,
+    runtime: &dyn Runtime,
+    _admission: Option<wacore::net::StreamingRequestPermit>,
     response: wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
-    media_key: &[u8],
-    media_type: MediaType,
+    (media_key, media_type): (&[u8], MediaType),
     hashes: ExpectedMediaHashes,
-    mut writer: W,
+    writer: W,
     finish: impl FnOnce(W) -> T,
 ) -> WriterAttempt<W, T>
 where
-    W: DownloadWriter,
+    W: DownloadWriter + MaybeSend + 'static,
 {
+    let mut current_writer = Some(writer);
     let result = async {
         let budget = hashes
             .budget
@@ -1633,30 +1666,77 @@ where
         budget
             .check_cancelled()
             .map_err(DownloadRequestError::ResourcePolicy)?;
-        let _admission = match http_client.streaming_admission() {
-            Some(admission) => Some(admission.await.map_err(DownloadRequestError::other)?),
-            None => None,
-        };
-        clear_writer(&mut writer).map_err(DownloadRequestError::writer_io)?;
+        clear_writer(current_writer.as_mut().expect("media writer"))
+            .map_err(DownloadRequestError::writer_io)?;
         let response = response.await.map_err(DownloadRequestError::other)?;
         validate_download_status(response.status_code)?;
-        let reader = budget.async_reader(response.body);
-        DownloadUtils::decrypt_async_stream_to_writer_with_hashes(
-            reader,
-            media_key,
-            media_type,
-            hashes.encrypted(),
-            hashes.plaintext(),
-            &mut budget.writer(WriterIoOrigin(&mut writer)),
-        )
-        .await
-        .map_err(DownloadRequestError::streamed)?;
+        use futures::io::AsyncReadExt;
+
+        let mut reader = budget.async_reader(response.body);
+        let mut decryptor = Box::new(
+            wacore::download::MediaDecryptStream::new(
+                media_key,
+                media_type,
+                hashes.encrypted().is_some(),
+                hashes.plaintext().is_some(),
+            )
+            .map_err(DownloadRequestError::streamed)?,
+        );
+        const DECRYPT_BATCH_BYTES: usize = 128 * 1024;
+        let mut ciphertext = vec![0; DECRYPT_BATCH_BYTES];
+        loop {
+            let mut filled = 0;
+            while filled < ciphertext.len() {
+                let read = reader
+                    .read(&mut ciphertext[filled..])
+                    .await
+                    .map_err(|error| DownloadRequestError::streamed(error.into()))?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            if filled == 0 {
+                break;
+            }
+            let budget_for_job = budget.clone();
+            let mut writer = current_writer.take().expect("media writer");
+            let result;
+            (decryptor, ciphertext, writer, result) =
+                wacore::runtime::blocking(runtime, move || {
+                    let result = decryptor.push(
+                        &ciphertext[..filled],
+                        &mut budget_for_job.writer(WriterIoOrigin(&mut writer)),
+                    );
+                    (decryptor, ciphertext, writer, result)
+                })
+                .await;
+            current_writer = Some(writer);
+            result.map_err(DownloadRequestError::streamed)?;
+            if filled < ciphertext.len() {
+                break;
+            }
+            #[cfg(target_arch = "wasm32")]
+            if let Some(yield_now) = runtime.yield_now() {
+                yield_now.await;
+            }
+        }
+        decryptor
+            .finish(
+                hashes.encrypted(),
+                hashes.plaintext(),
+                &mut budget.writer(WriterIoOrigin(
+                    current_writer.as_mut().expect("media writer"),
+                )),
+            )
+            .map_err(DownloadRequestError::streamed)?;
         budget
             .check_cancelled()
             .map_err(DownloadRequestError::ResourcePolicy)?;
-        finish_verified_write(&mut writer)
+        finish_verified_write(current_writer.as_mut().expect("media writer"))
     }
     .await;
+    let writer = current_writer.expect("media writer");
     match result {
         Ok(()) => WriterAttempt::Verified(finish(writer)),
         Err(error) => WriterAttempt::Failed(writer, error),
@@ -3221,7 +3301,45 @@ mod tests {
         assert_eq!(provider.macs.load(Ordering::Relaxed), 3);
     }
 
-    struct AsyncBodyHttp(std::sync::Mutex<Option<wacore::net::AsyncHttpBody>>);
+    struct CountRuntime {
+        inner: crate::TokioRuntime,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Runtime for CountRuntime {
+        fn spawn(
+            &self,
+            future: wacore::runtime::BoxFuture<'static, ()>,
+        ) -> wacore::runtime::AbortHandle {
+            self.inner.spawn(future)
+        }
+        fn sleep(&self, duration: std::time::Duration) -> wacore::runtime::BoxFuture<'static, ()> {
+            self.inner.sleep(duration)
+        }
+        fn spawn_blocking(
+            &self,
+            work: Box<dyn FnOnce() + Send + 'static>,
+        ) -> wacore::runtime::BoxFuture<'static, ()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.spawn_blocking(work)
+        }
+        fn yield_now(&self) -> Option<wacore::runtime::BoxFuture<'static, ()>> {
+            self.inner.yield_now()
+        }
+    }
+
+    struct AsyncBodyHttp {
+        body: std::sync::Mutex<Option<wacore::net::AsyncHttpBody>>,
+        admission: Option<Arc<tokio::sync::Mutex<()>>>,
+    }
+
+    impl AsyncBodyHttp {
+        fn new(body: wacore::net::AsyncHttpBody) -> Self {
+            Self {
+                body: std::sync::Mutex::new(Some(body)),
+                admission: None,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl HttpClient for AsyncBodyHttp {
@@ -3238,11 +3356,47 @@ mod tests {
             _: crate::http::HttpRequest,
         ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>>
         {
-            Some(Box::pin(async {
-                let body = self.0.lock().unwrap().take().unwrap();
+            let body = self.body.lock().unwrap().take().unwrap();
+            Some(Box::pin(async move {
                 Ok(wacore::net::AsyncStreamingHttpResponse::new(200, body))
             }))
         }
+        fn streaming_admission(
+            &self,
+        ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::StreamingRequestPermit>>>
+        {
+            self.admission.as_ref().map(|gate| {
+                Box::pin(async move {
+                    Ok(Box::new(gate.clone().lock_owned().await)
+                        as wacore::net::StreamingRequestPermit)
+                }) as wacore::runtime::BoxFuture<'_, _>
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn public_bounded_download_accepts_async_only_http_client() {
+        let plaintext = vec![0x42; 300_017];
+        let (params, encrypted) = encrypted_params(&plaintext);
+        let limits = DownloadLimits::new(encrypted.len() as u64, plaintext.len() as u64);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = Arc::new(CountRuntime {
+            inner: crate::TokioRuntime,
+            calls: calls.clone(),
+        });
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let permit = gate.clone().lock_owned().await;
+        let mut http = AsyncBodyHttp::new(Box::pin(futures::io::Cursor::new(encrypted)));
+        http.admission = Some(gate);
+        let http = Arc::new(http);
+        let downloader = MediaDownloader::with_default_hosts(http.clone(), runtime);
+
+        let mut download = std::pin::pin!(downloader.download(&params, limits));
+        assert!(futures::poll!(download.as_mut()).is_pending());
+        assert!(http.body.lock().unwrap().is_some());
+        drop(permit);
+        assert_eq!(download.await.unwrap(), plaintext);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -3259,9 +3413,8 @@ mod tests {
             if overflow {
                 body.push(0);
             }
-            let http: Arc<dyn HttpClient> = Arc::new(AsyncBodyHttp(std::sync::Mutex::new(Some(
-                Box::pin(futures::io::Cursor::new(body)),
-            ))));
+            let http: Arc<dyn HttpClient> =
+                Arc::new(AsyncBodyHttp::new(Box::pin(futures::io::Cursor::new(body))));
             let result = streaming_download_and_decrypt_mapped::<_, _, _, AdoptBufferedBody>(
                 &http,
                 &runtime,
@@ -3318,9 +3471,8 @@ mod tests {
         }
 
         let released = Arc::new(AtomicBool::new(false));
-        let http: Arc<dyn HttpClient> = Arc::new(AsyncBodyHttp(std::sync::Mutex::new(Some(
-            Box::pin(WaitingBody(released.clone())),
-        ))));
+        let http: Arc<dyn HttpClient> =
+            Arc::new(AsyncBodyHttp::new(Box::pin(WaitingBody(released.clone()))));
         let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
         let (params, _) = encrypted_params(b"synthetic media");
         let request =
@@ -6227,30 +6379,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::Duration;
         use wacore::net::{StreamingHttpResponse, StreamingRequestPermit};
-        use wacore::runtime::{AbortHandle, BoxFuture};
+        use wacore::runtime::BoxFuture;
 
-        struct CountRuntime {
-            inner: crate::TokioRuntime,
-            calls: Arc<AtomicUsize>,
-        }
-        impl Runtime for CountRuntime {
-            fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandle {
-                self.inner.spawn(future)
-            }
-            fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-                self.inner.sleep(duration)
-            }
-            fn spawn_blocking(
-                &self,
-                work: Box<dyn FnOnce() + Send + 'static>,
-            ) -> BoxFuture<'static, ()> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.inner.spawn_blocking(work)
-            }
-            fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
-                self.inner.yield_now()
-            }
-        }
         struct Permit {
             _guard: async_lock::MutexGuardArc<()>,
             live: Arc<AtomicBool>,

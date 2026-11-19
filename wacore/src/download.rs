@@ -643,7 +643,9 @@ fn same_media_host(left: &str, right: &str) -> bool {
     matches!((parse(left), parse(right)), (Some(left), Some(right)) if left == right)
 }
 
-struct MediaDecryptStream {
+/// Incremental authenticated media decryption for callers that schedule their own I/O.
+#[doc(hidden)]
+pub struct MediaDecryptStream {
     encrypted_hasher: Option<Sha256>,
     plaintext_hasher: Option<Sha256>,
     hmac: Hmac<Sha256>,
@@ -654,7 +656,7 @@ struct MediaDecryptStream {
 }
 
 impl MediaDecryptStream {
-    fn new(
+    pub fn new(
         media_key: &[u8],
         app_info: MediaType,
         check_encrypted: bool,
@@ -708,7 +710,18 @@ impl MediaDecryptStream {
         Ok(())
     }
 
-    fn finish(
+    pub fn push(&mut self, mut ciphertext: &[u8], writer: &mut impl std::io::Write) -> Result<()> {
+        while !ciphertext.is_empty() {
+            let input = self.input();
+            let len = input.len().min(ciphertext.len());
+            input[..len].copy_from_slice(&ciphertext[..len]);
+            self.advance(len, writer)?;
+            ciphertext = &ciphertext[len..];
+        }
+        Ok(())
+    }
+
+    pub fn finish(
         self,
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
@@ -1066,37 +1079,6 @@ impl DownloadUtils {
         )?;
         loop {
             let n = reader.read(stream.input())?;
-            if n == 0 {
-                return stream.finish(expected_enc_sha256, expected_sha256, writer);
-            }
-            stream.advance(n, writer)?;
-        }
-    }
-
-    /// Authenticate and decrypt media from an asynchronous reader into a
-    /// synchronous sink. Use a nonblocking sink such as an in-memory buffer.
-    /// Discard the sink's contents on any error or cancellation.
-    pub async fn decrypt_async_stream_to_writer_with_hashes<R, W>(
-        mut reader: R,
-        media_key: &[u8],
-        app_info: MediaType,
-        expected_enc_sha256: Option<&[u8]>,
-        expected_sha256: Option<&[u8]>,
-        writer: &mut W,
-    ) -> Result<u64>
-    where
-        R: futures::io::AsyncRead + Unpin,
-        W: std::io::Write,
-    {
-        use futures::io::AsyncReadExt;
-        let mut stream = MediaDecryptStream::new(
-            media_key,
-            app_info,
-            expected_enc_sha256.is_some(),
-            expected_sha256.is_some(),
-        )?;
-        loop {
-            let n = reader.read(stream.input()).await?;
             if n == 0 {
                 return stream.finish(expected_enc_sha256, expected_sha256, writer);
             }
@@ -1960,20 +1942,21 @@ mod tests {
     }
 
     #[test]
-    fn async_streaming_decrypt_checks_complete_authenticated_input() {
+    fn incremental_decrypt_checks_complete_authenticated_input() {
         let plaintext = vec![0x59; 20_000];
         let encrypted = crate::upload::encrypt_media(&plaintext, MediaType::Image).unwrap();
         let decode = |ciphertext: &[u8]| {
             let mut output = Vec::new();
-            let result = futures::executor::block_on(
-                DownloadUtils::decrypt_async_stream_to_writer_with_hashes(
-                    futures::io::Cursor::new(ciphertext),
-                    &encrypted.media_key,
-                    MediaType::Image,
-                    Some(&encrypted.file_enc_sha256),
-                    Some(&encrypted.file_sha256),
-                    &mut output,
-                ),
+            let mut stream =
+                MediaDecryptStream::new(&encrypted.media_key, MediaType::Image, true, true)
+                    .unwrap();
+            for chunk in ciphertext.chunks(5003) {
+                stream.push(chunk, &mut output).unwrap();
+            }
+            let result = stream.finish(
+                Some(&encrypted.file_enc_sha256),
+                Some(&encrypted.file_sha256),
+                &mut output,
             );
             (result, output)
         };
