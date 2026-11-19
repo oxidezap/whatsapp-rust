@@ -1885,12 +1885,20 @@ impl SignalStoreCache {
         }
         // Backend I/O outside the lock, like every other cold path.
         let loaded = backend.get_sessions_batch(&missing).await?;
+        let aligned = loaded.len() == missing.len()
+            && missing.windows(2).all(|keys| keys[0] < keys[1])
+            && loaded
+                .iter()
+                .zip(&missing)
+                .all(|((address, _), key)| address == key);
+        let by_address = (!aligned).then(|| {
+            loaded
+                .iter()
+                .map(|(address, record)| (address.as_ref(), record.as_ref()))
+                .collect::<HashMap<_, _>>()
+        });
         let mut state = self.lock_sessions().await;
-        let mut found: HashMap<&str, &[u8]> = HashMap::with_capacity(loaded.len());
-        for (address, record) in &loaded {
-            found.insert(address.as_ref(), record.as_ref());
-        }
-        for key in &missing {
+        for (index, key) in missing.into_iter().enumerate() {
             // Raced with a concurrent install, checkout or eviction: keep the
             // newer entry, or skip a key whose newer write was dropped behind
             // us, rather than rewinding it with the batch's older read. This is
@@ -1903,16 +1911,17 @@ impl SignalStoreCache {
             // Decoded against the current incarnation, which may have bumped
             // while the batch was in flight; the rows are still the backend's
             // truth either way.
-            let record = found
-                .get(key.as_ref())
-                .copied()
-                .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
-                .map(Arc::new);
-            let entry = match &record {
-                Some(record) => SessionEntry::Present(record.clone()),
+            let bytes = match &by_address {
+                Some(rows) => rows.get(key.as_ref()).copied(),
+                None => Some(loaded[index].1.as_ref()),
+            };
+            let record = bytes
+                .and_then(|bytes| Self::decode_stored_session(&key, bytes, &state.incarnation));
+            let entry = match record {
+                Some(record) => SessionEntry::Present(Arc::new(record)),
                 None => SessionEntry::Absent,
             };
-            state.cache.insert(key.clone(), entry);
+            state.cache.insert(key, entry);
         }
         state.evict_if_needed(self.max_entries);
         Ok(())
