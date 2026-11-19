@@ -922,6 +922,19 @@ impl wacore::net::HttpClient for MobileMediaHttpClient {
     ) -> Result<wacore::net::StreamingHttpResponse> {
         self.inner.execute_streaming(self.profile.apply(request))
     }
+    fn supports_async_streaming(&self) -> bool {
+        self.inner.supports_async_streaming()
+    }
+
+    fn execute_async_streaming(
+        &self,
+        request: HttpRequest,
+    ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>>
+    {
+        self.inner
+            .execute_async_streaming(self.profile.apply(request))
+    }
+
     fn supports_upload_streaming(&self) -> bool {
         self.inner.supports_upload_streaming()
     }

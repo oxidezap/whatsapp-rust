@@ -149,6 +149,16 @@ impl DownloadBudget {
         }
     }
 
+    pub(super) fn async_reader<R: futures::io::AsyncRead + Unpin>(
+        &self,
+        inner: R,
+    ) -> impl futures::io::AsyncRead + Unpin + use<'_, R> {
+        BudgetReader {
+            inner,
+            budget: self,
+        }
+    }
+
     pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<'_, W> {
         BudgetWriter {
             inner,
@@ -231,6 +241,36 @@ impl<R: Read> Read for BudgetReader<'_, R> {
         let n = self.inner.read(&mut buf[..len])?;
         self.budget.charge(MediaByteDomain::Wire, n);
         Ok(n)
+    }
+}
+
+impl<R: futures::io::AsyncRead + Unpin> futures::io::AsyncRead for BudgetReader<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::task::{Poll, ready};
+        let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let remaining = this.budget.remaining(MediaByteDomain::Wire)?;
+        let mut inner = std::pin::Pin::new(&mut this.inner);
+        if remaining == 0 {
+            let n = ready!(inner.as_mut().poll_read(cx, &mut [0; 1]))?;
+            return if n == 0 {
+                Poll::Ready(Ok(0))
+            } else {
+                Poll::Ready(Err(this.budget.exceeded(MediaByteDomain::Wire)))
+            };
+        }
+        let len = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let n = ready!(inner.as_mut().poll_read(cx, &mut buf[..len]))?;
+        this.budget.charge(MediaByteDomain::Wire, n);
+        Poll::Ready(Ok(n))
     }
 }
 
