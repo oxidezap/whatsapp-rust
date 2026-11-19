@@ -1269,6 +1269,19 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
+    /// Conditionally clean a group of pending rows, retaining the mutation lease.
+    /// An applied result means every revision matched. A conflict leaves that
+    /// row untouched while still deleting the other matching revisions.
+    /// Backends without this operation return `None`.
+    async fn delete_pending_inbound_batch_if(
+        &self,
+        _rows: &[(PendingInboundKey<'_>, PendingInboundRevision)],
+        _max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<Option<PendingInboundMutation>> {
+        Ok(None)
+    }
+
     /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
     /// offline drain buffers one commit-batch of messages per call, so backends
     /// should override this with a single transaction (the bundled SqliteStore
