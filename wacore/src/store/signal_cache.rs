@@ -1885,12 +1885,20 @@ impl SignalStoreCache {
         }
         // Backend I/O outside the lock, like every other cold path.
         let loaded = backend.get_sessions_batch(&missing).await?;
+        let aligned = loaded.len() == missing.len()
+            && missing.windows(2).all(|keys| keys[0] < keys[1])
+            && loaded
+                .iter()
+                .zip(&missing)
+                .all(|((address, _), key)| address == key);
+        let by_address = (!aligned).then(|| {
+            loaded
+                .iter()
+                .map(|(address, record)| (address.as_ref(), record.as_ref()))
+                .collect::<HashMap<_, _>>()
+        });
         let mut state = self.lock_sessions().await;
-        let mut found: HashMap<&str, &[u8]> = HashMap::with_capacity(loaded.len());
-        for (address, record) in &loaded {
-            found.insert(address.as_ref(), record.as_ref());
-        }
-        for key in &missing {
+        for (index, key) in missing.into_iter().enumerate() {
             // Raced with a concurrent install, checkout or eviction: keep the
             // newer entry, or skip a key whose newer write was dropped behind
             // us, rather than rewinding it with the batch's older read. This is
@@ -1903,16 +1911,17 @@ impl SignalStoreCache {
             // Decoded against the current incarnation, which may have bumped
             // while the batch was in flight; the rows are still the backend's
             // truth either way.
-            let record = found
-                .get(key.as_ref())
-                .copied()
-                .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
-                .map(Arc::new);
-            let entry = match &record {
-                Some(record) => SessionEntry::Present(record.clone()),
+            let bytes = match &by_address {
+                Some(rows) => rows.get(key.as_ref()).copied(),
+                None => Some(loaded[index].1.as_ref()),
+            };
+            let record = bytes
+                .and_then(|bytes| Self::decode_stored_session(&key, bytes, &state.incarnation));
+            let entry = match record {
+                Some(record) => SessionEntry::Present(Arc::new(record)),
                 None => SessionEntry::Absent,
             };
-            state.cache.insert(key.clone(), entry);
+            state.cache.insert(key, entry);
         }
         state.evict_if_needed(self.max_entries);
         Ok(())
@@ -3227,6 +3236,7 @@ mod sender_key_lock_tests {
     struct BlockingSessionLookup {
         started: async_lock::Barrier,
         release: async_lock::Barrier,
+        batch_rows: Vec<(Arc<str>, Bytes)>,
     }
 
     impl BlockingSessionLookup {
@@ -3234,6 +3244,7 @@ mod sender_key_lock_tests {
             Self {
                 started: async_lock::Barrier::new(2),
                 release: async_lock::Barrier::new(2),
+                batch_rows: Vec::new(),
             }
         }
     }
@@ -3256,6 +3267,10 @@ mod sender_key_lock_tests {
             self.started.wait().await;
             self.release.wait().await;
             Ok(None)
+        }
+
+        async fn get_sessions_batch(&self, _: &[Arc<str>]) -> StoreResult<Vec<(Arc<str>, Bytes)>> {
+            Ok(self.batch_rows.clone())
         }
 
         async fn has_session(&self, _: &str) -> StoreResult<bool> {
@@ -4694,6 +4709,53 @@ mod sender_key_lock_tests {
             .await
             .expect("warm prefetch");
         assert_eq!(cache.try_has_session(&missing), Some(false));
+    }
+
+    #[tokio::test]
+    async fn prefetch_preserves_distinct_records_for_ordered_reordered_and_duplicate_rows() {
+        let first = ProtocolAddress::new("15550001000", 1.into());
+        let second = ProtocolAddress::new("15550001001", 1.into());
+        let first_record = lease_reload_tests::leased_session();
+        let second_record = lease_reload_tests::leased_session();
+        let replacement = lease_reload_tests::leased_session();
+        let row = |address: &ProtocolAddress, record: &SessionRecord| {
+            (
+                Arc::from(address.as_str()),
+                Bytes::from(record.serialize().unwrap()),
+            )
+        };
+        let ordered = [row(&first, &first_record), row(&second, &second_record)];
+        let first_key = first_record.alice_base_key().unwrap();
+        let second_key = second_record.alice_base_key().unwrap();
+        let replacement_key = replacement.alice_base_key().unwrap();
+        assert_ne!(first_key, second_key);
+        assert_ne!(first_key, replacement_key);
+        for (request, rows, expected_first) in [
+            ([first.clone(), second.clone()], ordered.clone(), &first_key),
+            (
+                [first.clone(), second.clone()],
+                [ordered[1].clone(), ordered[0].clone()],
+                &first_key,
+            ),
+            (
+                [first.clone(), first.clone()],
+                [ordered[0].clone(), row(&first, &replacement)],
+                &replacement_key,
+            ),
+        ] {
+            let cache = SignalStoreCache::new();
+            let mut backend = BlockingSessionLookup::new();
+            backend.batch_rows = rows.to_vec();
+            cache.prefetch_sessions(&request, &backend).await.unwrap();
+            let (actual, generation) = cache.try_checkout_session(&first).unwrap().unwrap();
+            assert_eq!(&actual.unwrap().alice_base_key().unwrap(), expected_first);
+            cache.cancel_session_checkout(&first, generation);
+            if request[1] == second {
+                let (actual, generation) = cache.try_checkout_session(&second).unwrap().unwrap();
+                assert_eq!(actual.unwrap().alice_base_key().unwrap(), second_key);
+                cache.cancel_session_checkout(&second, generation);
+            }
+        }
     }
 
     #[tokio::test]
