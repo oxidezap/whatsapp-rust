@@ -559,8 +559,6 @@ pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: crate::inbound_queue::ChatQueueSender,
     pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,
-    pub global_budget: Arc<crate::inbound_queue::ByteBudget>,
-    pub work: Arc<crate::flush_scope::FlushScope>,
     /// Held by the lane's worker for as long as it runs; a replacement
     /// worker takes it before its first message. Why it is shared across
     /// lane generations is explained at `create_chat_lane`.
@@ -572,6 +570,8 @@ impl ChatLane {
     /// Give it bounded turns; never wait for capacity on the IQ-serving reader.
     pub(crate) async fn enqueue_scoped(
         &self,
+        budgets: &crate::inbound_queue::QueueBudgets,
+        enqueue: &async_lock::MutexGuard<'_, ()>,
         mut node: Arc<wacore_binary::OwnedNodeRef>,
         mut shutdown: wacore::runtime::ShutdownSignal,
         runtime: &dyn Runtime,
@@ -579,15 +579,15 @@ impl ChatLane {
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         let mut turns = crate::inbound_queue::SATURATION_RETRY_TURNS;
         loop {
-            let queued = match self.try_enqueue_scoped(node, shutdown, offline) {
+            let queued = match self.try_enqueue_scoped(budgets, enqueue, node, shutdown, offline) {
                 Err(async_channel::TrySendError::Full(queued)) => queued,
                 result => return result,
             };
-            if turns == 0 || queued.shutdown.is_fired() || self.work.is_closed() {
+            if turns == 0 || queued.shutdown.is_fired() || budgets.work.is_closed() {
                 return Err(async_channel::TrySendError::Full(queued));
             }
             crate::inbound_queue::yield_for_capacity(runtime).await;
-            if queued.shutdown.is_fired() || self.work.is_closed() {
+            if queued.shutdown.is_fired() || budgets.work.is_closed() {
                 return Err(async_channel::TrySendError::Full(queued));
             }
             turns -= 1;
@@ -601,17 +601,34 @@ impl ChatLane {
     #[cfg(test)]
     pub(crate) fn try_enqueue(
         &self,
+        budgets: &crate::inbound_queue::QueueBudgets,
         node: Arc<wacore_binary::OwnedNodeRef>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
-        self.try_enqueue_scoped(node, wacore::runtime::ShutdownSignal::never(), None)
+        let enqueue = self
+            .enqueue_lock
+            .try_lock()
+            .expect("exclusive test enqueue");
+        self.try_enqueue_scoped(
+            budgets,
+            &enqueue,
+            node,
+            wacore::runtime::ShutdownSignal::never(),
+            None,
+        )
     }
 
     pub(crate) fn try_enqueue_scoped(
         &self,
+        budgets: &crate::inbound_queue::QueueBudgets,
+        enqueue: &async_lock::MutexGuard<'_, ()>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: wacore::runtime::ShutdownSignal,
         offline: Option<Box<offline_resume::OfflinePendingGuard>>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        assert!(std::ptr::eq(
+            async_lock::MutexGuard::source(enqueue),
+            self.enqueue_lock.as_ref()
+        ));
         let queued = QueuedChatMessage {
             node,
             shutdown,
@@ -619,23 +636,23 @@ impl ChatLane {
             work: None,
             offline,
         };
-        let Some(queue_tx) = self.queue_tx.active_sender() else {
-            return Err(async_channel::TrySendError::Closed(queued));
+        let queue_tx = match self.queue_tx.admit_sender() {
+            Ok(sender) => sender,
+            Err(crate::inbound_queue::ChatQueueAdmitError::Closed) => {
+                return Err(async_channel::TrySendError::Closed(queued));
+            }
+            Err(crate::inbound_queue::ChatQueueAdmitError::Full) => {
+                return Err(async_channel::TrySendError::Full(queued));
+            }
         };
-        if queue_tx.is_closed() {
-            return Err(async_channel::TrySendError::Closed(queued));
-        }
-        if queue_tx.is_full() {
-            return Err(async_channel::TrySendError::Full(queued));
-        }
         // Refuse closed admission before compacting/parsing a possibly large
         // node. A successful guard also covers that work if close races here.
-        let Some(work) = self.work.try_track() else {
+        let Some(work) = budgets.work.try_track() else {
             return Err(async_channel::TrySendError::Full(queued));
         };
         let Some(retained) = crate::inbound_queue::retain_node(
             &queued.node,
-            &self.global_budget,
+            &budgets.chat,
             &self.byte_budget,
             Arc::clone(&self.enqueue_lock),
         ) else {
@@ -643,19 +660,17 @@ impl ChatLane {
         };
         let original = queued.node;
         queue_tx
-            .try_send(Box::new(QueuedChatMessage {
+            .try_send(QueuedChatMessage {
                 node: Arc::new(retained),
                 work: Some(work),
                 ..queued
-            }))
+            })
             .map_err(|error| match error {
-                async_channel::TrySendError::Full(queued) => {
-                    let mut queued = *queued;
+                async_channel::TrySendError::Full(mut queued) => {
                     queued.node = original;
                     async_channel::TrySendError::Full(queued)
                 }
-                async_channel::TrySendError::Closed(queued) => {
-                    let mut queued = *queued;
+                async_channel::TrySendError::Closed(mut queued) => {
                     queued.node = original;
                     async_channel::TrySendError::Closed(queued)
                 }
