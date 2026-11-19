@@ -848,11 +848,13 @@ impl Client {
             scope
                 .run(
                     self,
-                    crate::handlers::message::MessageHandler::handle_inline_scoped(
-                        Arc::clone(self),
-                        node,
-                        &mut cancelled,
-                        Some(scope),
+                    Box::pin(
+                        crate::handlers::message::MessageHandler::handle_inline_scoped(
+                            Arc::clone(self),
+                            node,
+                            &mut cancelled,
+                            Some(scope),
+                        ),
                     ),
                 )
                 .await;
