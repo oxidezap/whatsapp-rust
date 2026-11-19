@@ -106,14 +106,28 @@ pub enum BotBuilderError {
     Client(#[from] ClientBuilderError),
 }
 
-/// `message` is `Arc` so cloning the context across spawned tasks only bumps a
-/// refcount, matching the pattern used by serenity's `Context` and matrix-sdk's
-/// `Room`/`Client`.
+/// A decrypted message and the client available to a bot message handler.
+///
+/// Use [`Self::reply`] for plain text, [`Self::reply_quoting`] to quote the
+/// incoming message, or [`Self::send_message`] to send a prepared protobuf.
+///
+/// ```
+/// use whatsapp_rust::{SendError, bot::MessageContext};
+///
+/// async fn respond(ctx: MessageContext) -> Result<(), SendError> {
+///     ctx.reply_quoting("I received your message").await?;
+///     Ok(())
+/// }
+/// ```
+///
 #[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct MessageContext {
+    /// Shared incoming payload. Clone the Arc to retain it beyond the handler.
     pub message: Arc<wa::Message>,
+    /// Incoming message ID, routing information, and sender metadata.
     pub info: MessageInfo,
+    /// The client that received the message, for operations beyond replies.
     pub client: Arc<Client>,
     /// Disappearing-message timer of the chat this message arrived in, in
     /// seconds, when the stanza carried one. Mirrors
