@@ -207,6 +207,10 @@ struct PreKeyUploadPlan {
     new_next: u32,
 }
 
+fn prekey_watermarks_need_recovery(first: u32, next: u32) -> bool {
+    first == 0 || first > next
+}
+
 /// Compute the upload window and generation range from the two watermarks.
 ///
 /// `first_unupload == 0` is the unset/legacy state: the window starts fresh at
@@ -241,7 +245,7 @@ fn plan_prekey_upload(
         }
     };
 
-    if first == 0 || first > next_eff {
+    if prekey_watermarks_need_recovery(first_unupload, next) {
         return fresh_window(start_prekey_id(next, max_store_id) as u64);
     }
     // Cap leftovers at the target: surplus stays in the window for next time
@@ -755,7 +759,14 @@ impl Client {
     ) -> Result<(u32, PublicKey), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let backend = device_snapshot.backend.clone();
-        let max_id = backend.get_max_prekey_id().await?;
+        let max_id = if prekey_watermarks_need_recovery(
+            device_snapshot.first_unupload_pre_key_id,
+            device_snapshot.next_pre_key_id,
+        ) {
+            backend.get_max_prekey_id().await?
+        } else {
+            0
+        };
         let plan = plan_prekey_upload(
             device_snapshot.first_unupload_pre_key_id,
             device_snapshot.next_pre_key_id,
@@ -919,7 +930,14 @@ impl Client {
 
         // WA Web getOrGenPreKeys: re-offer the leftover generated-but-unuploaded
         // window first and only generate enough new keys to reach the target.
-        let max_id = backend.get_max_prekey_id().await?;
+        let max_id = if prekey_watermarks_need_recovery(
+            device_snapshot.first_unupload_pre_key_id,
+            device_snapshot.next_pre_key_id,
+        ) {
+            backend.get_max_prekey_id().await?
+        } else {
+            0
+        };
         if device_snapshot.first_unupload_pre_key_id == 0 {
             log::info!(
                 "Initialising prekey upload window (legacy counter = {}, MAX(key_id) = {})",
@@ -2022,6 +2040,29 @@ mod window_tests {
             next, 1,
             "NEXT collapses onto the wrapped head: window empty"
         );
+    }
+
+    #[tokio::test]
+    async fn single_prekey_reads_max_only_when_watermarks_need_recovery() {
+        use crate::store::release::tests::ProbeBackend;
+        use std::sync::{Arc, atomic::AtomicBool};
+        use wacore::store::commands::DeviceCommand;
+
+        let (mut backend, _) = ProbeBackend::new();
+        backend.fail_before_method = Some(("get_max_prekey_id", Arc::new(AtomicBool::new(true))));
+        let client = crate::test_utils::create_test_client_with_backend(Arc::new(backend)).await;
+        let _guard = client.prekey_upload_lock.lock().await;
+        assert!(client.get_or_gen_single_pre_key().await.is_err());
+
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 10,
+                first_unupload_pre_key_id: 10,
+            })
+            .await;
+        let (id, _) = client.get_or_gen_single_pre_key().await.expect("mint key");
+        assert_eq!(id, 10);
     }
 
     /// A consumed window head must not abandon the live keys behind it: the
