@@ -32,8 +32,7 @@ impl<Conn> RunQueryDsl<Conn> for BoundedPendingQuery<'_> {}
 impl QueryFragment<Sqlite> for BoundedPendingQuery<'_> {
     fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
         out.push_sql(
-            "SELECT typeof(message) AS storage_type, \
-             CASE WHEN typeof(message) = 'blob' THEN length(message) ELSE NULL END AS byte_len, \
+            "SELECT CASE WHEN typeof(message) = 'blob' THEN length(message) ELSE NULL END AS byte_len, \
              CASE WHEN typeof(message) = 'blob' THEN \
                CASE WHEN length(message) <= ",
         );
