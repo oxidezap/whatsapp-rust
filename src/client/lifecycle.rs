@@ -29,6 +29,18 @@ pub struct ShutdownReport {
     pub message_secrets: SecretFlushReport,
 }
 
+impl ShutdownReport {
+    /// Whether all reported drains completed and no persistence failure was observed.
+    pub fn is_clean(&self) -> bool {
+        self.inbound == DrainOutcome::Completed
+            && self.outbound == DrainOutcome::Completed
+            && self.signal_settle == DrainOutcome::Completed
+            && self.device.is_ok()
+            && self.message_secrets.failed_batches == 0
+            && self.message_secrets.first_error.is_none()
+    }
+}
+
 /// Observations from [`Client::logout`], not a credential-deletion report or
 /// a join of the run loop, callbacks or backend owners.
 #[derive(Debug)]
