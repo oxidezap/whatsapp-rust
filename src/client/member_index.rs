@@ -92,6 +92,14 @@ const FILTER_MIN_MEMBERS: usize = 64;
 const FILTER_BITS_PER_MEMBER: usize = 16;
 const FILTER_WORD_BITS: usize = u64::BITS as usize;
 
+fn filter_probe(fingerprint: u64, word_mask: usize) -> (usize, u64) {
+    let word = (fingerprint >> 32) as usize & word_mask;
+    let first = 1_u64 << (fingerprint & 63);
+    // An odd rotation keeps the two bits distinct within the word.
+    let second = first.rotate_left((fingerprint >> 6) as u32 | 1);
+    (word, first | second)
+}
+
 pub(crate) enum ChangedMembers {
     Small(MemberIndex),
     Large(Box<FilteredMembers>),
@@ -109,12 +117,10 @@ impl ChangedMembers {
         }
         let words = members.len().next_power_of_two() * FILTER_BITS_PER_MEMBER / FILTER_WORD_BITS;
         let mut bits = vec![0; words].into_boxed_slice();
-        let mask = words * FILTER_WORD_BITS - 1;
+        let word_mask = words - 1;
         for &fingerprint in &members.fingerprints {
-            for hash in [fingerprint as usize, (fingerprint >> 32) as usize] {
-                let bit = hash & mask;
-                bits[bit / FILTER_WORD_BITS] |= 1 << (bit % FILTER_WORD_BITS);
-            }
+            let (word, probe) = filter_probe(fingerprint, word_mask);
+            bits[word] |= probe;
         }
         Self::Large(Box::new(FilteredMembers { members, bits }))
     }
@@ -135,15 +141,11 @@ impl ChangedMembers {
             Self::Small(touched) => touched.intersects(members),
             Self::Large(filtered) => {
                 let bits = &filtered.bits;
-                let mask = bits.len() * FILTER_WORD_BITS - 1;
+                let word_mask = bits.len() - 1;
                 // A filter hit still needs an exact fingerprint match.
                 members.fingerprints.iter().any(|&fingerprint| {
-                    let x = fingerprint as usize & mask;
-                    let y = (fingerprint >> 32) as usize & mask;
-                    (bits[x / FILTER_WORD_BITS] >> (x % FILTER_WORD_BITS))
-                        & (bits[y / FILTER_WORD_BITS] >> (y % FILTER_WORD_BITS))
-                        & 1
-                        != 0
+                    let (word, probe) = filter_probe(fingerprint, word_mask);
+                    bits[word] & probe == probe
                         && filtered
                             .members
                             .fingerprints
