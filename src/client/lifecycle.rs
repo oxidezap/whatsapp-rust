@@ -718,6 +718,7 @@ impl Client {
             app_state_key_requests: Mutex::new(HashMap::new()),
             app_state_syncing: app_state::SyncInFlight::new(),
             app_state_send_lock: Mutex::new(()),
+            catalog_owner_token: std::sync::OnceLock::new(),
             snapshot_recovery: std::sync::OnceLock::new(),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: AtomicBool::new(false),

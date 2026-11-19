@@ -3854,6 +3854,7 @@ fn client_size_pins_runtime_cache_config_saving() {
     // Snapshot recovery state is built on the first recovery reply, so the
     // client carries only its cell; count it rather than raising the base.
     expected += size_of::<std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>>();
+    expected += size_of::<std::sync::OnceLock<Box<Mutex<Option<CatalogOwnerToken>>>>>();
     // The detached storage owner now also owns the reusable arena, replacing
     // its former inline async mutex. Account for the actual attachment rather
     // than raising the fixed Client base; retention includes test-only gates.

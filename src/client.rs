@@ -297,6 +297,7 @@ impl wacore::socket::FrameTap for SentFrameTap {
 pub struct NodeFilter {
     tag: String,
     attrs: Vec<(String, Option<String>)>,
+    child: Option<&'static str>,
 }
 
 impl NodeFilter {
@@ -305,6 +306,7 @@ impl NodeFilter {
         Self {
             tag: tag.into(),
             attrs: Vec::new(),
+            child: None,
         }
     }
 
@@ -324,8 +326,16 @@ impl NodeFilter {
         self.attr("from", jid.to_string())
     }
 
+    pub(crate) fn with_child(mut self, tag: &'static str) -> Self {
+        self.child = Some(tag);
+        self
+    }
+
     fn matches(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         node.tag == self.tag.as_str()
+            && self
+                .child
+                .is_none_or(|tag| node.get_optional_child(tag).is_some())
             && self.attrs.iter().all(|(k, v)| match v {
                 Some(value) => node
                     .get_attr(k.as_str())
@@ -1982,6 +1992,11 @@ pub(crate) struct ClientCore {
     pub(crate) event_bus: wacore::types::events::CoreEventBus,
 }
 
+pub(crate) struct CatalogOwnerToken {
+    pub generation: u64,
+    pub value: Arc<str>,
+}
+
 /// A single WhatsApp session: the connection, the Signal state, and every
 /// protocol operation built on top of them.
 ///
@@ -2355,6 +2370,7 @@ pub struct Client {
     /// pay for this cell and nothing else; what it holds, and why, is on
     /// `crate::pdo::SnapshotRecoveryState`.
     pub(crate) snapshot_recovery: std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>,
+    pub(crate) catalog_owner_token: std::sync::OnceLock<Box<Mutex<Option<CatalogOwnerToken>>>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 

@@ -1,8 +1,7 @@
 //! WhatsApp Business catalog, collections, orders and business-profile writes.
 //!
-//! Catalog and collection lookups through this client support other businesses.
-//! WhatsApp Web uses a separate Facebook GraphQL endpoint with an ad-account
-//! token for the linked account's own catalog and collections.
+//! Linked-account reads use Facebook GraphQL with a catalog management token
+//! issued to the authenticated session.
 //!
 //! Visitor catalog and collection reads use the WhatsApp HTTP GraphQL endpoint.
 //! Order lookup uses MEX.
@@ -33,16 +32,19 @@
 //! opposite case and are handled: `variant_info.variant_properties` comes back
 //! on a plain order query, so [`OrderProduct::variant_properties`] carries it.
 
-use crate::client::Client;
+use crate::client::{CatalogOwnerToken, Client};
 use crate::features::mex::{MexError, mex_request};
 use crate::http::{HttpRequest, HttpStatusError};
 use crate::request::IqError;
+use crate::{NodeBuilder, NodeFilter};
 use serde_json::{Value, json};
+use std::sync::{Arc, atomic::Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use wacore::WireEnum;
 use wacore::iq::business::{BusinessProfileUpdateSpec, RemoveCoverPhotoSpec, SetCoverPhotoSpec};
 use wacore::iq::mex_operations::{biz_query_order, query_catalog, query_product_collections};
-use wacore_binary::Jid;
+use wacore_binary::{Jid, NodeContentRef, NodeRef};
 
 // The profile types are protocol types and live in wacore, but they are the
 // arguments, results and error of this feature's public methods, so they belong
@@ -75,12 +77,17 @@ const DEFAULT_COLLECTION_LIMIT: u32 = 51;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BusinessError {
-    /// The linked account's catalog and collections require the authenticated
-    /// catalog management API.
+    /// The linked account must be connected to read its catalog and collections.
     #[error(
         "reading the linked account's catalog or collections requires catalog management authentication"
     )]
     OwnCatalogUnsupported,
+
+    #[error("catalog owner authentication requires account recovery in WhatsApp")]
+    CatalogOwnerRecoveryRequired,
+
+    #[error("catalog owner authentication failed at {stage}")]
+    CatalogOwnerAuthentication { stage: &'static str },
 
     #[error("visitor catalog reads require a WhatsApp catalog application token")]
     CatalogVisitorTokenRequired,
@@ -475,19 +482,26 @@ impl<'a> Business<'a> {
     /// Paginate by feeding [`Catalog::after_cursor`] back through
     /// [`CatalogOptions::after`] until it comes back `None`.
     ///
-    /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
+    /// Linked-account reads require an authenticated connection.
     /// Visitor reads require [`Business::with_catalog_visitor_token`].
     pub async fn get_catalog(
         &self,
         jid: &Jid,
         options: &CatalogOptions,
     ) -> Result<Catalog, BusinessError> {
-        self.require_external_catalog(jid)?;
         let mut variables = catalog_variables(&jid.to_non_ad(), options);
-        add_visitor_thumbnail_fields(&mut variables["request"]["product_catalog"]);
-        let data = self
-            .execute_visitor_catalog(query_catalog::DOC_ID, variables, "catalog")
-            .await?;
+        let input = &mut variables["request"]["product_catalog"];
+        add_visitor_thumbnail_fields(input);
+        let data = if self.client.is_own_jid(jid) {
+            input["allow_shop_source"] = json!(options.allow_shop_source);
+            input["belongs_to"] = json!({});
+            variables["request"]["platform"] = json!("WEB");
+            self.execute_owner_catalog("9957894520961099", variables, "catalog")
+                .await?
+        } else {
+            self.execute_visitor_catalog(query_catalog::DOC_ID, variables, "catalog")
+                .await?
+        };
         parse_catalog(&data)
     }
 
@@ -497,19 +511,26 @@ impl<'a> Business<'a> {
     /// Paginate by feeding [`Collections::after_cursor`] back through
     /// [`CollectionOptions::after`] until it comes back `None`.
     ///
-    /// Returns [`BusinessError::OwnCatalogUnsupported`] for the linked account.
+    /// Linked-account reads require an authenticated connection.
     /// Visitor reads require [`Business::with_catalog_visitor_token`].
     pub async fn get_collections(
         &self,
         jid: &Jid,
         options: &CollectionOptions,
     ) -> Result<Collections, BusinessError> {
-        self.require_external_catalog(jid)?;
         let mut variables = collection_variables(&jid.to_non_ad(), options);
         add_visitor_thumbnail_fields(&mut variables["request"]["collections"]);
-        let data = self
-            .execute_visitor_catalog(query_product_collections::DOC_ID, variables, "collections")
-            .await?;
+        let data = if self.client.is_own_jid(jid) {
+            self.execute_owner_catalog("9687699931342731", variables, "collections")
+                .await?
+        } else {
+            self.execute_visitor_catalog(
+                query_product_collections::DOC_ID,
+                variables,
+                "collections",
+            )
+            .await?
+        };
         parse_collections(&data)
     }
 
@@ -529,7 +550,53 @@ impl<'a> Business<'a> {
             "variables": variables,
             "lang": "en_US"
         });
-        let request = HttpRequest::post("https://graph.whatsapp.com/graphql/catalog")
+        self.execute_catalog_http(
+            "https://graph.whatsapp.com/graphql/catalog",
+            body,
+            operation,
+        )
+        .await
+    }
+
+    async fn execute_owner_catalog(
+        &self,
+        doc_id: &'static str,
+        variables: Value,
+        operation: &'static str,
+    ) -> Result<Value, BusinessError> {
+        let token = self.catalog_owner_token().await?;
+        let body = json!({
+            "access_token": token.as_ref(),
+            "doc_id": doc_id,
+            "variables": variables,
+            "locale": "en_US",
+        });
+        let result = self
+            .execute_catalog_http("https://graph.facebook.com/graphql", body, operation)
+            .await;
+        if matches!(
+            result,
+            Err(BusinessError::CatalogGraphQl { code: Some(190) })
+        ) && let Some(state) = self.client.catalog_owner_token.get()
+        {
+            let mut cached = state.lock().await;
+            if cached
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(&cached.value, &token))
+            {
+                *cached = None;
+            }
+        }
+        result
+    }
+
+    async fn execute_catalog_http(
+        &self,
+        endpoint: &'static str,
+        body: Value,
+        operation: &'static str,
+    ) -> Result<Value, BusinessError> {
+        let request = HttpRequest::post(endpoint)
             .with_header("Accept", "application/json")
             .with_header("Content-Type", "application/json")
             .with_body(body.to_string());
@@ -539,16 +606,103 @@ impl<'a> Business<'a> {
             .execute(request)
             .await
             .map_err(|_| BusinessError::CatalogTransport)?;
-        parse_visitor_response(response, operation)
+        parse_catalog_http_response(response, operation)
     }
 
-    fn require_external_catalog(&self, jid: &Jid) -> Result<(), BusinessError> {
-        // WAWebQueryCatalog and WAWebQueryProductCollections route the owner
-        // to the management API before issuing any visitor query.
-        if self.client.is_own_jid(jid) {
+    async fn catalog_owner_token(&self) -> Result<Arc<str>, BusinessError> {
+        if !self.client.can_reach_server() {
             return Err(BusinessError::OwnCatalogUnsupported);
         }
-        Ok(())
+        let state = self
+            .client
+            .catalog_owner_token
+            .get_or_init(|| Box::new(async_lock::Mutex::new(None)));
+        // The nonce notification has no request ID. Concurrent catalog reads must share
+        // the token exchange rather than issuing competing requests for the same nonce.
+        let mut state = state.lock().await;
+        if !self.client.can_reach_server() {
+            return Err(BusinessError::OwnCatalogUnsupported);
+        }
+        let generation = self.client.connection_generation.load(Ordering::SeqCst);
+        if let Some(cached) = state
+            .as_ref()
+            .filter(|token| token.generation == generation)
+        {
+            return Ok(cached.value.clone());
+        }
+        *state = None;
+        let token = self.fetch_catalog_owner_token(generation).await?;
+        *state = Some(CatalogOwnerToken {
+            generation,
+            value: token.clone(),
+        });
+        Ok(token)
+    }
+
+    async fn fetch_catalog_owner_token(&self, generation: u64) -> Result<Arc<str>, BusinessError> {
+        let nonce_push = self.client.wait_for_node(
+            NodeFilter::tag("notification")
+                .attr("type", "business")
+                .attr("from", "s.whatsapp.net")
+                .with_child("wa_ad_account_nonce"),
+        );
+        let response = self
+            .client
+            .send_iq_node(catalog_owner_iq("118").build(), None)
+            .await?;
+        let status = response
+            .get()
+            .get_optional_child("result")
+            .and_then(|node| node.attrs().optional_string("status"));
+        match status.as_deref() {
+            Some("Success") => {}
+            Some("RecoveryRequired") => return Err(BusinessError::CatalogOwnerRecoveryRequired),
+            _ => {
+                return Err(BusinessError::CatalogOwnerAuthentication {
+                    stage: "nonce request",
+                });
+            }
+        }
+        let push = wacore::runtime::timeout(
+            self.client.runtime.as_ref(),
+            Duration::from_secs(15),
+            nonce_push,
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(BusinessError::CatalogOwnerAuthentication {
+            stage: "nonce notification",
+        })?;
+        let nonce = push
+            .get()
+            .get_optional_child("wa_ad_account_nonce")
+            .and_then(catalog_auth_content)
+            .ok_or(BusinessError::CatalogOwnerAuthentication {
+                stage: "nonce decoding",
+            })?;
+        if self.client.connection_generation.load(Ordering::SeqCst) != generation
+            || !self.client.can_reach_server()
+        {
+            return Err(IqError::NotConnected.into());
+        }
+        let request = catalog_owner_iq("104")
+            .children([NodeBuilder::new("parameters")
+                .children([NodeBuilder::new("code").string_content(nonce).build()])
+                .build()])
+            .build();
+        let response = self.client.send_iq_node(request, None).await?;
+        if self.client.connection_generation.load(Ordering::SeqCst) != generation {
+            return Err(IqError::NotConnected.into());
+        }
+        response
+            .get()
+            .get_optional_child("access_token")
+            .and_then(catalog_auth_content)
+            .map(Arc::from)
+            .ok_or(BusinessError::CatalogOwnerAuthentication {
+                stage: "token decoding",
+            })
     }
 
     /// Look up an order's line items and totals.
@@ -604,12 +758,29 @@ impl<'a> Business<'a> {
     }
 }
 
+fn catalog_owner_iq(id: &'static str) -> NodeBuilder {
+    NodeBuilder::new("iq")
+        .attr("type", "get")
+        .attr("to", "s.whatsapp.net")
+        .attr("xmlns", "fb:thrift_iq")
+        .attr("smax_id", id)
+}
+
+fn catalog_auth_content(node: &NodeRef<'_>) -> Option<String> {
+    let value: &str = match node.content.as_ref()? {
+        NodeContentRef::String(value) => value,
+        NodeContentRef::Bytes(value) => std::str::from_utf8(value).ok()?,
+        NodeContentRef::Nodes(_) => return None,
+    };
+    (!value.trim().is_empty()).then(|| value.to_owned())
+}
+
 fn add_visitor_thumbnail_fields(variables: &mut Value) {
     variables["variant_thumbnail_width"] = Value::Null;
     variables["variant_thumbnail_height"] = Value::Null;
 }
 
-fn parse_visitor_response(
+fn parse_catalog_http_response(
     response: crate::http::HttpResponse,
     operation: &'static str,
 ) -> Result<Value, BusinessError> {
@@ -952,7 +1123,10 @@ fn parse_importer_address(value: &Value) -> Option<ImporterAddress> {
 fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
     const OP: &str = "catalog";
 
-    let catalog = &data["xwa_product_catalog_get_product_catalog"]["product_catalog"];
+    let root = data
+        .get("xfb_whatsapp_catalog")
+        .unwrap_or(&data["xwa_product_catalog_get_product_catalog"]);
+    let catalog = &root["product_catalog"];
     if !catalog.is_object() {
         return Err(BusinessError::malformed(
             OP,
@@ -981,7 +1155,9 @@ fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
 fn parse_collections(data: &Value) -> Result<Collections, BusinessError> {
     const OP: &str = "collections";
 
-    let root = &data["xwa_product_catalog_get_collections"];
+    let root = data
+        .get("xfb_whatsapp_catalog_collections")
+        .unwrap_or(&data["xwa_product_catalog_get_collections"]);
     let collections = root["collections"].as_array().ok_or_else(|| {
         BusinessError::malformed(
             OP,
@@ -1105,14 +1281,15 @@ mod tests {
 
         let error = HttpResponse::new(200, br#"{"errors":[{"code":2498052}]}"#.to_vec());
         assert!(matches!(
-            parse_visitor_response(error, "catalog"),
+            parse_catalog_http_response(error, "catalog"),
             Err(BusinessError::CatalogGraphQl {
                 code: Some(2498052)
             })
         ));
 
         let empty = HttpResponse::new(200, br#"{"data":{"xwa_product_catalog_get_product_catalog":{"product_catalog":{"products":[]}}}}"#.to_vec());
-        let catalog = parse_catalog(&parse_visitor_response(empty, "catalog").unwrap()).unwrap();
+        let catalog =
+            parse_catalog(&parse_catalog_http_response(empty, "catalog").unwrap()).unwrap();
         assert!(catalog.products.is_empty());
     }
 
@@ -1187,6 +1364,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(catalog.after_cursor.as_deref(), Some("fixture-cursor"));
+        assert_eq!(
+            catalog.products[0].id,
+            collections.collections[0].products[0].id
+        );
+    }
+
+    #[test]
+    fn owner_http_catalog_and_collections_use_management_roots() {
+        let product = json!({"id": "owner-product", "is_hidden": true});
+        let catalog = parse_catalog(&json!({
+            "xfb_whatsapp_catalog": {"product_catalog": {
+                "products": [product], "paging": {"after": "next-page"}
+            }}
+        }))
+        .unwrap();
+        let collections = parse_collections(&json!({
+            "xfb_whatsapp_catalog_collections": {"collections": [
+                {"id": "owner-collection", "products": [product]}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(catalog.after_cursor.as_deref(), Some("next-page"));
+        assert_eq!(catalog.products[0].is_hidden, Some(true));
         assert_eq!(
             catalog.products[0].id,
             collections.collections[0].products[0].id
