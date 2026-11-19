@@ -783,8 +783,8 @@ fn info_bytes(info: &MessageInfo) -> usize {
 }
 #[inline(never)]
 fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
-    first.source.chat == second.source.chat
-        && first.id == second.id
+    first.id == second.id
+        && first.source.chat == second.source.chat
         && if first.source.chat.is_group() {
             first.source.sender.user == second.source.sender.user
                 && first.source.sender.server == second.source.sender.server
