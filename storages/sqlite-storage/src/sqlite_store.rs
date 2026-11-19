@@ -3702,35 +3702,28 @@ fn insert_missing_pending_inbound_row(
     message: &[u8],
     timestamp: &InsertionTime,
 ) -> QueryResult<usize> {
-    use pending_inbound_messages as pending;
-
-    let values = (
-        pending::chat.eq(chat),
-        pending::sender.eq(sender),
-        pending::id.eq(id),
-        pending::message.eq(message),
-        pending::device_id.eq(device_id),
-    );
-    let target = (
-        pending::chat,
-        pending::sender,
-        pending::id,
-        pending::device_id,
-    );
     #[cfg(feature = "instance-clock")]
     if let Some(seconds) = timestamp.seconds() {
-        return diesel::insert_into(pending::table)
-            .values((values, pending::inserted_at.eq(seconds)))
-            .on_conflict(target)
-            .do_nothing()
-            .execute(conn);
+        return crate::upsert_queries::InsertMissingPending::<true> {
+            chat,
+            sender,
+            id,
+            message,
+            device_id,
+            timestamp: seconds,
+        }
+        .execute(conn);
     }
     let _ = timestamp;
-    diesel::insert_into(pending::table)
-        .values(values)
-        .on_conflict(target)
-        .do_nothing()
-        .execute(conn)
+    crate::upsert_queries::InsertMissingPending::<false> {
+        chat,
+        sender,
+        id,
+        message,
+        device_id,
+        timestamp: 0,
+    }
+    .execute(conn)
 }
 
 #[derive(QueryableByName)]
@@ -6359,6 +6352,61 @@ mod tests {
             );
         }
         assert_eq!(cached.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_insert_statement_rebinds_keys_and_preserves_conflicts() {
+        use diesel::connection::{InstrumentationEvent, SimpleConnection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute("CREATE TABLE pending_inbound_messages (chat TEXT, sender TEXT, id TEXT, message BLOB, device_id INTEGER, inserted_at INTEGER DEFAULT 77, UNIQUE (chat, sender, id, device_id))").unwrap();
+        let cached = Arc::new(AtomicUsize::new(0));
+        let observed = cached.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::CacheQuery { .. } = event {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let untimed = |device_id, message| crate::upsert_queries::InsertMissingPending::<false> {
+            chat: "chat",
+            sender: "sender",
+            id: "id",
+            message,
+            device_id,
+            timestamp: 0,
+        };
+        assert_eq!(untimed(1, b"first").execute(&mut conn).unwrap(), 1);
+        assert_eq!(untimed(1, b"replaced").execute(&mut conn).unwrap(), 0);
+        assert_eq!(untimed(2, b"second").execute(&mut conn).unwrap(), 1);
+        let timed = || crate::upsert_queries::InsertMissingPending::<true> {
+            chat: "chat",
+            sender: "sender",
+            id: "id",
+            message: b"timed",
+            device_id: 3,
+            timestamp: 123,
+        };
+        assert_eq!(timed().execute(&mut conn).unwrap(), 1);
+        assert_eq!(timed().execute(&mut conn).unwrap(), 0);
+        assert_eq!(cached.load(Ordering::SeqCst), 2);
+        let rows = pending_inbound_messages::table
+            .select((
+                pending_inbound_messages::device_id,
+                pending_inbound_messages::message,
+                pending_inbound_messages::inserted_at,
+            ))
+            .order(pending_inbound_messages::device_id)
+            .load::<(i32, Vec<u8>, i64)>(&mut conn)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, b"first".to_vec(), 77),
+                (2, b"second".to_vec(), 77),
+                (3, b"timed".to_vec(), 123)
+            ]
+        );
     }
 
     #[tokio::test]

@@ -4,6 +4,49 @@ use diesel::result::QueryResult;
 use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
 
+pub(crate) struct InsertMissingPendingId<const TIMED: bool>;
+
+pub(crate) struct InsertMissingPending<'a, const TIMED: bool> {
+    pub chat: &'a str,
+    pub sender: &'a str,
+    pub id: &'a str,
+    pub message: &'a [u8],
+    pub device_id: i32,
+    pub timestamp: i64,
+}
+
+impl<const TIMED: bool> QueryId for InsertMissingPending<'_, TIMED> {
+    type QueryId = InsertMissingPendingId<TIMED>;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+impl<Conn, const TIMED: bool> RunQueryDsl<Conn> for InsertMissingPending<'_, TIMED> {}
+
+impl<const TIMED: bool> QueryFragment<Sqlite> for InsertMissingPending<'_, TIMED> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO pending_inbound_messages (chat, sender, id, message, device_id");
+        if TIMED {
+            out.push_sql(", inserted_at");
+        }
+        out.push_sql(") VALUES (");
+        out.push_bind_param::<Text, _>(&self.chat)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.sender)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(&self.id)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Binary, _>(&self.message)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        if TIMED {
+            out.push_sql(", ");
+            out.push_bind_param::<BigInt, _>(&self.timestamp)?;
+        }
+        out.push_sql(") ON CONFLICT (chat, sender, id, device_id) DO NOTHING");
+        Ok(())
+    }
+}
+
 /// Static query identifier for `UpsertSession`.
 #[derive(Debug, Clone, Copy)]
 pub struct UpsertSessionQuery;
