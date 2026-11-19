@@ -861,6 +861,16 @@ impl Session {
         self.wait_until(|| !self.client.signal_flush_worker_armed())
             .await
             .context("warm-up Signal flush worker did not retire")?;
+        // The warm-up leaves many small chunks in glibc's fastbins and unsorted
+        // bin, and glibc only consolidates and sorts them on a request that no
+        // tcache, fastbin or small-bin chunk serves. Without this, that request
+        // is a small allocation inside the measured maintenance (the
+        // `event_listener` in `RwLock::write_unlock`), which then pays a
+        // variable +6..15 µs under the MALLOC_* settings pinned in the
+        // CodSpeed workflow. A 100 KiB request is above the small-bin and
+        // tcache limits and below the 128 KiB mmap threshold, so glibc does
+        // that work here, outside the measured region.
+        drop(std::hint::black_box(Vec::<u8>::with_capacity(100 * 1024)));
         Ok(())
     }
 
