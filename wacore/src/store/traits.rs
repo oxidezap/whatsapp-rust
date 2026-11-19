@@ -1254,6 +1254,21 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
+    /// Whether this backend can insert fresh journal rows in one transaction.
+    fn supports_pending_insert_batch(&self) -> bool {
+        false
+    }
+
+    /// Insert rows in order while their keys are absent. Identical revisions
+    /// are idempotent. A conflict leaves that row untouched and commits only the preceding rows.
+    async fn insert_pending_batch_if_missing(
+        &self,
+        _rows: &[(PendingInboundKey<'_>, &PendingInboundPayload)],
+        _max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Delete only the exact stored bytes observed by the current owner, in one
     /// atomic operation. Missing expected and stored revisions are a no-op
     /// success; a present expected revision against absence is a conflict.
@@ -1367,7 +1382,7 @@ impl std::fmt::Debug for PendingInboundLease {
 /// Immutable replacement bytes and the ownership that accounts for them.
 /// The caller reserves before allocating; the lease must also cover bounded
 /// prior-row scratch. SQLite's internal copies need separate peak accounting.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PendingInboundPayload {
     bytes: Bytes,
     revision: PendingInboundRevision,

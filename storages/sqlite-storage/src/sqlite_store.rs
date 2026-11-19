@@ -3693,6 +3693,46 @@ fn insert_pending_inbound_row(
         .execute(conn)
 }
 
+fn insert_missing_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+    message: &[u8],
+    timestamp: &InsertionTime,
+) -> QueryResult<usize> {
+    use pending_inbound_messages as pending;
+
+    let values = (
+        pending::chat.eq(chat),
+        pending::sender.eq(sender),
+        pending::id.eq(id),
+        pending::message.eq(message),
+        pending::device_id.eq(device_id),
+    );
+    let target = (
+        pending::chat,
+        pending::sender,
+        pending::id,
+        pending::device_id,
+    );
+    #[cfg(feature = "instance-clock")]
+    if let Some(seconds) = timestamp.seconds() {
+        return diesel::insert_into(pending::table)
+            .values((values, pending::inserted_at.eq(seconds)))
+            .on_conflict(target)
+            .do_nothing()
+            .execute(conn);
+    }
+    let _ = timestamp;
+    diesel::insert_into(pending::table)
+        .values(values)
+        .on_conflict(target)
+        .do_nothing()
+        .execute(conn)
+}
+
 #[derive(QueryableByName)]
 struct BoundedPendingPayload<T = Vec<u8>> {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -4945,6 +4985,78 @@ impl ProtocolStore for SqliteStore {
                 revision,
             },
         )
+        .await
+    }
+
+    fn supports_pending_insert_batch(&self) -> bool {
+        self.commit_barrier.is_none()
+    }
+
+    async fn insert_pending_batch_if_missing(
+        &self,
+        rows: &[(PendingInboundKey<'_>, &PendingInboundPayload)],
+        max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        if !self.supports_pending_insert_batch() {
+            return Err(StoreError::InvalidConfig(
+                "pending insert batch requires local commit".into(),
+            ));
+        }
+        if rows
+            .iter()
+            .any(|(_, payload)| payload.bytes().len() > max_bytes)
+        {
+            return Err(StoreError::Validation(
+                "pending insert batch contains an oversized row".into(),
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(PendingInboundMutation::Applied);
+        }
+        let rows = Arc::new(
+            rows.iter()
+                .map(|(key, payload)| {
+                    (
+                        key.chat.to_owned(),
+                        key.sender.to_owned(),
+                        key.id.to_owned(),
+                        (*payload).clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let device_id = self.device_id;
+        let timestamp = self.insertion_time();
+        self.with_retry("insert_pending_batch_if_missing", || {
+            let rows = rows.clone();
+            let timestamp = timestamp.clone();
+            Box::new(move |conn| {
+                conn.immediate_transaction(|conn| {
+                    for (chat, sender, id, payload) in &*rows {
+                        let inserted = insert_missing_pending_inbound_row(
+                            conn,
+                            device_id,
+                            chat,
+                            sender,
+                            id,
+                            payload.bytes(),
+                            &timestamp,
+                        )?;
+                        if inserted == 0 {
+                            let revision = read_pending_inbound_payload::<HashedPendingPayload>(
+                                conn, device_id, chat, sender, id, max_bytes,
+                            )?
+                            .map_err(|error| DieselError::DeserializationError(Box::new(error)))?
+                            .map_or(PendingInboundRevision::missing(), |row| row.0);
+                            if revision != payload.revision() {
+                                return Ok(PendingInboundMutation::Conflict);
+                            }
+                        }
+                    }
+                    Ok(PendingInboundMutation::Applied)
+                })
+            })
+        })
         .await
     }
 
@@ -6250,6 +6362,110 @@ mod tests {
             );
         }
         assert_eq!(cached.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_insert_batch_retries_prefix_and_stops_at_conflict() {
+        let store = create_test_store().await;
+        let first = PendingInboundKey {
+            chat: "group@g.us",
+            sender: "200@lid",
+            id: "first",
+        };
+        let second = PendingInboundKey {
+            id: "second",
+            ..first
+        };
+        let third = PendingInboundKey {
+            id: "third",
+            ..first
+        };
+        let payload =
+            PendingInboundPayload::new(Bytes::from_static(b"owned"), pending_test_lease());
+        store
+            .store_pending_inbound(second.chat, second.sender, second.id, b"successor")
+            .await
+            .unwrap();
+
+        let rows = [(first, &payload), (second, &payload), (third, &payload)];
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .insert_pending_batch_if_missing(&rows, 16)
+                    .await
+                    .unwrap(),
+                PendingInboundMutation::Conflict,
+            );
+            assert_eq!(
+                store
+                    .get_pending_inbound(first.chat, first.sender, first.id)
+                    .await
+                    .unwrap(),
+                Some(b"owned".to_vec())
+            );
+            assert_eq!(
+                store
+                    .get_pending_inbound(second.chat, second.sender, second.id)
+                    .await
+                    .unwrap(),
+                Some(b"successor".to_vec())
+            );
+            assert_eq!(
+                store
+                    .get_pending_inbound(third.chat, third.sender, third.id)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            store
+                .insert_pending_batch_if_missing(&[(first, &payload), (third, &payload)], 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied,
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(third.chat, third.sender, third.id)
+                .await
+                .unwrap(),
+            Some(b"owned".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_insert_batch_rejects_oversize_before_committing_any_row() {
+        let store = create_test_store().await;
+        let first = PendingInboundKey {
+            chat: "group@g.us",
+            sender: "200@lid",
+            id: "first",
+        };
+        let second = PendingInboundKey {
+            id: "second",
+            ..first
+        };
+        let first_payload =
+            PendingInboundPayload::new(Bytes::from_static(b"a"), pending_test_lease());
+        let second_payload =
+            PendingInboundPayload::new(Bytes::from_static(b"too large"), pending_test_lease());
+        assert!(matches!(
+            store
+                .insert_pending_batch_if_missing(
+                    &[(first, &first_payload), (second, &second_payload)],
+                    1
+                )
+                .await,
+            Err(StoreError::Validation(_)),
+        ));
+        assert_eq!(
+            store
+                .get_pending_inbound(first.chat, first.sender, first.id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
