@@ -576,26 +576,47 @@ pub fn aes_256_cbc_decrypt_into(
     iv: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), DecryptionError> {
-    let cipher = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)
-        .map_err(|_| DecryptionError::BadKeyOrIv)?;
-    let start = out.len();
-    out.extend_from_slice(ciphertext);
-    let result = cipher
-        .decrypt_padded::<Pkcs7>(&mut out[start..])
-        .map(|plain| plain.len());
-    match result {
-        Ok(len) => {
-            out.truncate(start + len);
-            Ok(())
-        }
-        Err(_) => {
-            use zeroize::Zeroize;
-            out[start..].zeroize();
-            out.truncate(start);
-            Err(DecryptionError::BadCiphertext("invalid PKCS#7 padding"))
+    let key: &[u8; 32] = key.try_into().map_err(|_| DecryptionError::BadKeyOrIv)?;
+    PreparedAes256CbcDecryptor::new(key).decrypt_into(ciphertext, iv, out)
+}
+
+/// Reuses an AES-256 key schedule across records with independent IVs.
+pub struct PreparedAes256CbcDecryptor(aes::Aes256Dec);
+
+impl PreparedAes256CbcDecryptor {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self(aes::Aes256Dec::new(key.into()))
+    }
+
+    pub fn decrypt_into(
+        &self,
+        ciphertext: &[u8],
+        iv: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DecryptionError> {
+        use aes::cipher::InnerIvInit;
+        let iv: &[u8; 16] = iv.try_into().map_err(|_| DecryptionError::BadKeyOrIv)?;
+        let cipher = cbc::Decryptor::inner_iv_init(&self.0, iv.into());
+        let start = out.len();
+        out.extend_from_slice(ciphertext);
+        let result = cipher
+            .decrypt_padded::<Pkcs7>(&mut out[start..])
+            .map(|plain| plain.len());
+        match result {
+            Ok(len) => {
+                out.truncate(start + len);
+                Ok(())
+            }
+            Err(_) => {
+                use zeroize::Zeroize;
+                out[start..].zeroize();
+                out.truncate(start);
+                Err(DecryptionError::BadCiphertext("invalid PKCS#7 padding"))
+            }
         }
     }
 }
+
 pub fn aes_256_cbc_decrypt_in_place(
     ciphertext: &mut Vec<u8>,
     key: &[u8],
@@ -1054,6 +1075,28 @@ mod tests {
             <[u8; 32]>::from(Sha256::digest(b""))
         );
         assert_eq!(hash.finalize(), Sha256::digest(b"").to_vec());
+    }
+
+    #[test]
+    fn cbc_prepared_decryptor_reuses_key_without_reusing_iv() {
+        let key = [3; 32];
+        let decryptor = PreparedAes256CbcDecryptor::new(&key);
+        let mut out = b"prefix".to_vec();
+        for (iv, plaintext) in [
+            ([4; 16], b"first".as_slice()),
+            ([5; 16], b"second".as_slice()),
+        ] {
+            let mut ciphertext = Vec::new();
+            aes_256_cbc_encrypt_into(plaintext, &key, &iv, &mut ciphertext).unwrap();
+            decryptor.decrypt_into(&ciphertext, &iv, &mut out).unwrap();
+            let mut bad_iv = iv;
+            bad_iv[15] ^= 1;
+            assert!(matches!(
+                decryptor.decrypt_into(&ciphertext, &bad_iv, &mut out),
+                Err(DecryptionError::BadCiphertext(_))
+            ));
+        }
+        assert_eq!(out, b"prefixfirstsecond");
     }
 
     #[test]

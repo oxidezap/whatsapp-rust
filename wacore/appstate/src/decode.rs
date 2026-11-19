@@ -7,7 +7,7 @@ use hmac::{Hmac, KeyInit as _};
 use sha2::{Sha256, Sha512};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
+use wacore_libsignal::crypto::{PreparedAes256CbcDecryptor, aes_256_cbc_decrypt_into};
 use waproto::whatsapp as wa;
 
 /// A decoded mutation from an app state record.
@@ -71,11 +71,16 @@ pub fn decode_record(
 #[derive(Default)]
 pub(crate) struct BatchRecordDecoder {
     plaintext: Vec<u8>,
+    prepared: Option<PreparedRecordCrypto>,
+}
+
+struct PreparedRecordCrypto {
+    keys: Arc<ExpandedAppStateKeys>,
+    cipher: PreparedAes256CbcDecryptor,
     macs: Option<PreparedRecordMacs>,
 }
 
 struct PreparedRecordMacs {
-    keys: Arc<ExpandedAppStateKeys>,
     content: Hmac<Sha512>,
     index: Hmac<Sha256>,
 }
@@ -89,16 +94,16 @@ impl BatchRecordDecoder {
         key_id: &[u8],
         validate_macs: bool,
     ) -> Result<(Mutation, RecordMacs), AppStateError> {
-        if validate_macs
-            && !self
-                .macs
-                .as_ref()
-                .is_some_and(|macs| Arc::ptr_eq(&macs.keys, keys))
-        {
-            self.macs = Some(PreparedRecordMacs {
+        if self.prepared.as_ref().is_none_or(|prepared| {
+            !Arc::ptr_eq(&prepared.keys, keys) || (validate_macs && prepared.macs.is_none())
+        }) {
+            self.prepared = Some(PreparedRecordCrypto {
                 keys: Arc::clone(keys),
-                content: Hmac::new_from_slice(&keys.value_mac).expect("valid HMAC key"),
-                index: Hmac::new_from_slice(&keys.index).expect("valid HMAC key"),
+                cipher: PreparedAes256CbcDecryptor::new(&keys.value_encryption),
+                macs: validate_macs.then(|| PreparedRecordMacs {
+                    content: Hmac::new_from_slice(&keys.value_mac).expect("valid HMAC key"),
+                    index: Hmac::new_from_slice(&keys.index).expect("valid HMAC key"),
+                }),
             });
         }
         decode_record_into(
@@ -108,7 +113,7 @@ impl BatchRecordDecoder {
             key_id,
             validate_macs,
             &mut self.plaintext,
-            self.macs.as_ref(),
+            self.prepared.as_ref(),
         )
     }
 }
@@ -120,7 +125,7 @@ fn decode_record_into(
     key_id: &[u8],
     validate_macs: bool,
     plaintext: &mut Vec<u8>,
-    prepared: Option<&PreparedRecordMacs>,
+    prepared: Option<&PreparedRecordCrypto>,
 ) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
@@ -137,7 +142,7 @@ fn decode_record_into(
 
     if validate_macs {
         let data = &value_blob[..value_blob.len() - 32];
-        let expected = match prepared {
+        let expected = match prepared.and_then(|prepared| prepared.macs.as_ref()) {
             Some(macs) => content_mac_with(operation, data, key_id, macs.content.clone()),
             None => generate_content_mac(operation, data, key_id, &keys.value_mac),
         };
@@ -148,8 +153,11 @@ fn decode_record_into(
 
     plaintext.clear();
     plaintext.reserve_exact(ciphertext.len());
-    aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, plaintext)
-        .map_err(|_| AppStateError::DecryptionFailed)?;
+    match prepared {
+        Some(prepared) => prepared.cipher.decrypt_into(ciphertext, iv, plaintext),
+        None => aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, plaintext),
+    }
+    .map_err(|_| AppStateError::DecryptionFailed)?;
 
     // Owned decode (not a view): the `value` sub-message is needed owned, so a
     // view would parse it once into a view and copy it again into the owned
@@ -168,7 +176,7 @@ fn decode_record_into(
             .and_then(|i| i.blob.as_ref())
             .ok_or(AppStateError::MissingIndexMAC)?;
         let index = action.index.as_deref().unwrap_or(&[]);
-        match prepared {
+        match prepared.and_then(|prepared| prepared.macs.as_ref()) {
             Some(macs) => validate_index_mac_with(index, stored, macs.index.clone())?,
             None => validate_index_mac(index, stored, &keys.index)?,
         }
