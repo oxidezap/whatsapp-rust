@@ -146,14 +146,14 @@ pub fn extract_envelope(msg: &wa::Message) -> Option<EncryptedEdit<'_>> {
 /// `inner` is the value returned by [`decrypt`]. Returns `None` if the
 /// decrypted message did not contain `protocol_message.edited_message`
 /// (caller should log + skip).
-pub fn rewrap_as_legacy_edit(inner: wa::Message) -> Option<wa::Message> {
-    let pm = inner.protocol_message.into_option()?;
-    let edited = pm.edited_message.into_option()?;
+pub fn rewrap_as_legacy_edit(mut inner: wa::Message) -> Option<wa::Message> {
+    let mut pm = inner.protocol_message.take()?;
+    let edited = pm.edited_message.take()?;
     Some({
         let mut proto_ = wa::Message::default();
         proto_.protocol_message = MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.key = pm.key;
+            proto_.key = std::mem::take(&mut pm.key);
             proto_.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
             proto_.edited_message = MessageField::some(edited);
             proto_.timestamp_ms = pm.timestamp_ms;
