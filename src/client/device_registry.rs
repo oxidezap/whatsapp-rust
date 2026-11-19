@@ -263,19 +263,17 @@ impl Client {
                 .await?,
             )));
         }
-        let memo = self.group_devices_memo.get(group).await;
-        // Include updates that landed while the cache read was waiting.
-        // Sample before any registry reads so updates during a resolve leave
-        // a stale stamp on the result and force revalidation next time.
-        let generation = self.device_topology.current();
+        // Sample after waiting for the memo and before any registry reads.
+        let generation;
 
         // Each exit records the term that decided it, on the branch that
         // decided it, rather than classifying into a value and dispatching on
         // it twice — the counter is meant to be free on the hit path, and a
         // second dispatch is not free.
-        if let Some(memo) = memo {
+        if let Some(memo) = self.group_devices_memo.get(group).await {
             use std::sync::atomic::Ordering;
             let memo_generation = memo.generation.load(Ordering::Acquire);
+            generation = self.device_topology.current();
             if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
                 self.device_memo_counters
                     .record_group_devices(Outcome::MissGroupInfo);
@@ -303,6 +301,7 @@ impl Client {
                     .record_group_devices(Outcome::MissTopology);
             }
         } else {
+            generation = self.device_topology.current();
             self.device_memo_counters
                 .record_group_devices(Outcome::MissAbsent);
         }
