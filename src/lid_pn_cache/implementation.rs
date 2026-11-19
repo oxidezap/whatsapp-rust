@@ -394,6 +394,11 @@ impl LidPnCache {
         }
     }
 
+    pub(crate) fn is_unbounded_local(&self) -> bool {
+        // Only non-expiring local maps keep persistence in the mapping itself.
+        self.persisted.is_none()
+    }
+
     /// Get the current LID for a phone number.
     ///
     /// Returns the LID user part if a mapping exists, None otherwise.

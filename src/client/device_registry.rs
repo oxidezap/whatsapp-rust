@@ -1906,14 +1906,36 @@ impl Client {
     ) -> (Vec<Jid>, Vec<Jid>) {
         let mut devices = Vec::with_capacity(jids.len() * 2);
         let mut pending: Vec<(Jid, UserLookupKeys)> = Vec::new();
+        // Keep alias reads for mappings subject to expiry, eviction, or an external store.
+        let can_skip_alias_lookup = self.lid_pn_cache.is_unbounded_local();
         'users: for jid in jids {
+            // For a LID query, its own key is always first, even with a PN alias.
+            let lid_first = can_skip_alias_lookup && jid.server == Server::Lid;
+            if lid_first
+                && let Some(record) = self.device_registry_cache.get(&jid.user).await
+                && !record.devices.is_empty()
+            {
+                devices.extend(Self::device_jids(&jid, &record));
+                continue;
+            }
+
             let lookup = self.resolve_lookup_keys_for_jid(&jid).await;
-            for key in lookup.all_keys() {
-                if let Some(record) = self.device_registry_cache.get(key).await {
-                    let found = Self::device_jids(&jid, &record);
-                    if found.len() != 0 {
-                        devices.extend(found);
-                        continue 'users;
+            if lid_first {
+                if let UserLookupKeys::LidWithPn { pn, .. } = &lookup
+                    && let Some(record) = self.device_registry_cache.get(pn).await
+                    && !record.devices.is_empty()
+                {
+                    devices.extend(Self::device_jids(&jid, &record));
+                    continue;
+                }
+            } else {
+                for key in lookup.all_keys() {
+                    if let Some(record) = self.device_registry_cache.get(key).await {
+                        let found = Self::device_jids(&jid, &record);
+                        if found.len() != 0 {
+                            devices.extend(found);
+                            continue 'users;
+                        }
                     }
                 }
             }
@@ -2149,6 +2171,27 @@ mod tests {
             .device_registry_cache
             .raw_insert_for_tests(user.into(), Arc::new(record))
             .await;
+    }
+
+    #[tokio::test]
+    async fn registry_batch_prefers_lid_and_uses_pn_when_lid_has_no_devices() {
+        let client = create_test_client().await;
+        let lid = "100000000000007";
+        let pn = "15550103177";
+        setup_lid_pn(&client, lid, pn).await;
+        setup_device_record(&client, pn, &[0, 7]).await;
+
+        for (lid_devices, expected) in [(&[0, 3][..], 3), (&[][..], 7)] {
+            setup_device_record(&client, lid, lid_devices).await;
+            let (devices, missing) = client
+                .get_devices_from_registry_batch(vec![Jid::lid(lid)])
+                .await;
+            assert!(missing.is_empty());
+            assert_eq!(
+                devices,
+                [Jid::lid_device(lid, 0), Jid::lid_device(lid, expected)]
+            );
+        }
     }
 
     /// The server-aware probe must resolve the same canonical record as the
