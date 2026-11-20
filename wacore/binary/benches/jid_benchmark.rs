@@ -13,31 +13,51 @@ const LID: &str = "123456789012345@lid";
 const AD_DEVICE: &str = "5511999990000.0:7@s.whatsapp.net";
 const GROUP: &str = "120363012345678901@g.us";
 
+// The parse and format rows run a whole `BATCH` per measured iteration, like
+// the identity section below. A single call is under 100 instructions, so its
+// one cold pass was almost all simulated cache misses, and those follow the
+// runner's CPU: the same binary read ~55 ns (one miss) apart on Intel and AMD
+// runners. Each output is dropped before the next call, so the Memory rows
+// still report one call's peak.
 #[divan::bench(args = [PN, LID, AD_DEVICE, GROUP])]
-fn bench_jid_parse(input: &str) -> Jid {
-    black_box(black_box(input).parse().unwrap())
+fn bench_jid_parse(bencher: divan::Bencher, input: &str) {
+    bencher.counter(ItemsCount::new(BATCH)).bench(|| {
+        for _ in 0..BATCH {
+            black_box(black_box(input).parse::<Jid>().unwrap());
+        }
+    });
 }
 
 #[divan::bench]
 fn bench_jid_to_string(bencher: divan::Bencher) {
     bencher
+        .counter(ItemsCount::new(BATCH))
         .with_inputs(|| {
             let mut jid = Jid::lid("123456789012345");
             jid.device = 7;
             jid
         })
-        .bench_refs(|jid| black_box(jid.to_string()));
+        .bench_refs(|jid| {
+            for _ in 0..BATCH {
+                black_box(black_box(&*jid).to_string());
+            }
+        });
 }
 
 #[divan::bench]
 fn bench_jid_to_non_ad_string(bencher: divan::Bencher) {
     bencher
+        .counter(ItemsCount::new(BATCH))
         .with_inputs(|| {
             let mut jid = Jid::pn("5511999990000");
             jid.device = 3;
             jid
         })
-        .bench_refs(|jid| black_box(jid.to_non_ad_string()));
+        .bench_refs(|jid| {
+            for _ in 0..BATCH {
+                black_box(black_box(&*jid).to_non_ad_string());
+            }
+        });
 }
 
 /// The per-recipient fan-out formatter: writes the AD form into a reused
@@ -45,21 +65,25 @@ fn bench_jid_to_non_ad_string(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_jid_push_phash_form(bencher: divan::Bencher) {
     bencher
+        .counter(ItemsCount::new(BATCH))
         .with_inputs(|| {
             let mut jid = Jid::lid("123456789012345");
             jid.device = 7;
             (jid, String::with_capacity(64))
         })
         .bench_refs(|(jid, buf)| {
-            // The destination has to be opaque BEFORE the write. Observing the
-            // buffer afterwards -- even as `buf.as_bytes()` -- hands LLVM only
-            // the pointer and the length, never the bytes, so it proves the
-            // formatting stores dead and the row measures as nothing at all.
-            // Laundering `buf` through `black_box` first makes the pointer
-            // escape, which is what forces the stores to happen.
-            let buf = black_box(buf);
-            black_box(jid).push_phash_form_to(buf);
-            black_box(buf.len());
+            for _ in 0..BATCH {
+                buf.clear();
+                // The destination has to be opaque BEFORE the write. Observing the
+                // buffer afterwards -- even as `buf.as_bytes()` -- hands LLVM only
+                // the pointer and the length, never the bytes, so it proves the
+                // formatting stores dead and the row measures as nothing at all.
+                // Laundering `buf` through `black_box` first makes the pointer
+                // escape, which is what forces the stores to happen.
+                let buf = black_box(&mut *buf);
+                black_box(&*jid).push_phash_form_to(buf);
+                black_box(buf.len());
+            }
         });
 }
 
