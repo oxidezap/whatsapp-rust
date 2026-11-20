@@ -801,40 +801,54 @@ impl Client {
         self: &Arc<Self>,
         receiver: async_channel::Receiver<MajorSyncTask>,
     ) {
-        let worker_client = Arc::downgrade(self);
         self.runtime
-            .spawn(Box::pin(async move {
-                while let Ok(task) = receiver.recv().await {
-                    let Some(worker_client) = worker_client.upgrade() else {
-                        break;
-                    };
-
-                    if let MajorSyncTask::HistorySync {
-                        message_id,
-                        notification,
-                        mut tracker,
-                    } = task {
-                        let Some(permit) = worker_client.acquire_history_sync_permit().await else {
-                            continue;
-                        };
-                        let task_client = worker_client.clone();
-                        worker_client
-                            .runtime
-                            .spawn(Box::pin(async move {
-                                task_client.process_history_sync_task_with_permit(
-                                    message_id, *notification, &mut tracker, permit,
-                                ).await;
-                            }))
-                            .detach();
-                    } else {
-                        worker_client.process_sync_task(task).await;
-                    }
-                }
-                info!(
-                    "Sync worker intake loop finished (detached history-sync tasks may still be running)."
-                );
-            }))
+            .spawn(Box::pin(Self::run_sync_task_worker(
+                Arc::downgrade(self),
+                receiver,
+            )))
             .detach();
+    }
+
+    async fn run_sync_task_worker(
+        worker_client: std::sync::Weak<Self>,
+        receiver: async_channel::Receiver<MajorSyncTask>,
+    ) {
+        while let Ok(task) = receiver.recv().await {
+            let Some(worker_client) = worker_client.upgrade() else {
+                break;
+            };
+
+            if let MajorSyncTask::HistorySync {
+                message_id,
+                notification,
+                mut tracker,
+            } = task
+            {
+                let Some(permit) = worker_client.acquire_history_sync_permit().await else {
+                    continue;
+                };
+                let task_client = worker_client.clone();
+                worker_client
+                    .runtime
+                    .spawn(Box::pin(async move {
+                        task_client
+                            .process_history_sync_task_with_permit(
+                                message_id,
+                                *notification,
+                                &mut tracker,
+                                permit,
+                            )
+                            .await;
+                    }))
+                    .detach();
+            } else {
+                // The worker lives for the session. Only reserve the sync frame while running it.
+                Box::pin(worker_client.process_sync_task(task)).await;
+            }
+        }
+        info!(
+            "Sync worker intake loop finished (detached history-sync tasks may still be running)."
+        );
     }
 
     /// Replays one collection from the beginning.
