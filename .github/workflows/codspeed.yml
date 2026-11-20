@@ -215,6 +215,7 @@ jobs:
           # Compilation dominates these jobs. Keep dependencies and build
           # scripts as well as registry downloads; each shard has its own key.
           cache-targets: "true"
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # simulation and memory share the same instrumented build, so one
       # build covers both instruments.
@@ -370,6 +371,7 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo-codspeed-integration
           cache-targets: "true"
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Wait for mock server
         run: cargo xt ci workflow wait-for-mock

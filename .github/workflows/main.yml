@@ -261,6 +261,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+          # The large PR archive is only reusable within that same PR.
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Build (all features)
         run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
       - name: Clippy (all features)
