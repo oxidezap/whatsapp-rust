@@ -21,6 +21,8 @@ pub enum Task {
         #[arg(long)]
         shards: usize,
     },
+    /// Select connected retention measurements for changes to their inputs.
+    ConnectedRetentionInputs,
     /// Wait for the local self-signed mock service used by E2E/bench jobs.
     WaitForMock,
     /// Reject direct native pool references outside the SQLite platform shim.
@@ -264,6 +266,39 @@ fn codspeed_targets(metadata: &Value, shard: usize, shards: usize) -> Result<Str
 
 pub fn run_task(root: &Path, task: Task) -> Result<()> {
     match task {
+        Task::ConnectedRetentionInputs => {
+            let base = env("BASE_REVISION")?;
+            let head = env("HEAD_REVISION")?;
+            for sha in [&base, &head] {
+                ensure!(
+                    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "connected retention requires full commit SHAs"
+                );
+            }
+            let status = Command::new("git")
+                .current_dir(root)
+                .args([
+                    "diff",
+                    "--quiet",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    &base,
+                    &head,
+                    "--",
+                    ".",
+                    ":(exclude,literal).github/workflows/main.yml",
+                    ":(exclude,literal).github/workflows/wasm.yml",
+                    ":(exclude,literal).github/workflows/e2e.yml",
+                ])
+                .status()?;
+            let measure = match status.code() {
+                Some(0) => false,
+                Some(1) => true,
+                _ => anyhow::bail!("could not compare connected retention inputs: {status}"),
+            };
+            println!("Connected retention measurement needed: {measure}");
+            output("measure", if measure { "true" } else { "false" })?;
+        }
         Task::QualificationSha => {
             let expected = env("EXPECTED_SHA")?;
             let actual = String::from_utf8(
