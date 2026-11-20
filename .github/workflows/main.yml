@@ -45,7 +45,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
+        id: toolchain
         with:
           toolchain: 1.100.0
           components: rustfmt
@@ -53,36 +55,18 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         run: cargo xt ci sync-bartender-image --check
-      - run: cargo fmt --all -- --check
-
-  generated:
-    name: Generated Artifacts
-    runs-on: ubuntu-latest
-    # The vendored whatspec files are regenerated, never edited, and the tool
-    # that writes them pins the exact IR commit — so a hand-edit or a
-    # half-refreshed tree is a diff this job can name. Lives beside `format`
-    # rather than in a build job: it needs rustfmt and git, not protoc (--check
-    # never rebuilds the descriptor) and not a compiled workspace.
-    # Bounded because the step fetches an external repository: a hung fetch
-    # would otherwise hold a required check open for the full six hours.
-    timeout-minutes: 15
-    steps:
-      # This job never pushes, and the codegen shells out to `git fetch` against
-      # a different repository; the checkout token has no business being left in
-      # .git/config for that.
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-          components: rustfmt
-      # RUSTC_WRAPPER is set workspace-wide, so cargo needs sccache on PATH even
-      # in a job this small.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Setup sccache
+        id: sccache
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         uses: mozilla-actions/sccache-action@v0.0.11
-      - run: cargo run -p whatspec-codegen -- --check
+      # The vendored files must match the pinned whatspec IR. Bound the fetch
+      # so a hung external repository cannot stall the whole workflow.
+      - name: Check generated artifacts
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo run -p whatspec-codegen -- --check
 
   clippy:
     name: Clippy Linter
