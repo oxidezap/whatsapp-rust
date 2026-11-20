@@ -141,32 +141,14 @@ jobs:
             features: --features wacore-libsignal/legacy-session-interop,wacore-libsignal/bench-internals
           # The client crate's own benchmarks. Its fixture needs crate-private
           # internals a bench target cannot otherwise reach, so it builds with
-          # the non-default `bench-harness` feature. Dedicated shards rather than a
-          # third package on an existing one: this is the only package that compiles
-          # the full client dependency tree (Diesel/SQLite, rustls, tokio), so
-          # folding it in would serialize that build behind benchmarks that do
-          # not need it. Partition Cargo's complete target inventory so new
-          # benchmarks remain covered without increasing per-runner memory use.
-          # Unlike `integration-benchmarks` below it needs no mock
-          # server — the fixture drives the send path over a sink transport.
-          # `features` is separate from `packages` because only
-          # `cargo codspeed build` accepts it — `cargo codspeed run` rejects
-          # `--features` outright ("unexpected argument"), since by then the
-          # benchmark binaries are already built and it only selects among them.
-          - name: client-0
+          # the non-default `bench-harness` feature. Keep the full client
+          # build on one runner so the benchmarks share their dependency
+          # artifacts. The integration job still owns the mock-server setup.
+          - name: client
             client: true
-            index: 0
             packages: -p whatsapp-rust
             features: --features bench-harness
-            # A successful SDK build peaked above 12 GiB RSS on a 15 GiB runner.
-            # Serialize its thin-LTO compiler/linker processes to leave memory
-            # headroom without changing codegen or the benchmark workloads.
-            build_flags: --jobs 1
-          - name: client-1
-            client: true
-            index: 1
-            packages: -p whatsapp-rust
-            features: --features bench-harness
+            # Serialize thin-LTO builds to leave headroom on the hosted runner.
             build_flags: --jobs 1
     steps:
       - uses: actions/checkout@v7
@@ -236,12 +218,10 @@ jobs:
 
       # simulation and memory share the same instrumented build, so one
       # build covers both instruments.
-      - name: Partition all client benchmark targets
+      - name: Select all client benchmark targets
         if: matrix.shard.client
         id: targets
-        env:
-          SHARD_INDEX: ${{ matrix.shard.index }}
-        run: cargo xt ci workflow codspeed-targets --shard "$SHARD_INDEX" --shards 2
+        run: cargo xt ci workflow codspeed-targets --shard 0 --shards 1
 
       - name: Build the benchmark targets
         env:
