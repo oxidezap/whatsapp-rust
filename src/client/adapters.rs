@@ -259,10 +259,10 @@ impl Client {
         // deactivated while we waited for the permit.
         let drain_active = self.inbound_commit_batch.is_active();
         if drain_active && let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-            return if client
-                .flush_inbound_commits_under_permit(false, None, None)
-                .await
-            {
+            // Boxed: the commit future is ~1.3 KB and would otherwise be inlined
+            // into every caller's state, including the flush worker that each
+            // receive spawns, while only the drain branch ever polls it.
+            return if Box::pin(client.flush_inbound_commits_under_permit(false, None, None)).await {
                 Ok(())
             } else {
                 Err(SignalMaintenanceError::DrainCommitFailed)
