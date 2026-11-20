@@ -16,8 +16,10 @@ permissions:
   id-token: write # for OpenID Connect authentication with CodSpeed
 
 concurrency:
-  group: codspeed-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  # Let an active push publish a baseline while newer pushes replace the pending run.
+  # Manual backtests stay independent.
+  group: codspeed-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: never
