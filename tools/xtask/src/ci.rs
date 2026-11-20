@@ -72,6 +72,8 @@ pub enum Task {
     TestWaprotoFeatures,
     /// Run combined compatible features for each package, keeping the first failure.
     TestFeaturePackages { packages: Vec<String> },
+    /// Check each feature of every package independently, keeping the first failure.
+    CheckFeaturePackages { packages: Vec<String> },
     /// Publishable workspace crates as a JSON array.
     FeatureMatrixCrates {
         #[arg(long)]
@@ -324,6 +326,30 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         "--tests".into(),
                     ],
                 )?;
+                if status == 0 {
+                    status = rc;
+                }
+            }
+            return Ok(status);
+        }
+        Task::CheckFeaturePackages { packages } => {
+            ensure!(!packages.is_empty(), "at least one package is required");
+            let mut status = 0;
+            for package in packages {
+                println!("::group::Feature check ({package})");
+                let result = Command::new("cargo")
+                    .args([
+                        "hack",
+                        "check",
+                        "--each-feature",
+                        "--no-dev-deps",
+                        "-p",
+                        &package,
+                    ])
+                    .current_dir(root)
+                    .status();
+                println!("::endgroup::");
+                let rc = xtask_support::exit_code(result?);
                 if status == 0 {
                     status = rc;
                 }

@@ -406,15 +406,10 @@ jobs:
       - name: Check each feature
         env:
           FEATURE_CRATES: ${{ join(matrix.shard.crates, ' ') }}
-        run: |
-          status=0
-          for crate in $FEATURE_CRATES; do
-            echo "::group::Feature check ($crate)"
-            cargo hack check --each-feature --no-dev-deps -p "$crate" || status=1
-            echo "::endgroup::"
-          done
-          df -h /
-          exit "$status"
+        run: cargo xt ci check-feature-packages $FEATURE_CRATES
+      - name: Report free disk space
+        if: ${{ !cancelled() }}
+        run: df -h /
 
   test-stable:
     name: Test Stable (MSRV)
