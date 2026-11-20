@@ -72,6 +72,8 @@ pub enum Task {
     TestWaprotoFeatures,
     /// Run combined compatible features for each package, keeping the first failure.
     TestFeaturePackages { packages: Vec<String> },
+    /// Check each feature of every package independently, keeping the first failure.
+    CheckFeaturePackages { packages: Vec<String> },
     /// Publishable workspace crates as a JSON array.
     FeatureMatrixCrates {
         #[arg(long)]
@@ -330,6 +332,30 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             }
             return Ok(status);
         }
+        Task::CheckFeaturePackages { packages } => {
+            ensure!(!packages.is_empty(), "at least one package is required");
+            let mut status = 0;
+            for package in packages {
+                println!("::group::Feature check ({package})");
+                let result = Command::new("cargo")
+                    .args([
+                        "hack",
+                        "check",
+                        "--each-feature",
+                        "--no-dev-deps",
+                        "-p",
+                        &package,
+                    ])
+                    .current_dir(root)
+                    .status();
+                println!("::endgroup::");
+                let rc = xtask_support::exit_code(result?);
+                if status == 0 {
+                    status = rc;
+                }
+            }
+            return Ok(status);
+        }
         Task::FeatureMatrixCrates {
             github_output: output,
         } => {
@@ -347,11 +373,29 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             names.sort();
-            let text = serde_json::to_string(&names)?;
             if output {
-                github_output("crates", &text)?;
+                // Each crate keeps its own cargo-hack invocation. These
+                // shorter checks can share a runner and its artifact cache.
+                let (short, separate): (Vec<_>, Vec<_>) = names.into_iter().partition(|name| {
+                    matches!(
+                        name.as_str(),
+                        "wacore-appstate"
+                            | "wacore-binary"
+                            | "wacore-derive"
+                            | "wacore-libsignal"
+                            | "wacore-noise"
+                    )
+                });
+                let mut shards: Vec<_> = separate
+                    .into_iter()
+                    .map(|name| json!({ "name": name, "crates": [&name] }))
+                    .collect();
+                if !short.is_empty() {
+                    shards.push(json!({ "name": "wacore support", "crates": short }));
+                }
+                github_output("shards", &serde_json::to_string(&shards)?)?;
             } else {
-                println!("{text}");
+                println!("{}", serde_json::to_string(&names)?);
             }
         }
         Task::TestFeatures { package } => {
