@@ -6354,6 +6354,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "syn 3.0.10",
  "tar",
  "tempfile",
  "toml 1.2.1+spec-1.1.0",

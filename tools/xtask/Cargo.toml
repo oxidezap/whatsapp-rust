@@ -23,5 +23,8 @@ hex.workspace = true
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 url = "2"
 
+[dev-dependencies]
+syn = { version = "3.0", features = ["full"] }
+
 [lints]
 workspace = true
