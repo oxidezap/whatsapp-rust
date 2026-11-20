@@ -3,8 +3,7 @@
 //! tree even with LTO. Derive the replacement from the generated Rust fields,
 //! not a second hand-maintained schema, and keep every other derive unchanged.
 
-pub fn generate(source: &str, targets: &[&str]) -> Result<String, String> {
-    let mut file = syn::parse_file(source).map_err(|error| error.to_string())?;
+pub fn apply(file: &mut syn::File, targets: &[&str]) -> Result<(), String> {
     let mut implementations: Vec<Option<syn::Item>> = targets.iter().map(|_| None).collect();
     for item in &mut file.items {
         let syn::Item::Struct(message) = item else {
@@ -69,5 +68,5 @@ pub fn generate(source: &str, targets: &[&str]) -> Result<String, String> {
         file.items
             .push(implementation.ok_or_else(|| format!("generated {target} struct is missing"))?);
     }
-    Ok(prettyplease::unparse(&file))
+    Ok(())
 }

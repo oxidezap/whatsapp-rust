@@ -303,13 +303,12 @@ fn main() -> std::io::Result<()> {
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let generated = out_path.join("whatsapp.rs");
-    let source = std::fs::read_to_string(&generated)?;
-    let source =
-        pin_clone::generate(&source, &["Message", "ContextInfo"]).map_err(std::io::Error::other)?;
-    std::fs::write(generated, source)?;
-
-    let mut api = emission::finish(&out_path, "whatsapp", &fds)?;
+    let mut api = emission::finish(&out_path, "whatsapp", |suffix, file| {
+        if suffix.is_empty() {
+            pin_clone::apply(file, &["Message", "ContextInfo"]).map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    })?;
     api.extend(names::wire_api(&fds));
     let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
     std::fs::write(out_path.join("api.snapshot"), snapshot)?;
