@@ -7,6 +7,7 @@ use wacore::store::traits::TcTokenEntry;
 use wacore::types::events::Event;
 use wacore_binary::OwnedNodeRef;
 use wacore_binary::node::Node;
+use whatsapp_rust::waproto::whatsapp::history_sync::HistorySyncType;
 use whatsapp_rust::{MessageId, NodeFilter, SendOptions, SendRequest};
 
 fn has_descendant(node: &Node, tag: &str) -> bool {
@@ -817,15 +818,36 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
     let mut client_b = TestClient::connect_as("e2e_cstok_recon_b", &sender_name).await?;
 
     let before_reconnect = client_b.wait_for_nct_salt(10).await?;
-    client_b.reconnect_and_wait().await?;
+    let is_last_history_chunk = |event: &Event| {
+        matches!(event, Event::HistorySync(sync)
+            if sync.sync_type() == HistorySyncType::NON_BLOCKING_DATA as i32)
+    };
+    client_b
+        .wait_for_event(15, is_last_history_chunk)
+        .await
+        .map_err(|e| anyhow::anyhow!("Bartender's initial history did not finish: {e}"))?;
+
+    client_b.go_offline().await?;
+    assert_eq!(
+        client_b.wait_for_nct_salt(5).await?,
+        before_reconnect,
+        "NCT salt should survive disconnect"
+    );
+    client_b.come_back_online();
+
+    // Bartender creates fresh primary Signal sessions during reconnect history.
+    // Connected and startup sync can both complete before that history arrives.
+    client_b
+        .wait_for_event(15, is_last_history_chunk)
+        .await
+        .map_err(|e| anyhow::anyhow!("Bartender's reconnect history did not finish: {e}"))?;
     client_b
         .client
-        .wait_for_startup_sync(tokio::time::Duration::from_secs(15))
+        .wait_for_session_ready(tokio::time::Duration::from_secs(10))
         .await?;
-
-    let after_reconnect = client_b.wait_for_nct_salt(5).await?;
     assert_eq!(
-        after_reconnect, before_reconnect,
+        client_b.wait_for_nct_salt(5).await?,
+        before_reconnect,
         "NCT salt should survive reconnect"
     );
 
@@ -839,16 +861,16 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
         .client
         .lid()
         .expect("restricted recipient should have a LID");
+    let message_id = format!("E2ECSRECON{}", uuid::Uuid::new_v4().simple());
+    let ack_waiter = client_b
+        .client
+        .wait_for_node(NodeFilter::tag("ack").attr("id", message_id.clone()));
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
         .send(
-            SendRequest::new(&jid_a_lid, text_msg("reconnect cstoken first contact")).with_options(
-                SendOptions::default().with_message_id(MessageId::new(format!(
-                    "E2ECSRECON{}",
-                    uuid::Uuid::new_v4().simple()
-                ))?),
-            ),
+            SendRequest::new(&jid_a_lid, text_msg("reconnect cstoken first contact"))
+                .with_options(SendOptions::default().with_message_id(MessageId::new(&message_id)?)),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -857,6 +879,18 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
         .map_err(|_| anyhow::anyhow!("sent message waiter was canceled"))?;
     assert!(has_child(&sent, "cstoken"));
     assert!(!has_child(&sent, "tctoken"));
+    let ack = tokio::time::timeout(tokio::time::Duration::from_secs(10), ack_waiter)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for first-contact message ack"))?
+        .map_err(|_| anyhow::anyhow!("first-contact message ack waiter was canceled"))?;
+    assert!(
+        ack.get()
+            .get_attr("class")
+            .is_some_and(|value| value.as_str() == "message")
+            && ack.get().get_attr("error").is_none(),
+        "server rejected the first-contact message: {:?}",
+        ack.get()
+    );
     client_a
         .wait_for_text("reconnect cstoken first contact", 30)
         .await?;
