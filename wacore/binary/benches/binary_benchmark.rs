@@ -1,4 +1,5 @@
 use divan::black_box;
+use divan::counter::ItemsCount;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::collections::HashSet;
@@ -14,6 +15,34 @@ use wacore_binary::util::{FORMAT_COMPRESSED, unpack};
 
 fn main() {
     divan::main();
+}
+
+/// Calls per measured iteration for the rows whose single call costs only a
+/// few microseconds.
+///
+/// CodSpeed's simulation runs one iteration, and on a call this small the
+/// cold first pass is mostly simulated cache misses, whose classification
+/// follows the host CPU of the runner. The same binary then read as two
+/// levels on Intel and AMD runners, one or two misses (~55 ns each) apart.
+/// Repeating the call over the same input makes the warm instruction cost
+/// dominate. Each output is dropped before the next call, so the Memory peak
+/// stays that of one call.
+const BATCH: usize = 256;
+
+fn bench_batched<I, O>(
+    bencher: divan::Bencher,
+    batch: usize,
+    setup: impl Fn() -> I + Sync,
+    op: impl Fn(&I) -> O + Sync,
+) {
+    bencher
+        .counter(ItemsCount::new(batch))
+        .with_inputs(setup)
+        .bench_refs(|input| {
+            for _ in 0..batch {
+                black_box(op(black_box(&*input)));
+            }
+        });
 }
 
 fn create_small_node() -> Node {
@@ -197,23 +226,23 @@ fn create_many_children_node() -> Node {
 // plain/exact strategies are tracked on a single shape for comparison.
 #[divan::bench]
 fn bench_marshal_auto_small(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_small_node)
-        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
+    bench_batched(bencher, BATCH, create_small_node, |node| {
+        marshal_auto(node).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_marshal_auto_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_large_node)
-        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
+    bench_batched(bencher, BATCH, create_large_node, |node| {
+        marshal_auto(node).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_marshal_auto_long_string(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_long_string_node)
-        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
+    bench_batched(bencher, BATCH, create_long_string_node, |node| {
+        marshal_auto(node).unwrap()
+    });
 }
 
 #[divan::bench]
@@ -253,33 +282,37 @@ fn bench_marshal_shallow_many_children(bencher: divan::Bencher) {
 // Strategy comparison on one shape.
 #[divan::bench]
 fn bench_marshal_plain_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_large_node)
-        .bench_refs(|node| black_box(marshal(black_box(node)).unwrap()));
+    bench_batched(bencher, BATCH, create_large_node, |node| {
+        marshal(node).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_marshal_exact_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_large_node)
-        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+    bench_batched(bencher, BATCH, create_large_node, |node| {
+        marshal_exact(node).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_marshal_shallow_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_large_node)
-        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
+    bench_batched(bencher, BATCH, create_large_node, |node| {
+        marshal_shallow(node).expect("marshal_shallow")
+    });
 }
 
 #[divan::bench]
 fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
     bencher
+        .counter(ItemsCount::new(BATCH))
         .with_inputs(|| (create_large_node(), Vec::with_capacity(4096)))
         .bench_refs(|(node, buffer)| {
-            marshal_to(black_box(node), buffer).unwrap();
-            // Contents, not length: keeps the marshal writes observable.
-            black_box(buffer.as_slice());
+            for _ in 0..BATCH {
+                buffer.clear();
+                marshal_to(black_box(&*node), buffer).unwrap();
+                // Contents, not length: keeps the marshal writes observable.
+                black_box(buffer.as_slice());
+            }
         });
 }
 
@@ -299,11 +332,9 @@ fn setup_large_node_bytes() -> Vec<u8> {
 
 #[divan::bench]
 fn bench_unmarshal_small(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_small_node_bytes)
-        .bench_refs(|bytes| {
-            black_box(unmarshal_ref(black_box(bytes)).unwrap());
-        });
+    bench_batched(bencher, BATCH, setup_small_node_bytes, |bytes| {
+        black_box(unmarshal_ref(bytes).unwrap());
+    });
 }
 
 fn setup_ack_node_bytes() -> Vec<u8> {
@@ -316,29 +347,23 @@ fn setup_fanout_node_bytes() -> Vec<u8> {
 
 #[divan::bench]
 fn bench_unmarshal_ack(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_ack_node_bytes)
-        .bench_refs(|bytes| {
-            black_box(unmarshal_ref(black_box(bytes)).unwrap());
-        });
+    bench_batched(bencher, BATCH, setup_ack_node_bytes, |bytes| {
+        black_box(unmarshal_ref(bytes).unwrap());
+    });
 }
 
 #[divan::bench]
 fn bench_unmarshal_fanout(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_fanout_node_bytes)
-        .bench_refs(|bytes| {
-            black_box(unmarshal_ref(black_box(bytes)).unwrap());
-        });
+    bench_batched(bencher, BATCH, setup_fanout_node_bytes, |bytes| {
+        black_box(unmarshal_ref(bytes).unwrap());
+    });
 }
 
 #[divan::bench]
 fn bench_unmarshal_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_large_node_bytes)
-        .bench_refs(|bytes| {
-            black_box(unmarshal_ref(black_box(bytes)).unwrap());
-        });
+    bench_batched(bencher, BATCH, setup_large_node_bytes, |bytes| {
+        black_box(unmarshal_ref(bytes).unwrap());
+    });
 }
 
 // Unpack benchmarks: payloads are pre-built in setup so the compressed case
@@ -360,20 +385,18 @@ fn setup_compressed_payload() -> Vec<u8> {
 
 #[divan::bench]
 fn bench_unpack_uncompressed(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_uncompressed_payload)
-        .bench_refs(|payload| {
-            black_box(unpack(black_box(payload)).unwrap());
-        });
+    // Borrowing the body is a handful of instructions, so this row needs a
+    // much longer batch than the others for the warm cost to dominate.
+    bench_batched(bencher, 16 * BATCH, setup_uncompressed_payload, |payload| {
+        black_box(unpack(payload).unwrap());
+    });
 }
 
 #[divan::bench]
 fn bench_unpack_compressed(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_compressed_payload)
-        .bench_refs(|payload| {
-            black_box(unpack(black_box(payload)).unwrap());
-        });
+    bench_batched(bencher, BATCH, setup_compressed_payload, |payload| {
+        black_box(unpack(payload).unwrap());
+    });
 }
 
 // Setup function for attr_parser benchmark - pre-compute node bytes
@@ -385,105 +408,89 @@ fn setup_attr_node_bytes() -> Vec<u8> {
 // so the parse cannot be moved into setup without owning the node.
 #[divan::bench]
 fn bench_attr_parser(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_attr_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(bytes).unwrap();
+    bench_batched(bencher, BATCH, setup_attr_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
 
-            let mut parser = node_ref.attrs();
-            black_box(parser.optional_string("xmlns"));
-            black_box(parser.optional_string("type"));
-            black_box(parser.optional_jid("from"));
-            black_box(parser.optional_bool("has_flag"));
-            black_box(parser.optional_u64("timestamp"));
-            black_box(parser.finish().is_ok());
-        });
+        let mut parser = node_ref.attrs();
+        black_box(parser.optional_string("xmlns"));
+        black_box(parser.optional_string("type"));
+        black_box(parser.optional_jid("from"));
+        black_box(parser.optional_bool("has_flag"));
+        black_box(parser.optional_u64("timestamp"));
+        black_box(parser.finish().is_ok());
+    });
 }
 
 // Round-trip benchmark: unmarshal to NodeRef and re-marshal using the borrowed path.
 // This tests the zero-copy encoding path with EncodeNode trait.
 #[divan::bench]
 fn bench_roundtrip_small(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_small_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_small_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref(&node_ref).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_roundtrip_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_large_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_large_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref(&node_ref).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_small_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref_auto(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_small_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref_auto(&node_ref).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_large_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref_auto(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_large_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref_auto(&node_ref).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_small_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref_exact(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_small_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref_exact(&node_ref).unwrap()
+    });
 }
 
 #[divan::bench]
 fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_large_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
-            black_box(marshal_ref_exact(&node_ref).unwrap())
-        });
+    bench_batched(bencher, BATCH, setup_large_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
+        marshal_ref_exact(&node_ref).unwrap()
+    });
 }
 
 // Child iteration benchmark: tests get_children_by_tag performance over the
 // recursive traversal pattern used in usync parsing. The tree is pre-built.
 #[divan::bench]
 fn bench_get_children_by_tag(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(create_usync_like_node)
-        .bench_refs(|node| {
-            let usync = node.get_optional_child("usync").unwrap();
-            let list = usync.get_optional_child("list").unwrap();
+    bench_batched(bencher, BATCH, create_usync_like_node, |node| {
+        let usync = node.get_optional_child("usync").unwrap();
+        let list = usync.get_optional_child("list").unwrap();
 
-            let mut count = 0;
-            for user in black_box(list.get_children_by_tag("user")) {
-                if let Some(devices) = user.get_optional_child("devices")
-                    && let Some(device_list) = devices.get_optional_child("device-list")
-                {
-                    for _device in black_box(device_list.get_children_by_tag("device")) {
-                        count += 1;
-                    }
+        let mut count = 0;
+        for user in black_box(list.get_children_by_tag("user")) {
+            if let Some(devices) = user.get_optional_child("devices")
+                && let Some(device_list) = devices.get_optional_child("device-list")
+            {
+                for _device in black_box(device_list.get_children_by_tag("device")) {
+                    count += 1;
                 }
             }
-            black_box(count);
-        });
+        }
+        count
+    });
 }
 
 // Setup function for JID optimization benchmark - pre-compute JID-heavy node bytes
@@ -499,25 +506,23 @@ fn setup_jid_heavy_node_bytes() -> Vec<u8> {
 // - After: JID decoded → preserved as Jid in to_owned() → cloned in optional_jid()
 #[divan::bench]
 fn bench_jid_to_owned_access(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_jid_heavy_node_bytes)
-        .bench_refs(|bytes| {
-            let node_ref = unmarshal_ref(bytes).unwrap();
+    bench_batched(bencher, BATCH, setup_jid_heavy_node_bytes, |bytes| {
+        let node_ref = unmarshal_ref(bytes).unwrap();
 
-            // Convert to owned Node - this is where JIDs are preserved (optimization)
-            let node = node_ref.to_owned();
+        // Convert to owned Node - this is where JIDs are preserved (optimization)
+        let node = node_ref.to_owned();
 
-            // Access JID attributes via AttrParser - if JIDs are preserved, no parsing needed
-            let mut parser = node.attrs();
-            black_box(parser.optional_jid("from"));
-            black_box(parser.optional_jid("to"));
-            black_box(parser.optional_jid("participant"));
-            black_box(parser.optional_jid("recipient"));
-            black_box(parser.optional_jid("notify"));
-            black_box(parser.optional_string("id"));
-            black_box(parser.optional_string("type"));
-            node
-        });
+        // Access JID attributes via AttrParser - if JIDs are preserved, no parsing needed
+        let mut parser = node.attrs();
+        black_box(parser.optional_jid("from"));
+        black_box(parser.optional_jid("to"));
+        black_box(parser.optional_jid("participant"));
+        black_box(parser.optional_jid("recipient"));
+        black_box(parser.optional_jid("notify"));
+        black_box(parser.optional_string("id"));
+        black_box(parser.optional_string("type"));
+        node
+    });
 }
 
 // The A/B props catalog: thousands of small `<prop>` children under one
