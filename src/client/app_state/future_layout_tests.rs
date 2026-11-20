@@ -23,7 +23,15 @@ async fn app_state_async_frames_fit_small_heap_blocks() {
     };
     let message = wa::Message::default();
     let error = anyhow::anyhow!("synthetic layout probe");
+    let (_sender, receiver) = async_channel::bounded(1);
     let frames = [
+        (
+            "worker",
+            size_of_val(&Client::run_sync_task_worker(
+                Arc::downgrade(&client),
+                receiver,
+            )),
+        ),
         (
             "sync",
             size_of_val(&client.sync_collections_batched(vec![WAPatchName::Regular], scope)),
