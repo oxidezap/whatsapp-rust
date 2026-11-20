@@ -21,6 +21,8 @@ pub enum Task {
         #[arg(long)]
         shards: usize,
     },
+    /// Select connected retention measurements for changes to their inputs.
+    ConnectedRetentionInputs,
     /// Wait for the local self-signed mock service used by E2E/bench jobs.
     WaitForMock,
     /// Reject direct native pool references outside the SQLite platform shim.
@@ -262,8 +264,45 @@ fn codspeed_targets(metadata: &Value, shard: usize, shards: usize) -> Result<Str
         .join(" "))
 }
 
+fn connected_retention_inputs(root: &Path, base: &str, head: &str) -> Result<&'static str> {
+    for sha in [base, head] {
+        ensure!(
+            sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "connected retention requires full commit SHAs"
+        );
+    }
+    let status = Command::new("git")
+        .current_dir(root)
+        .args([
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-renames",
+            base,
+            head,
+            "--",
+            ".",
+            ":(exclude,literal).github/workflows/main.yml",
+            ":(exclude,literal).github/workflows/wasm.yml",
+            ":(exclude,literal).github/workflows/e2e.yml",
+        ])
+        .status()?;
+    match status.code() {
+        Some(0) => Ok("false"),
+        Some(1) => Ok("true"),
+        _ => anyhow::bail!("could not compare connected retention inputs: {status}"),
+    }
+}
+
 pub fn run_task(root: &Path, task: Task) -> Result<()> {
     match task {
+        Task::ConnectedRetentionInputs => {
+            let base = env("BASE_REVISION")?;
+            let head = env("HEAD_REVISION")?;
+            let measure = connected_retention_inputs(root, &base, &head)?;
+            println!("Connected retention measurement needed: {measure}");
+            output("measure", measure)?;
+        }
         Task::QualificationSha => {
             let expected = env("EXPECTED_SHA")?;
             let actual = String::from_utf8(
@@ -576,7 +615,7 @@ mod tests {
         .to_owned()
     }
 
-    fn size_repository() -> tempfile::TempDir {
+    fn test_repository() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "-q", "-b", "main"]);
@@ -591,8 +630,61 @@ mod tests {
     }
 
     #[test]
+    fn connected_retention_keeps_non_excluded_changes_and_rejects_missing_revisions() {
+        let dir = test_repository();
+        let root = dir.path();
+        let base = git(root, &["rev-parse", "HEAD"]);
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        for workflow in ["main", "wasm", "e2e"] {
+            std::fs::write(
+                root.join(format!(".github/workflows/{workflow}.yml")),
+                "name: fixture\n",
+            )
+            .unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "unrelated workflows"]);
+        let excluded = git(root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            connected_retention_inputs(root, &base, &excluded).unwrap(),
+            "false"
+        );
+
+        std::fs::write(
+            root.join(".github/workflows/codspeed.yml"),
+            "name: performance\n",
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "change CodSpeed"]);
+        let codspeed = git(root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            connected_retention_inputs(root, &excluded, &codspeed).unwrap(),
+            "true"
+        );
+
+        git(root, &["mv", "-f", "shared", ".github/workflows/main.yml"]);
+        git(root, &["commit", "-qm", "rename into excluded workflow"]);
+        let renamed = git(root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            connected_retention_inputs(root, &codspeed, &renamed).unwrap(),
+            "true"
+        );
+
+        std::fs::write(root.join("Cargo.toml"), "# manifest change\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "change build inputs"]);
+        let source = git(root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            connected_retention_inputs(root, &renamed, &source).unwrap(),
+            "true"
+        );
+        assert!(connected_retention_inputs(root, &"0".repeat(40), &source).is_err());
+    }
+
+    #[test]
     fn size_comparison_includes_frozen_base_but_excludes_later_main_commits() {
-        let dir = size_repository();
+        let dir = test_repository();
         let root = dir.path();
         std::fs::write(root.join("base-only"), "base\n").unwrap();
         git(root, &["add", "."]);
@@ -619,7 +711,7 @@ mod tests {
 
     #[test]
     fn size_comparison_preserves_a_current_head_and_refuses_dirty_checkouts() {
-        let dir = size_repository();
+        let dir = test_repository();
         let root = dir.path();
         let base = git(root, &["rev-parse", "HEAD"]);
         std::fs::write(root.join("head-only"), "head\n").unwrap();
@@ -635,7 +727,7 @@ mod tests {
 
     #[test]
     fn size_comparison_refuses_conflicts_and_invalid_heads() {
-        let dir = size_repository();
+        let dir = test_repository();
         let root = dir.path();
         std::fs::write(root.join("shared"), "base\n").unwrap();
         git(root, &["commit", "-qam", "base change"]);

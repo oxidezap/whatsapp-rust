@@ -54,14 +54,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: connected-retention
           cache-targets: "true"
+      - name: Check connected retention inputs
+        id: inputs
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: cargo xt ci workflow connected-retention-inputs
+      - uses: taiki-e/install-action@v2
+        if: steps.inputs.outputs.measure == 'true'
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Build library revisions with a shared measurement harness
+        if: steps.inputs.outputs.measure == 'true'
         env:
           BASE_REVISION: ${{ github.event.pull_request.base.sha }}
           HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
@@ -92,6 +100,7 @@ jobs:
           cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
           cp target/release/examples/connected_idle .retention-out/head
       - name: Compare connected requested heap on the same host
+        if: steps.inputs.outputs.measure == 'true'
         env:
           BASE_REVISION: ${{ github.event.pull_request.base.sha }}
           HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
@@ -103,7 +112,7 @@ jobs:
           --head-revision "$HEAD_REVISION"
           --repeats 3 --out-dir .retention-out/results
       - name: Preserve retention measurements and failures
-        if: always()
+        if: ${{ always() && steps.inputs.outputs.measure == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: connected-retention
