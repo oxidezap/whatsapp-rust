@@ -41,6 +41,8 @@ jobs:
   format:
     name: Format Check
     runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.crates.outputs.shards }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -51,11 +53,18 @@ jobs:
         with:
           toolchain: 1.100.0
           components: rustfmt
+      - name: Select feature shards
+        id: crates
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo xt ci feature-matrix-crates --github-output
       - name: Check Bartender image pins
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         env:
           RUSTC_WRAPPER: ""
         run: cargo xt ci sync-bartender-image --check
       - name: Check formatting
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo fmt --all -- --check
       - name: Setup sccache
         id: sccache
@@ -335,28 +344,12 @@ jobs:
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
 
-  feature-matrix-crates:
-    name: Feature Matrix (crates)
-    runs-on: ubuntu-latest
-    env:
-      RUSTC_WRAPPER: ""
-    # The host-only task derives publishable crates from cargo metadata.
-    outputs:
-      shards: ${{ steps.crates.outputs.shards }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-      - id: crates
-        run: cargo xt ci feature-matrix-crates --github-output
-
   feature-matrix:
     name: Feature Matrix (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    needs: feature-matrix-crates
+    needs: format
+    # The matrix remains independent of later check results in the setup job.
+    if: ${{ !cancelled() && needs.format.outputs.shards != '' }}
     # Individual features are only ever exercised in the combinations the other
     # jobs happen to build (default / --all-features), so a feature whose gates
     # are wrong compiles fine there and breaks for a downstream consumer that
@@ -366,7 +359,7 @@ jobs:
       # one runner and still test every crate with its own feature resolution.
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.feature-matrix-crates.outputs.shards) }}
+        shard: ${{ fromJSON(needs.format.outputs.shards) }}
     steps:
       - uses: actions/checkout@v7
         with:
