@@ -60,7 +60,7 @@ fn protect(attrs: &mut Vec<syn::Attribute>) {
 pub fn finish(
     out: &Path,
     package: &str,
-    _fds: &buffa_descriptor::generated::descriptor::FileDescriptorSet,
+    mut transform: impl FnMut(&str, &mut syn::File) -> io::Result<()>,
 ) -> io::Result<BTreeSet<String>> {
     let mut api = BTreeSet::new();
     for (suffix, serde) in [
@@ -73,6 +73,7 @@ pub fn finish(
         let path = out.join(format!("{package}{suffix}.rs"));
         let mut file =
             syn::parse_file(&std::fs::read_to_string(&path)?).map_err(io::Error::other)?;
+        transform(suffix, &mut file)?;
         wallpaper::qualify(&mut file)?;
         Extensible { serde }.visit_file_mut(&mut file);
         let implementation = match suffix {

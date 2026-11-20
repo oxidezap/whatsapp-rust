@@ -1,9 +1,15 @@
 #[path = "../build/pin_clone.rs"]
 mod pin_clone;
 
+fn generate(source: &str, targets: &[&str]) -> Result<String, String> {
+    let mut file = syn::parse_file(source).map_err(|error| error.to_string())?;
+    pin_clone::apply(&mut file, targets)?;
+    Ok(prettyplease::unparse(&file))
+}
+
 #[test]
 fn clone_covers_all_fields_and_preserves_other_derives() {
-    let output = pin_clone::generate(
+    let output = generate(
         "#[derive(Clone, PartialEq, Default)] pub struct Message { pub first: String, pub future: Option<u32> } #[derive(Clone)] pub struct Other;",
         &["Message"],
     ).unwrap();
@@ -13,7 +19,7 @@ fn clone_covers_all_fields_and_preserves_other_derives() {
     assert!(output.contains("#[inline(never)]"));
     assert!(output.contains("#[derive(Clone)]\npub struct Other;"));
     assert!(
-        pin_clone::generate(&output, &["Message"]).is_err(),
+        generate(&output, &["Message"]).is_err(),
         "must not silently double-apply"
     );
 }
@@ -27,20 +33,17 @@ fn generator_drift_fails_closed() {
         "#[derive(Clone)] pub struct Message(u32);",
         "#[derive(Clone)] pub struct Message {} #[derive(Clone)] pub struct Message {}",
     ] {
-        assert!(
-            pin_clone::generate(source, &["Message"]).is_err(),
-            "{source}"
-        );
+        assert!(generate(source, &["Message"]).is_err(), "{source}");
     }
 }
 
 #[test]
 fn selected_structs_have_separate_pinned_clone_impls() {
     let source = "#[derive(Clone)] struct Message { field: u8 } #[derive(Clone)] struct ContextInfo { other: u16 }";
-    let output = pin_clone::generate(source, &["Message", "ContextInfo"]).unwrap();
+    let output = generate(source, &["Message", "ContextInfo"]).unwrap();
     assert!(output.contains("impl ::core::clone::Clone for Message"));
     assert!(output.contains("impl ::core::clone::Clone for ContextInfo"));
     assert!(output.contains("other: ::core::clone::Clone::clone(&self.other)"));
     assert_eq!(output.matches("#[inline(never)]").count(), 2);
-    assert!(pin_clone::generate(source, &["Message", "BotMetadata"]).is_err());
+    assert!(generate(source, &["Message", "BotMetadata"]).is_err());
 }

@@ -247,7 +247,7 @@ fn emit(
         .out_dir(out)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut api = emission::finish(out, "contract", fds)?;
+    let mut api = emission::finish(out, "contract", |_, _| Ok(()))?;
     api.extend(names::wire_api(fds));
     Ok(api)
 }
