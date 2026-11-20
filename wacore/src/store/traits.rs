@@ -110,6 +110,30 @@ impl PackedPreKeys {
     }
 }
 
+#[cfg(test)]
+mod packed_prekey_tests {
+    use super::*;
+
+    #[test]
+    fn packed_prekeys_reject_invalid_offsets_and_overflowing_ids() {
+        let bytes = Bytes::from_static(b"abc");
+        for ends in [vec![], vec![0, 3], vec![1, 1, 3], vec![2, 1, 3], vec![2]] {
+            assert!(PackedPreKeys::new(1, bytes.clone(), ends).is_err());
+        }
+        assert!(PackedPreKeys::new(u32::MAX, bytes, vec![1, 3]).is_err());
+    }
+
+    #[test]
+    fn packed_prekeys_accept_the_last_representable_id() {
+        let batch =
+            PackedPreKeys::new(u32::MAX - 1, Bytes::from_static(b"abc"), vec![1, 3]).unwrap();
+        assert_eq!(
+            batch.records().collect::<Vec<_>>(),
+            vec![(u32::MAX - 1, &b"a"[..]), (u32::MAX, &b"bc"[..])],
+        );
+    }
+}
+
 pub use crate::types::message_secret::{InvalidMessageSecret, MessageSecret};
 
 /// A validated stored secret and the parent's event time in Unix seconds.
