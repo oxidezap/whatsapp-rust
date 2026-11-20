@@ -1,17 +1,25 @@
 //! Fast connected-workload CPU/allocation-peak surfaces, NOT idle RSS.
 //! Real elapsed checkpoints live in `examples/connected_idle.rs`; see `connected_idle.md`.
 
-use whatsapp_rust::bench_support::connected_idle::{Activity, BackendFixture, Session};
+use whatsapp_rust::bench_support::connected_idle::{
+    Activity, BackendFixture, MaintenanceSample, Session,
+};
 
 struct Fixture<'a> {
     rt: &'a tokio::runtime::Runtime,
     session: Option<Session>,
     activity: Option<Activity>,
     backend: Option<BackendFixture>,
+    maintenance: Option<MaintenanceSample>,
 }
 
 impl Drop for Fixture<'_> {
     fn drop(&mut self) {
+        if let (Some(session), Some(sample)) = (self.session.as_ref(), self.maintenance.take()) {
+            self.rt
+                .block_on(session.finish_maintenance_passes(sample))
+                .expect("maintenance passes settled without initialization");
+        }
         if let Some(session) = self.session.take() {
             self.rt
                 .block_on(session.shutdown())
@@ -58,6 +66,7 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
                     session: Some(session),
                     activity: Some(activity),
                     backend: Some(backend),
+                    maintenance: None,
                 }
             })
         })
@@ -74,6 +83,15 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
         });
 }
 
+/// Production cache sweeps per measured sample.
+///
+/// CodSpeed's simulation measures one iteration, and one sweep is a few
+/// thousand instructions: a single cold pass was ~75% simulated cache misses,
+/// whose cost follows the runner CPU. The repeated warm sweeps make the
+/// instruction cost dominate. Settling and the initialization check run when
+/// the input is dropped, outside the timed region.
+const MAINTENANCE_PASSES: usize = 256;
+
 #[divan::bench(args = [false, true], sample_count = 5, sample_size = 1)]
 fn cache_maintenance_after_activity(bencher: divan::Bencher, sqlite: bool) {
     let rt = runtime();
@@ -88,21 +106,28 @@ fn cache_maintenance_after_activity(bencher: divan::Bencher, sqlite: bool) {
                 let session = Session::connect(backend.backend()).await.expect("connect");
                 let activity = session.prepare_activity().await.expect("prepare activity");
                 session.receive_activity(activity).await.expect("activity");
-                session
-                    .prepare_maintenance_sample()
+                let sample = session
+                    .prepare_maintenance_passes()
                     .await
-                    .expect("warm-up Signal flush worker retired");
+                    .expect("warm-up maintenance and Signal flush worker retired");
                 Fixture {
                     rt: &rt,
                     session: Some(session),
                     activity: None,
                     backend: Some(backend),
+                    maintenance: Some(sample),
                 }
             })
         })
         .bench_local_refs(|fixture| {
-            rt.block_on(fixture.session.as_ref().expect("session").maintenance())
-                .expect("cache maintenance");
+            rt.block_on(
+                fixture
+                    .session
+                    .as_ref()
+                    .expect("session")
+                    .maintenance_passes(MAINTENANCE_PASSES),
+            )
+            .expect("cache maintenance");
         });
 }
 
@@ -123,6 +148,7 @@ fn cold_startup_to_ready(bencher: divan::Bencher) {
             session: None,
             activity: None,
             backend: Some(BackendFixture::memory()),
+            maintenance: None,
         })
         .bench_local_refs(|fixture| {
             rt.block_on(async {
@@ -159,6 +185,7 @@ fn first_inbound_dm(bencher: divan::Bencher) {
                         session: Some(session),
                         activity: None,
                         backend: Some(backend),
+                        maintenance: None,
                     },
                     input,
                 )

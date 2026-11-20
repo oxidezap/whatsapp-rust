@@ -73,9 +73,12 @@ Boolean arguments mean `false = InMemoryBackend`, `true = file-backed SQLite`.
   Registration happens before spawn under `bench-harness`, with RAII completion
   on return or cancellation. Empty IQ waiters alone cannot establish this barrier:
   initialization may be unpolled or awaiting SQLite before its next query.
-  Only the explicit production cache sweep and settling are timed. Maintenance
-  rejects pending/new initialization and checks the synthetic wire's initialization
-  IQ count; it never waits for startup inside this timed region. Periodic keepalive
+  Setup also runs one checked maintenance pass, so the lazy per-lock allocations
+  of the first sweep are not timed. Only 256 back-to-back production cache sweeps
+  are timed: a single sweep was mostly simulated cold-cache misses, which follow
+  the runner CPU. Settling and the check that rejects pending/new initialization
+  (including the synthetic wire's initialization IQ count) run when the input is
+  dropped; nothing waits for startup inside this timed region. Periodic keepalive
   and other session-long workers are deliberately not part of the startup barrier.
 * Both use fresh fixtures; graceful shutdown/database cleanup is outside timing.
   Shutdown/database cleanup errors fail the fixture. `AllocProfiler` supplies

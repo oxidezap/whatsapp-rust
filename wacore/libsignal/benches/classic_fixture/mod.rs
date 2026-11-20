@@ -86,6 +86,9 @@ pub enum Case {
     #[cfg(feature = "legacy-session-interop")]
     ImportBudget8000,
 }
+#[cfg(feature = "bench-internals")]
+const IDENTITY_COMPARISONS: usize = 4096;
+
 pub const CASES: &[Case] = &[
     Case::Establish,
     #[cfg(feature = "bench-internals")]
@@ -1068,11 +1071,17 @@ impl Fixture {
         match case {
             Case::Establish => self.alice.establish(&self.bob),
             #[cfg(feature = "bench-internals")]
+            // One comparison is a few dozen instructions, and CodSpeed's
+            // simulation measures a single iteration: alone it was ~95%
+            // simulated cache misses, whose count follows the runner CPU.
             Case::SameIdentity | Case::DifferentIdentity => {
-                assert_eq!(
-                    access::same_identity(self.state.as_ref().unwrap()),
-                    matches!(case, Case::SameIdentity)
-                );
+                let state = self.state.as_ref().unwrap();
+                for _ in 0..IDENTITY_COMPARISONS {
+                    assert_eq!(
+                        access::same_identity(black_box(state)),
+                        matches!(case, Case::SameIdentity)
+                    );
+                }
             }
 
             Case::EncryptFirst | Case::EncryptSubsequent => {

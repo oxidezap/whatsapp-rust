@@ -149,20 +149,35 @@ fn bench_encode_and_pad(bencher: divan::Bencher) {
         .bench_refs(|msg| black_box(MessageUtils::encode_and_pad(black_box(msg))));
 }
 
+/// Unpads per measured iteration in `bench_unpad_message_ref`.
+///
+/// CodSpeed's simulation runs one iteration, and one unpad is a few dozen
+/// instructions: a single call was ~95% simulated cache misses, whose count
+/// follows the runner CPU and moved the row by up to a third.
+const UNPAD_BATCH: usize = 4096;
+
 /// Unpad of a received plaintext: runs once per decrypted message.
 #[divan::bench]
 fn bench_unpad_message_ref(bencher: divan::Bencher) {
     bencher
+        .counter(divan::counter::ItemsCount::new(UNPAD_BATCH))
         .with_inputs(|| {
             use buffa::Message as _;
-            MessageUtils::pad_message_v2(text_message().encode_to_vec())
+            // A fixed v2 pad: `pad_message_v2` draws 1..=16 bytes at random,
+            // and unpad's cost depends on that length.
+            const PAD: u8 = 16;
+            let mut padded = text_message().encode_to_vec();
+            padded.resize(padded.len() + usize::from(PAD), PAD);
+            padded
         })
         .bench_refs(|padded| {
-            black_box(
-                MessageUtils::unpad_message_ref(black_box(padded), 2)
-                    .unwrap()
-                    .len(),
-            )
+            for _ in 0..UNPAD_BATCH {
+                black_box(
+                    MessageUtils::unpad_message_ref(black_box(&*padded), 2)
+                        .unwrap()
+                        .len(),
+                );
+            }
         });
 }
 
