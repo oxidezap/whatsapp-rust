@@ -139,21 +139,28 @@ impl ChangedMembers {
                 .iter()
                 .any(|value| members.fingerprints.binary_search(value).is_ok()),
             Self::Small(touched) => touched.intersects(members),
-            Self::Large(filtered) => {
-                let bits = &filtered.bits;
-                let word_mask = bits.len() - 1;
-                // A filter hit still needs an exact fingerprint match.
-                members.fingerprints.iter().any(|&fingerprint| {
-                    let (word, probe) = filter_probe(fingerprint, word_mask);
-                    bits[word] & probe == probe
-                        && filtered
-                            .members
-                            .fingerprints
-                            .binary_search(&fingerprint)
-                            .is_ok()
-                })
-            }
+            Self::Large(filtered) => filtered.intersects(members),
         }
+    }
+}
+
+impl FilteredMembers {
+    #[inline(never)]
+    fn intersects(&self, members: &MemberIndex) -> bool {
+        let bits = &self.bits;
+        let word_mask = bits.len() - 1;
+        members.fingerprints.iter().any(|&fingerprint| {
+            let word = (fingerprint >> 32) as usize & word_mask;
+            let first = 1_u64 << (fingerprint & 63);
+            let bits = bits[word];
+            bits & first != 0
+                && bits & first.rotate_left((fingerprint >> 6) as u32 | 1) != 0
+                && self
+                    .members
+                    .fingerprints
+                    .binary_search(&fingerprint)
+                    .is_ok()
+        })
     }
 }
 
