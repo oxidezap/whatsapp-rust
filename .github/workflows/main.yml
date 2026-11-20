@@ -340,7 +340,7 @@ jobs:
       RUSTC_WRAPPER: ""
     # The host-only task derives publishable crates from cargo metadata.
     outputs:
-      crates: ${{ steps.crates.outputs.crates }}
+      shards: ${{ steps.crates.outputs.shards }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -352,7 +352,7 @@ jobs:
         run: cargo xt ci feature-matrix-crates --github-output
 
   feature-matrix:
-    name: Feature Matrix (${{ matrix.crate }})
+    name: Feature Matrix (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
     needs: feature-matrix-crates
     # Individual features are only ever exercised in the combinations the other
@@ -360,14 +360,11 @@ jobs:
     # are wrong compiles fine there and breaks for a downstream consumer that
     # picks it alone.
     strategy:
-      # One crate per runner. `cargo hack` walks a crate's features serially, so
-      # a single job spent its whole time on seven walks that shared nothing but
-      # the dependency build, with whatsapp-rust alone most of it. Each leg is
-      # also an independent question, so one failing must not withdraw the
-      # verdict on the others.
+      # Keep longer feature walks in parallel. The shorter checks share
+      # one runner and still test every crate with its own feature resolution.
       fail-fast: false
       matrix:
-        crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
+        shard: ${{ fromJSON(needs.feature-matrix-crates.outputs.shards) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -402,14 +399,22 @@ jobs:
           cache-targets: "true"
           # Each leg builds a different feature set into the same target dir;
           # without this they would all write one cache entry and race for it.
-          key: ${{ matrix.crate }}
+          key: ${{ matrix.shard.name }}
       # --no-dev-deps: dev-dependencies enable features on the crate under test
       # (wacore/test-util, for one), which would mask exactly the gaps this
       # job looks for.
       - name: Check each feature
+        env:
+          FEATURE_CRATES: ${{ join(matrix.shard.crates, ' ') }}
         run: |
-          cargo hack check --each-feature --no-dev-deps -p ${{ matrix.crate }}
+          status=0
+          for crate in $FEATURE_CRATES; do
+            echo "::group::Feature check ($crate)"
+            cargo hack check --each-feature --no-dev-deps -p "$crate" || status=1
+            echo "::endgroup::"
+          done
           df -h /
+          exit "$status"
 
   test-stable:
     name: Test Stable (MSRV)
