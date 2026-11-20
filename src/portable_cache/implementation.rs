@@ -1379,72 +1379,76 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (value, renew_at) = {
+        enum Update {
+            Expire { seq: u64, inserted_at: Instant },
+            Renew,
+        }
+
+        let (value, update) = {
             let guard = match self.inner.try_read() {
                 Some(guard) => guard,
                 None => self.inner.read().await,
             };
-            match &*guard {
-                Storage::Plain(inner) => {
-                    return inner.get(key).cloned();
+            let inner = match &*guard {
+                Storage::Plain(inner) => return inner.get(key).cloned(),
+                Storage::Managed(inner) => inner,
+            };
+            let entry = inner.get(key)?;
+            let now = self.entry_time();
+            if self.is_expired(entry, now) {
+                (
+                    None,
+                    Some((
+                        now,
+                        Update::Expire {
+                            seq: entry.seq,
+                            inserted_at: entry.inserted_at,
+                        },
+                    )),
+                )
+            } else {
+                if inner.track_order {
+                    entry
+                        .referenced
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                Storage::Managed(inner) => {
-                    let entry = inner.get(key)?;
-                    // Read the clock after the lookup: a miss has no timestamp to
-                    // compare, and lookups that miss are a large share of the calls
-                    // (every negative registry probe, every warm-up).
-                    let now = self.entry_time();
-                    if self.is_expired(entry, now) {
-                        // Identity of the entry judged expired: `seq` moves if the slot
-                        // was re-inserted, `inserted_at` if the value was rewritten in
-                        // place. Removing without it could drop a replacement written
-                        // while the guard was down and judge it by a stale `now`.
-                        let observed = (entry.seq, entry.inserted_at);
-                        drop(guard);
-                        let mut wguard = self.inner.write().await;
-                        let Storage::Managed(managed) = &mut *wguard else {
-                            return None;
-                        };
-                        if let Some(e) = managed.get(key)
-                            && (e.seq, e.inserted_at) == observed
-                            && self.is_expired(e, now)
-                        {
-                            managed.remove_key(key);
-                        }
-                        return None;
-                    }
-                    if inner.track_order {
-                        entry
-                            .referenced
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    (
-                        entry.value.clone(),
-                        self.needs_tti_renewal(entry, now).then_some(now),
-                    )
-                }
+                (
+                    Some(entry.value.clone()),
+                    self.needs_tti_renewal(entry, now)
+                        .then_some((now, Update::Renew)),
+                )
             }
         };
 
-        if let Some(now) = renew_at {
+        if let Some((now, update)) = update {
             let mut guard = self.inner.write().await;
             let Storage::Managed(managed) = &mut *guard else {
-                return Some(value);
+                return value;
             };
-            // Re-decide under the lock: the key may have been invalidated (the
-            // miss leaves it that way) or already refreshed by a racing renewal
-            // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(entry) = managed.get_mut(key)
-                && self.needs_tti_renewal(entry, now)
-            {
-                entry.last_accessed_at = now;
-                #[cfg(test)]
-                self.tti_renewals
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match update {
+                Update::Expire { seq, inserted_at } => {
+                    // A replacement may have arrived while the read lock was down.
+                    if let Some(entry) = managed.get(key)
+                        && (entry.seq, entry.inserted_at) == (seq, inserted_at)
+                        && self.is_expired(entry, now)
+                    {
+                        managed.remove_key(key);
+                    }
+                }
+                Update::Renew => {
+                    if let Some(entry) = managed.get_mut(key)
+                        && self.needs_tti_renewal(entry, now)
+                    {
+                        entry.last_accessed_at = now;
+                        #[cfg(test)]
+                        self.tti_renewals
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
 
-        Some(value)
+        value
     }
 
     pub async fn insert(&self, key: K, value: V) {
