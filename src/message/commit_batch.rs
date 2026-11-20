@@ -680,7 +680,11 @@ impl Client {
                 }
             }
         }
-        let mut groups: Vec<PendingWriteGroup<'_>> = Vec::new();
+        let mut groups: Vec<PendingWriteGroup<'_>> = if unique_ids {
+            Vec::with_capacity(items.len())
+        } else {
+            Vec::new()
+        };
         for item in items {
             let chat = item.info.source.chat.to_string();
             let item_id = item.info.id.as_str();
