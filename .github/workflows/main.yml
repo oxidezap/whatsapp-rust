@@ -120,11 +120,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Reclaim unused Android SDK space
+      - &reclaim-android-sdk
+        name: Reclaim unused Android SDK space if needed
         run: |
           df -h /
-          sudo rm -rf --one-file-system /usr/local/lib/android
-          df -h /
+          min_free_gib=80
+          free_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if [[ "$free_kib" =~ ^[0-9]+$ ]] && (( free_kib >= min_free_gib * 1024 * 1024 )); then
+            printf 'At least %s GiB free. Keeping the Android SDK.\n' "$min_free_gib"
+          else
+            sudo rm -rf --one-file-system /usr/local/lib/android
+            df -h /
+          fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
@@ -245,11 +252,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Reclaim unused Android SDK space
-        run: |
-          df -h /
-          sudo rm -rf --one-file-system /usr/local/lib/android
-          df -h /
+      - *reclaim-android-sdk
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
@@ -314,11 +317,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Reclaim unused Android SDK space
-        run: |
-          df -h /
-          sudo rm -rf --one-file-system /usr/local/lib/android
-          df -h /
+      - *reclaim-android-sdk
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
