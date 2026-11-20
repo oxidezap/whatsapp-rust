@@ -286,6 +286,13 @@ async fn sqlite_first_dm_with_pause(
     })
 }
 
+/// Initialization counters taken before a batched maintenance sample.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceSample {
+    started: usize,
+    initialization_iqs: usize,
+}
+
 /// Only lifecycle observables, not a replacement for heap or process measurements.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Checkpoint {
@@ -895,6 +902,49 @@ impl Session {
         Ok(())
     }
 
+    /// Untimed setup for [`Self::maintenance_passes`].
+    ///
+    /// One checked [`Self::maintenance`] pass runs first: the first write to
+    /// each cache lock allocates its `event_listener` state, a once-per-process
+    /// cost that would otherwise be the allocator-dependent part of the sample.
+    pub async fn prepare_maintenance_passes(&self) -> Result<MaintenanceSample> {
+        self.maintenance().await?;
+        self.prepare_maintenance_sample().await?;
+        Ok(MaintenanceSample {
+            started: self.client.bench_startup.started(),
+            initialization_iqs: self.initialization_iqs(),
+        })
+    }
+
+    /// `passes` back-to-back production cache sweeps, without settling.
+    ///
+    /// One sweep is a few thousand instructions, and a single cold pass is
+    /// mostly simulated cache misses whose cost follows the runner CPU. Pair
+    /// with [`Self::finish_maintenance_passes`] outside the timed region.
+    pub async fn maintenance_passes(&self, passes: usize) -> Result<()> {
+        ensure!(
+            self.client.bench_startup.pending() == 0,
+            "startup is still in flight before maintenance"
+        );
+        for _ in 0..passes {
+            self.client.run_cache_maintenance().await;
+        }
+        Ok(())
+    }
+
+    /// Settle after [`Self::maintenance_passes`] and reject initialization
+    /// that the passes started.
+    pub async fn finish_maintenance_passes(&self, sample: MaintenanceSample) -> Result<()> {
+        self.settle().await?;
+        ensure!(
+            self.client.bench_startup.pending() == 0
+                && self.client.bench_startup.started() == sample.started
+                && self.initialization_iqs() == sample.initialization_iqs,
+            "initialization entered measured maintenance"
+        );
+        Ok(())
+    }
+
     /// Unsupported, non-active/non-keepalive IQs observed by the synthetic wire.
     /// Lifecycle tests use this to reject initialization leaking into maintenance.
     pub fn initialization_iqs(&self) -> usize {
@@ -1375,6 +1425,9 @@ mod tests {
             ensure!(!session.client.signal_flush_worker_armed());
             session.maintenance().await?;
             ensure!(!session.client.signal_flush_worker_armed());
+            let sample = session.prepare_maintenance_passes().await?;
+            session.maintenance_passes(4).await?;
+            session.finish_maintenance_passes(sample).await?;
             session.shutdown().await?;
             backend.cleanup()?;
         }
