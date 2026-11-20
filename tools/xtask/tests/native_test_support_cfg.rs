@@ -14,7 +14,8 @@ fn imported_name(tree: &syn::UseTree, name: &str) -> bool {
 }
 
 fn guards(path: &str, names: &[&str]) -> String {
-    let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = std::fs::read_to_string(root.join(path)).unwrap();
     let parsed = syn::parse_file(&source).unwrap();
     let mut attributes = parsed.attrs;
     let mut items = parsed.items;
