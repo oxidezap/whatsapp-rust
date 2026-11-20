@@ -1,410 +1,268 @@
-name: CodSpeed
+name: Android SDK disk probe
 
-on:
-  push:
-    branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
-  pull_request:
-    branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
-  # Allows CodSpeed to trigger backtest performance analysis to generate
-  # initial baseline data.
-  workflow_dispatch:
+on: workflow_dispatch
 
 permissions:
   contents: read
-  id-token: write # for OpenID Connect authentication with CodSpeed
-
-concurrency:
-  # Let an active push publish a baseline while newer pushes replace the pending run.
-  # Manual backtests stay independent.
-  group: codspeed-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CARGO_TERM_COLOR: never
-  PROTOC_VERSION: "3.25.3"
-  # Freeze glibc malloc's adaptive thresholds: mmap/trim/arena decisions vary
-  # with allocation history and read as spurious instruction/memory deltas
-  # under the deterministic instruments (codspeed.io/docs -> reducing-variance).
-  MALLOC_ARENA_MAX: "1"
-  MALLOC_MMAP_THRESHOLD_: "131072"
-  MALLOC_TRIM_THRESHOLD_: "131072"
-  MALLOC_TOP_PAD_: "131072"
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: '3.25.3'
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  # The target dir is restored fresh each run (Swatinem cache), so incremental
+  # state is always cold and only bloats artifacts; worse, sccache refuses to
+  # cache incremental compilations, so leaving it on excludes the workspace
+  # crates from caching entirely.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  # The regular shards publish the same source paths, names and instruments on
-  # PRs and main. PR-only generated base/head copies have no main baseline and
-  # appear as new benchmarks on every PR, even when the workload is unchanged.
-  connected-retention:
-    name: Connected retention against PR base
-    if: github.event_name == 'pull_request'
+  test:
+    name: Build & Test
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Retain backtraces while keeping workspace test artifacts within runner disk limits.
     env:
-      # Apply one stable compiler and flags to both checked-out revisions.
-      RUSTUP_TOOLCHAIN: 1.100.0
-      RUSTFLAGS: "-Clink-arg=-Wl,--icf=all"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: connected-retention
-          cache-targets: "true"
-      - name: Check connected retention inputs
-        id: inputs
-        env:
-          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
-          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
-        run: cargo xt ci workflow connected-retention-inputs
-      - uses: taiki-e/install-action@v2
-        if: steps.inputs.outputs.measure == 'true'
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
-      - name: Build library revisions with a shared measurement harness
-        if: steps.inputs.outputs.measure == 'true'
-        env:
-          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
-          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
-        run: |
-          mkdir -p .retention-out/results/harness/connected_idle .retention-out/results/harness/fixture
-          cargo build --locked -p whatsapp-xtask
-          cp target/debug/whatsapp-xtask .retention-out/compare
-          cp examples/connected_idle.rs .retention-out/results/harness/
-          cp examples/connected_idle/allocator.rs examples/connected_idle/process_locks.rs .retention-out/results/harness/connected_idle/
-          cp src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle/{util,ping_pong,offline_replay}.rs .retention-out/results/harness/fixture/
-          git checkout --detach "$BASE_REVISION"
-          cp .retention-out/results/harness/connected_idle.rs examples/connected_idle.rs
-          cp .retention-out/results/harness/connected_idle/*.rs examples/connected_idle/
-          cp .retention-out/results/harness/fixture/bench_support.rs src/bench_support.rs
-          cp .retention-out/results/harness/fixture/connected_idle.rs src/bench_support/connected_idle.rs
-          cp .retention-out/results/harness/fixture/{util,ping_pong,offline_replay}.rs src/bench_support/connected_idle/
-          cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' parking_lot@=0.13.0
-          cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' --rename parking_lot_012 parking_lot@=0.12.5
-          git diff -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle/allocator.rs examples/connected_idle/process_locks.rs src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle/{util,ping_pong,offline_replay}.rs > .retention-out/results/base-harness.patch
-          if ! git ls-files --error-unmatch -- src/bench_support/connected_idle/offline_replay.rs >/dev/null 2>&1; then
-            git diff --no-index -- /dev/null src/bench_support/connected_idle/offline_replay.rs >> .retention-out/results/base-harness.patch || test "$?" -eq 1
-          fi
-          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
-          cp target/release/examples/connected_idle .retention-out/base
-          git restore -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle
-          git clean -f -- examples/connected_idle/process_locks.rs src/bench_support/connected_idle/{ping_pong,offline_replay}.rs
-          git checkout --detach "$HEAD_REVISION"
-          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
-          cp target/release/examples/connected_idle .retention-out/head
-      - name: Compare connected requested heap on the same host
-        if: steps.inputs.outputs.measure == 'true'
-        env:
-          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
-          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
-        run: >
-          .retention-out/compare ci session-retention
-          --base-executable .retention-out/base
-          --head-executable .retention-out/head
-          --base-revision "$BASE_REVISION"
-          --head-revision "$HEAD_REVISION"
-          --repeats 3 --out-dir .retention-out/results
-      - name: Preserve retention measurements and failures
-        if: ${{ always() && steps.inputs.outputs.measure == 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: connected-retention
-          path: .retention-out/results
-          retention-days: 14
-
-  benchmarks:
-    name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
-    runs-on: ubuntu-24.04
-    # The SDK shard needs headroom for a full build, measurement and result
-    # upload. Keep bounded jobs so infrastructure stalls cannot run indefinitely.
-    timeout-minutes: ${{ matrix.shard.client && 50 || 25 }}
-    strategy:
-      # One shard failing must not cancel the other: CodSpeed merges shards
-      # into a single run, and a cancelled shard leaves it incomplete.
-      fail-fast: false
-      # Shards split by package within one workflow (same OIDC auth), halving
-      # the serial wall time; CodSpeed merges shard results into one run
-      # (codspeed.io/docs -> sharded-benchmarks).
-      matrix:
-        shard:
-          # `features` is required here, not optional: `voip_benchmark` and
-          # `sframe_varint_benchmark` carry `required-features`, and a bench
-          # target whose required features are off is SILENTLY SKIPPED by cargo
-          # rather than erroring. Without this the entire VoIP media plane --
-          # MLow encode/decode, E2E-SRTP, SFrame, the codec stage rows -- built
-          # nowhere and uploaded nothing, so none of it was regression-gated.
-          - name: core
-            packages: -p wacore -p wacore-noise
-            # The optional mobile policy rows must not be silently skipped.
-            features: --features voip-mlow,bench-internals,wacore/mobile
-          - name: proto-signal
-            packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate -p whatsapp-rust-sqlite-storage
-            # Persisted-state import benchmarks are feature-gated.
-            features: --features wacore-libsignal/legacy-session-interop,wacore-libsignal/bench-internals
-          # The client crate's own benchmarks. Its fixture needs crate-private
-          # internals a bench target cannot otherwise reach, so it builds with
-          # the non-default `bench-harness` feature. Keep the full client
-          # build on one runner so the benchmarks share their dependency
-          # artifacts. The integration job still owns the mock-server setup.
-          - name: client
-            client: true
-            packages: -p whatsapp-rust
-            features: --features bench-harness
-            # Serialize thin-LTO builds to leave headroom on the hosted runner.
-            build_flags: --jobs 1
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
+      - name: Sample root disk before setup
+        run: |
+          df -h /
+          # shellcheck disable=SC2016
+          nohup bash -c 'while true; do
+            printf "%s " "$(date +%s)"
+            df -B1 --output=avail / | tail -1
+            sleep 1
+          done' </dev/null > "$RUNNER_TEMP/free-disk-samples.txt" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/free-disk-sampler.pid"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
-
-      # The CodSpeed runner installs its patched valgrind with a bare
-      # `apt-get update && apt-get install`, and it buffers that command's
-      # output, printing it only on failure -- so a stalled mirror or a held
-      # dpkg lock reads as a step that emits nothing and never returns. Two
-      # things follow from that, and the steps below do both.
-      #
-      # Bound apt globally: the config file applies to the runner's own
-      # invocation too, turning an unbounded wait into a bounded failure.
-      #
-      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
-      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
-      # file-level restore never satisfies, so every job fell through to a full
-      # network install. Having the package installed for real is what lets that
-      # check pass and the cached valgrind be used without touching apt at all.
-      #
-      # The budgets nest, and the order matters: apt's own limits are meant to
-      # fire first and `timeout` is only the backstop for the case they cannot
-      # see, which is a transfer that keeps trickling bytes. The step is not
-      # fatal -- if it gives up, the runner installs the package itself, now
-      # bounded by the same config, which is slow but still runs the benchmarks.
-      #
-      # `apt-get update` is the part that actually stalls: it fetches every
-      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
-      # budget while the install that followed took 15s. So it is the last
-      # resort here, not the first move. The cached .deb comes first, then the
-      # image's own package lists, and only a miss on both refreshes them.
-      - name: Key the libc6-dbg cache on the installed libc6
-        id: libc6
-        run: cargo xt ci workflow libc-version
-
-      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
-      # the cache key: it hits while the package is valid and misses the moment
-      # the runner image bumps glibc.
-      - name: Cache the libc6-dbg package
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/libc6-dbg
-          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
-
-      - name: Bound apt and pre-install libc6-dbg
-        env:
-          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
-        run: cargo xt ci workflow install-libc-debug
-      - name: Install tools (protoc, cargo-codspeed)
+      # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # cargo-nextest ships pre-built binaries (nexte.st/docs/installation/pre-built-binaries),
+      # which is what install-action fetches — no compile step on the runner.
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-
-      - name: Cache instrumented Rust build
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ${{ runner.os }}-cargo-codspeed-${{ matrix.shard.name }}
-          # Compilation dominates these jobs. Keep dependencies and build
-          # scripts as well as registry downloads; each shard has its own key.
           cache-targets: "true"
-          save-if: ${{ github.event_name != 'pull_request' }}
-
-      # simulation and memory share the same instrumented build, so one
-      # build covers both instruments.
-      - name: Select all client benchmark targets
-        if: matrix.shard.client
-        id: targets
-        run: cargo xt ci workflow codspeed-targets --shard 0 --shards 1
-
-      - name: Build the benchmark targets
+      # No separate build step. There used to be one, and it was pure waste: in
+      # three different spellings, `cargo build --all-targets`, `cargo test
+      # --all-targets --no-run`, and finally nextest's own `--no-run` build, the
+      # step below went on to recompile the same thirteen crates anyway. Measured
+      # on the runner with the last of those, which differs from the step below
+      # only by `--no-run`: 223s to build, then 189s recompiling before the first
+      # test ran. Whatever cargo is keying on there, nothing the build step
+      # produced was reusable, so the workspace is compiled once, here.
+      #
+      # What that gives up is a job whose default-feature targets all link:
+      # benches and examples are not test targets, so nextest does not build
+      # them. `Clippy Linter` still compiles them on this same push, and `Build &
+      # Lint (all features)` still links them with all features on. The seam left
+      # is a target that links with all features and not with the default set.
+      - name: Run tests
         env:
-          SHARD_PACKAGES: ${{ matrix.shard.packages }}
-          SHARD_FEATURES: ${{ matrix.shard.features }}
-          SHARD_BUILD_FLAGS: ${{ matrix.shard.build_flags }}
-          SHARD_TARGETS: ${{ steps.targets.outputs.args }}
-        run: |
-          nproc
-          free -h
-          df -h /
-          /usr/bin/time -v -o "$RUNNER_TEMP/benchmark-build.txt" \
-            cargo codspeed build --locked -m simulation -m memory \
-            $SHARD_PACKAGES $SHARD_FEATURES $SHARD_BUILD_FLAGS $SHARD_TARGETS
-      - name: Preserve benchmark build resource usage
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
+        run: cargo xt ci nextest-timed workspace -- --workspace --exclude e2e-tests
+      - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-build-${{ matrix.shard.name }}
-          path: ${{ runner.temp }}/benchmark-build.txt
+          name: test-timings-build-and-test
+          path: ${{ runner.temp }}/test-timings
           retention-days: 14
           if-no-files-found: warn
+          # v4 artifacts are immutable and scoped to the run, not the attempt,
+          # and `if: always()` means attempt 1 uploaded even when it failed. So
+          # a rerun of a failed job would 409 here and finish red with green
+          # tests, which is the opposite of what these reports are for. Same
+          # reason on every timing upload below and in e2e.yml.
           overwrite: true
-
-      # Both instruments run serially in a single invocation so each
-      # benchmark uploads as one run carrying CPU and memory metrics.
-      #
-      # v5 weights each instruction by its estimated cycle cost rather than
-      # charging every instruction the same, so the simulation metric changes
-      # scale: expect a one-time step across every series at the first run on
-      # this action, and read the PR right after the bump against the new
-      # baseline, not the old one. `cycle-estimation: false` reverts it.
-      - name: Run the benchmarks
-        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
-        env:
-          SHARD_PACKAGES: ${{ matrix.shard.packages }}
-          SHARD_TARGETS: ${{ steps.targets.outputs.args }}
+      # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
+      # none, so they need their own libtest step — the workspace has ~200 doc
+      # examples whose compilation is asserted nowhere else.
+      - name: Run doctests
+        run: cargo test --workspace --exclude e2e-tests --doc --verbose
+      - name: Report lowest sampled free disk space
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/free-disk-sampler.pid")" || true
+          wc -l "$RUNNER_TEMP/free-disk-samples.txt"
+          head -1 "$RUNNER_TEMP/free-disk-samples.txt"
+          sort -nk2 "$RUNNER_TEMP/free-disk-samples.txt" | sed -n "1p"
+          df -h /
+      - name: Preserve disk samples
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          mode: simulation,memory
-          runner-version: "5.4.2"
-          # v5.4 defaults; keep allocation stacks and RSS explicit. RSS requires
-          # Linux >= 6.8 and is distinct from peak allocated heap memory.
-          disable-memory-capture-stack: "false"
-          disable-memory-track-physical: "false"
-          run: cargo codspeed run $SHARD_PACKAGES $SHARD_TARGETS
+          name: disk-samples-test
+          path: ${{ runner.temp }}/free-disk-samples.txt
 
-  # Integration benches drive the real async client against the bartender mock
-  # server, so they need the service container + MOCK_SERVER_URL. Kept as a
-  # separate job so the unit-bench job above stays fast and mock-server-free.
-  integration-benchmarks:
-    name: Run CodSpeed integration benchmarks
-    # Forks and Dependabot cannot use the Actions secret for the private image.
-    # `credentials.password` rejects the empty string while the job template is
-    # being prepared, so the job fails before any step runs and a step-level
-    # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: >-
-      ${{ github.actor != 'dependabot[bot]' &&
-          (github.event_name != 'pull_request' ||
-           (github.event.pull_request.head.repo.full_name == github.repository &&
-            github.event.pull_request.user.login != 'dependabot[bot]')) }}
+  test-all-features:
+    name: Build & Lint (all features)
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
     runs-on: ubuntu-24.04
-    # These benches drive the real client (connect/reconnect handshakes) under
-    # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
-    # indefinitely. A healthy run finishes well under this even on slow runners.
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write # for OpenID Connect authentication with CodSpeed
-    services:
-      mock-server:
-        # Pinned by digest, not `:latest`: send_and_receive measures a live
-        # round-trip and the mock server is the other end of it, so a tag moving
-        # under us shifts the instruction counts with no code change and
-        # pollutes the CodSpeed baseline. Same freeze rationale as the malloc
-        # thresholds above. Generated from .github/bartender-image.txt by
-        # cargo xt ci sync-bartender-image.
-        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:56cbabbc2bba22a3306bfdf7bf02f0fbd6041483a7cac8b0c6217ac4cfa58f75
-        credentials:
-          username: ${{ github.actor }}
-          password: ${{ secrets.BARTENDER_GHCR_TOKEN }}
-        ports:
-          - 8080:8080
-        env:
-          CHATSTATE_TTL_SECS: "3"
-        options: --log-driver none
+    # The all-targets build filled the hosted runner's disk on a cold cache.
+    # Retain limited debug info for backtraces; keep assertions and optimization defaults.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
+    # Runs on every PR (no voip path filter): the voip-gated code is scattered across the client,
+    # handler, send and stanza layers, so enumerating its files in a path filter kept leaking. The
+    # webrtc/opus tree compiles once and is cached (sccache), so the steady-state cost is the
+    # workspace recompile with voip on, not the deps. The heavy relay e2e tests stay out of `--lib`.
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
+      - name: Sample root disk before setup
+        run: |
+          df -h /
+          # shellcheck disable=SC2016
+          nohup bash -c 'while true; do
+            printf "%s " "$(date +%s)"
+            df -B1 --output=avail / | tail -1
+            sleep 1
+          done' </dev/null > "$RUNNER_TEMP/free-disk-samples.txt" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/free-disk-sampler.pid"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
-
-      # The CodSpeed runner installs its patched valgrind with a bare
-      # `apt-get update && apt-get install`, and it buffers that command's
-      # output, printing it only on failure -- so a stalled mirror or a held
-      # dpkg lock reads as a step that emits nothing and never returns. Two
-      # things follow from that, and the steps below do both.
-      #
-      # Bound apt globally: the config file applies to the runner's own
-      # invocation too, turning an unbounded wait into a bounded failure.
-      #
-      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
-      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
-      # file-level restore never satisfies, so every job fell through to a full
-      # network install. Having the package installed for real is what lets that
-      # check pass and the cached valgrind be used without touching apt at all.
-      #
-      # The budgets nest, and the order matters: apt's own limits are meant to
-      # fire first and `timeout` is only the backstop for the case they cannot
-      # see, which is a transfer that keeps trickling bytes. The step is not
-      # fatal -- if it gives up, the runner installs the package itself, now
-      # bounded by the same config, which is slow but still runs the benchmarks.
-      #
-      # `apt-get update` is the part that actually stalls: it fetches every
-      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
-      # budget while the install that followed took 15s. So it is the last
-      # resort here, not the first move. The cached .deb comes first, then the
-      # image's own package lists, and only a miss on both refreshes them.
-      - name: Key the libc6-dbg cache on the installed libc6
-        id: libc6
-        run: cargo xt ci workflow libc-version
-
-      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
-      # the cache key: it hits while the package is valid and misses the moment
-      # the runner image bumps glibc.
-      - name: Cache the libc6-dbg package
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/libc6-dbg
-          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
-
-      - name: Bound apt and pre-install libc6-dbg
-        env:
-          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
-        run: cargo xt ci workflow install-libc-debug
-      - name: Install tools (protoc, cargo-codspeed)
+      # The voip example (built under --all-features --all-targets) links cpal,
+      # which needs ALSA on Linux.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-
-      - name: Cache instrumented Rust build
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ${{ runner.os }}-cargo-codspeed-integration
           cache-targets: "true"
+          # The large PR archive is only reusable within that same PR.
           save-if: ${{ github.event_name != 'pull_request' }}
-
-      - name: Wait for mock server
-        run: cargo xt ci workflow wait-for-mock
-      # Integration benches run only the simulation (instruction-count)
-      # instrument, NOT memory. send_and_receive drives a live async round-trip,
-      # whose in-flight pipeline buffers (TLS/websocket/noise/decrypt/dispatch)
-      # straddle divan sample boundaries, so its peakMemoryBytes tracked runner
-      # scheduling/CPU rather than code (freeCalls ~= 2x allocCalls; cross-CPU
-      # runs tripped a false memory regression on every send-path PR). Simulation
-      # counts are deterministic under Valgrind regardless of host CPU and stay a
-      # meaningful end-to-end signal; the deterministic memory signal lives in the
-      # single-threaded unit benches (other job), which keep the memory instrument.
-      - name: Build the benchmark targets
-        run: cargo codspeed build --locked -m simulation -p bench-integration
-
-      # `-p bench-integration` is required: `tests/bench-integration` is not a
-      # workspace default-member, so a bare `cargo codspeed run` discovers no
-      # benchmarks for it ("No benchmarks found for the simulation mode").
-      - name: Run the benchmarks
-        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
+      - name: Build (all features)
+        run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
+      # There is no `cargo test --all-features` because a few features cannot
+      # share a build with the rest. `cargo xt ci test-features` derives the
+      # set that can from cargo metadata and carries the exclusions with their
+      # reasons, so a feature added tomorrow is tested without editing CI.
+      # Compiling a test is not running it: the two `--all-features` steps above
+      # build the codec suite, its golden checksums and every C/Go ground-truth
+      # vector among them, but nothing executed them until a step actually
+      # enabled `voip-mlow` and ran it. That is what this loop does.
+      - name: Test (every shareable feature)
         env:
-          MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
-          RUST_LOG: warn
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
+        # wacore/mobile and transport/tcp are off by default. Include both
+        # owners here so their unit tests execute, rather than only compiling
+        # through all-features or constructing a factory in an API consumer.
+        run: cargo xt ci test-feature-packages wacore wacore-libsignal whatsapp-rust whatsapp-rust-tokio-transport
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          mode: simulation
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p bench-integration
+          name: test-timings-all-features
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Report lowest sampled free disk space
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/free-disk-sampler.pid")" || true
+          wc -l "$RUNNER_TEMP/free-disk-samples.txt"
+          head -1 "$RUNNER_TEMP/free-disk-samples.txt"
+          sort -nk2 "$RUNNER_TEMP/free-disk-samples.txt" | sed -n "1p"
+          df -h /
+      - name: Preserve disk samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: disk-samples-test-all-features
+          path: ${{ runner.temp }}/free-disk-samples.txt
+
+  rustdoc:
+    name: Rustdoc
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
+    runs-on: ubuntu-24.04
+    env:
+      # Broken intra-doc links and malformed doc attributes are only surfaced by
+      # rustdoc, never by clippy or rustc, so they need their own gate.
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Sample root disk before setup
+        run: |
+          df -h /
+          # shellcheck disable=SC2016
+          nohup bash -c 'while true; do
+            printf "%s " "$(date +%s)"
+            df -B1 --output=avail / | tail -1
+            sleep 1
+          done' </dev/null > "$RUNNER_TEMP/free-disk-samples.txt" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/free-disk-sampler.pid"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      # The voip-cli member links cpal, which needs ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      # --all-features so the voip-gated docs are covered too. Default features
+      # alone would leave their links unchecked, and docs.rs builds with features
+      # on (hence the `cfg(docsrs)` in the workspace check-cfg).
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --all-features
+      - name: Report lowest sampled free disk space
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/free-disk-sampler.pid")" || true
+          wc -l "$RUNNER_TEMP/free-disk-samples.txt"
+          head -1 "$RUNNER_TEMP/free-disk-samples.txt"
+          sort -nk2 "$RUNNER_TEMP/free-disk-samples.txt" | sed -n "1p"
+          df -h /
+      - name: Preserve disk samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: disk-samples-rustdoc
+          path: ${{ runner.temp }}/free-disk-samples.txt
