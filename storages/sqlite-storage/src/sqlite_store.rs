@@ -2882,6 +2882,26 @@ impl SqliteStore {
     }
 }
 
+fn upsert_prekey_batch<'a>(
+    conn: &mut SqliteConnection,
+    records: impl Iterator<Item = (u32, &'a [u8])>,
+    uploaded: bool,
+    device_id: i32,
+) -> QueryResult<()> {
+    conn.transaction(|conn| {
+        for (id, key) in records {
+            crate::upsert_queries::UpsertPrekey {
+                id: id as i32,
+                key,
+                uploaded,
+                device_id,
+            }
+            .execute(conn)?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SignalStore for SqliteStore {
@@ -3249,18 +3269,20 @@ impl SignalStore for SqliteStore {
         self.with_retry("store_prekeys_batch", || {
             let batch = batch.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                conn.transaction(|conn| {
-                    for (id, record) in batch.iter() {
-                        crate::upsert_queries::UpsertPrekey {
-                            id: *id as i32,
-                            key: record.as_ref(),
-                            uploaded,
-                            device_id,
-                        }
-                        .execute(conn)?;
-                    }
-                    Ok(())
-                })
+                let records = batch.iter().map(|(id, bytes)| (*id, bytes.as_ref()));
+                upsert_prekey_batch(conn, records, uploaded, device_id)
+            })
+        })
+        .await
+    }
+
+    async fn store_packed_prekeys(&self, keys: PackedPreKeys, uploaded: bool) -> Result<()> {
+        let device_id = self.device_id;
+        let batch = Arc::new(keys);
+        self.with_retry("store_prekeys_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                upsert_prekey_batch(conn, batch.records(), uploaded, device_id)
             })
         })
         .await
@@ -8655,6 +8677,25 @@ mod tests {
             .await
             .expect("empty ok");
         store.remove_prekeys_batch(&[]).await.expect("empty ok");
+    }
+
+    #[tokio::test]
+    async fn packed_prekeys_persist_each_record_at_its_id() {
+        let store = create_test_store().await;
+        let batch = PackedPreKeys::new(8, Bytes::from_static(b"abCDEf"), vec![2, 5, 6]).unwrap();
+        store.store_packed_prekeys(batch, false).await.unwrap();
+        assert_eq!(
+            store.load_prekey(8).await.unwrap().as_deref(),
+            Some(&b"ab"[..])
+        );
+        assert_eq!(
+            store.load_prekey(9).await.unwrap().as_deref(),
+            Some(&b"CDE"[..])
+        );
+        assert_eq!(
+            store.load_prekey(10).await.unwrap().as_deref(),
+            Some(&b"f"[..])
+        );
     }
 
     /// Round-trips the prekey watermarks through the SQLite schema: save with

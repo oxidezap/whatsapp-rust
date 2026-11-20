@@ -18,6 +18,7 @@ use wacore::iq::prekeys::{
 use wacore::libsignal::protocol::{IdentityKey, KeyPair, PreKeyBundle, PublicKey};
 use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
+use wacore::store::traits::PackedPreKeys;
 use wacore_binary::Jid;
 
 pub use wacore::prekeys::PreKeyUtils;
@@ -991,7 +992,8 @@ impl Client {
                     private.clear();
                     private.extend_from_slice(key_pair.private_key.serialize());
                     waproto::codec::pre_key_record_encode_into(&record, &mut buf);
-                    ends.push(buf.len());
+                    // MAX_PRE_KEY_UPLOAD_BATCH * MAX_RECORD_LEN fits in u32.
+                    ends.push(buf.len() as u32);
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 };
                 let full = gen_count / KEY_BATCH * KEY_BATCH;
@@ -1006,27 +1008,17 @@ impl Client {
                 for i in full..gen_count {
                     encode(i, KeyPair::generate(&mut rng));
                 }
-                let shared = bytes::Bytes::from(buf);
-                let mut start = 0;
-                let encoded_batch: Vec<(u32, bytes::Bytes)> = ends
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, end)| {
-                        let record = shared.slice(start..end);
-                        start = end;
-                        (gen_start + index as u32, record)
-                    })
-                    .collect();
-                (encoded_batch, pubkeys)
+                PackedPreKeys::new(gen_start, bytes::Bytes::from(buf), ends)
+                    .map(|encoded| (encoded, pubkeys))
             })
-            .await;
+            .await?;
 
             // Persist the freshly generated prekeys before uploading them so they are
             // already available for local decryption if the server starts sending
             // pkmsg traffic immediately after accepting the upload.
             // Propagate errors — uploading a key we can't store locally would cause
             // decryption failures when the server hands it out.
-            backend.store_prekeys_batch(&encoded_batch, false).await?;
+            backend.store_packed_prekeys(encoded_batch, false).await?;
             fresh_pre_keys = generated;
         }
 

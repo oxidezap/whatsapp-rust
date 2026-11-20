@@ -20,6 +20,96 @@ use wacore_binary::Jid;
 /// unrepresentable without a heap allocation or pointer indirection per row.
 pub type MessageSecretBytes = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
 
+/// Encoded prekeys with consecutive IDs held in one buffer.
+pub struct PackedPreKeys {
+    pub(crate) first: u32,
+    bytes: Bytes,
+    ends: Box<[u32]>,
+}
+
+impl PackedPreKeys {
+    // A removed record's end is still the next record's start.
+    const REMOVED: u32 = 1 << 31;
+
+    /// Build a batch from the exclusive byte ends of its nonempty records.
+    /// IDs starting at `first` must fit in `u32`.
+    pub fn new(first: u32, bytes: Bytes, ends: Vec<u32>) -> Result<Self> {
+        if ends.is_empty()
+            || ends[0] == 0
+            || ends.last().map(|&end| end as usize) != Some(bytes.len())
+            || bytes.len() >= Self::REMOVED as usize
+            || ends.windows(2).any(|pair| pair[0] >= pair[1])
+            || u32::try_from(ends.len() - 1)
+                .ok()
+                .and_then(|last| first.checked_add(last))
+                .is_none()
+        {
+            return Err(crate::store::error::StoreError::Validation(
+                "invalid packed prekey batch".into(),
+            ));
+        }
+        Ok(Self {
+            first,
+            bytes,
+            ends: ends.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<Bytes> {
+        Some(self.bytes.slice(self.range(index)?))
+    }
+
+    fn range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let end = self.ends[index];
+        if end & Self::REMOVED != 0 {
+            return None;
+        }
+        let start = if index == 0 {
+            0
+        } else {
+            self.ends[index - 1] & !Self::REMOVED
+        };
+        Some(start as usize..end as usize)
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> bool {
+        let end = &mut self.ends[index];
+        let removed = *end & Self::REMOVED != 0;
+        *end |= Self::REMOVED;
+        !removed
+    }
+
+    pub(crate) fn last_present(&self) -> Option<usize> {
+        self.ends.iter().rposition(|end| end & Self::REMOVED == 0)
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.bytes.len() + size_of_val(self.ends.as_ref())
+    }
+
+    /// Borrow the IDs and encoded payloads without creating per-row buffers.
+    pub fn records(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        (0..self.len()).filter_map(|index| {
+            self.range(index)
+                .map(|range| (self.first + index as u32, &self.bytes[range]))
+        })
+    }
+
+    /// Convert this batch to individual ID and encoded-record pairs.
+    pub fn into_records(self) -> Vec<(u32, Bytes)> {
+        let mut records = Vec::with_capacity(self.len());
+        records.extend((0..self.len()).filter_map(|index| {
+            self.get(index)
+                .map(|bytes| (self.first + index as u32, bytes))
+        }));
+        records
+    }
+}
+
 pub use crate::types::message_secret::{InvalidMessageSecret, MessageSecret};
 
 /// A validated stored secret and the parent's event time in Unix seconds.
@@ -713,6 +803,13 @@ pub trait SignalStore: Send + Sync {
             self.store_prekey(*id, record, uploaded).await?;
         }
         Ok(())
+    }
+
+    /// Store a generated batch. Backends without packed storage use their
+    /// existing batch write, including any atomicity guarantees it provides.
+    async fn store_packed_prekeys(&self, keys: PackedPreKeys, uploaded: bool) -> Result<()> {
+        self.store_prekeys_batch(&keys.into_records(), uploaded)
+            .await
     }
 
     /// Load a pre-key by ID.
