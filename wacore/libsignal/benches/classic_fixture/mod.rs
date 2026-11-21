@@ -88,6 +88,7 @@ pub enum Case {
 }
 #[cfg(feature = "bench-internals")]
 const IDENTITY_COMPARISONS: usize = 4096;
+const ROOT_UPDATES: usize = 4096;
 
 pub const CASES: &[Case] = &[
     Case::Establish,
@@ -1156,12 +1157,15 @@ impl Fixture {
                         .unwrap(),
                 );
             }
+            // One update is a 32-byte copy, so a single call was ~95%
+            // simulated cache misses, whose count follows the runner CPU.
             Case::RootUpdate => {
-                self.state
-                    .as_mut()
-                    .unwrap()
-                    .set_root_key(&RootKey::new([73; 32]));
-                black_box(self.state.as_ref().unwrap());
+                let state = self.state.as_mut().unwrap();
+                let key = RootKey::new([73; 32]);
+                for _ in 0..ROOT_UPDATES {
+                    black_box(&mut *state).set_root_key(black_box(&key));
+                }
+                black_box(&*state);
             }
             Case::RejectPreKey256 => {
                 for _ in 0..256 {
