@@ -7,6 +7,41 @@ use crate::types::jid::make_sender_key_name;
 use std::collections::HashMap;
 use wacore_binary::Jid;
 
+#[test]
+fn status_participants_preserve_distribution_and_append_uncovered_users_in_order() {
+    use wacore_binary::builder::NodeBuilder;
+
+    let covered: Jid = "123:2@s.whatsapp.net".parse().unwrap();
+    let first = Jid::pn("234");
+    let second = Jid::pn("345");
+    let encrypted = NodeBuilder::new("to")
+        .attr("jid", covered.clone())
+        .children([NodeBuilder::new("enc").bytes(vec![1, 2, 3]).build()])
+        .build();
+    let recipients = GroupRoutingInfo::new(
+        vec![first.clone(), covered.to_non_ad(), second.clone()],
+        Default::default(),
+    );
+    let existing = NodeBuilder::new("participants")
+        .children([encrypted.clone()])
+        .build();
+    let stanza = NodeBuilder::new("message").children([existing]).build();
+
+    let result = ensure_status_participants(stanza, &recipients);
+    let participants = result.children().unwrap()[0].children().unwrap();
+    assert_eq!(participants.len(), 3);
+    assert_eq!(participants[0], encrypted);
+    assert_eq!(
+        participants[1].attrs.get("jid").unwrap().to_jid(),
+        Some(first)
+    );
+    assert_eq!(
+        participants[2].attrs.get("jid").unwrap().to_jid(),
+        Some(second)
+    );
+    assert!(participants[1..].iter().all(|node| node.content.is_none()));
+}
+
 mod assemble_status_participants {
     use super::*;
 
