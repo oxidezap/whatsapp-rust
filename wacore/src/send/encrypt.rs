@@ -3,6 +3,7 @@
 use super::*;
 use crate::stats::UnkeyableDevice;
 use anyhow::Context;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use wacore_binary::node::{Attrs, AttrsVec, NodeContent};
 
@@ -659,7 +660,7 @@ pub struct SessionPlan {
     /// of formatting every device a second time. Empty for plans that predate
     /// the memo ([`SessionPlan::assume_ready`]); consumers fall back to
     /// rendering per device when the lengths disagree.
-    effective_addresses: Vec<ProtocolAddress>,
+    effective_addresses: SmallVec<[ProtocolAddress; 1]>,
     /// Fingerprint of the exact device identities the memo was rendered from.
     /// Length alone cannot prove the memo belongs to this list — same length,
     /// different devices would silently encrypt to stale sessions — so the
@@ -700,7 +701,7 @@ impl SessionPlan {
             session_guard: crate::client::context::SessionLockGuard::none(),
             device_count,
             encryption_overrides: Vec::new(),
-            effective_addresses: Vec::new(),
+            effective_addresses: SmallVec::new(),
             device_fingerprint: 0,
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
@@ -870,7 +871,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
     // mapping lookup (a boxed `async_trait` call into an async-locked cache) N
     // extra times. A caller-resolved address that equals the device is "no
     // upgrade", the same answer the lookup gives.
-    let mut lid_upgrades: Vec<Option<Cow<'_, Jid>>> = Vec::with_capacity(devices.len());
+    let mut lid_upgrades = SmallVec::<[Option<Cow<'_, Jid>>; 1]>::with_capacity(devices.len());
     for (idx, device_jid) in devices.iter().enumerate() {
         lid_upgrades.push(match signal_addresses {
             Some(addrs) => {
@@ -889,12 +890,17 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
     // probes under, with the LID upgrades appended after (their positions in
     // `lid_addr_of`). The probe loop and the encrypt fan-out both consume these
     // renders, so no device formats its address twice per send anymore.
-    let mut candidates: Vec<ProtocolAddress> =
-        Vec::with_capacity(devices.len() + lid_upgrades.iter().filter(|u| u.is_some()).count());
+    let mut candidates = SmallVec::<[ProtocolAddress; 2]>::with_capacity(
+        devices.len()
+            + lid_upgrades
+                .iter()
+                .filter(|upgrade| upgrade.is_some())
+                .count(),
+    );
     for device_jid in devices.iter() {
         candidates.push(device_jid.to_protocol_address());
     }
-    let mut lid_addr_of: Vec<Option<usize>> = Vec::with_capacity(devices.len());
+    let mut lid_addr_of = SmallVec::<[Option<usize>; 1]>::with_capacity(devices.len());
     for upgrade in &lid_upgrades {
         match upgrade {
             Some(lid_jid) => {
@@ -915,7 +921,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
 
     // The effective encryption address per device, parallel to `devices`: the
     // single render the encrypt fan-out reuses.
-    let mut effective_addresses: Vec<ProtocolAddress> = Vec::with_capacity(devices.len());
+    let mut effective_addresses = SmallVec::with_capacity(devices.len());
 
     for (idx, device_jid) in devices.iter().enumerate() {
         // WhatsApp Web's SignalAddress.toString() normalizes PN → LID before
