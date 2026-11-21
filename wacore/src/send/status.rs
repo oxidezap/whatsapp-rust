@@ -13,13 +13,7 @@ pub fn ensure_status_participants(mut stanza: Node, group_info: &GroupRoutingInf
     use wacore_binary::NodeContent;
     use wacore_binary::builder::NodeBuilder;
 
-    // Build bare <to jid="USER_JID"/> entries for each participant.
-    // WhatsApp Web uses USER_JID (not DEVICE_JID) for the participantList.
-    let bare_to_nodes: Vec<Node> = group_info
-        .participants
-        .iter()
-        .map(|jid| NodeBuilder::new("to").attr("jid", jid.to_non_ad()).build())
-        .collect();
+    let bare_to_node = |jid: &Jid| NodeBuilder::new("to").attr("jid", jid.to_non_ad()).build();
 
     // Check if <participants> already exists in the stanza children
     let children = match &mut stanza.content {
@@ -44,28 +38,24 @@ pub fn ensure_status_participants(mut stanza: Node, group_info: &GroupRoutingInf
             .filter_map(|n| n.attrs.get("jid").and_then(|v| v.to_jid()).map(|j| j.user))
             .collect();
 
-        let new_to_nodes: Vec<Node> = bare_to_nodes
-            .into_iter()
-            .filter(|n| {
-                n.attrs
-                    .get("jid")
-                    .and_then(|v| v.to_jid())
-                    .is_some_and(|j| !existing_users.contains(&j.user))
-            })
-            .collect();
+        let additions = group_info
+            .participants
+            .iter()
+            .filter(|jid| !existing_users.contains(&jid.user))
+            .map(bare_to_node);
 
-        if !new_to_nodes.is_empty() {
-            match &mut participants_node.content {
-                Some(NodeContent::Nodes(nodes)) => nodes.extend(new_to_nodes),
-                _ => {
-                    participants_node.content = Some(NodeContent::Nodes(new_to_nodes));
+        match &mut participants_node.content {
+            Some(NodeContent::Nodes(nodes)) => nodes.extend(additions),
+            content => {
+                let nodes: Vec<_> = additions.collect();
+                if !nodes.is_empty() {
+                    *content = Some(NodeContent::Nodes(nodes));
                 }
             }
         }
     } else {
-        // No <participants> node — create one with bare <to> entries.
         let participants_node = NodeBuilder::new("participants")
-            .children(bare_to_nodes)
+            .children(group_info.participants.iter().map(bare_to_node))
             .build();
         children.insert(0, participants_node);
     }
