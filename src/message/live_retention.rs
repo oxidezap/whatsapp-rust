@@ -47,8 +47,13 @@ impl Drop for Charge {
 #[derive(Default)]
 struct State {
     reservations: Vec<Reservation>,
-    receipts: Vec<std::sync::Weak<ReceiptScope>>,
+    receipts: Vec<RegisteredReceipt>,
 }
+struct RegisteredReceipt {
+    arrival_addr: usize,
+    scope: std::sync::Weak<ReceiptScope>,
+}
+
 struct Reservation {
     origin: StanzaOrigin,
     charge: Arc<Charge>,
@@ -220,7 +225,7 @@ struct ReceiptState {
     charge: std::sync::Weak<Charge>,
 }
 pub(super) struct ReceiptScope {
-    arrival: std::sync::Weak<MessageInfo>,
+    _arrival: std::sync::Weak<MessageInfo>,
     state: Mutex<ReceiptState>,
 }
 impl ReceiptScope {
@@ -228,7 +233,7 @@ impl ReceiptScope {
     /// must never authorize an ACK for payloads still awaiting redelivery.
     pub fn withheld(info: &Arc<MessageInfo>) -> Arc<Self> {
         Arc::new(Self {
-            arrival: Arc::downgrade(info),
+            _arrival: Arc::downgrade(info),
             state: Mutex::new(ReceiptState {
                 closed: true,
                 failed: true,
@@ -285,7 +290,9 @@ impl LiveRetention {
         if state.reservations.is_empty() {
             state.reservations = Vec::new();
         }
-        state.receipts.retain(|scope| scope.strong_count() != 0);
+        state
+            .receipts
+            .retain(|entry| entry.scope.strong_count() != 0);
         if state.receipts.is_empty() {
             state.receipts = Vec::new();
         }
@@ -329,7 +336,9 @@ impl LiveRetention {
     }
     pub fn begin_receipts(&self, info: &Arc<MessageInfo>) -> anyhow::Result<ReceiptProducer> {
         let mut state = lock(&self.state);
-        state.receipts.retain(|scope| scope.strong_count() != 0);
+        state
+            .receipts
+            .retain(|entry| entry.scope.strong_count() != 0);
         anyhow::ensure!(
             state.receipts.len() < 400,
             "pending receipt capacity exhausted"
@@ -342,20 +351,26 @@ impl LiveRetention {
             .map_or(info, |raw| &raw.info);
         let original = Arc::clone(original);
         let scope = Arc::new(ReceiptScope {
-            arrival: Arc::downgrade(info),
+            _arrival: Arc::downgrade(info),
             state: Mutex::new(ReceiptState::default()),
         });
-        state.receipts.push(Arc::downgrade(&scope));
+        state.receipts.push(RegisteredReceipt {
+            arrival_addr: Arc::as_ptr(info).addr(),
+            scope: Arc::downgrade(&scope),
+        });
         Ok(ReceiptProducer(scope, original))
     }
     pub fn receipt_for(&self, info: &Arc<MessageInfo>) -> Option<Arc<ReceiptScope>> {
         #[cfg(test)]
         self.assert_access_allowed();
+        let arrival_addr = Arc::as_ptr(info).addr();
+        // A live scope holds a weak arrival reference, so the address
+        // cannot be reused while that entry can still be upgraded.
         lock(&self.state)
             .receipts
             .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|scope| scope.arrival.as_ptr() == Arc::as_ptr(info))
+            .filter(|entry| entry.arrival_addr == arrival_addr)
+            .find_map(|entry| entry.scope.upgrade())
     }
     pub fn fail_receipt(&self, info: &Arc<MessageInfo>) {
         if let Some(scope) = self.receipt_for(info) {
@@ -822,6 +837,26 @@ fn same_entry_details(first: &RetainedDelivery, second: &PendingDelivery) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_lookup_uses_arrival_identity_and_skips_retired_matches() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let different_arrival = Arc::new(MessageInfo::default());
+        let first = retention.begin_receipts(&info).unwrap();
+        let second = retention.begin_receipts(&info).unwrap();
+
+        assert!(retention.receipt_for(&different_arrival).is_none());
+        assert!(Arc::ptr_eq(
+            &retention.receipt_for(&info).unwrap(),
+            &first.0
+        ));
+        drop(first);
+        assert!(Arc::ptr_eq(
+            &retention.receipt_for(&info).unwrap(),
+            &second.0
+        ));
+    }
 
     #[test]
     fn idle_reclamation_releases_completed_burst_metadata() {
