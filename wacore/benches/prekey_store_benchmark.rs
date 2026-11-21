@@ -72,3 +72,34 @@ fn store_prekeys_batch_populated(bencher: Bencher) {
             black_box(&backend);
         });
 }
+
+#[divan::bench(args = [false, true])]
+fn store_packed_prekey_upload(bencher: Bencher, refill: bool) {
+    fn packed(first: u32, count: usize) -> wacore::store::traits::PackedPreKeys {
+        wacore::store::traits::PackedPreKeys::new(
+            first,
+            Bytes::from(vec![7; count * RECORD_LEN]),
+            (1..=count).map(|end| (end * RECORD_LEN) as u32).collect(),
+        )
+        .expect("fixture packed prekeys must have valid record boundaries")
+    }
+    bencher
+        .with_inputs(|| {
+            let backend = InMemoryBackend::new();
+            let next = if refill {
+                block_on(backend.store_packed_prekeys(packed(1, CONNECT_BATCH), true))
+                    .expect("store initial packed prekey batch");
+                block_on(backend.remove_prekeys_batch(&(1..=600).collect::<Vec<_>>()))
+                    .expect("consume fixture prekeys before refill");
+                packed(CONNECT_BATCH as u32 + 1, 600)
+            } else {
+                packed(1, CONNECT_BATCH)
+            };
+            (backend, next)
+        })
+        .bench_values(|(backend, keys)| {
+            block_on(backend.store_packed_prekeys(keys, false))
+                .expect("store measured packed prekey batch");
+            black_box(backend)
+        });
+}

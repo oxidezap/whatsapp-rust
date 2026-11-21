@@ -65,14 +65,19 @@ impl PendingInboundEntry {
 
 #[derive(Default)]
 struct PreKeyTable {
-    run: Option<Box<PreKeyRun>>,
+    runs: Option<Box<PreKeyRuns>>,
     sparse: HashMap<u32, Bytes>,
+}
+
+enum PreKeyRuns {
+    Single(PreKeyRun),
+    Multiple(Vec<PreKeyRun>),
 }
 
 struct PreKeyRun {
     first: u32,
     records: PreKeyRecords,
-    occupied: usize,
+    occupied: u32,
 }
 
 enum PreKeyRecords {
@@ -83,28 +88,79 @@ enum PreKeyRecords {
 impl PreKeyRun {
     fn index(&self, id: u32) -> Option<usize> {
         let index = id.checked_sub(self.first)? as usize;
-        let len = match &self.records {
+        (index < self.len()).then_some(index)
+    }
+
+    fn len(&self) -> usize {
+        match &self.records {
             PreKeyRecords::Slices(records) => records.len(),
             PreKeyRecords::Packed(records) => records.len(),
-        };
-        (index < len).then_some(index)
+        }
     }
 }
 
 impl PreKeyTable {
+    fn runs(&self) -> &[PreKeyRun] {
+        match self.runs.as_deref() {
+            None => &[],
+            Some(PreKeyRuns::Single(run)) => std::slice::from_ref(run),
+            Some(PreKeyRuns::Multiple(runs)) => runs,
+        }
+    }
+
+    fn runs_mut(&mut self) -> &mut [PreKeyRun] {
+        match self.runs.as_deref_mut() {
+            None => &mut [],
+            Some(PreKeyRuns::Single(run)) => std::slice::from_mut(run),
+            Some(PreKeyRuns::Multiple(runs)) => runs,
+        }
+    }
+
+    fn push_run(&mut self, run: PreKeyRun) {
+        match self.runs.as_deref_mut() {
+            Some(PreKeyRuns::Multiple(runs)) => runs.push(run),
+            Some(root) => {
+                let mut runs = Vec::with_capacity(2);
+                if let PreKeyRuns::Single(first) =
+                    std::mem::replace(root, PreKeyRuns::Multiple(Vec::new()))
+                {
+                    runs.push(first);
+                }
+                runs.push(run);
+                *root = PreKeyRuns::Multiple(runs);
+            }
+            None => self.runs = Some(Box::new(PreKeyRuns::Single(run))),
+        }
+    }
+
     fn len(&self) -> usize {
-        self.sparse.len() + self.run.as_ref().map_or(0, |run| run.occupied)
+        self.sparse.len()
+            + self
+                .runs()
+                .iter()
+                .map(|run| run.occupied as usize)
+                .sum::<usize>()
     }
 
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.sparse.is_empty() && self.runs.is_none()
+    }
+
+    fn run_slot(&self, id: u32) -> Option<(usize, usize)> {
+        if let [run] = self.runs() {
+            return Some((0, run.index(id)?));
+        }
+        let run = self
+            .runs()
+            .partition_point(|run| run.first <= id)
+            .checked_sub(1)?;
+        Some((run, self.runs()[run].index(id)?))
     }
 
     #[inline]
     fn get(&self, id: u32) -> Option<Bytes> {
-        if let Some(run) = &self.run
-            && let Some(index) = run.index(id)
-            && let Some(record) = match &run.records {
+        if let Some((run, index)) = self.run_slot(id)
+            && let Some(record) = match &self.runs()[run].records {
                 PreKeyRecords::Slices(records) => records[index].clone(),
                 PreKeyRecords::Packed(records) => records.get(index),
             }
@@ -115,52 +171,69 @@ impl PreKeyTable {
     }
 
     fn insert(&mut self, id: u32, value: Bytes) {
-        if let Some(run) = &mut self.run
-            && let Some(index) = run.index(id)
-            && let PreKeyRecords::Slices(records) = &mut run.records
-        {
-            run.occupied += usize::from(records[index].replace(value).is_none());
-            return;
+        if let Some((run_index, index)) = self.run_slot(id) {
+            let run = &mut self.runs_mut()[run_index];
+            if let PreKeyRecords::Slices(records) = &mut run.records {
+                run.occupied += u32::from(records[index].replace(value).is_none());
+                return;
+            }
+            self.remove_slot(run_index, index);
         }
-        self.remove_from_run(id);
         self.sparse.insert(id, value);
     }
 
     fn insert_packed(&mut self, keys: PackedPreKeys) {
-        if self.is_empty() && keys.len() >= 64 {
-            self.sparse = HashMap::new();
-            self.run = Some(Box::new(PreKeyRun {
-                first: keys.first,
-                occupied: keys.len(),
-                records: PreKeyRecords::Packed(keys),
-            }));
-        } else {
+        let empty = self.runs.is_none();
+        if keys.len() < 64
+            || !self.sparse.is_empty()
+            || !empty
+                && !self.runs().last().is_some_and(|last| {
+                    keys.first
+                        .checked_sub(last.first)
+                        .is_some_and(|gap| gap as usize >= last.len())
+                })
+        {
             self.insert_batch(&keys.into_records());
+            return;
+        }
+        let run = PreKeyRun {
+            first: keys.first,
+            occupied: keys.len() as u32,
+            records: PreKeyRecords::Packed(keys),
+        };
+        if empty {
+            self.sparse = HashMap::new();
+            self.runs = Some(Box::new(PreKeyRuns::Single(run)));
+        } else {
+            self.push_run(run);
         }
     }
 
     fn insert_batch(&mut self, keys: &[(u32, Bytes)]) {
         if self.is_empty()
             && keys.len() >= 64
+            && let Ok(occupied) = u32::try_from(keys.len())
             && keys
                 .windows(2)
                 .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0))
         {
             self.sparse = HashMap::new();
-            self.run = Some(Box::new(PreKeyRun {
+            self.runs = Some(Box::new(PreKeyRuns::Single(PreKeyRun {
                 first: keys[0].0,
                 records: PreKeyRecords::Slices(
                     keys.iter().map(|(_, bytes)| Some(bytes.clone())).collect(),
                 ),
-                occupied: keys.len(),
-            }));
+                occupied,
+            })));
             return;
         }
 
         // A distinct batch can overwrite at most the number of existing rows.
         // Exclude ids covered by the dense run before reserving the sparse map.
         if keys.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            let sparse_keys = match &self.run {
+            // A slice-backed run can only be installed into an empty table.
+            // Later runs are packed, so only the first run can absorb overwrites.
+            let sparse_keys = match self.runs().first() {
                 Some(run) if matches!(&run.records, PreKeyRecords::Slices(_)) => keys
                     .iter()
                     .filter(|(id, _)| run.index(*id).is_none())
@@ -176,27 +249,38 @@ impl PreKeyTable {
     }
 
     fn remove(&mut self, id: u32) {
-        self.remove_from_run(id);
+        if let Some((run, index)) = self.run_slot(id) {
+            self.remove_slot(run, index);
+        }
         self.sparse.remove(&id);
     }
 
-    fn remove_from_run(&mut self, id: u32) {
-        if let Some(run) = &mut self.run
-            && let Some(index) = run.index(id)
-        {
-            let removed = match &mut run.records {
-                PreKeyRecords::Slices(records) => records[index].take().is_some(),
-                PreKeyRecords::Packed(records) => records.remove(index),
-            };
-            run.occupied -= usize::from(removed);
-            if run.occupied == 0 {
-                self.run = None;
+    fn remove_slot(&mut self, run_index: usize, index: usize) {
+        let run = &mut self.runs_mut()[run_index];
+        let removed = match &mut run.records {
+            PreKeyRecords::Slices(records) => records[index].take().is_some(),
+            PreKeyRecords::Packed(records) => records.remove(index),
+        };
+        run.occupied -= u32::from(removed);
+        if run.occupied == 0 {
+            match self.runs.as_deref_mut() {
+                Some(root @ PreKeyRuns::Multiple(_)) => {
+                    if let PreKeyRuns::Multiple(runs) = root {
+                        runs.remove(run_index);
+                        if runs.len() == 1
+                            && let Some(remaining) = runs.pop()
+                        {
+                            *root = PreKeyRuns::Single(remaining);
+                        }
+                    }
+                }
+                _ => self.runs = None,
             }
         }
     }
 
     fn max_id(&self) -> u32 {
-        let dense = self.run.as_ref().and_then(|run| {
+        let dense = self.runs().last().and_then(|run| {
             let index = match &run.records {
                 PreKeyRecords::Slices(records) => records.iter().rposition(Option::is_some),
                 PreKeyRecords::Packed(records) => records.last_present(),
@@ -209,16 +293,24 @@ impl PreKeyTable {
     fn heap_bytes(&self) -> usize {
         table_bytes(&self.sparse)
             + self.sparse.values().map(Bytes::len).sum::<usize>()
-            + self.run.as_ref().map_or(0, |run| {
-                size_of::<PreKeyRun>()
-                    + match &run.records {
-                        PreKeyRecords::Slices(records) => {
-                            size_of_val(records.as_ref())
-                                + records.iter().flatten().map(Bytes::len).sum::<usize>()
-                        }
-                        PreKeyRecords::Packed(records) => records.heap_bytes(),
+            + self.runs.as_deref().map_or(0, |runs| {
+                size_of::<PreKeyRuns>()
+                    + match runs {
+                        PreKeyRuns::Multiple(runs) => runs.capacity() * size_of::<PreKeyRun>(),
+                        PreKeyRuns::Single(_) => 0,
                     }
             })
+            + self
+                .runs()
+                .iter()
+                .map(|run| match &run.records {
+                    PreKeyRecords::Slices(records) => {
+                        size_of_val(records.as_ref())
+                            + records.iter().flatten().map(Bytes::len).sum::<usize>()
+                    }
+                    PreKeyRecords::Packed(records) => records.heap_bytes(),
+                })
+                .sum::<usize>()
     }
 }
 
@@ -2636,8 +2728,93 @@ mod tests {
         for id in first + 2..first + 63 {
             backend.remove_prekey(id).await.unwrap();
         }
-        assert!(backend.state.lock().await.prekeys.run.is_none());
+        assert!(backend.state.lock().await.prekeys.runs.is_none());
         assert_eq!(backend.get_max_prekey_id().await.unwrap(), first + 1);
+    }
+
+    #[test]
+    fn single_prekey_run_preserves_its_allocation_size() {
+        enum OriginalRecords {
+            Slices(Box<[Option<Bytes>]>),
+            Packed(PackedPreKeys),
+        }
+        struct OriginalRun {
+            first: u32,
+            records: OriginalRecords,
+            occupied: usize,
+        }
+        let original = OriginalRun {
+            first: 1,
+            records: OriginalRecords::Slices(Box::new([])),
+            occupied: 0,
+        };
+        let packed = OriginalRecords::Packed(
+            PackedPreKeys::new(1, Bytes::from_static(b"a"), vec![1]).unwrap(),
+        );
+        assert!(
+            matches!(&original.records, OriginalRecords::Slices(records) if records.is_empty())
+        );
+        assert!(matches!(packed, OriginalRecords::Packed(records) if records.len() == 1));
+        assert_eq!((original.first, original.occupied), (1, 0));
+        assert_eq!(size_of::<PreKeyRuns>(), size_of::<OriginalRun>());
+    }
+
+    #[test]
+    fn packed_prekey_refills_keep_disjoint_batches_compact() {
+        fn records(first: u32, value: u8) -> PackedPreKeys {
+            PackedPreKeys::new(
+                first,
+                Bytes::from(vec![value; 70 * 800]),
+                (1..=800).map(|end| end * 70).collect(),
+            )
+            .unwrap()
+        }
+
+        let mut packed = PreKeyTable::default();
+        let mut sparse_control = PreKeyTable::default();
+        for table in [&mut packed, &mut sparse_control] {
+            table.insert_packed(records(1, 1));
+            for id in 1..=600 {
+                table.remove(id);
+            }
+        }
+        packed.insert_packed(records(1001, 2));
+        sparse_control.insert_batch(&records(1001, 2).into_records());
+        assert_eq!(packed.len(), sparse_control.len());
+        assert_eq!(packed.runs().len(), 2);
+        assert!(packed.sparse.is_empty());
+        assert!(packed.heap_bytes() < sparse_control.heap_bytes());
+        for id in 1..=1801 {
+            assert_eq!(packed.get(id), sparse_control.get(id));
+        }
+        assert_eq!(packed.max_id(), 1800);
+        packed.insert_packed(records(1751, 3));
+        assert_eq!(packed.get(1750).unwrap()[0], 2);
+        assert_eq!(packed.get(1751).unwrap()[0], 3);
+        assert_eq!(packed.max_id(), 2550);
+        for id in 1001..=2550 {
+            packed.remove(id);
+        }
+        assert_eq!(packed.runs().len(), 1);
+        assert_eq!(packed.max_id(), 800);
+    }
+
+    #[test]
+    fn replaying_a_slice_run_after_a_packed_refill_does_not_reserve_sparse_rows() {
+        let mut table = PreKeyTable::default();
+        let keys: Vec<_> = (1..=64)
+            .map(|id| (id, Bytes::from_static(b"old")))
+            .collect();
+        table.insert_batch(&keys);
+        let refill =
+            PackedPreKeys::new(65, Bytes::from_static(&[1; 64]), (1..=64).collect()).unwrap();
+        table.insert_packed(refill);
+        assert_eq!(table.runs().len(), 2);
+        table.insert_batch(&keys);
+        assert_eq!(table.sparse.capacity(), 0);
+        table.insert_batch(&[(65, Bytes::from_static(b"new"))]);
+        assert_eq!(table.get(65).as_deref(), Some(b"new".as_slice()));
+        assert_eq!(table.len(), 128);
     }
 
     #[tokio::test]
@@ -2659,7 +2836,7 @@ mod tests {
         for (id, _) in batch {
             backend.remove_prekey(id).await.unwrap();
         }
-        assert!(backend.state.lock().await.prekeys.run.is_none());
+        assert!(backend.state.lock().await.prekeys.runs.is_none());
         assert_eq!(backend.get_max_prekey_id().await.unwrap(), 1);
     }
 
