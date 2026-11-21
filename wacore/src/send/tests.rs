@@ -56,6 +56,19 @@ mod assemble_status_participants {
     }
 
     #[test]
+    fn large_audience_keeps_first_occurrence_and_order() {
+        let own = lid("5000@lid");
+        let expected: Vec<_> = (0..140)
+            .map(|i| Jid::new((5000 + i).to_string(), wacore_binary::Server::Lid))
+            .collect();
+        let input = expected.iter().flat_map(|jid| {
+            let duplicate = Jid::new(jid.user.clone(), wacore_binary::Server::Pn);
+            [None, Some(jid.clone()), Some(duplicate)]
+        });
+        assert_eq!(assemble_status_participants(input, &own).unwrap(), expected);
+    }
+
+    #[test]
     fn errors_when_every_recipient_is_unresolvable() {
         // Regression guard for the original bug: a single LID-only
         // contact used to hard-abort the send with

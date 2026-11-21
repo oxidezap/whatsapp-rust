@@ -109,19 +109,42 @@ pub fn status_revoke_target_id(message: &wa::Message) -> Option<&str> {
 /// `WAWebLidMigrationUtils.toUserLid` + `compactMap` dropping unresolvable
 /// entries; an empty result means "nothing to send to").
 ///
-/// Pure function: no allocations besides the returned `Vec` and (when needed)
-/// the own-LID push. Dedup is a linear Vec scan — status lists stay small
-/// enough that a HashSet is not worth its allocation.
+/// Small audiences use a linear scan. Large audiences index the emitted users
+/// so de-duplication preserves the first recipient without quadratic scans.
 pub fn assemble_status_participants<I>(resolved: I, own_lid: &Jid) -> Result<Vec<Jid>>
 where
     I: IntoIterator<Item = Option<Jid>>,
 {
     let iter = resolved.into_iter();
     let (lower, _upper) = iter.size_hint();
+    const LINEAR_LIMIT: usize = 64;
     let mut out: Vec<Jid> = Vec::with_capacity(lower.saturating_add(1));
-    for jid in iter.flatten() {
+    let mut recipients = iter.flatten();
+    for jid in recipients.by_ref() {
         if !out.iter().any(|r| r.user == jid.user) {
             out.push(jid);
+            if out.len() == LINEAR_LIMIT {
+                break;
+            }
+        }
+    }
+    if out.len() == LINEAR_LIMIT
+        && let Some(next) = recipients.next()
+    {
+        use std::hash::{BuildHasher, RandomState};
+
+        let hash_builder = RandomState::new();
+        let hash_user = |jid: &Jid| hash_builder.hash_one(&jid.user);
+        let mut seen = hashbrown::HashTable::with_capacity(lower.max(out.len()));
+        for (index, jid) in out.iter().enumerate() {
+            seen.insert_unique(hash_user(jid), index, |&i| hash_user(&out[i]));
+        }
+        for jid in std::iter::once(next).chain(recipients) {
+            let hash = hash_user(&jid);
+            if seen.find(hash, |&i| out[i].user == jid.user).is_none() {
+                seen.insert_unique(hash, out.len(), |&i| hash_user(&out[i]));
+                out.push(jid);
+            }
         }
     }
     if out.is_empty() {
