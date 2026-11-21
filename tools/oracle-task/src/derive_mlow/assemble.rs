@@ -221,6 +221,12 @@ pub fn all(out: &Path) -> Result<()> {
             let toc = *packet
                 .first()
                 .with_context(|| format!("{run} packet {i} is empty"))?;
+            // A 16 kHz, 60 ms, mono, non-SID MLow TOC; VAD (bit6), low_rate (bit2) and bit1 vary, so
+            // the captured 0x10/0x14 inactive packets pass.
+            ensure!(
+                toc & 0b1011_1001 == 0b0001_0000,
+                "{run} packet {i}: TOC 0x{toc:02x} is not a 16 kHz 60 ms mono MLow frame"
+            );
             ensure!(
                 (toc & 0x04 != 0) == low_rate.contains(&i),
                 "{run} packet {i}: TOC 0x{toc:02x} has the wrong low_rate bit"

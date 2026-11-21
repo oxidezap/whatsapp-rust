@@ -25,10 +25,16 @@ cargo xt mlow regenerate --check
 ```
 
 `regenerate` replays the locked specs. A spec that changes on purpose (a new spec such as
-`mlow_low_rate.json`, or edited steps or output assertions) is re-locked first, after reviewing the
-assertions that changed: `cargo xt mlow verify --update-lock` executes every derivation on both
-captures and rewrites `mlow.lock.json`, and only then does `cargo xt mlow regenerate` rebuild the
-fixtures from it.
+`mlow_low_rate.json`, or edited steps) is re-locked before the fixtures are rebuilt:
+
+- An edit that leaves every output byte unchanged is re-locked directly: `cargo xt mlow verify
+  --update-lock` executes every derivation on both captures and rewrites `mlow.lock.json`.
+- An edit that changes output cannot be, because the spec's own `assert_sha256` steps would fail.
+  Run it once without them against the pinned capture into a disposable directory (`oracle derive
+  --spec <copy> --out <tmp>`), review the new packets and PCM, write their hashes into the spec's
+  assertions, and then re-lock as above.
+
+Only then does `cargo xt mlow regenerate` rebuild the fixtures from the lock.
 
 The Rust task builds the tool with locked dependencies, fetches hash-pinned captures when needed,
 runs all 11 derivations, verifies every output and selector, assembles the fixtures and packs them.
