@@ -1,5 +1,5 @@
 {
-  "derivation_lock_sha256": "18c806046ab47d3147b69641d96ba96fa23469526f80600d69f13d4ff230b854",
+  "derivation_lock_sha256": "db5285198f2912613c9058302f993fc14459fce9f4dd132c365b251bfb4b1beb",
   "files": {
     "wasm_derived_120ms_frames.json": {
       "bytes": 4087,
@@ -20,6 +20,14 @@
     "wasm_derived_low_rate_ref.raw": {
       "bytes": 211200,
       "sha256": "c3aad1c10390e2dd1de2b6ec42fa7802282d548388867fbe2a3b860cd4c950e0"
+    },
+    "wasm_derived_rate_switch_frames.json": {
+      "bytes": 16247,
+      "sha256": "a9534fab8bcd5f1076c2afa0fca159d5299963f002a64c815611f8c1f9e9f7e9"
+    },
+    "wasm_derived_rate_switch_ref.raw": {
+      "bytes": 211200,
+      "sha256": "4f70d564dbd435593f8fccb66c2a955afba511e071eeb339c001840aad046a47"
     },
     "wasm_derived_ref.raw": {
       "bytes": 211200,

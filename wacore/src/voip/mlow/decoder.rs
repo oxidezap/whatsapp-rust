@@ -1129,6 +1129,74 @@ mod tests {
         );
     }
 
+    /// A call changes rate mid-stream, so the state that crosses packets (LSF predictor, ACB
+    /// history, tilt memory) must survive both switches. The shipped engine encodes synth_mic at
+    /// 16 kbps, 8 kbps from packet 30 and 16 kbps again from packet 80 (`specs/mlow_rate_switch.json`),
+    /// and one decoder, never reset, must track what it decoded around each switch.
+    #[test]
+    fn wasm_derived_rate_switch_decode_matches_wasm_reference() {
+        let frames: Vec<String> = serde_json::from_str(include_str!(
+            "testdata/wasm_derived_rate_switch_frames.json"
+        ))
+        .expect("wasm_derived_rate_switch_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_rate_switch_ref.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        for (k, hex_frame) in frames.iter().enumerate() {
+            let frame = hex::decode(hex_frame).unwrap();
+            let low_rate = frame[0] & 0x04 != 0;
+            assert_eq!(
+                low_rate,
+                (30..80).contains(&k),
+                "packet {k}: the switches moved"
+            );
+            out.extend_from_slice(&dec.decode(&frame));
+            let report = dec.take_frame_report();
+            assert_eq!(
+                report.off_point + report.concealed,
+                0,
+                "packet {k} was not decoded"
+            );
+        }
+        assert_eq!(out.len(), refp.len(), "decode length vs reference");
+
+        // Correlation and level over packets `from..to`, so a bad switch cannot hide in the mean.
+        let window = |from: usize, to: usize| {
+            let (r, o) = (&refp[from * 960..to * 960], &out[from * 960..to * 960]);
+            let n = r.len() as f64;
+            let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / n;
+            let (mr, mo) = (mean(r), mean(o));
+            let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+            for (a, b) in r.iter().zip(o) {
+                let (da, db) = (*a as f64 - mr, *b as f64 - mo);
+                sxy += da * db;
+                sxx += da * da;
+                syy += db * db;
+            }
+            (sxy / (sxx * syy).sqrt(), (syy / sxx).sqrt())
+        };
+        for (name, from, to) in [
+            ("high to low", 27, 34),
+            ("low to high", 77, 84),
+            ("whole stream", 0, 110),
+        ] {
+            let (corr, level) = window(from, to);
+            println!("{name}: corr {corr:.6} level {level:.4}");
+            assert!(
+                corr > 0.999,
+                "{name}: lag-0 corr {corr:.6} vs shipped reference"
+            );
+            assert!(
+                (0.97..1.03).contains(&level),
+                "{name}: level {level:.4} vs shipped reference"
+            );
+        }
+    }
+
     /// Decoding a multi-frame packet must leave the cross-frame predictor usable: a real 60 ms frame
     /// after it still has to produce audio.
     #[test]

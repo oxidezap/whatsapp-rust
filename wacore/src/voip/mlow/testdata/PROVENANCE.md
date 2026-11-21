@@ -24,6 +24,12 @@ cargo xt mlow regenerate --check
 # To replace fixtures after an intentional, reviewed oracle change, omit --check.
 ```
 
+`regenerate` replays the locked specs. A spec that changes on purpose (a new spec such as
+`mlow_low_rate.json`, or edited steps or output assertions) is re-locked first, after reviewing the
+assertions that changed: `cargo xt mlow verify --update-lock` executes every derivation on both
+captures and rewrites `mlow.lock.json`, and only then does `cargo xt mlow regenerate` rebuild the
+fixtures from it.
+
 The Rust task builds the tool with locked dependencies, fetches hash-pinned captures when needed,
 runs all 11 derivations, verifies every output and selector, assembles the fixtures and packs them.
 It runs from any directory; its disposable work stays under `--out` (default `.derive-mlow/wasm`).
@@ -46,6 +52,7 @@ is at `attr+1200`, so the old 1184-byte allocation was invalid. The decoder cont
 | `wasm_derived_frames.json` + `wasm_derived_ref.raw` | 110 packets / 110×960 s16le samples; J/S equality | `quality_tests`, `decoder` |
 | `wasm_derived_120ms_frames.json` + `wasm_derived_120ms_ref.raw` | 8 packets / 8×1920 samples; J/S equality | `decoder` |
 | `wasm_derived_low_rate_frames.json` + `wasm_derived_low_rate_ref.raw` | 110 low-rate packets (`OPUS_SET_BITRATE(8000)`) / 110×960 samples | `decoder` |
+| `wasm_derived_rate_switch_frames.json` + `wasm_derived_rate_switch_ref.raw` | 110 packets, high→low→high at packets 30 and 80 / 110×960 samples | `decoder` |
 | `wasm_derived_vad.json` | 99 active / 11 inactive packets | `smpl_vad` |
 | `wasm_fe.cbor.zst` | 330 windows, F2, R, LPC before/after BWE | `smpl_lpc` |
 | `wasm_signal_mode.cbor.zst` | 330 VUV inputs/outputs/states and exact speech-activity probabilities | `smpl_signal_mode`, `smpl_vad` |
@@ -57,9 +64,14 @@ is at `attr+1200`, so the old 1184-byte allocation was invalid. The decoder cont
 | `wasm_harm_postfilter.cbor.zst` | 110 harmonic-filter inputs/outputs/states | `smpl_harm_postfilter` |
 
 The `mlow_low_rate` spec sets `OPUS_SET_BITRATE(8000)` and checks `OPUS_GET_BITRATE()==8000` before
-encoding the same synth_mic stream. At 8 kbps (and 6 kbps; 10 kbps and above stay high rate) the
-shipped encoder switches to its low-rate layout: 11×`0x14`, 3×`0x16`, 96×`0x54`, each 20 ms internal
-frame two 160-sample subframes. Its decoded PCM is the reference the low-rate path is held to.
+encoding the same synth_mic stream. At 8 kbps the shipped encoder uses its low-rate layout: 11×`0x14`,
+3×`0x16`, 96×`0x54`, each 20 ms internal frame two 160-sample subframes. Its decoded PCM is the
+reference the low-rate path is held to.
+
+The `mlow_rate_switch` spec starts at `OPUS_SET_BITRATE(16000)` (checked by `OPUS_GET_BITRATE()`),
+sets 8000 before packet 30 and 16000 again before packet 80. The encoder follows each switch at that
+packet (0–29 and 80–109 high rate, 30–79 low rate), so one decoder carries its LSF, ACB and tilt state
+across both layout changes.
 
 The stream contains 11×`0x10`, 3×`0x12`, 96×`0x50`. Inactive packets are indices 17–19 and 62–69;
 hangover packets are 16, 59 and 61. `0x12` counts as active routing. The explicit `mlow_dtx_off`
