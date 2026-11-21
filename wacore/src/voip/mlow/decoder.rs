@@ -99,8 +99,8 @@ pub struct MlowDecoder {
     /// silently), so it does not detect a tampered payload. Read via `had_error`. Diagnostic only,
     /// never gates output.
     had_error: bool,
-    /// Count of inbound frames dropped because they fall outside this decoder's single operating point
-    /// (16kHz wideband, low_rate=0, and a duration whose internal geometry it implements). Such a
+    /// Count of inbound frames dropped because they fall outside this decoder's operating point
+    /// (16kHz wideband and a duration whose internal geometry it implements). Such a
     /// frame would desync the range coder if decoded, so it is dropped (treated as a lost frame). The
     /// count drives a once + every-100th `warn` naming the offending dimension.
     dropped_unsupported: u32,
@@ -312,16 +312,14 @@ impl MlowDecoder {
             self.report.inactive_or_sid = self.report.inactive_or_sid.saturating_add(1);
             return vec![0.0; samps];
         }
-        // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
-        // geometry, or a duration whose internal geometry differs would consume the payload with the
-        // wrong symbol count and desync the range coder (garbage plus a poisoned cross-frame predictor
-        // that propagates to later packets). Drop those as lost frames so the predictor holds its last
-        // good values. flag2 is the smpl TOC's low_rate bit.
+        // Operating-point guard for active frames: a different internal rate, or a duration whose
+        // internal geometry differs, would consume the payload with the wrong symbol count and desync
+        // the range coder (garbage plus a poisoned cross-frame predictor that propagates to later
+        // packets). Drop those as lost frames so the predictor holds its last good values. low_rate=1
+        // (the smpl TOC's flag2) is decoded with its own two-subframe geometry.
         let frames = internal_frames(toc.frame_ms);
         let off_point = if toc.sample_rate != 16000 {
             Some(("rate", i64::from(toc.sample_rate / 1000)))
-        } else if toc.low_rate {
-            Some(("low_rate", 1))
         } else if frames.is_none() {
             Some(("frame_ms", i64::from(toc.frame_ms)))
         } else {
@@ -332,7 +330,7 @@ impl MlowDecoder {
             if self.dropped_unsupported == 1 || self.dropped_unsupported.is_multiple_of(100) {
                 log::warn!(
                     "mlow: dropping out-of-operating-point frame #{} ({dim}={val}, TOC 0x{:02x}); \
-                     the decoder runs 16kHz / low_rate=0 / 20-120ms",
+                     the decoder runs 16kHz / 20-120ms",
                     self.dropped_unsupported,
                     frame[0]
                 );
@@ -360,8 +358,10 @@ impl MlowDecoder {
         let cc = load_cc_tables();
         let mut dec = RangeDecoder::new(&frame[1..]);
 
-        // The low_rate bit of the smpl TOC (this capture is low_rate==0; the synth gates on it).
+        // The low_rate bit of the smpl TOC. A low-rate internal frame is two 160-sample subframes;
+        // high rate is four of 80.
         let low_rate = (frame[0] >> 2) & 1 != 0;
+        let subframes: usize = if low_rate { 2 } else { 4 };
 
         // The overrun that invalidates a body is only detectable after the last internal frame, by
         // which point the loop has already advanced the LSF predictor, the CELP history and
@@ -397,7 +397,7 @@ impl MlowDecoder {
                 &mut dec,
                 cc,
                 SMPL_INTF_LEN as i32,
-                4,
+                subframes as i32,
                 i32::from(coded_as_active_voice),
                 config as i32,
                 lsf.stage1,
@@ -419,7 +419,7 @@ impl MlowDecoder {
                     cc,
                     &mut self.state.lstate,
                     SMPL_INTF_LEN as i32,
-                    4,
+                    subframes as i32,
                     config as i32,
                     pulses.subfr,
                 );
@@ -434,7 +434,7 @@ impl MlowDecoder {
                     params.fcbg_idx[sf] = pr.filt_idx[sf].max(0);
                 }
             } else {
-                let g = decode_smpl_gains(&mut dec, cc, 4, pulses.subfr);
+                let g = decode_smpl_gains(&mut dec, cc, subframes as i32, pulses.subfr);
                 // The unvoiced gains decode yields gain_q (the nrgres_dbq_Q14 field) and nrg_res (the
                 // fcbg_idx field).
                 params.nrgres_dbq_q14 = g.gain_q;
@@ -462,6 +462,7 @@ impl MlowDecoder {
                 &params,
                 low_rate,
                 SMPL_INTF_LEN as i32,
+                subframes,
                 &mut sig,
             );
             self.state.prev_nlsf = nlsf;
@@ -1079,6 +1080,55 @@ mod tests {
         assert!(corr > 0.95, "lag-0 corr {corr:.6} vs shipped reference");
     }
 
+    /// Low rate, from the shipped engine (`specs/mlow_low_rate.json`; see PROVENANCE.md): at 8 kbps
+    /// it encodes synth_mic in its two-160-sample-subframe layout, and every packet must decode to
+    /// what it decoded itself. 0.9996 was measured at lock time; before the two-subframe path these
+    /// packets were all dropped as off the operating point.
+    #[test]
+    fn wasm_derived_low_rate_decode_matches_wasm_reference() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/wasm_derived_low_rate_frames.json"))
+                .expect("wasm_derived_low_rate_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_low_rate_ref.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            assert!(
+                frame[0] & 0x04 != 0,
+                "the fixture must stay low-rate packets"
+            );
+            out.extend_from_slice(&dec.decode(&frame));
+            let report = dec.take_frame_report();
+            assert_eq!(report.off_point, 0, "a low-rate packet was dropped");
+            assert_eq!(report.concealed, 0, "a low-rate packet was concealed");
+        }
+        assert_eq!(out.len(), refp.len(), "decode length vs reference");
+
+        let n = refp.len() as f64;
+        let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let (mr, mo) = (mean(&refp), mean(&out));
+        let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+        for (r, o) in refp.iter().zip(&out) {
+            let (dr, dz) = (*r as f64 - mr, *o as f64 - mo);
+            sxy += dr * dz;
+            sxx += dr * dr;
+            syy += dz * dz;
+        }
+        let corr = sxy / (sxx * syy).sqrt();
+        assert!(corr > 0.999, "lag-0 corr {corr:.6} vs shipped reference");
+        // Level, not just shape: the voiced path once ran 2 dB quiet at a 0.98 correlation.
+        let level = (syy / sxx).sqrt();
+        assert!(
+            (0.97..1.03).contains(&level),
+            "level {level:.4} vs shipped reference"
+        );
+    }
+
     /// Decoding a multi-frame packet must leave the cross-frame predictor usable: a real 60 ms frame
     /// after it still has to produce audio.
     #[test]
@@ -1254,10 +1304,12 @@ mod tests {
         fuzz_decode_shard(3);
     }
 
-    // Fail-loud guards: a frame outside our single operating point (32kHz/fullband, or low_rate=1) is
-    // DROPPED to 60ms silence WITHOUT touching the range coder, so it can't desync + poison the
-    // cross-frame predictor. A real low_rate=0 frame before and after the drops still decodes (proves
-    // the drop is a clean "lost frame", not a desync), and the guards don't false-positive on it.
+    // Fail-loud guards: a frame outside our operating point (32kHz/fullband, or a 10 ms active frame)
+    // is DROPPED to silence WITHOUT touching the range coder, so it can't desync + poison the
+    // cross-frame predictor. A real frame before and after the drops still decodes (proves the drop
+    // is a clean "lost frame", not a desync), and the guards don't false-positive on it. low_rate=1
+    // is no longer off the operating point; `wasm_derived_low_rate_decode_matches_wasm_reference`
+    // covers it.
     #[test]
     fn unsupported_frames_drop_clean_without_desync() {
         let frames: Vec<String> =
@@ -1280,15 +1332,6 @@ mod tests {
         assert!(
             out_32k.iter().all(|&s| s == 0.0),
             "32kHz frame must drop to silence"
-        );
-
-        // A low_rate=1 TOC -> dropped to 60ms silence. 0x54 = 0b0101_0100: bit5=0 (16kHz, so the rate
-        // branch does NOT catch it), bits4:3=10 (60ms), bit2=1 (low_rate) -> exercises the low_rate branch.
-        let out_lr = dec.decode(&[0x54, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(out_lr.len(), 960);
-        assert!(
-            out_lr.iter().all(|&s| s == 0.0),
-            "low_rate=1 frame must drop to silence"
         );
 
         // A 10ms ACTIVE 16kHz/low_rate=0 TOC (0x40) must also drop: it is the one duration whose

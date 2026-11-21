@@ -463,6 +463,67 @@
       "spec_sha256": "f9f017f23c97968c30f6388b393f46caa77afcc6221dc9a703bdfc12029dd9f8",
       "tree_sha256": "2061381dc4dc35e92aa4b01c50f747f8ba076a69df6d2f4020562abd2e48dcd9"
     },
+    "mlow_low_rate": {
+      "module": {
+        "id": "JgwtTQVeWPm",
+        "sha256": "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db",
+        "size": 10650934
+      },
+      "outputs": 221,
+      "resolutions": {
+        "encoder_ctl": {
+          "fingerprint": 10288455479157149083,
+          "index": 10684,
+          "slots": [
+            5051
+          ]
+        },
+        "log_mutex_init": {
+          "fingerprint": 2800334344202656096,
+          "index": 9848,
+          "slots": [
+            8583
+          ]
+        },
+        "opus_decode": {
+          "fingerprint": 11600650185080705472,
+          "index": 6670,
+          "slots": [
+            5068
+          ]
+        },
+        "opus_encode": {
+          "fingerprint": 2178560120312827931,
+          "index": 6666,
+          "slots": [
+            5065
+          ]
+        },
+        "opus_open": {
+          "fingerprint": 9908632863975356346,
+          "index": 6658,
+          "slots": [
+            5061
+          ]
+        },
+        "pj_init": {
+          "fingerprint": 8591841716802926967,
+          "index": 9981,
+          "slots": [
+            8581
+          ]
+        },
+        "smpl_init": {
+          "fingerprint": null,
+          "index": 10566,
+          "slots": [
+            7242
+          ]
+        }
+      },
+      "spec_sha256": "65ad7b8f0ffc469e64629b58764af4b2977983ef4a4048bda5d3421ca1b7f026",
+      "tree_sha256": "271226f84415d6c82f23248aba9fab6a04b1964f9774cddde9d395d4ee71d91d"
+    },
     "mlow_params_trace": {
       "module": {
         "id": "JgwtTQVeWPm",

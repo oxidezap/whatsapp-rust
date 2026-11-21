@@ -185,6 +185,17 @@ fn create_runlen_table(max_samples: i32) -> RunlenCmfs {
 }
 
 const NRGRES_GAIN4_N: usize = 84;
+/// Two-subframe (low-rate) unvoiced main-gain DCMF, 71 deltas (72 symbols).
+const NRGRES_GAIN2_DCMF: [u8; 71] = [
+    139, 194, 196, 200, 209, 225, 239, 243, 246, 246, 253, 255, 253, 249, 244, 239, 233, 231, 230,
+    228, 219, 216, 214, 214, 213, 211, 214, 215, 220, 223, 230, 234, 237, 240, 242, 244, 245, 245,
+    246, 242, 237, 230, 220, 210, 190, 170, 148, 125, 104, 83, 64, 49, 36, 22, 14, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+];
+/// Two-subframe (low-rate) unvoiced delta-gain DCMF, 22 deltas (23 symbols).
+const NRGRES_SHAPE2_DCMF: [u8; 22] = [
+    47, 52, 137, 58, 61, 21, 73, 240, 55, 95, 255, 68, 83, 108, 48, 50, 49, 45, 35, 155, 31, 41,
+];
 const NRGRES_SHAPE4_N: usize = 98;
 const FCBG_OFFSET_STEPS: usize = 176; // dcmf len; cmf row len is +1
 const FCBG_OFFSET_BUCKETS: usize = 4;
@@ -206,6 +217,8 @@ pub(crate) use super::smpl_tables_blob::tables::CcSeed;
 /// directly, byte-identical to the old heap u16 reads. The accessor takes the LOGICAL index.
 pub(crate) struct CcTables {
     nrgres_gain4: Vec<u16>,       // [85]
+    nrgres_gain2: Vec<u16>,       // [72]
+    nrgres_shape2: Vec<u16>,      // [23]
     nrgres_shape4: Vec<u16>,      // [99]
     fcbg_offset: Vec<Vec<u16>>,   // [3*4][177]
     acbgains_hr: Vec<u16>,        // [17*17] row-major rows of 17
@@ -291,6 +304,8 @@ impl CcSeed {
 
         CcTables {
             nrgres_gain4,
+            nrgres_gain2: dcmf_to_cmf(&NRGRES_GAIN2_DCMF),
+            nrgres_shape2: dcmf_to_cmf(&NRGRES_SHAPE2_DCMF),
             nrgres_shape4,
             fcbg_offset,
             acbgains_hr,
@@ -322,6 +337,16 @@ impl CcTables {
     /// nrgres main-gain CDF (n=85).
     pub(crate) fn nrgres_gain4(&self) -> &[u16] {
         &self.nrgres_gain4
+    }
+
+    /// Two-subframe main-gain CDF (n=72).
+    pub(crate) fn nrgres_gain2(&self) -> &[u16] {
+        &self.nrgres_gain2
+    }
+
+    /// Two-subframe delta-gain CDF (n=23).
+    pub(crate) fn nrgres_shape2(&self) -> &[u16] {
+        &self.nrgres_shape2
     }
 
     /// nrgres delta-gain / shape CDF (n=99).

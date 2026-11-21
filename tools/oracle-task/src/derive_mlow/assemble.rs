@@ -212,6 +212,21 @@ pub fn all(out: &Path) -> Result<()> {
     }
     write_json(&dest.join("wasm_derived_120ms_frames.json"), &frames)?;
     write(&dest.join("wasm_derived_120ms_ref.raw"), &pcm)?;
+    frames.clear();
+    pcm.clear();
+    for i in 0..110 {
+        let packet = std::fs::read(out.join(format!("mlow_low_rate/packet{i:03}.bin")))?;
+        ensure!(
+            packet[0] & 0x04 != 0,
+            "low-rate packet {i} lost its low_rate bit"
+        );
+        frames.push(hex::encode(packet));
+        pcm.extend(std::fs::read(
+            out.join(format!("mlow_low_rate/decoded{i:03}.raw")),
+        )?);
+    }
+    write_json(&dest.join("wasm_derived_low_rate_frames.json"), &frames)?;
+    write(&dest.join("wasm_derived_low_rate_ref.raw"), &pcm)?;
     type Build = fn(&Path) -> Result<Value>;
     for (leaf, run, build) in [
         ("fe", "fe", fe as Build),
