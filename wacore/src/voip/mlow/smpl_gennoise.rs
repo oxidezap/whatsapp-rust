@@ -410,8 +410,10 @@ fn add_noise_uv(
     }
 }
 
-/// `smpl_celp_gen_noise`: build the shaped residual noise for one subframe (faithful port).
+/// `smpl_celp_gen_noise`: build the shaped residual noise for one subframe (faithful port). Always
+/// inlined so each synthesis layout gets loops over a constant `l`.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn smpl_celp_gen_noise(
     ng: &mut NoiseGenerator,
     exc_lpc: &[f32],

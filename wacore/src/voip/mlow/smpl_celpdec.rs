@@ -123,6 +123,7 @@ fn nlsf_poly(out: &mut [f64], cosv: &[f64], half: usize, parity: usize) {
 /// Per-subframe interpolation of the LSF between `prev_lsf` and `lsf`, then NLSF->A. Returns the
 /// per-subframe A coefficients and writes the per-subframe interpolated LSF. Mutates `prev_lsf` to
 /// the last interpolated LSF (codec carries it across frames).
+#[inline(always)]
 fn lpc_interpol(
     lsf: &[f32],
     prev_lsf: &mut [f32; SMPL_LPC_ORDER],
@@ -201,6 +202,7 @@ fn pitch_sharp(x: &mut [f32], lag: usize, l: usize) {
 
 /// Build the ACB basis from the excitation history; mutates `state` forward. `state` is the full ACB
 /// state; the logical start is `state[state_len - n_lags*40]`.
+#[inline(always)]
 fn syn_ltp_basis(
     lags: &[f32],
     n_lags: usize,
@@ -270,7 +272,9 @@ fn syn_ltp_basis(
 
 /// Voiced branch: add the ACB (LTP) contribution into `lpc_res`, then push the subframe into the ACB
 /// state. `acb_state_len = 2*SUBFR_LEN + 2*MAX_PITCH_LAG + LTP_INTERPOL_DELAY`, room for a 160-sample
-/// low-rate subframe after the history.
+/// low-rate subframe after the history. Always inlined, like its helpers, so each `synth_frame_n`
+/// copy sees a constant subframe length.
+#[inline(always)]
 fn celp_decode(
     acb_state: &mut [f32],
     acb_state_len: usize,
@@ -432,6 +436,64 @@ impl CelpDecState {
         subframes: usize,
         out: &mut [f32],
     ) {
+        // One copy per layout, so the high-rate path keeps its constant 80-sample loop bounds.
+        if subframes == 2 {
+            self.synth_frame_low_rate(
+                nlsf,
+                lsf_interpol_idx,
+                pulses,
+                params,
+                low_rate,
+                frame_length_16,
+                out,
+            );
+        } else {
+            self.synth_frame_n::<4>(
+                nlsf,
+                lsf_interpol_idx,
+                pulses,
+                params,
+                low_rate,
+                frame_length_16,
+                out,
+            );
+        }
+    }
+
+    /// The two-subframe copy, kept out of line so the four-subframe one stays inlined in its caller.
+    #[inline(never)]
+    fn synth_frame_low_rate(
+        &mut self,
+        nlsf: &[f32],
+        lsf_interpol_idx: usize,
+        pulses: &[i32],
+        params: &CelpDecParams,
+        low_rate: bool,
+        frame_length_16: i32,
+        out: &mut [f32],
+    ) {
+        self.synth_frame_n::<2>(
+            nlsf,
+            lsf_interpol_idx,
+            pulses,
+            params,
+            low_rate,
+            frame_length_16,
+            out,
+        );
+    }
+
+    fn synth_frame_n<const SUBFRAMES: usize>(
+        &mut self,
+        nlsf: &[f32],
+        lsf_interpol_idx: usize,
+        pulses: &[i32],
+        params: &CelpDecParams,
+        low_rate: bool,
+        frame_length_16: i32,
+        out: &mut [f32],
+    ) {
+        let subframes = SUBFRAMES;
         let gains = fcb_gains();
         // Four 80-sample subframes, or two of 160 at low rate.
         let subfr_len = SMPL_FRAME_LEN / subframes;
