@@ -82,9 +82,15 @@ pub(crate) fn decode_smpl_pulses(
         k as i32
     };
 
-    // --- recursive binary SPLIT (p3==4 path) ---
+    // --- SPLIT: one level for two subframes (low rate), two levels for four ---
     let mut split = [0i32; 8];
-    if total != 0 {
+    if total != 0 && p3 == 2 {
+        let s0 = smpl_split_3537(dec, cc, total, subfr_len16);
+        if s0 != -1 {
+            split[0] = s0;
+            split[1] = total - s0;
+        }
+    } else if total != 0 {
         let mut sum = (total - subfr_len16 * 2).max(0);
         let lo = (total - 80).max(0);
         if sum < lo {

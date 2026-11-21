@@ -1,5 +1,5 @@
 {
-  "derivation_lock_sha256": "5fc53f04d7f0f59b334abdfec896b423edd46980360b8bd7c3dfd5c83b6cef6f",
+  "derivation_lock_sha256": "db5285198f2912613c9058302f993fc14459fce9f4dd132c365b251bfb4b1beb",
   "files": {
     "wasm_derived_120ms_frames.json": {
       "bytes": 4087,
@@ -12,6 +12,22 @@
     "wasm_derived_frames.json": {
       "bytes": 23291,
       "sha256": "c3b9c0b5140cd48401be07311ec547ec024e3e4c0841f5cdbf8178ede7d24bb3"
+    },
+    "wasm_derived_low_rate_frames.json": {
+      "bytes": 10581,
+      "sha256": "030b6427b780ccfb22c10ad78d69bc7316459fd79b05f507764ead751e1cd6db"
+    },
+    "wasm_derived_low_rate_ref.raw": {
+      "bytes": 211200,
+      "sha256": "c3aad1c10390e2dd1de2b6ec42fa7802282d548388867fbe2a3b860cd4c950e0"
+    },
+    "wasm_derived_rate_switch_frames.json": {
+      "bytes": 16247,
+      "sha256": "a9534fab8bcd5f1076c2afa0fca159d5299963f002a64c815611f8c1f9e9f7e9"
+    },
+    "wasm_derived_rate_switch_ref.raw": {
+      "bytes": 211200,
+      "sha256": "4f70d564dbd435593f8fccb66c2a955afba511e071eeb339c001840aad046a47"
     },
     "wasm_derived_ref.raw": {
       "bytes": 211200,

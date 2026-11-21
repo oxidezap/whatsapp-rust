@@ -14,7 +14,18 @@ pub(crate) struct SmplGainResult {
     pub(crate) nrg_res: [i32; 4],
 }
 
-/// Decode the gains+nrgres reads (the p3==4 path). `subfr_counts` are the per-subframe pulse counts.
+/// Two-subframe (low-rate) gain reconstruction codebook, indexed `sf + 2 * gain_delta`.
+const GAIN_RECON_2: [i16; 46] = [
+    -9672, 9672, -4437, 4437, -907, 907, 3610, -3610, -2857, 2857, 9345, -9345, -2220, 2220, 420,
+    -420, -3565, 3565, -1577, 1577, -184, 184, 2973, -2973, 2389, -2389, 1774, -1774, -7315, 7315,
+    4405, -4405, -5630, 5630, -12927, 12927, -17376, 17376, 1107, -1107, 7058, -7058, 5481, -5481,
+    0, 0,
+];
+/// Energy step per main-gain index, by gain-table row.
+const NRG_STEPS: [i32; 3] = [16384, 19843, 16686];
+
+/// Decode the gains+nrgres reads for `p3` subframes (2 at low rate, 4 otherwise). `subfr_counts` are
+/// the per-subframe pulse counts.
 pub(crate) fn decode_smpl_gains(
     dec: &mut RangeDecoder,
     cc: &CcTables,
@@ -27,18 +38,41 @@ pub(crate) fn decode_smpl_gains(
     };
 
     // main gain (n=85) + delta gain (n=99)
-    let gain_main = dec.decode_cdf(cc.nrgres_gain4());
-    let gain_delta = dec.decode_cdf(cc.nrgres_shape4());
+    let (gain_main, gain_delta) = if p3 == 2 {
+        (
+            dec.decode_cdf(cc.nrgres_gain2()),
+            dec.decode_cdf(cc.nrgres_shape2()),
+        )
+    } else {
+        (
+            dec.decode_cdf(cc.nrgres_gain4()),
+            dec.decode_cdf(cc.nrgres_shape4()),
+        )
+    };
     let cfg_sel = 2i32;
 
     // gain reconstruction. The index sf + p3*gain_delta is NOT bounded to the visible 64-entry array
     // (gain_delta up to 98); the WASM reads adjacent rodata, which the seed carries verbatim.
     let off6 = p3 * gain_delta;
-    let base7 = gain_main * cc.nrg_step(cfg_sel) - 0x154000;
+    // Two subframes use the second energy step; four keep the configured one.
+    let step = if p3 == 2 {
+        NRG_STEPS[1]
+    } else {
+        cc.nrg_step(cfg_sel)
+    };
+    let base7 = gain_main * step - 0x154000;
     for (sf, gain) in res.gain_q.iter_mut().enumerate().take((p3 as usize).min(4)) {
-        let cbv = cc.gain_recon(p3 == 4, sf as i32 + off6);
+        let cbv = if p3 == 2 {
+            GAIN_RECON_2
+                .get((sf as i32 + off6) as usize)
+                .map_or(0, |v| i32::from(*v))
+        } else {
+            cc.gain_recon(p3 == 4, sf as i32 + off6)
+        };
         *gain = base7 + (cbv << 4);
     }
+    // Two subframes read their energy residuals from the second offset table.
+    let table_ix = if p3 == 2 { 1 } else { cfg_sel as usize };
 
     // nrgres: per-subframe bucketed CDF (n=92) with a gain-derived slice shift.
     for (sf, &cnt) in subfr_counts.iter().enumerate().take((p3 as usize).min(4)) {
@@ -53,8 +87,7 @@ pub(crate) fn decode_smpl_gains(
         }
         let neg_part = (g >> 31) & g;
         let min_offset = (-neg_part) as usize;
-        res.nrg_res[sf] =
-            dec.decode_cdf(cc.fcbg_offset(cfg_sel as usize, bucket as usize, min_offset));
+        res.nrg_res[sf] = dec.decode_cdf(cc.fcbg_offset(table_ix, bucket as usize, min_offset));
     }
     log::trace!(
         "mlow gains: main={gain_main} delta={gain_delta} gain_q={:?} nrg_res={:?}",

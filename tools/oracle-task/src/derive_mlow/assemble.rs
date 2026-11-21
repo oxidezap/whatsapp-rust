@@ -212,6 +212,36 @@ pub fn all(out: &Path) -> Result<()> {
     }
     write_json(&dest.join("wasm_derived_120ms_frames.json"), &frames)?;
     write(&dest.join("wasm_derived_120ms_ref.raw"), &pcm)?;
+    // The packets on which each low-rate stream must carry the TOC low_rate bit.
+    for (run, low_rate) in [("low_rate", 0..110), ("rate_switch", 30..80)] {
+        frames.clear();
+        pcm.clear();
+        for i in 0..110 {
+            let packet = std::fs::read(out.join(format!("mlow_{run}/packet{i:03}.bin")))?;
+            let toc = *packet
+                .first()
+                .with_context(|| format!("{run} packet {i} is empty"))?;
+            // A 16 kHz, 60 ms, mono, non-SID MLow TOC; VAD (bit6), low_rate (bit2) and bit1 vary, so
+            // the captured 0x10/0x14 inactive packets pass.
+            ensure!(
+                toc & 0b1011_1001 == 0b0001_0000,
+                "{run} packet {i}: TOC 0x{toc:02x} is not a 16 kHz 60 ms mono MLow frame"
+            );
+            ensure!(
+                (toc & 0x04 != 0) == low_rate.contains(&i),
+                "{run} packet {i}: TOC 0x{toc:02x} has the wrong low_rate bit"
+            );
+            frames.push(hex::encode(packet));
+            pcm.extend(std::fs::read(
+                out.join(format!("mlow_{run}/decoded{i:03}.raw")),
+            )?);
+        }
+        write_json(
+            &dest.join(format!("wasm_derived_{run}_frames.json")),
+            &frames,
+        )?;
+        write(&dest.join(format!("wasm_derived_{run}_ref.raw")), &pcm)?;
+    }
     type Build = fn(&Path) -> Result<Value>;
     for (leaf, run, build) in [
         ("fe", "fe", fe as Build),

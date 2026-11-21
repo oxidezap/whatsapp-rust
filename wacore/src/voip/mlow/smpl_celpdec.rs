@@ -35,6 +35,10 @@ const SMPL_DEC_ACB_HIGH_BOOST: [f32; 2] = [0.35, 0.18];
 
 /// LSF->LPC interpolation factors per subframe, `[lsf_interpol_idx][sf]`.
 const SMPL_LSF_INTERPOL_4: [[f32; 4]; 2] = [[0.55, 0.88, 1.0, 1.0], [0.3, 0.65, 0.95, 1.0]];
+/// Low-rate voiced excitation smoothing, `b0*x[n] + b1*x[n-1]`.
+const SMPL_LR_VOICED_TILT: [f32; 2] = [0.84, 0.16];
+/// The same per-subframe LSF weights for the two-subframe (low-rate) layout.
+const SMPL_LSF_INTERPOL_2: [[f32; 2]; 2] = [[0.75, 1.0], [0.4, 0.95]];
 
 /// 16-tap symmetric LTP interpolation kernel.
 #[rustfmt::skip]
@@ -122,7 +126,7 @@ fn nlsf_poly(out: &mut [f64], cosv: &[f64], half: usize, parity: usize) {
 fn lpc_interpol(
     lsf: &[f32],
     prev_lsf: &mut [f32; SMPL_LPC_ORDER],
-    interpol: &[f32; 4],
+    interpol: &[f32],
     a_out: &mut [[f32; SMPL_LPC_ORDER + 1]; SMPL_NUM_SUBFR],
     lsfs_out: &mut [[f32; SMPL_LPC_ORDER]; SMPL_NUM_SUBFR],
 ) {
@@ -131,7 +135,7 @@ fn lpc_interpol(
     }
     let mut ilsf = [0.0f32; SMPL_LPC_ORDER];
     let mut prev_factor = -1.0f32;
-    for j in 0..SMPL_NUM_SUBFR {
+    for j in 0..interpol.len() {
         if interpol[j] == prev_factor {
             a_out[j] = a_out[j - 1];
         } else {
@@ -265,7 +269,8 @@ fn syn_ltp_basis(
 }
 
 /// Voiced branch: add the ACB (LTP) contribution into `lpc_res`, then push the subframe into the ACB
-/// state. `acb_state_len = subfrlen + 2*MAX_PITCH_LAG + LTP_INTERPOL_DELAY`.
+/// state. `acb_state_len = 2*SUBFR_LEN + 2*MAX_PITCH_LAG + LTP_INTERPOL_DELAY`, room for a 160-sample
+/// low-rate subframe after the history.
 fn celp_decode(
     acb_state: &mut [f32],
     acb_state_len: usize,
@@ -278,6 +283,9 @@ fn celp_decode(
     normalized_bitrate: f32,
     lpc_res: &mut [f32],
 ) {
+    // The history ends at a fixed point with room for a whole low-rate subframe after it, so the
+    // two subframe lengths share one history when a stream switches between them.
+    let history = acb_state_len - 2 * SMPL_SUBFR_LEN;
     if voiced {
         let high_boost = SMPL_DEC_ACB_HIGH_BOOST[0]
             + (SMPL_DEC_ACB_HIGH_BOOST[1] - SMPL_DEC_ACB_HIGH_BOOST[0]) * normalized_bitrate;
@@ -287,7 +295,13 @@ fn celp_decode(
         }
         let mut acb_basis = vec![0.0f32; subfrlen * SMPL_ACBG_M];
         let mut acb = vec![0.0f32; subfrlen];
-        syn_ltp_basis(lags, num_lags, acb_state, acb_state_len, &mut acb_basis);
+        syn_ltp_basis(
+            lags,
+            num_lags,
+            acb_state,
+            history + subfrlen,
+            &mut acb_basis,
+        );
         let mut acb_gain = [0.0f32; SMPL_ACBG_M];
         acb_dequant(low_rate, acb_gain_idx, &mut acb_gain);
         acb_synthesize(subfrlen, &acb_basis, &acb_gain, high_boost, &mut acb);
@@ -296,9 +310,8 @@ fn celp_decode(
         }
     }
     // Update ACB state: shift left by subfrlen, append this subframe's excitation.
-    acb_state.copy_within(subfrlen..acb_state_len - subfrlen, 0);
-    acb_state[acb_state_len - 2 * subfrlen..acb_state_len - subfrlen]
-        .copy_from_slice(&lpc_res[..subfrlen]);
+    acb_state.copy_within(subfrlen..history, 0);
+    acb_state[history - subfrlen..history].copy_from_slice(&lpc_res[..subfrlen]);
 }
 
 /// AR(16) over one subframe: `y[n] = x[n] - sum_{i} coef[16-i]*y[n-16+i]`. `ybuf` holds a 16-sample
@@ -337,6 +350,8 @@ pub(crate) struct CelpDecState {
     lpc_synth_mem: [f32; SMPL_LPC_ORDER],
     lsf_prev: [f32; SMPL_LPC_ORDER],
     prev_nrgres: f32,
+    /// The previous excitation sample, for the low-rate voiced tilt.
+    lr_tilt: f32,
     /// Post-LPC HP (pitch-harmonic) postfilter state, persistent across the stream.
     hp: super::smpl_harmcomb::HpPostfilterState,
     /// Test-only capture of the per-subframe pre-noise excitation (`exc_pre`), 80/subframe.
@@ -357,6 +372,7 @@ impl Clone for CelpDecState {
             lpc_synth_mem: self.lpc_synth_mem,
             lsf_prev: self.lsf_prev,
             prev_nrgres: self.prev_nrgres,
+            lr_tilt: self.lr_tilt,
             hp: self.hp.clone(),
             #[cfg(test)]
             dbg_exc_pre: Vec::new(),
@@ -377,6 +393,7 @@ impl Clone for CelpDecState {
         self.lpc_synth_mem = source.lpc_synth_mem;
         self.lsf_prev = source.lsf_prev;
         self.prev_nrgres = source.prev_nrgres;
+        self.lr_tilt = source.lr_tilt;
         self.hp.copy_state_from(&source.hp);
         // `dbg_exc_pre` is deliberately not carried, for the reason above the `clone` impl.
     }
@@ -384,7 +401,7 @@ impl Clone for CelpDecState {
 
 impl Default for CelpDecState {
     fn default() -> Self {
-        let acb_state_len = SMPL_SUBFR_LEN + 2 * SMPL_MAX_PITCH_LAG + SMPL_LTP_INTERPOL_DELAY;
+        let acb_state_len = 2 * SMPL_SUBFR_LEN + 2 * SMPL_MAX_PITCH_LAG + SMPL_LTP_INTERPOL_DELAY;
         CelpDecState {
             noise: NoiseGenerator::default(),
             acb_state: vec![0.0; acb_state_len],
@@ -392,6 +409,7 @@ impl Default for CelpDecState {
             lpc_synth_mem: [0.0; SMPL_LPC_ORDER],
             lsf_prev: [0.0; SMPL_LPC_ORDER],
             prev_nrgres: 0.0,
+            lr_tilt: 0.0,
             hp: super::smpl_harmcomb::HpPostfilterState::default(),
             #[cfg(test)]
             dbg_exc_pre: Vec::new(),
@@ -411,13 +429,20 @@ impl CelpDecState {
         params: &CelpDecParams,
         low_rate: bool,
         frame_length_16: i32,
+        subframes: usize,
         out: &mut [f32],
     ) {
         let gains = fcb_gains();
+        // Four 80-sample subframes, or two of 160 at low rate.
+        let subfr_len = SMPL_FRAME_LEN / subframes;
         // Per-subframe LPC interpolation.
         let mut a = [[0.0f32; SMPL_LPC_ORDER + 1]; SMPL_NUM_SUBFR];
         let mut lsfs = [[0.0f32; SMPL_LPC_ORDER]; SMPL_NUM_SUBFR];
-        let interpol = &SMPL_LSF_INTERPOL_4[lsf_interpol_idx.min(1)];
+        let interpol: &[f32] = if subframes == 2 {
+            &SMPL_LSF_INTERPOL_2[lsf_interpol_idx.min(1)]
+        } else {
+            &SMPL_LSF_INTERPOL_4[lsf_interpol_idx.min(1)]
+        };
         lpc_interpol(nlsf, &mut self.lsf_prev, interpol, &mut a, &mut lsfs);
 
         let normalized_bitrate = smpl_get_normalized_bitrate(params.total_pulses, frame_length_16);
@@ -427,39 +452,38 @@ impl CelpDecState {
         let gain_tab: &[f32] = if params.voiced { &gains.v } else { &gains.uv };
         for pos in 0..SMPL_FRAME_LEN {
             if pulses[pos] != 0 {
-                let sf = pos / SMPL_SUBFR_LEN;
+                let sf = pos / subfr_len;
                 lpc_res[pos] = pulses[pos] as f32 * gain_tab[params.fcbg_idx[sf] as usize];
             }
         }
 
-        let lags_per_subfr = 2; // 80-sample subframe / 40-sample lag subframe
+        let lags_per_subfr = subfr_len / SMPL_LAG_SUBFRLEN;
         // Contiguous synthesis buffer: 16-sample history prefix + 320 frame samples.
         let mut ybuf = [0.0f32; SMPL_LPC_ORDER + SMPL_FRAME_LEN];
         ybuf[..SMPL_LPC_ORDER].copy_from_slice(&self.lpc_synth_mem);
-        for sf in 0..SMPL_NUM_SUBFR {
-            let base = sf * SMPL_SUBFR_LEN;
-            // CELP (ACB/LTP) decode: adds the voiced adaptive-codebook contribution + updates state.
-            // With lags_per_subframe == 2 the two 40-blocks of this subframe carry independent lags.
-            let sf_lags = [params.block_lags[2 * sf], params.block_lags[2 * sf + 1]];
+        for sf in 0..subframes {
+            let base = sf * subfr_len;
+            // CELP (ACB/LTP) decode over the whole subframe, with its own 40-sample lag blocks.
+            let first = base / SMPL_LAG_SUBFRLEN;
             celp_decode(
                 &mut self.acb_state,
                 self.acb_state_len,
                 params.voiced,
                 params.acbg_idx[sf],
-                &sf_lags,
+                &params.block_lags[first..first + lags_per_subfr],
                 lags_per_subfr,
-                SMPL_SUBFR_LEN,
+                subfr_len,
                 low_rate,
                 normalized_bitrate,
-                &mut lpc_res[base..base + SMPL_SUBFR_LEN],
+                &mut lpc_res[base..base + subfr_len],
             );
 
             #[cfg(test)]
             self.dbg_exc_pre
-                .extend_from_slice(&lpc_res[base..base + SMPL_SUBFR_LEN]);
+                .extend_from_slice(&lpc_res[base..base + subfr_len]);
 
             // Residual noise energy + shaped noise (the dominant unvoiced fix).
-            let nrgres = smpl_decode_resnrg(params.nrgres_dbq_q14[sf], SMPL_SUBFR_LEN as i32);
+            let nrgres = smpl_decode_resnrg(params.nrgres_dbq_q14[sf], subfr_len as i32);
             if !params.voiced {
                 self.prev_nrgres = nrgres;
             }
@@ -467,8 +491,8 @@ impl CelpDecState {
             let mut noise = [0.0f32; 160];
             smpl_celp_gen_noise(
                 &mut self.noise,
-                &lpc_res[base..base + SMPL_SUBFR_LEN],
-                SMPL_SUBFR_LEN,
+                &lpc_res[base..base + subfr_len],
+                subfr_len,
                 params.voiced,
                 params.sf_pulses[sf],
                 nrgres,
@@ -478,17 +502,27 @@ impl CelpDecState {
                 &gains.uv,
                 &mut noise,
             );
-            for i in 0..SMPL_SUBFR_LEN {
+            for i in 0..subfr_len {
                 lpc_res[base + i] += noise[i];
+            }
+            // Low rate smooths a voiced subframe's excitation before synthesis.
+            if low_rate && params.voiced {
+                for sample in &mut lpc_res[base..base + subfr_len] {
+                    let x = *sample;
+                    *sample = SMPL_LR_VOICED_TILT[0] * x + SMPL_LR_VOICED_TILT[1] * self.lr_tilt;
+                    self.lr_tilt = x;
+                }
+            } else {
+                self.lr_tilt = lpc_res[base + subfr_len - 1];
             }
 
             // LPC synthesis (contiguous history across subframes/frames).
             filt_ar16(
-                &lpc_res[base..base + SMPL_SUBFR_LEN],
+                &lpc_res[base..base + subfr_len],
                 &a[sf],
                 &mut ybuf,
                 SMPL_LPC_ORDER + base,
-                SMPL_SUBFR_LEN,
+                subfr_len,
             );
         }
         out[..SMPL_FRAME_LEN].copy_from_slice(&ybuf[SMPL_LPC_ORDER..]);
@@ -657,6 +691,7 @@ mod tests {
                     &params,
                     low_rate,
                     320,
+                    4,
                     &mut sig,
                 );
                 prev_nlsf = nlsf;
