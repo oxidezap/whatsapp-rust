@@ -163,8 +163,8 @@ fn differential_add_and_double(
 
     let t6 = &t4 - &t5;     // 4 U_P W_P
 
-    let t7 = &t0 * &t3;     // (U_P + W_P) (U_Q - W_Q) = U_P U_Q + W_P U_Q - U_P W_Q - W_P W_Q
-    let t8 = &t1 * &t2;     // (U_P - W_P) (U_Q + W_Q) = U_P U_Q - W_P U_Q + U_P W_Q - W_P W_Q
+    let t7 = t0.mul_ladder(&t3);     // (U_P + W_P) (U_Q - W_Q) = U_P U_Q + W_P U_Q - U_P W_Q - W_P W_Q
+    let t8 = t1.mul_ladder(&t2);     // (U_P - W_P) (U_Q + W_Q) = U_P U_Q - W_P U_Q + U_P W_Q - W_P W_Q
 
     let t9  = &t7 + &t8;    // 2 (U_P U_Q - W_P W_Q)
     let t10 = &t7 - &t8;    // 2 (W_P U_Q - U_P W_Q)
@@ -174,12 +174,12 @@ fn differential_add_and_double(
 
     let t13 = t6.mul121666(); // (A + 2) U_P U_Q
 
-    let t14 = &t4 * &t5;    // ((U_P + W_P)(U_P - W_P))^2 = (U_P^2 - W_P^2)^2
+    let t14 = t4.mul_ladder(&t5);    // ((U_P + W_P)(U_P - W_P))^2 = (U_P^2 - W_P^2)^2
     let t15 = &t13 + &t5;   // (U_P - W_P)^2 + (A + 2) U_P W_P
 
-    let t16 = &t6 * &t15;   // 4 (U_P W_P) ((U_P - W_P)^2 + (A + 2) U_P W_P)
+    let t16 = t6.mul_ladder(&t15);   // 4 (U_P W_P) ((U_P - W_P)^2 + (A + 2) U_P W_P)
 
-    let t17 = affine_PmQ * &t12; // U_D * 4 (W_P U_Q - U_P W_Q)^2
+    let t17 = affine_PmQ.mul_ladder(&t12); // U_D * 4 (W_P U_Q - U_P W_Q)^2
     let t18 = t11;               // W_D * 4 (U_P U_Q - W_P W_Q)^2
 
     P.U = t14;  // U_{P'} = (U_P + W_P)^2 (U_P - W_P)^2
