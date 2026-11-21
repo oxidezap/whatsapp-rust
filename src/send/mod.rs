@@ -1315,15 +1315,7 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     // disappearing-messages chat, viewOnce) must not hide the payload: without
     // the <biz> node the server accepts and acks the message but the phone
     // renders it as plain text with no buttons.
-    let mut base = msg.get_base_message();
-    loop {
-        let inner = base.get_base_message();
-        if std::ptr::eq(inner, base) {
-            break;
-        }
-        base = inner;
-    }
-    base.interactive_message.as_option()
+    msg.get_base_message().interactive_message.as_option()
 }
 
 /// Refuse a caller node that repeats one this send already derives.
@@ -8307,8 +8299,6 @@ mod tests {
             }
         }
 
-        /// `get_base_message` unwraps in one fixed order, so a wrapper nested the
-        /// other way round needs another pass to reach the payload.
         #[test]
         fn wrappers_nested_in_either_order_keep_their_biz_node() {
             fn future_proof(

@@ -2,6 +2,46 @@ use std::str::FromStr;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
+// Ordered FutureProofMessage fields shared with the send classifier. Each walk
+// handles device-sent, edits, and empty wrappers according to its own contract.
+macro_rules! for_each_classified_fp_wrapper {
+    ($callback:ident) => {
+        $callback!(ephemeral_message);
+        $callback!(view_once_message);
+        $callback!(view_once_message_v2);
+        $callback!(view_once_message_v2_extension);
+        $callback!(document_with_caption_message);
+        $callback!(group_mentioned_message);
+        $callback!(bot_invoke_message);
+        $callback!(associated_child_message);
+        $callback!(poll_creation_option_image_message);
+        $callback!(event_cover_image);
+        $callback!(group_status_message);
+        $callback!(group_status_message_v2);
+        $callback!(group_status_mention_message);
+        $callback!(status_add_yours);
+        $callback!(status_mention_message);
+        $callback!(question_message);
+        $callback!(question_reply_message);
+        $callback!(spoiler_message);
+        $callback!(lottie_sticker_message);
+        $callback!(limit_sharing_message);
+        $callback!(newsletter_admin_profile_message);
+        $callback!(newsletter_admin_profile_message_v2);
+        $callback!(poll_creation_message_v4);
+        $callback!(bot_forwarded_message);
+    };
+}
+pub(crate) use for_each_classified_fp_wrapper;
+
+macro_rules! for_each_base_wrapper {
+    ($callback:ident) => {
+        $callback!(device_sent_message);
+        for_each_classified_fp_wrapper!($callback);
+        $callback!(edited_message);
+    };
+}
+
 /// Direct `Message` fields whose payload declares `ContextInfo` in the schema.
 /// The order preserves the helpers' first-carrier precedence; new carriers are
 /// appended. All direct carriers are included, even non-renderable bodies:
@@ -149,7 +189,9 @@ impl MessageBuilderExt for wa::Message {
 
 /// Extension trait for wa::Message
 pub trait MessageExt {
-    /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.
+    /// Follows the first wrapper with an inner message at each level: device-sent,
+    /// the send classifier's ordered wrappers, then edited. Returns the current
+    /// message when no wrapper has a body or the protobuf recursion limit is reached.
     fn get_base_message(&self) -> &wa::Message;
     /// Consuming version of [`get_base_message`](Self::get_base_message). Moves the innermost message out of
     /// wrapper types (device_sent, ephemeral, view_once, etc.) without cloning.
@@ -289,64 +331,39 @@ pub trait MessageExt {
 impl MessageExt for wa::Message {
     fn get_base_message(&self) -> &wa::Message {
         let mut current = self;
-        if let Some(dsm) = self.device_sent_message.as_option()
-            && let Some(msg) = dsm.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.ephemeral_message.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.view_once_message.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.view_once_message_v2.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.view_once_message_v2_extension.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.document_with_caption_message.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
-        }
-        if let Some(wrapper) = current.edited_message.as_option()
-            && let Some(msg) = wrapper.message.as_option()
-        {
-            current = msg;
+        for _ in 0..buffa::RECURSION_LIMIT {
+            macro_rules! peel {
+                ($field:ident) => {
+                    if let Some(inner) = current
+                        .$field
+                        .as_option()
+                        .and_then(|w| w.message.as_option())
+                    {
+                        current = inner;
+                        continue;
+                    }
+                };
+            }
+            for_each_base_wrapper!(peel);
+            break;
         }
         current
     }
 
     fn into_base_message(mut self) -> wa::Message {
-        macro_rules! peel_wrapper {
-            ($field:ident) => {
-                if let Some(mut wrapper) = self.$field.take() {
-                    if let Some(msg) = wrapper.message.take() {
-                        self = msg;
-                    } else {
-                        self.$field = buffa::MessageField::some(wrapper);
+        for _ in 0..buffa::RECURSION_LIMIT {
+            macro_rules! peel {
+                ($field:ident) => {
+                    if let Some(inner) = self.$field.as_option_mut().and_then(|w| w.message.take())
+                    {
+                        self = inner;
+                        continue;
                     }
-                }
-            };
+                };
+            }
+            for_each_base_wrapper!(peel);
+            break;
         }
-
-        peel_wrapper!(device_sent_message);
-        peel_wrapper!(ephemeral_message);
-        peel_wrapper!(view_once_message);
-        peel_wrapper!(view_once_message_v2);
-        peel_wrapper!(view_once_message_v2_extension);
-        peel_wrapper!(document_with_caption_message);
-        peel_wrapper!(edited_message);
         self
     }
 
