@@ -209,7 +209,26 @@ impl SenderKeyDeviceMap {
     /// so the two device lookups share a single outer (user-string) hash instead
     /// of re-hashing the user per call. A missing entry counts as cold.
     pub fn device_and_primary_warm(&self, user: &str, device: u16) -> bool {
-        let states = match self.devices.get(user) {
+        Self::bucket_device_and_primary_warm(self.devices.get(user), device)
+    }
+
+    pub(crate) fn consecutive_warm_device_lookup<'a>(&'a self) -> impl FnMut(&'a str, u16) -> bool {
+        let mut previous: Option<(&str, Option<&StoredDevices>)> = None;
+        move |user, device| {
+            let bucket = match previous {
+                Some((last, bucket)) if device != 0 && last == user => bucket,
+                _ => {
+                    let bucket = self.devices.get(user);
+                    previous = Some((user, bucket));
+                    bucket
+                }
+            };
+            Self::bucket_device_and_primary_warm(bucket, device)
+        }
+    }
+
+    fn bucket_device_and_primary_warm(bucket: Option<&StoredDevices>, device: u16) -> bool {
+        let states = match bucket {
             Some(DeviceBucket::One(state)) => {
                 return device == 0
                     && state.device_id == 0
@@ -457,6 +476,23 @@ mod tests {
             gen_before + 1,
             "a batch of flips bumps the generation exactly once"
         );
+    }
+
+    #[test]
+    fn consecutive_lookup_observes_primary_invalidation() {
+        let map = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:0@lid".to_owned(), true),
+            ("111:2@lid".to_owned(), true),
+            ("222:0@lid".to_owned(), true),
+        ]);
+        let mut is_warm = map.consecutive_warm_device_lookup();
+
+        assert!(is_warm("111", 2));
+        let primary = device_state(map.devices.get("111").unwrap().as_slice(), 0).unwrap();
+        primary.has_key.store(false, Ordering::Relaxed);
+        assert!(!is_warm("111", 2));
+        assert!(is_warm("222", 0));
+        assert!(!is_warm("111", 0));
     }
 
     #[test]

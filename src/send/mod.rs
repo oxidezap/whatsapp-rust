@@ -2061,6 +2061,7 @@ impl Client {
         cached_map: &crate::sender_key_device_cache::SenderKeyDeviceMap,
         own_sending_jid: &Jid,
     ) -> Vec<Jid> {
+        let mut is_warm = cached_map.consecutive_warm_device_lookup();
         let needs_skdm: Vec<Jid> = all_devices
             .iter()
             .filter(|device| {
@@ -2073,9 +2074,8 @@ impl Client {
                 // WA Web parity (ParticipantStore.js skDistribList): a device is
                 // warm only when it AND its primary (device 0) hold the key, so a
                 // forgotten primary redistributes the whole user while a forgotten
-                // companion redistributes only itself. One inner-map resolution
-                // per device (single user-string hash) instead of two.
-                !cached_map.device_and_primary_warm(&device.user, device.device)
+                // companion redistributes only itself.
+                !is_warm(&device.user, device.device)
             })
             .cloned()
             .collect();
