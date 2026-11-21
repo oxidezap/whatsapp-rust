@@ -81,15 +81,22 @@ impl<'a> Sub<&'a FieldElement51> for &FieldElement51 {
 impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
     type Output = FieldElement51;
 
+    fn mul(self, rhs: &'a FieldElement51) -> FieldElement51 {
+        self.mul_ladder(rhs)
+    }
+}
+
+impl FieldElement51 {
+    #[inline(always)]
     #[rustfmt::skip] // keep alignment of c* calculations
-    fn mul(self, _rhs: &'a FieldElement51) -> FieldElement51 {
+    pub(super) fn mul_ladder(&self, rhs: &Self) -> Self {
 
         #[inline(always)]
         fn m(x: u64, y: u64) -> u128 { (x as u128) * (y as u128) }
 
-        // Alias self, _rhs for more readable formulas
+        // Alias the operands for more readable formulas
         let a: &[u64; 5] = &self.0;
-        let b: &[u64; 5] = &_rhs.0;
+        let b: &[u64; 5] = &rhs.0;
 
         // Precondition: assume input limbs a[i], b[i] are bounded as
         //

@@ -257,6 +257,11 @@ impl FieldElement2625 {
         z
     }
 
+    #[inline]
+    pub(super) fn mul_ladder(&self, rhs: &Self) -> Self {
+        self * rhs
+    }
+
     pub(super) fn mul121666(&self) -> Self {
         // A factor in limb zero contributes one product to each output limb.
         Self::reduce(self.0.map(|limb| u64::from(limb) * 121666))
