@@ -538,6 +538,46 @@ async fn default_request_text_reply_quote_and_forward_preserve_their_preparation
 }
 
 #[tokio::test]
+async fn forwarding_an_album_child_sends_the_inner_image() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let chat: Jid = "120363000000000001@newsletter".parse().unwrap();
+    let mut body = wa::Message::default();
+    let image = body.image_message.get_or_insert_default();
+    image.caption = Some("album photo".into());
+    image.media_key = Some(vec![7; 32]);
+    let mut parent = wa::MessageKey::default();
+    parent.id = Some("album-parent".into());
+    let child = wacore::proto_helpers::wrap_as_album_child(body, parent);
+    let result = client.forward_message(&chat, &child).await.unwrap();
+    let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    let wire = waproto::codec::message_decode(
+        node.get()
+            .get_optional_child("plaintext")
+            .unwrap()
+            .content_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(&wire, &*result.message);
+    assert!(wire.associated_child_message.is_unset());
+    assert!(wire.message_context_info.message_association.is_unset());
+    let image = wire.image_message.as_option().unwrap();
+    assert_eq!(image.caption.as_deref(), Some("album photo"));
+    assert_eq!(image.media_key, Some(vec![7; 32]));
+    assert_eq!(image.context_info.is_forwarded, Some(true));
+    assert_eq!(image.context_info.forwarding_score, Some(0));
+    assert_eq!(
+        child
+            .message_context_info
+            .message_association
+            .parent_message_key
+            .id
+            .as_deref(),
+        Some("album-parent")
+    );
+}
+
+#[tokio::test]
 async fn invalid_request_targets_and_raw_ids_or_secrets_send_nothing() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let chat = Jid::pn("15550000001");

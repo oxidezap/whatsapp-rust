@@ -1,6 +1,7 @@
 //! Message classification: stanza/media type, ciphertext extraction, decrypt-fail gating.
 
 use super::*;
+use crate::proto_helpers::for_each_classified_fp_wrapper;
 
 /// Extract (enc_type, is_prekey, serialized) from a CiphertextMessage.
 pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool, Box<[u8]>)> {
@@ -15,41 +16,8 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
     }
 }
 
-/// The `FutureProofMessage` wrappers WA Web's `getUnwrappedProtobufMessage`
-/// traverses for classification. Single definition: [`unwrap_message`] and
-/// [`contains_group_history_payload`] both expand from here, so the two
-/// traversals cannot silently diverge.
-macro_rules! for_each_classified_fp_wrapper {
-    ($callback:ident) => {
-        $callback!(ephemeral_message);
-        $callback!(view_once_message);
-        $callback!(view_once_message_v2);
-        $callback!(view_once_message_v2_extension);
-        $callback!(document_with_caption_message);
-        $callback!(group_mentioned_message);
-        $callback!(bot_invoke_message);
-        $callback!(associated_child_message);
-        $callback!(poll_creation_option_image_message);
-        $callback!(event_cover_image);
-        $callback!(group_status_message);
-        $callback!(group_status_message_v2);
-        $callback!(group_status_mention_message);
-        $callback!(status_add_yours);
-        $callback!(status_mention_message);
-        $callback!(question_message);
-        $callback!(question_reply_message);
-        $callback!(spoiler_message);
-        $callback!(lottie_sticker_message);
-        $callback!(limit_sharing_message);
-        $callback!(newsletter_admin_profile_message);
-        $callback!(newsletter_admin_profile_message_v2);
-        $callback!(poll_creation_message_v4);
-        $callback!(bot_forwarded_message);
-    };
-}
-
 /// Every `FutureProofMessage` wrapper the current schema can nest a message
-/// in: the classification subset above plus the wrappers WA Web
+/// in: the shared classification subset plus the wrappers WA Web
 /// deliberately does not unwrap (`edited_message` is itself a signal
 /// callers may need). History detection traverses the full set: for the
 /// audience gate the safe direction is the superset. Adding a wrapper to
@@ -111,35 +79,32 @@ pub fn contains_group_history_payload(msg: &wa::Message) -> bool {
     false
 }
 
-/// Unwrap wrapper message types to reach the inner message.
-/// Matches WA Web's getUnwrappedProtobufMessage. Does not unwrap
-/// `edited_message`; that field is itself a signal callers may need.
-pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
-    macro_rules! try_unwrap_one {
-        ($field:ident) => {
-            if let Some(w) = msg.$field.as_option() {
-                if let Some(inner) = w.message.as_option() {
-                    return unwrap_message(inner);
+/// Follows classification wrappers before device-sent, preserving the edit
+/// envelope for callers that classify the edit itself. Walk iteratively so
+/// in-memory messages can reach the same leaf regardless of nesting depth.
+pub(crate) fn unwrap_message(mut msg: &wa::Message) -> &wa::Message {
+    loop {
+        macro_rules! try_unwrap_one {
+            ($field:ident) => {
+                if let Some(wrapper) = msg.$field.as_option()
+                    && let Some(inner) = wrapper.message.as_option()
+                {
+                    msg = inner;
+                    continue;
                 }
-            }
-        };
+            };
+        }
+        // WA Web's typeAttributeFromProtobuf re-checks bot_forwarded_message
+        // rather than classifying it, so the inner message decides the type — a
+        // botForwardedMessage carrying an imageMessage is type="media", not
+        // "text". Unwrapping here also reaches `mediaTypeFromProtobuf`, whose
+        // own list omits the wrapper: the same deliberate divergence #692 made
+        // for group_status_message_v2, and the one that delivers, because
+        // `media` with a mediatype renders and `media` without one does not.
+        for_each_classified_fp_wrapper!(try_unwrap_one);
+        try_unwrap_one!(device_sent_message);
+        return msg;
     }
-    // Remaining FutureProofMessage wrappers from WA Web's
-    // getUnwrappedProtobufMessage list; classify by the inner message.
-    // WA Web's typeAttributeFromProtobuf re-checks bot_forwarded_message
-    // rather than classifying it, so the inner message decides the type — a
-    // botForwardedMessage carrying an imageMessage is type="media", not
-    // "text". Unwrapping here also reaches `mediaTypeFromProtobuf`, whose
-    // own list omits the wrapper: the same deliberate divergence #692 made
-    // for group_status_message_v2, and the one that delivers, because
-    // `media` with a mediatype renders and `media` without one does not.
-    for_each_classified_fp_wrapper!(try_unwrap_one);
-    if let Some(dsm) = msg.device_sent_message.as_option()
-        && let Some(inner) = dsm.message.as_option()
-    {
-        return unwrap_message(inner);
-    }
-    msg
 }
 
 /// Matches WAWebE2EProtoUtils.typeAttributeFromProtobuf.

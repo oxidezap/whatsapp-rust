@@ -360,8 +360,7 @@ fn context_unwraps_only_once_for_late_or_absent_carriers() {
 }
 
 #[test]
-fn context_uses_existing_base_wrapper_order() {
-    // get_base_message does a single ordered pass, not arbitrary recursion.
+fn context_follows_device_sent_inside_ephemeral() {
     let mut inner = wa::Message::default();
     inner
         .poll_creation_message_v5
@@ -384,7 +383,44 @@ fn context_uses_existing_base_wrapper_order() {
         });
         proto
     };
-    assert!(message.get_base_message().device_sent_message.is_set());
-    assert!(message.context_info().is_none());
-    assert!(!message.is_forwarded());
+    assert_eq!(message.context_info(), Some(&context()));
+    assert!(message.is_forwarded());
+    assert_eq!(
+        message.get_base_message(),
+        &message.clone().into_base_message()
+    );
+}
+
+#[test]
+fn hd_image_child_exposes_the_media_caption_and_context() {
+    let mut body = wa::Message::default();
+    let image = body.image_message.get_or_insert_default();
+    image.caption = Some("original caption".into());
+    image.media_key = Some(vec![7; 32]);
+    image.context_info = buffa::MessageField::some(context());
+    let mut wrapped = wa::Message::default();
+    wrapped
+        .associated_child_message
+        .get_or_insert_default()
+        .message = buffa::MessageField::some(body);
+    let association = wrapped
+        .message_context_info
+        .get_or_insert_default()
+        .message_association
+        .get_or_insert_default();
+    association.association_type =
+        Some(wa::message_association::AssociationType::HD_IMAGE_DUAL_UPLOAD);
+    association.parent_message_key.get_or_insert_default().id = Some("sd-parent".into());
+
+    assert_eq!(wrapped.get_caption(), Some("original caption"));
+    assert_eq!(wrapped.context_info(), Some(&context()));
+    assert!(wrapped.is_forwarded());
+    assert!(wrapped.mentions_any_bot());
+    let recaptioned = wrapped.media_with_caption("new caption").unwrap();
+    assert_eq!(recaptioned.get_caption(), Some("new caption"));
+    assert_eq!(
+        recaptioned.image_message.as_option().unwrap().media_key,
+        Some(vec![7; 32])
+    );
+    assert_eq!(wrapped.get_caption(), Some("original caption"));
 }
