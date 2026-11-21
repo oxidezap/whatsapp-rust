@@ -1799,16 +1799,14 @@ impl Client {
         // contacts, each a cold-cache DB read). Stream over indices and rebuild
         // `resolved` in order — assemble_status_participants is position-sensitive.
         const STATUS_LID_RESOLVE_CONCURRENCY: usize = 16;
-        let resolved_indexed: Vec<(usize, Option<Jid>)> =
-            futures::stream::iter(0..recipients.len())
-                .map(|i| async move { (i, self.resolve_recipient_to_lid(&recipients[i]).await) })
-                .buffer_unordered(STATUS_LID_RESOLVE_CONCURRENCY)
-                .collect()
-                .await;
+        let resolved_indexed = futures::stream::iter(0..recipients.len())
+            .map(|i| async move { (i, self.resolve_recipient_to_lid(&recipients[i]).await) })
+            .buffer_unordered(STATUS_LID_RESOLVE_CONCURRENCY);
+        futures::pin_mut!(resolved_indexed);
         let mut resolved: Vec<Option<Jid>> = vec![None; recipients.len()];
         let mut lid_to_pn_map: HashMap<wacore_binary::CompactString, Jid> =
             HashMap::with_capacity(recipients.len() + 1);
-        for (i, lid) in resolved_indexed {
+        while let Some((i, lid)) = resolved_indexed.next().await {
             if let Some(lid_jid) = lid {
                 if recipients[i].is_pn() {
                     lid_to_pn_map.insert(lid_jid.user.clone(), recipients[i].to_non_ad());
