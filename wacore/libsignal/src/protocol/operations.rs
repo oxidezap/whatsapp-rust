@@ -25,7 +25,7 @@ pub struct DecryptionResult {
 // Keep this storage transition out of their otherwise specialized state machines.
 #[inline(never)]
 async fn commit_received_session<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Sized>(
-    mut checkout: SessionCheckout<'_, S>,
+    checkout: &mut SessionCheckout<'_, S>,
     candidate: SessionRecord,
     address: &ProtocolAddress,
     identities: &mut I,
@@ -46,7 +46,7 @@ async fn commit_received_session<S: SessionStore + ?Sized, I: IdentityKeyStore +
     let change = save_identity(identities, address, &remote).await?;
     // The original session remains recoverable until the identity step succeeds.
     *checkout.record_mut() = candidate;
-    checkout.commit_received(consumed_prekey).await?;
+    checkout.commit_received_in_place(consumed_prekey).await?;
     Ok(change)
 }
 pub async fn process_prekey_bundle<
@@ -263,7 +263,7 @@ async fn message_encrypt_using<
         }
     };
     let message = finish(bytes, prekey)?;
-    checkout.commit().await?;
+    checkout.commit_received_in_place(None).await?;
     Ok(message)
 }
 #[allow(clippy::too_many_arguments)]
@@ -782,7 +782,7 @@ async fn message_decrypt_signal_using<
     identities: &mut I,
     rng: &mut R,
 ) -> Result<DecryptionResult> {
-    let checkout = SessionCheckout::load(sessions, address)
+    let mut checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     let mut candidate = checkout.record().clone();
@@ -795,7 +795,7 @@ async fn message_decrypt_signal_using<
         .map_err(|error| {
             message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
         })?;
-    commit_received_session(checkout, candidate, address, identities, None).await?;
+    commit_received_session(&mut checkout, candidate, address, identities, None).await?;
     Ok(DecryptionResult {
         plaintext,
         consumed_prekey_id: None,
@@ -926,7 +926,7 @@ async fn message_decrypt_prekey_using<
             "post-quantum ratchet unsupported".into(),
         ));
     }
-    let checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
+    let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
     let mut candidate = checkout.record().clone();
     let mut random = RandomAdapter(rng);
     let mut engine = engine::Engine::new(&crypto, &mut random);
@@ -972,9 +972,14 @@ async fn message_decrypt_prekey_using<
             })?
     };
     let consumed_prekey_id = if existing { None } else { message.pre_key_id() };
-    let stored_change =
-        commit_received_session(checkout, candidate, address, identities, consumed_prekey_id)
-            .await?;
+    let stored_change = commit_received_session(
+        &mut checkout,
+        candidate,
+        address,
+        identities,
+        consumed_prekey_id,
+    )
+    .await?;
     Ok(DecryptionResult {
         plaintext,
         consumed_prekey_id,
