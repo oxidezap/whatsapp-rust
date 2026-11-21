@@ -184,8 +184,10 @@ impl PreKeyTable {
         // A distinct batch can overwrite at most the number of existing rows.
         // Exclude ids covered by the dense run before reserving the sparse map.
         if keys.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            let sparse_keys = match self.runs.as_slice() {
-                [run] if matches!(&run.records, PreKeyRecords::Slices(_)) => keys
+            // A slice-backed run can only be installed into an empty table.
+            // Later runs are packed, so only the first run can absorb overwrites.
+            let sparse_keys = match self.runs.first() {
+                Some(run) if matches!(&run.records, PreKeyRecords::Slices(_)) => keys
                     .iter()
                     .filter(|(id, _)| run.index(*id).is_none())
                     .count(),
@@ -2706,6 +2708,24 @@ mod tests {
         }
         assert_eq!(packed.runs.len(), 1);
         assert_eq!(packed.max_id(), 800);
+    }
+
+    #[test]
+    fn replaying_a_slice_run_after_a_packed_refill_does_not_reserve_sparse_rows() {
+        let mut table = PreKeyTable::default();
+        let keys: Vec<_> = (1..=64)
+            .map(|id| (id, Bytes::from_static(b"old")))
+            .collect();
+        table.insert_batch(&keys);
+        let refill =
+            PackedPreKeys::new(65, Bytes::from_static(&[1; 64]), (1..=64).collect()).unwrap();
+        table.insert_packed(refill);
+        assert_eq!(table.runs.len(), 2);
+        table.insert_batch(&keys);
+        assert_eq!(table.sparse.capacity(), 0);
+        table.insert_batch(&[(65, Bytes::from_static(b"new"))]);
+        assert_eq!(table.get(65).as_deref(), Some(b"new".as_slice()));
+        assert_eq!(table.len(), 128);
     }
 
     #[tokio::test]
