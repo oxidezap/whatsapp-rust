@@ -609,11 +609,9 @@ struct UserIndexedCache<V> {
     /// written" from "written, flushed, and evicted": a clean removal keeps the
     /// incarnation, so its pre-write bytes would be trusted as an exact reload.
     removal_seq: u64,
-    /// The last `RECENT_REMOVALS` removals, newest last, so a reader can ask
-    /// about its own key rather than about cache-wide churn. A fixed window
-    /// needs no per-reader registration, so a cancelled read leaves nothing
-    /// behind; a reader older than the window is told "removed" instead.
-    recent_removals: VecDeque<(u64, Arc<str>)>,
+    /// Contiguous fingerprints since the last opaque removal, newest last.
+    /// A hash collision forces a re-read, just as aging past the window does.
+    recent_removals: VecDeque<u64>,
     /// Sequence of the last removal that could not name its keys (`clear`,
     /// `retain`), which invalidates every reader older than it.
     opaque_removal_seq: u64,
@@ -661,25 +659,34 @@ impl<V> UserIndexedCache<V> {
         if self.opaque_removal_seq > since {
             return true;
         }
-        if self.removal_seq.saturating_sub(since) > RECENT_REMOVALS as u64 {
+        let elapsed = self.removal_seq.saturating_sub(since);
+        if elapsed > RECENT_REMOVALS as u64 {
             return true;
         }
+        if elapsed == 0 {
+            return false;
+        }
+        let fingerprint = fingerprint_hasher().hash_one(key);
         self.recent_removals
             .iter()
-            .any(|(seq, removed)| *seq > since && removed.as_ref() == key)
+            .rev()
+            .take(elapsed as usize)
+            .any(|&removed| removed == fingerprint)
     }
 
-    fn note_removal(&mut self, key: Arc<str>) {
+    fn note_removal(&mut self, key: &str) {
         self.removal_seq += 1;
         if self.recent_removals.len() == RECENT_REMOVALS {
             self.recent_removals.pop_front();
         }
-        self.recent_removals.push_back((self.removal_seq, key));
+        self.recent_removals
+            .push_back(fingerprint_hasher().hash_one(key));
     }
 
     fn note_opaque_removal(&mut self) {
         self.removal_seq += 1;
         self.opaque_removal_seq = self.removal_seq;
+        self.recent_removals.clear();
     }
 
     fn has_user(&self, user: &str) -> bool {
@@ -710,9 +717,7 @@ impl<V> UserIndexedCache<V> {
     }
 
     /// Retained bytes of everything this cache allocates except the entry
-    /// payloads: the primary map's buckets, the user index, the removal ring,
-    /// and the removal window's keys — which outlive the entries they name and
-    /// so are owned solely here.
+    /// payloads: the primary map's buckets, the user index and the removal ring.
     ///
     /// Slots, not entries: a `HashMap` holding n entries owns more buckets than
     /// n (see [`crate::stats::hash_table_bytes`]), and it is the buckets the
@@ -720,12 +725,7 @@ impl<V> UserIndexedCache<V> {
     fn overhead_bytes(&self) -> usize {
         crate::stats::hash_table_bytes(self.map.capacity(), size_of::<(Arc<str>, V)>())
             + crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
-            + self.recent_removals.capacity() * size_of::<(u64, Arc<str>)>()
-            + self
-                .recent_removals
-                .iter()
-                .map(|(_, key)| key.len())
-                .sum::<usize>()
+            + self.recent_removals.capacity() * size_of::<u64>()
     }
 
     fn get(&self, key: &str) -> Option<&V> {
@@ -745,9 +745,7 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn remove(&mut self, key: &str) -> Option<V> {
-        let (key, value) = self.map.remove_entry(key)?;
-        // Reuses the map's own `Arc<str>`, so recording a removal allocates
-        // nothing.
+        let value = self.map.remove(key)?;
         self.note_removal(key);
         Some(value)
     }
@@ -3102,11 +3100,6 @@ impl SignalStoreCache {
     /// shares that key, which `key_for` canonicalizes, so it is charged once).
     /// Its entry count includes those pending-only addresses.
     ///
-    /// One residual overlap is accepted rather than tracked: an address
-    /// evicted while still pending is charged both as a pending-only key and
-    /// in the removal window that named it. That window holds 64 entries,
-    /// which bounds the overstatement to a handful of addresses — cheaper to
-    /// state than to reconcile on a report that is an estimate by contract.
     pub async fn memory_stats(
         &self,
     ) -> (
@@ -8464,6 +8457,26 @@ mod cold_read_race_tests {
             40,
             "an unnamed removal must still reject bytes that predate the write"
         );
+    }
+
+    #[test]
+    fn an_opaque_removal_restarts_the_window_for_later_readers() {
+        let mut cache = UserIndexedCache::new();
+        let old = Arc::<str>::from("19995553008.0");
+        let other = Arc::<str>::from("19995553009.0");
+        cache.insert(Arc::clone(&old), ());
+        let before = cache.removal_seq();
+        cache.remove(&old);
+        assert_eq!(Arc::strong_count(&old), 1);
+        cache.insert(Arc::clone(&other), ());
+        cache.clear();
+        let after_clear = cache.removal_seq();
+        cache.insert(Arc::clone(&other), ());
+        cache.remove(&other);
+        assert!(cache.removed_since(&old, before));
+        assert!(!cache.removed_since(&old, after_clear));
+        assert!(cache.removed_since(&other, after_clear));
+        assert!(!cache.removed_since(&other, cache.removal_seq()));
     }
 
     /// A reader older than the retained window gets "removed" without its key

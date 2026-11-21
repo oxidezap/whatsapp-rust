@@ -124,3 +124,29 @@ fn address_keyed_map_probe(bencher: divan::Bencher, fanout: usize) {
         black_box(sum)
     });
 }
+
+#[divan::bench(args = [64, 256])]
+fn cold_session_cache_churn(bencher: divan::Bencher, capacity: usize) {
+    use futures::executor::block_on;
+    use wacore::store::InMemoryBackend;
+
+    let probes = addresses(1024, 0);
+    bencher
+        .with_inputs(|| {
+            (
+                SignalStoreCache::with_max_entries(capacity),
+                InMemoryBackend::new(),
+            )
+        })
+        .bench_refs(|(cache, backend)| {
+            block_on(async {
+                for address in &probes {
+                    let present = cache
+                        .has_session(black_box(address), backend)
+                        .await
+                        .expect("probe cold session");
+                    assert!(!present);
+                }
+            });
+        });
+}
