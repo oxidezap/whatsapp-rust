@@ -157,8 +157,7 @@ jobs:
             client: true
             packages: -p whatsapp-rust
             features: --features bench-harness
-            # Serialize thin-LTO builds to leave headroom on the hosted runner.
-            build_flags: --jobs 1
+            build_flags: --jobs 2
     steps:
       - uses: actions/checkout@v7
         with:
