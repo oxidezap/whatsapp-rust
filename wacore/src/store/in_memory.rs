@@ -374,7 +374,7 @@ type MsgSecretRow = (MessageSecretBytes, i64, i64);
 struct MsgSecretKey {
     chat: Arc<str>,
     sender: Arc<str>,
-    msg_id: Arc<str>,
+    msg_id: wacore_binary::CompactString,
 }
 
 #[derive(Hash)]
@@ -388,7 +388,7 @@ impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
     fn equivalent(&self, key: &MsgSecretKey) -> bool {
         self.chat == key.chat.as_ref()
             && self.sender == key.sender.as_ref()
-            && self.msg_id == key.msg_id.as_ref()
+            && self.msg_id == key.msg_id.as_str()
     }
 }
 
@@ -404,7 +404,7 @@ type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 #[derive(Eq, PartialEq)]
 struct MsgGroupKey {
     chat: Arc<str>,
-    msg_id: Arc<str>,
+    msg_id: wacore_binary::CompactString,
 }
 
 impl Hash for MsgGroupKey {
@@ -426,7 +426,7 @@ impl Hash for MsgGroupKeyRef<'_> {
 
 impl Equivalent<MsgGroupKey> for MsgGroupKeyRef<'_> {
     fn equivalent(&self, key: &MsgGroupKey) -> bool {
-        self.chat == key.chat.as_ref() && self.msg_id == key.msg_id.as_ref()
+        self.chat == key.chat.as_ref() && self.msg_id == key.msg_id.as_str()
     }
 }
 
@@ -1785,7 +1785,7 @@ impl MsgSecretStore for InMemoryBackend {
                 let key = MsgSecretKey {
                     chat: entry.chat,
                     sender: entry.sender,
-                    msg_id: entry.msg_id,
+                    msg_id: wacore_binary::CompactString::from(entry.msg_id.as_ref()),
                 };
                 match state.msg_secrets.entry(key) {
                     Entry::Occupied(mut occupied) => {
@@ -2026,7 +2026,9 @@ impl DeviceStore for InMemoryBackend {
         let mut conversations: std::collections::HashSet<*const u8> =
             std::collections::HashSet::new();
         for key in state.msg_secrets.keys() {
-            bytes += key.msg_id.len();
+            if key.msg_id.is_heap_allocated() {
+                bytes += key.msg_id.capacity();
+            }
             for shared in [&key.chat, &key.sender] {
                 if conversations.insert(shared.as_ptr()) {
                     bytes += shared.len();
@@ -2162,7 +2164,7 @@ fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
             bucket.insert(
                 MsgGroupKey {
                     chat: Arc::clone(&key.chat),
-                    msg_id: Arc::clone(&key.msg_id),
+                    msg_id: key.msg_id.clone(),
                 },
                 1,
             );
@@ -3693,7 +3695,7 @@ mod tests {
             let mut retained: Vec<_> = state
                 .msg_secrets
                 .keys()
-                .map(|key| key.msg_id.as_ref())
+                .map(|key| key.msg_id.as_str())
                 .collect();
             retained.sort_unstable();
             let expected: Vec<_> = (total - len..total).map(|i| format!("m{i:07}")).collect();
