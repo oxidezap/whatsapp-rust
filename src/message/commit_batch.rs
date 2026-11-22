@@ -1006,6 +1006,7 @@ impl Client {
         &self,
         item: PendingDelivery,
         track_commit: bool,
+        retained_wire_bytes: Option<usize>,
     ) -> (Option<u64>, Option<InboundCommitTicket>) {
         let batcher = &self.inbound_commit_batch;
         let mut state = batcher.lock();
@@ -1025,7 +1026,7 @@ impl Client {
             });
             return (None, ticket);
         }
-        state.bytes += item.retained_wire_bytes();
+        state.bytes += retained_wire_bytes.unwrap_or_else(|| item.retained_wire_bytes());
         state.entries.push(item);
         let ticket = track_commit.then(|| {
             state
@@ -1221,15 +1222,21 @@ impl Client {
         track_commit: bool,
     ) -> InboundCommitState {
         let durable = self.inbound_journal_enabled();
-        if durable
-            && let Err(error) = self
+        let retained_wire_bytes = if durable {
+            match self
                 .inbound_commit_batch
                 .live_retention
                 .prepare_delivery(&mut item, self.inbound_commit_batch.is_active())
-        {
-            log::warn!("Retention admission refused: {error:?}");
-            return InboundCommitState::Failed;
-        }
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!("Retention admission refused: {error:?}");
+                    return InboundCommitState::Failed;
+                }
+            }
+        } else {
+            None
+        };
         if !self.inbound_commit_batch.is_active() {
             let items = if durable {
                 let owned = match self
@@ -1273,7 +1280,8 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
-        let (timer_epoch, ticket) = self.enqueue_inbound_commit(item, track_commit);
+        let (timer_epoch, ticket) =
+            self.enqueue_inbound_commit(item, track_commit, retained_wire_bytes);
         if let Some(epoch) = timer_epoch {
             // Weak: a sleeper must not keep the whole Client graph alive for
             // up to 3s after the app drops its handle.
@@ -2793,6 +2801,7 @@ mod tests {
             let _ = client.enqueue_inbound_commit(
                 PendingDelivery::from(item("DEVICE_NOTIFY_PENDING")),
                 false,
+                None,
             );
             let mut details = wa::ADVKeyIndexList::default();
             details.raw_id = Some(1);
