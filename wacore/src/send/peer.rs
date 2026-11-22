@@ -121,9 +121,9 @@ where
     }
 
     let encrypted_message =
-        message_encrypt(&plaintext, signal_address, session_store, identity_store).await?;
+        crate::libsignal::protocol::message_encrypt_serialized(&plaintext, signal_address, session_store, identity_store).await?;
 
-    let (enc_type, is_prekey, serialized_bytes) = extract_ciphertext(encrypted_message)
+    let (enc_type, is_prekey, serialized_bytes) = extract_serialized_ciphertext(encrypted_message)
         .ok_or_else(|| anyhow!("Unexpected peer encryption message type"))?;
 
     let enc_node = NodeBuilder::new("enc")

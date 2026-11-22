@@ -16,6 +16,21 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
     }
 }
 
+/// Extract (enc_type, is_prekey, serialized_vec) from a SerializedCiphertext without intermediate allocations.
+pub fn extract_serialized_ciphertext(
+    msg: SerializedCiphertext,
+) -> Option<(&'static str, bool, Vec<u8>)> {
+    match msg.message_type() {
+        crate::libsignal::protocol::CiphertextMessageType::Whisper => {
+            Some((stanza::ENC_TYPE_MSG, false, msg.into_serialized()))
+        }
+        crate::libsignal::protocol::CiphertextMessageType::PreKey => {
+            Some((stanza::ENC_TYPE_PKMSG, true, msg.into_serialized()))
+        }
+        _ => None,
+    }
+}
+
 /// Every `FutureProofMessage` wrapper the current schema can nest a message
 /// in: the shared classification subset plus the wrappers WA Web
 /// deliberately does not unwrap (`edited_message` is itself a signal
