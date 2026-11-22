@@ -40,7 +40,6 @@ fn pack_contact_hash(hash: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, hash[0], hash[1], hash[2]])
 }
 
-#[cfg(not(target_pointer_width = "64"))]
 #[inline]
 fn contact_hash_key(user: &str) -> u32 {
     pack_contact_hash(wacore::crypto::contact_notification_hash(user))
@@ -65,7 +64,22 @@ struct CachedMapping {
 
 impl From<LidPnEntry> for CachedMapping {
     fn from(entry: LidPnEntry) -> Self {
-        Self::new(entry, false, None, None)
+        #[cfg(target_pointer_width = "64")]
+        {
+            Self {
+                lid: entry.lid,
+                phone_number: entry.phone_number,
+                created_at: entry.created_at,
+                learning_source: entry.learning_source,
+                persisted: AtomicBool::new(false),
+                lid_hash: [0; 3],
+                phone_hash: [0; 3],
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            Self::new(entry, false, None, None)
+        }
     }
 }
 
@@ -81,14 +95,14 @@ impl CachedMapping {
         Self {
             #[cfg(target_pointer_width = "64")]
             lid_hash: previous_lid
-                .filter(|previous| previous.lid == entry.lid)
+                .filter(|previous| previous.lid_hash != [0; 3] && previous.lid == entry.lid)
                 .map_or_else(
                     || wacore::crypto::contact_notification_hash(&entry.lid),
                     |previous| previous.lid_hash,
                 ),
             #[cfg(target_pointer_width = "64")]
             phone_hash: previous_pn
-                .filter(|previous| previous.phone_number == entry.phone_number)
+                .filter(|previous| previous.phone_hash != [0; 3] && previous.phone_number == entry.phone_number)
                 .map_or_else(
                     || wacore::crypto::contact_notification_hash(&entry.phone_number),
                     |previous| previous.phone_hash,
@@ -104,7 +118,11 @@ impl CachedMapping {
     fn lid_hash_key(&self) -> u32 {
         #[cfg(target_pointer_width = "64")]
         {
-            pack_contact_hash(self.lid_hash)
+            if self.lid_hash != [0; 3] {
+                pack_contact_hash(self.lid_hash)
+            } else {
+                contact_hash_key(&self.lid)
+            }
         }
         #[cfg(not(target_pointer_width = "64"))]
         {
@@ -115,7 +133,11 @@ impl CachedMapping {
     fn phone_hash_key(&self) -> u32 {
         #[cfg(target_pointer_width = "64")]
         {
-            pack_contact_hash(self.phone_hash)
+            if self.phone_hash != [0; 3] {
+                pack_contact_hash(self.phone_hash)
+            } else {
+                contact_hash_key(&self.phone_number)
+            }
         }
         #[cfg(not(target_pointer_width = "64"))]
         {
