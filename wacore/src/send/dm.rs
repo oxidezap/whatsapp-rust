@@ -658,8 +658,13 @@ where
         );
     }
 
-    let encrypted =
-        crate::libsignal::protocol::message_encrypt_serialized(&plaintext, &signal_address, session_store, identity_store).await?;
+    let encrypted = crate::libsignal::protocol::message_encrypt_serialized(
+        &plaintext,
+        &signal_address,
+        session_store,
+        identity_store,
+    )
+    .await?;
 
     let (enc_type, is_prekey, serialized) = extract_serialized_ciphertext(encrypted)
         .ok_or_else(|| anyhow!("Unexpected encryption message type for pairwise retry"))?;
