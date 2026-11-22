@@ -99,8 +99,11 @@ impl PendingDelivery {
         })
     }
     pub fn retained_wire_bytes(&self) -> usize {
-        waproto::codec::message_encoded_len(&self.message)
-            .saturating_add(self.carrier.as_ref().map_or(0, |(_, bytes)| bytes.len()))
+        self.wire_bytes_with_message_size(waproto::codec::message_encoded_len(&self.message))
+    }
+
+    pub(super) fn wire_bytes_with_message_size(&self, message_size: usize) -> usize {
+        message_size.saturating_add(self.carrier.as_ref().map_or(0, |(_, bytes)| bytes.len()))
     }
 }
 

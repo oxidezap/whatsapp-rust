@@ -99,8 +99,15 @@ impl Clone for RetainedDelivery {
 
 impl RetainedDelivery {
     #[inline(never)]
-    fn new(item: &PendingDelivery, charge: &Arc<Charge>) -> Self {
-        let encoded = waproto::codec::message_to_vec(&item.message);
+    fn new(
+        item: &PendingDelivery,
+        charge: &Arc<Charge>,
+        message_size: usize,
+        cache: &mut buffa::SizeCache,
+    ) -> Self {
+        let mut encoded = Vec::with_capacity(message_size);
+        waproto::codec::message_write_to(&item.message, cache, &mut encoded);
+        debug_assert_eq!(encoded.len(), message_size);
         let projection = match &item.carrier {
             Some((_, original)) if original.as_ref() == encoded => original.clone(),
             _ => encoded.into(),
@@ -461,7 +468,7 @@ impl LiveRetention {
         &self,
         item: &mut PendingDelivery,
         draining: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<usize>> {
         if item.receipt.is_none() {
             item.receipt = self.receipt_for(&item.info);
         }
@@ -472,14 +479,18 @@ impl LiveRetention {
                 origin_charge.or_else(|| item.receipt.as_ref().and_then(|scope| scope.admission()));
         }
         if !draining || admitted_origin {
-            self.retain(item)?;
+            return self.retain(item).map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
-    pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<()> {
-        let retained_bytes = item
-            .retained_wire_bytes()
+    pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<usize> {
+        let mut cache = buffa::SizeCache::new();
+        let message_size = waproto::codec::message_compute_size(&item.message, &mut cache);
+        buffa::checked_encode_size(message_size as u32)
+            .unwrap_or_else(|_| buffa::encode_size_overflow());
+        let wire_bytes = item.wire_bytes_with_message_size(message_size);
+        let retained_bytes = wire_bytes
             .checked_add(
                 item.comment_target
                     .as_ref()
@@ -504,7 +515,7 @@ impl LiveRetention {
                 "live delivery has a different reservation owner"
             );
             item.retention = Some(Arc::clone(&reservation.charge));
-            return Ok(());
+            return Ok(wire_bytes);
         }
         let index = item.origin.and_then(|origin| {
             state
@@ -554,7 +565,7 @@ impl LiveRetention {
             .iter()
             .any(|entry| same_entry(entry, item))
         {
-            return Ok(());
+            return Ok(wire_bytes);
         }
         let used = reservation
             .entries
@@ -605,10 +616,13 @@ impl LiveRetention {
         if reservation.single_slot && reservation.entries.capacity() == 0 {
             reservation.entries.reserve_exact(1);
         }
-        reservation
-            .entries
-            .push(RetainedDelivery::new(item, &reservation.charge));
-        Ok(())
+        reservation.entries.push(RetainedDelivery::new(
+            item,
+            &reservation.charge,
+            message_size,
+            &mut cache,
+        ));
+        Ok(wire_bytes)
     }
     #[cfg(test)]
     pub fn occupy_remaining_for_tests(&self) -> Arc<Charge> {
