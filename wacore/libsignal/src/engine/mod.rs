@@ -60,14 +60,32 @@ impl<'a, C: CryptoProvider, R: RandomSource> Engine<'a, C, R> {
         Self { crypto, random }
     }
     pub fn generate_key_pair(&mut self) -> Result<KeyPair> {
-        let mut private = [0; 32];
-        self.random.fill(&mut private)?;
-        private[0] &= 248;
-        private[31] = (private[31] & 127) | 64;
+        let private = self.generate_private_key()?;
         Ok(KeyPair {
             public: self.crypto.public_key(&private)?,
             private,
         })
+    }
+    /// Generate a ratchet key pair and run the root KDF step with its
+    /// agreement against `remote`. Returns the key pair, next root and chain.
+    pub(crate) fn fresh_root_step(
+        &mut self,
+        root: &[u8; 32],
+        remote: &[u8; 32],
+    ) -> Result<(KeyPair, [u8; 32], [u8; 32])> {
+        let private = self.generate_private_key()?;
+        let (public, shared) = self.crypto.public_key_and_agreement(&private, remote)?;
+        let fresh = KeyPair { public, private };
+        let shared = zeroize::Zeroizing::new(shared);
+        let (next_root, chain) = crypto::root_step_from_shared(self.crypto, root, &shared)?;
+        Ok((fresh, next_root, chain))
+    }
+    fn generate_private_key(&mut self) -> Result<[u8; 32]> {
+        let mut private = [0; 32];
+        self.random.fill(&mut private)?;
+        private[0] &= 248;
+        private[31] = (private[31] & 127) | 64;
+        Ok(private)
     }
 }
 

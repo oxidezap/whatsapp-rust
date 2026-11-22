@@ -12,6 +12,15 @@ pub trait RandomSource {
 pub trait CryptoProvider {
     fn public_key(&self, private: &[u8; 32]) -> Result<[u8; 32]>;
     fn agreement(&self, private: &[u8; 32], public: &[u8; 32]) -> Result<[u8; 32]>;
+    /// Return `public_key(private)` and `agreement(private, public)`.
+    /// Providers can override this to share work between the two.
+    fn public_key_and_agreement(
+        &self,
+        private: &[u8; 32],
+        public: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32])> {
+        Ok((self.public_key(private)?, self.agreement(private, public)?))
+    }
     fn sign(
         &self,
         private: &[u8; 32],
@@ -66,11 +75,19 @@ pub(crate) fn root_step<C: CryptoProvider>(
     public: &[u8; 32],
 ) -> Result<([u8; 32], [u8; 32])> {
     let shared = crypto.agreement(private, public)?;
+    root_step_from_shared(crypto, root, &shared)
+}
+/// [`root_step`] for a `shared` secret that was already agreed.
+pub(crate) fn root_step_from_shared<C: CryptoProvider>(
+    crypto: &C,
+    root: &[u8; 32],
+    shared: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32])> {
     if bool::from(shared.ct_eq(&[0; 32])) {
         return Err(Error::Crypto);
     }
     let mut material = [0; 64];
-    crypto.hkdf_sha256(root, &shared, b"WhisperRatchet", &mut material)?;
+    crypto.hkdf_sha256(root, shared, b"WhisperRatchet", &mut material)?;
     let mut next_root = [0; 32];
     let mut chain = [0; 32];
     next_root.copy_from_slice(&material[..32]);

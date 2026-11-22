@@ -102,13 +102,8 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             pairs.push((&p.base_key.private, public));
         }
         let (root, initial_chain) = initial_secrets(self.crypto, &pairs)?;
-        let ratchet = self.generate_key_pair()?;
-        let (next_root, sending) = root_step(
-            self.crypto,
-            &root,
-            &ratchet.private,
-            &p.remote_signed_pre_key,
-        )?;
+        let (ratchet, next_root, sending) =
+            self.fresh_root_step(&root, &p.remote_signed_pre_key)?;
         let mut session = state(
             &p.local_identity,
             p.remote_identity,
@@ -492,9 +487,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         if let Some(root) = receiving_root {
             // Failed archive candidates do not need a fresh reply key or a
             // second DH calculation. Authenticate before preparing either.
-            let fresh = self.generate_key_pair()?;
-            let (next_root, sending) =
-                root_step(self.crypto, &root, &fresh.private, &message.ratchet)?;
+            let (fresh, next_root, sending) = self.fresh_root_step(&root, &message.ratchet)?;
             session.previous_counter = session
                 .sender
                 .as_ref()
