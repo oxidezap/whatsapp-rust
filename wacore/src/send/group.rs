@@ -514,7 +514,7 @@ pub async fn prepare_group_stanza_resolved(
                     if !participant_nodes.is_empty() {
                         message_children.push(
                             NodeBuilder::new("participants")
-                                .children(participant_nodes)
+                                .children_vec(participant_nodes)
                                 .build(),
                         );
                         let device_identity = match distribution_policy {
@@ -646,7 +646,7 @@ pub async fn prepare_group_stanza_resolved(
     // Add any extra stanza nodes provided by the caller
     message_children.extend(extra_stanza_nodes.iter().cloned());
 
-    let stanza = stanza_builder.children(message_children).build();
+    let stanza = stanza_builder.children_vec(message_children).build();
 
     let stale_users = stale_users_for(
         had_unregistered_devices,

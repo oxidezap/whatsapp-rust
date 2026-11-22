@@ -154,5 +154,5 @@ where
         stanza_builder = stanza_builder.attr("privacy_sensitive", privacy_sensitive.as_str());
     }
 
-    Ok(stanza_builder.children(children).build())
+    Ok(stanza_builder.children_vec(children).build())
 }

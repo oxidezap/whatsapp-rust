@@ -46,6 +46,11 @@ impl NodeBuilder {
         self
     }
 
+    pub fn children_vec(mut self, children: Vec<Node>) -> Self {
+        self.content = Some(NodeContent::Nodes(children));
+        self
+    }
+
     pub fn bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.content = Some(NodeContent::Bytes(bytes.into()));
         self

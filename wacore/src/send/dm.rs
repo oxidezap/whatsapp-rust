@@ -406,7 +406,7 @@ pub async fn prepare_dm_stanza(
     let mut message_content_nodes = Vec::with_capacity(3 + extra_stanza_nodes.len());
     message_content_nodes.push(
         NodeBuilder::new("participants")
-            .children(participant_nodes)
+            .children_vec(participant_nodes)
             .build(),
     );
 
@@ -449,7 +449,7 @@ pub async fn prepare_dm_stanza(
         stanza_builder = stanza_builder.attr("edit", edit_attr.to_string_val());
     }
 
-    let stanza = stanza_builder.children(message_content_nodes).build();
+    let stanza = stanza_builder.children_vec(message_content_nodes).build();
 
     Ok(PreparedDmStanza {
         node: stanza,
