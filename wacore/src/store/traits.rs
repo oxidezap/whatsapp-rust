@@ -83,6 +83,25 @@ impl PackedPreKeys {
         !removed
     }
 
+    pub(crate) fn compact_sparse_payload(&mut self) {
+        let live_bytes = self.records().map(|(_, record)| record.len()).sum();
+        if live_bytes > self.bytes.len() / 2 {
+            return;
+        }
+        let mut payload = Vec::with_capacity(live_bytes);
+        let mut start = 0;
+        for marker in &mut self.ends {
+            let end = (*marker & !Self::REMOVED) as usize;
+            let removed = *marker & Self::REMOVED;
+            if removed == 0 {
+                payload.extend_from_slice(&self.bytes[start..end]);
+            }
+            *marker = payload.len() as u32 | removed;
+            start = end;
+        }
+        self.bytes = Bytes::from(payload);
+    }
+
     pub(crate) fn last_present(&self) -> Option<usize> {
         self.ends.iter().rposition(|end| end & Self::REMOVED == 0)
     }

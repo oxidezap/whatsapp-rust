@@ -103,3 +103,29 @@ fn store_packed_prekey_upload(bencher: Bencher, refill: bool) {
             black_box(backend)
         });
 }
+
+#[divan::bench]
+fn consume_packed_prekey_run(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            let backend = InMemoryBackend::new();
+            let bytes = Bytes::from(vec![7u8; CONNECT_BATCH * RECORD_LEN]);
+            let ends = (1..=CONNECT_BATCH)
+                .map(|n| (n * RECORD_LEN) as u32)
+                .collect();
+            let packed = wacore::store::traits::PackedPreKeys::new(1, bytes, ends)
+                .expect("valid packed batch");
+            block_on(backend.store_packed_prekeys(packed, true)).expect("store packed batch");
+            backend
+        })
+        .bench_refs(|backend| {
+            block_on(async {
+                for id in 1..=(CONNECT_BATCH - CONNECT_BATCH / 8) as u32 {
+                    backend
+                        .remove_prekey(id)
+                        .await
+                        .expect("consume packed prekey");
+                }
+            });
+        });
+}
