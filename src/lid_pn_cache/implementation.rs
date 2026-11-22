@@ -102,7 +102,9 @@ impl CachedMapping {
                 ),
             #[cfg(target_pointer_width = "64")]
             phone_hash: previous_pn
-                .filter(|previous| previous.phone_hash != [0; 3] && previous.phone_number == entry.phone_number)
+                .filter(|previous| {
+                    previous.phone_hash != [0; 3] && previous.phone_number == entry.phone_number
+                })
                 .map_or_else(
                     || wacore::crypto::contact_notification_hash(&entry.phone_number),
                     |previous| previous.phone_hash,
