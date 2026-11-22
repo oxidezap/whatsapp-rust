@@ -7,6 +7,21 @@ use wacore::telemetry::LiveAdmissionRefusal;
 use wacore_binary::diagnostics::{ObservedId, ProtocolText};
 use wacore_binary::jid::ObservedJid;
 
+#[derive(Debug, thiserror::Error)]
+enum CompanionCertificateError {
+    #[error("companion message omits ADV certificate")]
+    Missing,
+    #[error("companion message ADV validation failed")]
+    Invalid,
+}
+
+#[derive(Debug)]
+enum CompanionAccountRecheckError {
+    StaleGeneration,
+    Unavailable,
+    Rejected(usize),
+}
+
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
 /// Pre-key payloads are the large history-sync path and can safely donate
@@ -352,8 +367,7 @@ impl Client {
             // stale ordinary identity cannot authorize rolling this scope back.
             Some(_) => {}
         }
-        let certificate = certificate
-            .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
+        let certificate = certificate.ok_or(CompanionCertificateError::Missing)?;
         let primary = if account_locked {
             self.cached_adv_account_identity(sender)
                 .await?
@@ -370,20 +384,39 @@ impl Client {
             sender,
         ) != wacore::adv::AdvValidation::Valid
         {
-            anyhow::bail!("companion message ADV validation failed");
+            return Err(CompanionCertificateError::Invalid.into());
         }
         Ok(())
     }
 
-    /// Recheck prekeys after cold bootstrap and fence every companion decrypt:
-    /// even a regular msg saves identity before committing its session checkout.
+    #[cfg(test)]
     async fn lock_incoming_companion_account(
         &self,
         sender: &Jid,
         address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
-    ) -> anyhow::Result<IncomingAccountFence> {
+    ) -> Result<IncomingAccountFence, CompanionAccountRecheckError> {
+        self.recheck_incoming_companion_account(
+            sender,
+            address,
+            certificate,
+            payloads,
+            self.connection_generation.load(Ordering::Acquire),
+        )
+        .await
+    }
+
+    /// Recheck prekeys after cold bootstrap and fence every companion decrypt:
+    /// even a regular msg saves identity before committing its session checkout.
+    async fn recheck_incoming_companion_account(
+        &self,
+        sender: &Jid,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
+        certificate: Option<&[u8]>,
+        payloads: &[EncPayload],
+        lane_generation: u64,
+    ) -> Result<IncomingAccountFence, CompanionAccountRecheckError> {
         if sender.device == 0 || payloads.is_empty() {
             return Ok(IncomingAccountFence {
                 address: Some(address.clone()),
@@ -391,20 +424,34 @@ impl Client {
             });
         }
         let guard = self.lock_companion_account(sender).await;
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return Err(CompanionAccountRecheckError::StaleGeneration);
+        }
         for payload in payloads
             .iter()
             .filter(|payload| payload.enc_type == EncType::PreKeyMessage)
         {
             if let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) {
                 let identity = *message.identity_key().public_key().public_key_bytes();
-                self.validate_incoming_companion_identity_inner(
-                    sender,
-                    address,
-                    certificate,
-                    &identity,
-                    true,
-                )
-                .await?;
+                let validation = self
+                    .validate_incoming_companion_identity_inner(
+                        sender,
+                        address,
+                        certificate,
+                        &identity,
+                        true,
+                    )
+                    .await;
+                if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                    return Err(CompanionAccountRecheckError::StaleGeneration);
+                }
+                validation.map_err(|error| {
+                    if error.is::<CompanionCertificateError>() {
+                        CompanionAccountRecheckError::Rejected(payload.enc_index)
+                    } else {
+                        CompanionAccountRecheckError::Unavailable
+                    }
+                })?;
             }
         }
         Ok(IncomingAccountFence {
@@ -924,17 +971,66 @@ impl Client {
         group_payloads: &[EncPayload],
         bot_payloads: &[EncPayload],
     ) {
-        for payload in session_payloads
-            .iter()
-            .chain(group_payloads)
-            .chain(bot_payloads)
-        {
+        self.report_abandoned_payloads(
+            info,
+            session_payloads
+                .iter()
+                .chain(group_payloads)
+                .chain(bot_payloads),
+            None,
+        );
+    }
+
+    fn report_abandoned_payloads<'a>(
+        &self,
+        info: &Arc<MessageInfo>,
+        payloads: impl Iterator<Item = &'a EncPayload>,
+        rejected: Option<usize>,
+    ) {
+        for payload in payloads {
+            let reason = if rejected == Some(payload.enc_index) {
+                EncDecryptFailureReason::UntrustedIdentity
+            } else {
+                EncDecryptFailureReason::NotAttempted
+            };
             self.report_enc_decrypt_failure(
                 info,
                 payload.enc_index,
                 payload.enc_type.as_wire_str(),
-                EncDecryptFailureReason::NotAttempted,
+                reason,
             );
+        }
+    }
+
+    async fn report_companion_account_recheck_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        payloads: [&[EncPayload]; 3],
+        failure: CompanionAccountRecheckError,
+        lane_generation: u64,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) {
+        let rejected = match failure {
+            CompanionAccountRecheckError::Rejected(index)
+                if self.connection_generation.load(Ordering::Acquire) == lane_generation =>
+            {
+                Some(index)
+            }
+            _ => None,
+        };
+        self.report_abandoned_payloads(info, payloads.into_iter().flatten(), rejected);
+        // Report an authentication failure locally. This path leaves the
+        // stanza queued, including when local state could not be read.
+        if rejected.is_some()
+            && self.connection_generation.load(Ordering::Acquire) == lane_generation
+        {
+            self.dispatch_undecryptable_event(
+                Arc::clone(info),
+                false,
+                crate::types::events::UnavailableType::Unknown,
+                decrypt_fail_mode,
+            )
+            .await;
         }
     }
 
@@ -1117,23 +1213,14 @@ impl Client {
             log::warn!(
                 "Companion prekey message with an unverifiable ADV identity; requesting retry"
             );
-            for abandoned in session_payloads
-                .iter()
-                .chain(&group_payloads)
-                .chain(&bot_payloads)
-            {
-                let reason = if abandoned.enc_index == invalid_companion_enc {
-                    EncDecryptFailureReason::UntrustedIdentity
-                } else {
-                    EncDecryptFailureReason::NotAttempted
-                };
-                self.report_enc_decrypt_failure(
-                    &info,
-                    abandoned.enc_index,
-                    abandoned.enc_type.as_wire_str(),
-                    reason,
-                );
-            }
+            self.report_abandoned_payloads(
+                &info,
+                session_payloads
+                    .iter()
+                    .chain(&group_payloads)
+                    .chain(&bot_payloads),
+                Some(invalid_companion_enc),
+            );
             // Otherwise a sender-echoed count is lost after a restart or
             // eviction and the retry cap restarts at 1.
             self.preseed_sender_retry_count(&info, max_sender_retry_count)
@@ -1334,20 +1421,26 @@ impl Client {
 
         let session_outcome = if !is_group_sender && !session_payloads_empty {
             let account_fence = match self
-                .lock_incoming_companion_account(
+                .recheck_incoming_companion_account(
                     &sender_encryption_jid,
                     &signal_address,
                     device_identity.as_deref(),
                     &session_payloads,
+                    lane_generation,
                 )
                 .await
             {
                 Ok(fence) => fence,
-                Err(_) => {
-                    log::warn!(
-                        "Dropping companion session batch after account validation failed for {}",
-                        sender_encryption_jid.observe()
-                    );
+                Err(failure) => {
+                    log::debug!("Companion account recheck stopped decryption: {failure:?}");
+                    self.report_companion_account_recheck_failure(
+                        &info,
+                        [&session_payloads, &group_payloads, &bot_payloads],
+                        failure,
+                        lane_generation,
+                        decrypt_fail_mode,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -3928,6 +4021,111 @@ mod hosted_adv_tests;
 #[cfg(test)]
 mod adv_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn companion_recheck_reports_only_current_generation_certificate_rejections() {
+        use crate::test_utils::{TestEventCollector, create_iq_test_client};
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+        let _forwarding = client.acquire_enc_decrypt_failed_forwarding();
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let payloads = [EncType::PreKeyMessage, EncType::Message].map(|enc_type| EncPayload {
+            ciphertext: Default::default(),
+            enc_type,
+            padding_version: 2,
+            enc_index: usize::from(enc_type != EncType::PreKeyMessage),
+            state: None,
+            session_type: None,
+        });
+        for (id, failure, lane_generation, rejected) in [
+            (
+                "unavailable",
+                CompanionAccountRecheckError::Unavailable,
+                generation,
+                false,
+            ),
+            (
+                "stale",
+                CompanionAccountRecheckError::Rejected(0),
+                generation.wrapping_add(1),
+                false,
+            ),
+            (
+                "rejected",
+                CompanionAccountRecheckError::Rejected(0),
+                generation,
+                true,
+            ),
+        ] {
+            let info = Arc::new(MessageInfo {
+                id: id.into(),
+                ..Default::default()
+            });
+            client
+                .report_companion_account_recheck_failure(
+                    &info,
+                    [&payloads, &[], &[]],
+                    failure,
+                    lane_generation,
+                    crate::types::events::DecryptFailMode::Show,
+                )
+                .await;
+            let events = collector.events();
+            let reasons: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &**event {
+                    Event::EncDecryptFailed(event) if event.info.id == id => Some(event.reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reasons,
+                [
+                    if rejected {
+                        EncDecryptFailureReason::UntrustedIdentity
+                    } else {
+                        EncDecryptFailureReason::NotAttempted
+                    },
+                    EncDecryptFailureReason::NotAttempted,
+                ]
+            );
+            assert_eq!(
+                events.iter().filter(|event| matches!(&***event, Event::UndecryptableMessage(event) if event.info.id == id)).count(),
+                usize::from(rejected),
+            );
+        }
+        assert_eq!(transport.sent_count(), 0);
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn companion_recheck_rejects_a_generation_change_while_waiting_for_the_account_lock() {
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("12025550129", 7);
+        let address = sender.to_protocol_address();
+        let account_guard = client.lock_companion_account(&sender).await;
+        let payloads = [EncPayload {
+            ciphertext: Default::default(),
+            enc_type: EncType::Message,
+            padding_version: 2,
+            enc_index: 0,
+            state: None,
+            session_type: None,
+        }];
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let mut recheck = std::pin::pin!(client.recheck_incoming_companion_account(
+            &sender, &address, None, &payloads, generation,
+        ));
+        assert!(futures::poll!(&mut recheck).is_pending());
+        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        drop(account_guard);
+        assert!(matches!(
+            recheck.await,
+            Err(CompanionAccountRecheckError::StaleGeneration)
+        ));
+        client.signal_shutdown_sync();
+    }
 
     /// Real parsable Signal envelopes and a valid ADV certificate; crypto
     /// failure is sufficient for the lock-lifetime test and changes no trust.
