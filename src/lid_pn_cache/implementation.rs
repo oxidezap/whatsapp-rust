@@ -581,7 +581,19 @@ impl LidPnCache {
             let persisted = previous_pn.as_ref().is_some_and(|previous| {
                 !mapping_changed && previous.persisted.load(Ordering::Acquire)
             });
-            let shared = Arc::new(CachedMapping::new(&entry, persisted));
+            let shared = match (&previous_lid, &previous_pn) {
+                (Some(lid), Some(phone))
+                    if !mapping_changed
+                        && Arc::ptr_eq(lid, phone)
+                        && phone.lid == entry.lid
+                        && phone.phone_number == entry.phone_number
+                        && phone.created_at == entry.created_at
+                        && phone.learning_source == entry.learning_source =>
+                {
+                    Arc::clone(phone)
+                }
+                _ => Arc::new(CachedMapping::new(&entry, persisted)),
+            };
             if write_lid {
                 if track_startup {
                     self.track_startup_write(|writes| {
@@ -1491,6 +1503,26 @@ mod tests {
         // A remap to a new LID is not persisted (even a stale mark of the old
         // LID never satisfies the new pair), so it re-persists.
         assert!(!cache.is_persisted(pn, lid_b).await);
+    }
+
+    #[tokio::test]
+    async fn identical_pair_reuses_the_shared_mapping() {
+        let cache = LidPnCache::new();
+        let mut entry = LidPnEntry::with_timestamp("lid1", "pn1", 1, LearningSource::Usync);
+        cache.add(&entry).await;
+        let original = cache.pn_to_entry.get("pn1").await.unwrap();
+
+        cache.add(&entry).await;
+        let phone = cache.pn_to_entry.get("pn1").await.unwrap();
+        let lid = cache.lid_to_entry.get("lid1").await.unwrap();
+        assert!(Arc::ptr_eq(&original, &phone));
+        assert!(Arc::ptr_eq(&original, &lid));
+
+        entry.created_at = 2;
+        cache.add(&entry).await;
+        let refreshed = cache.pn_to_entry.get("pn1").await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &refreshed));
+        assert_eq!(refreshed.created_at, 2);
     }
 
     #[tokio::test]
