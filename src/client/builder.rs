@@ -382,15 +382,11 @@ impl ClientBuilder {
     /// Register a handler for one encrypted payload type before the client starts.
     /// The last registration for the same type wins. Custom handlers take
     /// precedence over built-in handlers; the registry is frozen at build time.
-    pub fn with_enc_handler<H>(mut self, payload_type: impl Into<String>, handler: H) -> Self
+    pub fn with_enc_handler<H>(self, payload_type: impl Into<String>, handler: H) -> Self
     where
         H: EncHandler + 'static,
     {
-        self.extensions_mut()
-            .custom_enc_handlers
-            .get_or_insert_default()
-            .insert(payload_type.into(), Arc::new(handler));
-        self
+        self.with_enc_handler_arc(payload_type, Arc::new(handler))
     }
 
     /// Register an already-shared encrypted payload handler, preserving its Arc
@@ -428,12 +424,11 @@ impl ClientBuilder {
 
     /// Persist each complete group notification before effects and ACK.
     /// See [`GroupNotificationDurabilityHook`] for cancellation and replay limits.
-    pub fn with_group_notification_durability_hook<Gh>(mut self, hook: Gh) -> Self
+    pub fn with_group_notification_durability_hook<Gh>(self, hook: Gh) -> Self
     where
         Gh: GroupNotificationDurabilityHook + 'static,
     {
-        self.extensions_mut().group_notification_durability_hook = Some(Arc::new(hook));
-        self
+        self.with_group_notification_durability_hook_arc(Arc::new(hook))
     }
 
     /// Register an already-shared hook. The last registration wins.
@@ -447,12 +442,11 @@ impl ClientBuilder {
 
     /// Retain self-sent history notifications and chunks before ACK/receipt.
     /// See [`HistorySyncDurabilityHook`] for backend requirements and replay.
-    pub fn with_history_sync_durability_hook<H>(mut self, hook: H) -> Self
+    pub fn with_history_sync_durability_hook<H>(self, hook: H) -> Self
     where
         H: HistorySyncDurabilityHook + 'static,
     {
-        self.extensions_mut().history_sync_durability_hook = Some(Arc::new(hook));
-        self
+        self.with_history_sync_durability_hook_arc(Arc::new(hook))
     }
 
     /// Register a shared history recovery hook. The last registration wins.
@@ -466,12 +460,11 @@ impl ClientBuilder {
 
     /// Await history capture before its receipt, independently of message durability.
     /// See [`HistorySyncCaptureHook`] for input, cancellation and replay limits.
-    pub fn with_history_sync_capture_hook<H>(mut self, hook: H) -> Self
+    pub fn with_history_sync_capture_hook<H>(self, hook: H) -> Self
     where
         H: HistorySyncCaptureHook + 'static,
     {
-        self.extensions_mut().history_sync_capture_hook = Some(Arc::new(hook));
-        self
+        self.with_history_sync_capture_hook_arc(Arc::new(hook))
     }
 
     /// Register an already-shared capture hook, preserving its Arc identity.
@@ -486,12 +479,11 @@ impl ClientBuilder {
 
     /// Register a synchronous policy that can reject inbound history-sync
     /// notifications before they create history-sync work.
-    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    pub fn with_history_sync_admission<A>(self, admission: A) -> Self
     where
         A: HistorySyncAdmission + 'static,
     {
-        self.extensions_mut().history_sync_admission = Some(Arc::new(admission));
-        self
+        self.with_history_sync_admission_arc(Arc::new(admission))
     }
 
     /// Register an already-shared history-sync admission policy.
@@ -535,12 +527,11 @@ impl ClientBuilder {
 
     /// Pace first and reconnect run-loop dials with a synchronous host policy.
     /// See [`ConnectAdmission`] for cancellation and reservation limits.
-    pub fn with_connect_admission<A>(mut self, admission: A) -> Self
+    pub fn with_connect_admission<A>(self, admission: A) -> Self
     where
         A: ConnectAdmission + 'static,
     {
-        self.extensions_mut().connect_admission = Some(Arc::new(admission));
-        self
+        self.with_connect_admission_arc(Arc::new(admission))
     }
 
     /// Share a host's dial budget across clients. Manual `connect()` is unaffected.
@@ -987,6 +978,8 @@ impl ClientBuilder {
     }
 }
 
+#[cold]
+#[inline(never)]
 async fn probe_durability_backend(
     backend: &Arc<dyn crate::store::traits::Backend>,
     runtime: &Arc<dyn Runtime>,
@@ -1006,6 +999,8 @@ async fn probe_durability_backend(
     })?
 }
 
+#[cold]
+#[inline(never)]
 async fn probe_durability_backend_owned(
     backend: &Arc<dyn crate::store::traits::Backend>,
 ) -> Result<(), ClientBuilderError> {
