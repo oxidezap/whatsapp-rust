@@ -276,6 +276,12 @@ impl PreKeyTable {
                 }
                 _ => self.runs = None,
             }
+        } else if removed
+            && let PreKeyRecords::Packed(records) = &mut run.records
+            && run.occupied as usize == records.len() / 8
+        {
+            // A packed run only loses entries, so it crosses this threshold once.
+            records.compact_sparse_payload();
         }
     }
 
@@ -2757,6 +2763,31 @@ mod tests {
         assert!(matches!(packed, OriginalRecords::Packed(records) if records.len() == 1));
         assert_eq!((original.first, original.occupied), (1, 0));
         assert_eq!(size_of::<PreKeyRuns>(), size_of::<OriginalRun>());
+    }
+
+    #[test]
+    fn mostly_consumed_packed_prekey_runs_release_their_payload() {
+        let mut table = PreKeyTable::default();
+        let bytes: Vec<_> = (0..812)
+            .flat_map(|index| std::iter::repeat_n(index as u8, 70))
+            .collect();
+        let ends = (1..=812).map(|end| end * 70).collect();
+        table.insert_packed(PackedPreKeys::new(1, bytes.into(), ends).unwrap());
+        let before = table.heap_bytes();
+        let old_view = table.get(1).unwrap();
+        for id in 1..=711 {
+            table.remove(id);
+        }
+        assert_eq!(table.len(), 101);
+        assert_eq!(table.max_id(), 812);
+        assert_eq!(before - table.heap_bytes(), 711 * 70);
+        assert_eq!(old_view.as_ref(), &[0; 70]);
+        assert!(table.get(711).is_none());
+        for id in 712..=812 {
+            assert_eq!(table.get(id).unwrap().as_ref(), &[(id - 1) as u8; 70]);
+        }
+        table.remove(812);
+        assert_eq!(table.max_id(), 811);
     }
 
     #[test]
