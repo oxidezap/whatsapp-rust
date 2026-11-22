@@ -38,6 +38,28 @@ impl MontgomeryPoint {
         )
     }
     fn mul_bits_be(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: the CPU supports BMI2, checked just above.
+            #[allow(unsafe_code)]
+            return unsafe { self.mul_bits_be_bmi2(bits) };
+        }
+        self.mul_bits_be_generic(bits)
+    }
+
+    // Baseline x86-64 `mul` writes its product to the fixed `rdx:rax` pair, so
+    // the ladder step, with its ~190 128-bit products, keeps moving operands
+    // through those two registers and spills about a third of its instructions
+    // to the stack. BMI2 `mulx` takes any destination registers. The field
+    // operations are `#[inline(always)]`, so they are compiled for BMI2 here.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "bmi2")]
+    fn mul_bits_be_bmi2(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
+        self.mul_bits_be_generic(bits)
+    }
+
+    #[inline(always)]
+    fn mul_bits_be_generic(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
         // Algorithm 8 of Costello-Smith 2017
         let affine_u = FieldElement::from_bytes(&self.0);
         let mut x0 = ProjectivePoint::identity();
@@ -148,6 +170,7 @@ impl ProjectivePoint {
 }
 
 #[rustfmt::skip] // keep alignment of explanatory comments
+#[inline(always)]
 fn differential_add_and_double(
     P: &mut ProjectivePoint,
     Q: &mut ProjectivePoint,
@@ -186,4 +209,31 @@ fn differential_add_and_double(
     P.W = t16;  // W_{P'} = (4 U_P W_P) ((U_P - W_P)^2 + ((A + 2)/4) 4 U_P W_P)
     Q.U = t18;  // U_{Q'} = W_D * 4 (U_P U_Q - W_P W_Q)^2
     Q.W = t17;  // W_{Q'} = U_D * 4 (W_P U_Q - U_P W_Q)^2
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha512};
+
+    #[test]
+    fn bmi2_ladder_matches_portable_ladder() {
+        if !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        for seed in 0u32..256 {
+            let wide: [u8; 64] = Sha512::digest(seed.to_le_bytes()).into();
+            let point = MontgomeryPoint(wide[..32].try_into().unwrap());
+            let scalar: [u8; 32] = wide[32..].try_into().unwrap();
+            let bits = || {
+                (0..256)
+                    .rev()
+                    .map(|bit| (scalar[bit / 8] >> (bit % 8)) & 1 != 0)
+            };
+            // SAFETY: BMI2 support is checked above.
+            #[allow(unsafe_code)]
+            let bmi2 = unsafe { point.mul_bits_be_bmi2(bits()) };
+            assert_eq!(bmi2.0, point.mul_bits_be_generic(bits()).0, "seed {seed}");
+        }
+    }
 }
