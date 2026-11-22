@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 const SMPL_LPC_ORDER: usize = 16;
 const SMPL_SUBFR_LEN: usize = 80; // 5 ms at 16 kHz, num_subframes==4
+const SMPL_MAX_SF_LEN: usize = 160;
 const SMPL_NUM_SUBFR: usize = 4;
 const SMPL_FRAME_LEN: usize = 320; // 20 ms
 const SMPL_LAG_SUBFRLEN: usize = 40;
@@ -286,6 +287,8 @@ fn celp_decode(
     low_rate: bool,
     normalized_bitrate: f32,
     lpc_res: &mut [f32],
+    acb_basis: &mut [f32],
+    acb: &mut [f32],
 ) {
     // The history ends at a fixed point with room for a whole low-rate subframe after it, so the
     // two subframe lengths share one history when a stream switches between them.
@@ -297,18 +300,14 @@ fn celp_decode(
         if low_rate {
             pitch_sharp(lpc_res, i_lag as usize, subfrlen);
         }
-        let mut acb_basis = vec![0.0f32; subfrlen * SMPL_ACBG_M];
-        let mut acb = vec![0.0f32; subfrlen];
-        syn_ltp_basis(
-            lags,
-            num_lags,
-            acb_state,
-            history + subfrlen,
-            &mut acb_basis,
-        );
+        let acb_basis = &mut acb_basis[..subfrlen * SMPL_ACBG_M];
+        let acb = &mut acb[..subfrlen];
+        acb_basis.fill(0.0);
+        acb.fill(0.0);
+        syn_ltp_basis(lags, num_lags, acb_state, history + subfrlen, acb_basis);
         let mut acb_gain = [0.0f32; SMPL_ACBG_M];
         acb_dequant(low_rate, acb_gain_idx, &mut acb_gain);
-        acb_synthesize(subfrlen, &acb_basis, &acb_gain, high_boost, &mut acb);
+        acb_synthesize(subfrlen, acb_basis, &acb_gain, high_boost, acb);
         for i in 0..subfrlen {
             lpc_res[i] += acb[i];
         }
@@ -523,6 +522,9 @@ impl CelpDecState {
         // Contiguous synthesis buffer: 16-sample history prefix + 320 frame samples.
         let mut ybuf = [0.0f32; SMPL_LPC_ORDER + SMPL_FRAME_LEN];
         ybuf[..SMPL_LPC_ORDER].copy_from_slice(&self.lpc_synth_mem);
+        // Stack scratch reused across subframes (avoids per-subframe heap vec! allocations).
+        let mut acb_basis = [0.0f32; SMPL_MAX_SF_LEN * SMPL_ACBG_M];
+        let mut acb = [0.0f32; SMPL_MAX_SF_LEN];
         for sf in 0..subframes {
             let base = sf * subfr_len;
             // CELP (ACB/LTP) decode over the whole subframe, with its own 40-sample lag blocks.
@@ -538,6 +540,8 @@ impl CelpDecState {
                 low_rate,
                 normalized_bitrate,
                 &mut lpc_res[base..base + subfr_len],
+                &mut acb_basis,
+                &mut acb,
             );
 
             #[cfg(test)]
