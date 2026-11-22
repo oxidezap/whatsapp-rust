@@ -122,9 +122,10 @@ jobs:
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
-    # The SDK shard needs headroom for a full build, measurement and result
-    # upload. Keep bounded jobs so infrastructure stalls cannot run indefinitely.
-    timeout-minutes: ${{ matrix.shard.client && 50 || 25 }}
+    # Shards need sufficient headroom for full build, measurement under Valgrind,
+    # and result upload. The client and core shards compile heavy benchmarks and run
+    # VoIP/MLow/Signal under emulation. Bounded jobs ensure infrastructure stalls cannot run indefinitely.
+    timeout-minutes: ${{ (matrix.shard.client || matrix.shard.name == 'core') && 50 || 35 }}
     strategy:
       # One shard failing must not cancel the other: CodSpeed merges shards
       # into a single run, and a cancelled shard leaves it incomplete.
