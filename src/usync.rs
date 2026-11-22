@@ -2438,16 +2438,15 @@ impl Client {
         mode: DeviceListApplyMode,
     ) -> anyhow::Result<PreparedDeviceListIdentities> {
         use futures::{StreamExt, TryStreamExt};
-        let lookups = response
+        let users: Vec<_> = response
             .device_lists
             .iter()
-            .filter(|list: &&wacore::usync::UserDeviceList| {
+            .filter(|list| {
                 list.key_index_bytes.is_some()
                     && !list.devices.iter().any(|device| device.is_hosted)
             })
-            .map(|list: &wacore::usync::UserDeviceList| {
-                self.prepare_device_list_identity(&list.user, mode)
-            });
+            .map(|list| list.user.clone())
+            .collect();
         // Limit queued account work as well as active IQs. Ordered results keep
         // duplicate rows in response order. Strict callers stop at the first error.
         let concurrency = if mode == DeviceListApplyMode::GroupRefresh {
@@ -2455,7 +2454,8 @@ impl Client {
         } else {
             1
         };
-        futures::stream::iter(lookups)
+        futures::stream::iter(users)
+            .map(|user| self.prepare_device_list_identity(user, mode))
             .buffered(concurrency)
             .try_collect()
             .await
@@ -2463,18 +2463,18 @@ impl Client {
 
     async fn prepare_device_list_identity(
         &self,
-        user: &Jid,
+        user: Jid,
         mode: DeviceListApplyMode,
     ) -> anyhow::Result<(Jid, PreparedAccountIdentity)> {
         let cached = {
             let (_sessions, _mapping) = self
-                .device_list_identity_guards(std::slice::from_ref(user))
+                .device_list_identity_guards(std::slice::from_ref(&user))
                 .await?;
-            self.device_list_account_identity(user).await
+            self.device_list_account_identity(&user).await
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
-            Ok(None) => self.ensure_adv_account_identity(user).await,
+            Ok(None) => self.ensure_adv_account_identity(&user).await,
             Err(error) => Err(error),
         };
         let prepared = match identity {
@@ -2490,7 +2490,7 @@ impl Client {
             }
             Err(error) => return Err(error),
         };
-        Ok((user.clone(), prepared))
+        Ok((user, prepared))
     }
 
     /// Inspect both alias directions in one registry batch before learning
