@@ -1252,6 +1252,22 @@ impl SignalStoreCache {
         }
     }
 
+    /// Sizes the session table so that, even at the eviction high watermark,
+    /// it is at most half full. When churn tombstones use up its free slots,
+    /// hashbrown then rehashes in place instead of doubling the table. Whether
+    /// and when that doubling happens depends on where removals leave
+    /// tombstones, i.e. on the per-process `RandomState` seed, so a churn
+    /// benchmark that allows it reports a seed-dependent heap peak.
+    #[cfg(feature = "bench-internals")]
+    pub fn reserve_sessions_for_churn(&self) {
+        let mut state = self
+            .sessions
+            .try_lock()
+            .expect("sessions lock is free during benchmark setup");
+        let peak = high_watermark(self.max_entries).saturating_add(1);
+        state.cache.map.reserve(peak.saturating_mul(2));
+    }
+
     fn pending_session_restores(&self) -> SyncMutexGuard<'_, Vec<PendingSessionRestore>> {
         self.pending_session_restores
             .lock()

@@ -133,10 +133,12 @@ fn cold_session_cache_churn(bencher: divan::Bencher, capacity: usize) {
     let probes = addresses(1024, 0);
     bencher
         .with_inputs(|| {
-            (
-                SignalStoreCache::with_max_entries(capacity),
-                InMemoryBackend::new(),
-            )
+            let cache = SignalStoreCache::with_max_entries(capacity);
+            // Without this, the measured probes may or may not double the
+            // session table depending on the hash seed, and the Memory peak
+            // flips between two levels with no code change.
+            cache.reserve_sessions_for_churn();
+            (cache, InMemoryBackend::new())
         })
         .bench_refs(|(cache, backend)| {
             block_on(async {
