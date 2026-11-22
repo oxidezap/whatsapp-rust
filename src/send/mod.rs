@@ -3697,7 +3697,7 @@ impl Client {
                     {
                         log::warn!(
                             "Failed to persist LID mapping {} -> {}: {e:?}",
-                            mapping.phone_number,
+                            ObservedJid::from(&mapping.phone_number),
                             mapping.lid
                         );
                     }
