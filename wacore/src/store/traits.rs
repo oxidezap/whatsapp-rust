@@ -85,7 +85,7 @@ impl PackedPreKeys {
 
     pub(crate) fn compact_sparse_payload(&mut self) {
         let live_bytes = self.records().map(|(_, record)| record.len()).sum();
-        if live_bytes >= self.bytes.len() / 2 {
+        if live_bytes > self.bytes.len() / 2 {
             return;
         }
         let mut payload = Vec::with_capacity(live_bytes);

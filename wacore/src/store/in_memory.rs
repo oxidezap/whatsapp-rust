@@ -2767,12 +2767,35 @@ mod tests {
 
     #[test]
     fn mostly_consumed_packed_prekey_runs_release_their_payload() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackedPayload {
+            data: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for TrackedPayload {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        impl Drop for TrackedPayload {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
         let mut table = PreKeyTable::default();
         let bytes: Vec<_> = (0..812)
             .flat_map(|index| std::iter::repeat_n(index as u8, 70))
             .collect();
         let ends = (1..=812).map(|end| end * 70).collect();
-        table.insert_packed(PackedPreKeys::new(1, bytes.into(), ends).unwrap());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let tracked_bytes = Bytes::from_owner(TrackedPayload {
+            data: bytes,
+            dropped: Arc::clone(&dropped),
+        });
+        table.insert_packed(PackedPreKeys::new(1, tracked_bytes, ends).unwrap());
         let before = table.heap_bytes();
         let old_view = table.get(1).unwrap();
         for id in 1..=711 {
@@ -2782,6 +2805,12 @@ mod tests {
         assert_eq!(table.max_id(), 812);
         assert_eq!(before - table.heap_bytes(), 711 * 70);
         assert_eq!(old_view.as_ref(), &[0; 70]);
+        // While old_view is kept alive, the original payload backing remains referenced.
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(old_view);
+        // Dropping old_view releases the original buffer completely because compaction replaced table.bytes.
+        assert!(dropped.load(Ordering::SeqCst));
+
         assert!(table.get(711).is_none());
         for id in 712..=812 {
             assert_eq!(table.get(id).unwrap().as_ref(), &[(id - 1) as u8; 70]);
