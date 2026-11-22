@@ -40,12 +40,14 @@ fn pack_contact_hash(hash: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, hash[0], hash[1], hash[2]])
 }
 
+#[cfg(not(target_pointer_width = "64"))]
 #[inline]
 fn contact_hash_key(user: &str) -> u32 {
     pack_contact_hash(wacore::crypto::contact_notification_hash(user))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(from = "LidPnEntry")]
 struct CachedMapping {
     lid: Arc<str>,
     phone_number: Arc<str>,
@@ -53,16 +55,71 @@ struct CachedMapping {
     learning_source: LearningSource,
     #[serde(skip)]
     persisted: AtomicBool,
+    #[cfg(target_pointer_width = "64")]
+    #[serde(skip)]
+    lid_hash: [u8; 3],
+    #[cfg(target_pointer_width = "64")]
+    #[serde(skip)]
+    phone_hash: [u8; 3],
+}
+
+impl From<LidPnEntry> for CachedMapping {
+    fn from(entry: LidPnEntry) -> Self {
+        Self::new(entry, false, None, None)
+    }
 }
 
 impl CachedMapping {
-    fn new(entry: &LidPnEntry, persisted: bool) -> Self {
+    fn new(
+        entry: LidPnEntry,
+        persisted: bool,
+        previous_lid: Option<&Self>,
+        previous_pn: Option<&Self>,
+    ) -> Self {
+        #[cfg(not(target_pointer_width = "64"))]
+        let _ = (previous_lid, previous_pn);
         Self {
-            lid: entry.lid.clone(),
-            phone_number: entry.phone_number.clone(),
+            #[cfg(target_pointer_width = "64")]
+            lid_hash: previous_lid
+                .filter(|previous| previous.lid == entry.lid)
+                .map_or_else(
+                    || wacore::crypto::contact_notification_hash(&entry.lid),
+                    |previous| previous.lid_hash,
+                ),
+            #[cfg(target_pointer_width = "64")]
+            phone_hash: previous_pn
+                .filter(|previous| previous.phone_number == entry.phone_number)
+                .map_or_else(
+                    || wacore::crypto::contact_notification_hash(&entry.phone_number),
+                    |previous| previous.phone_hash,
+                ),
+            lid: entry.lid,
+            phone_number: entry.phone_number,
             created_at: entry.created_at,
             learning_source: entry.learning_source,
             persisted: AtomicBool::new(persisted),
+        }
+    }
+
+    fn lid_hash_key(&self) -> u32 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            pack_contact_hash(self.lid_hash)
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            contact_hash_key(&self.lid)
+        }
+    }
+
+    fn phone_hash_key(&self) -> u32 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            pack_contact_hash(self.phone_hash)
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            contact_hash_key(&self.phone_number)
         }
     }
 
@@ -581,7 +638,12 @@ impl LidPnCache {
             let persisted = previous_pn.as_ref().is_some_and(|previous| {
                 !mapping_changed && previous.persisted.load(Ordering::Acquire)
             });
-            let shared = Arc::new(CachedMapping::new(&entry, persisted));
+            let shared = Arc::new(CachedMapping::new(
+                entry.as_ref().clone(),
+                persisted,
+                previous_lid.as_deref(),
+                previous_pn.as_deref(),
+            ));
             if write_lid {
                 if track_startup {
                     self.track_startup_write(|writes| {
@@ -594,15 +656,12 @@ impl LidPnCache {
                     .insert(shared.lid.clone(), Arc::clone(&shared))
                     .await;
                 self.contact_hash_to_lid
-                    .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
+                    .insert(shared.lid_hash_key(), Arc::clone(&shared.lid))
                     .await;
             }
             if should_update_pn {
                 self.contact_hash_to_lid
-                    .insert(
-                        contact_hash_key(&shared.phone_number),
-                        Arc::clone(&shared.lid),
-                    )
+                    .insert(shared.phone_hash_key(), Arc::clone(&shared.lid))
                     .await;
                 if track_startup {
                     self.track_startup_write(|writes| {
@@ -622,13 +681,13 @@ impl LidPnCache {
         if !record_topology {
             if !write_lid && let Some(existing) = &previous_lid {
                 self.contact_hash_to_lid
-                    .insert(contact_hash_key(&existing.lid), Arc::clone(&existing.lid))
+                    .insert(existing.lid_hash_key(), Arc::clone(&existing.lid))
                     .await;
                 if existing.phone_number != entry.phone_number {
                     let owner = self.pn_to_entry.get(&*existing.phone_number).await;
                     self.contact_hash_to_lid
                         .insert(
-                            contact_hash_key(&existing.phone_number),
+                            existing.phone_hash_key(),
                             owner.as_ref().map_or_else(
                                 || Arc::clone(&existing.lid),
                                 |owner| Arc::clone(&owner.lid),
@@ -639,13 +698,10 @@ impl LidPnCache {
             }
             if !should_update_pn && let Some(existing) = &previous_pn {
                 self.contact_hash_to_lid
-                    .insert(contact_hash_key(&existing.lid), Arc::clone(&existing.lid))
+                    .insert(existing.lid_hash_key(), Arc::clone(&existing.lid))
                     .await;
                 self.contact_hash_to_lid
-                    .insert(
-                        contact_hash_key(&existing.phone_number),
-                        Arc::clone(&existing.lid),
-                    )
+                    .insert(existing.phone_hash_key(), Arc::clone(&existing.lid))
                     .await;
             }
         }
@@ -1516,6 +1572,16 @@ mod tests {
         let entry = LidPnEntry::with_timestamp("lid1", "pn1", 1, LearningSource::Usync);
         let bytes = serde_json::to_vec(&entry).unwrap();
         let cached: CachedMapping = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            cached.lid_hash_key(),
+            pack_contact_hash(wacore::crypto::contact_notification_hash(&entry.lid))
+        );
+        assert_eq!(
+            cached.phone_hash_key(),
+            pack_contact_hash(wacore::crypto::contact_notification_hash(
+                &entry.phone_number
+            ))
+        );
         assert!(!cached.persisted.load(Ordering::Relaxed));
         cached.persisted.store(true, Ordering::Relaxed);
         assert_eq!(serde_json::to_vec(&cached).unwrap(), bytes);
