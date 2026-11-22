@@ -306,7 +306,7 @@ impl Client {
     ) -> Result<wacore::session_engine::publication::SignalCommitOutcome, anyhow::Error> {
         use wacore::session_engine::publication::SignalCommitOutcome;
         if self.signal_cache.needs_pre_wire_flush().await {
-            self.flush_signal_cache_batch_safe().await?;
+            Box::pin(self.flush_signal_cache_batch_safe()).await?;
             return Ok(SignalCommitOutcome::CommittedWrite);
         }
         self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));

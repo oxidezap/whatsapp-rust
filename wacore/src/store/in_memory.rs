@@ -370,11 +370,16 @@ impl Equivalent<BaseKeyKey> for BaseKeyKeyRef<'_> {
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
 type MsgSecretRow = (MessageSecretBytes, i64, i64);
 
+#[cfg(target_pointer_width = "64")]
+type MsgIdStorage = wacore_binary::CompactString;
+#[cfg(not(target_pointer_width = "64"))]
+type MsgIdStorage = Arc<str>;
+
 #[derive(Eq, Hash, PartialEq)]
 struct MsgSecretKey {
     chat: Arc<str>,
     sender: Arc<str>,
-    msg_id: Arc<str>,
+    msg_id: MsgIdStorage,
 }
 
 #[derive(Hash)]
@@ -388,7 +393,7 @@ impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
     fn equivalent(&self, key: &MsgSecretKey) -> bool {
         self.chat == key.chat.as_ref()
             && self.sender == key.sender.as_ref()
-            && self.msg_id == key.msg_id.as_ref()
+            && self.msg_id == AsRef::<str>::as_ref(&key.msg_id)
     }
 }
 
@@ -404,7 +409,7 @@ type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 #[derive(Eq, PartialEq)]
 struct MsgGroupKey {
     chat: Arc<str>,
-    msg_id: Arc<str>,
+    msg_id: MsgIdStorage,
 }
 
 impl Hash for MsgGroupKey {
@@ -426,7 +431,7 @@ impl Hash for MsgGroupKeyRef<'_> {
 
 impl Equivalent<MsgGroupKey> for MsgGroupKeyRef<'_> {
     fn equivalent(&self, key: &MsgGroupKey) -> bool {
-        self.chat == key.chat.as_ref() && self.msg_id == key.msg_id.as_ref()
+        self.chat == key.chat.as_ref() && self.msg_id == AsRef::<str>::as_ref(&key.msg_id)
     }
 }
 
@@ -1785,6 +1790,9 @@ impl MsgSecretStore for InMemoryBackend {
                 let key = MsgSecretKey {
                     chat: entry.chat,
                     sender: entry.sender,
+                    #[cfg(target_pointer_width = "64")]
+                    msg_id: wacore_binary::CompactString::from(entry.msg_id.as_ref()),
+                    #[cfg(not(target_pointer_width = "64"))]
                     msg_id: entry.msg_id,
                 };
                 match state.msg_secrets.entry(key) {
@@ -2026,7 +2034,14 @@ impl DeviceStore for InMemoryBackend {
         let mut conversations: std::collections::HashSet<*const u8> =
             std::collections::HashSet::new();
         for key in state.msg_secrets.keys() {
-            bytes += key.msg_id.len();
+            #[cfg(target_pointer_width = "64")]
+            if key.msg_id.is_heap_allocated() {
+                bytes += key.msg_id.capacity();
+            }
+            #[cfg(not(target_pointer_width = "64"))]
+            {
+                bytes += key.msg_id.len();
+            }
             for shared in [&key.chat, &key.sender] {
                 if conversations.insert(shared.as_ptr()) {
                     bytes += shared.len();
@@ -2162,7 +2177,7 @@ fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
             bucket.insert(
                 MsgGroupKey {
                     chat: Arc::clone(&key.chat),
-                    msg_id: Arc::clone(&key.msg_id),
+                    msg_id: key.msg_id.clone(),
                 },
                 1,
             );
@@ -3693,7 +3708,7 @@ mod tests {
             let mut retained: Vec<_> = state
                 .msg_secrets
                 .keys()
-                .map(|key| key.msg_id.as_ref())
+                .map(|key| key.msg_id.as_str())
                 .collect();
             retained.sort_unstable();
             let expected: Vec<_> = (total - len..total).map(|i| format!("m{i:07}")).collect();

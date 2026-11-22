@@ -3011,7 +3011,7 @@ impl Client {
         // flushes synchronously, and a persistence failure must abort the send
         // rather than transmit an advance we couldn't save.
         let pending_stanza = stanza_to_send.begin_commit();
-        let confirmation = Box::pin(self.confirm_signal_state_pre_wire()).await?;
+        let confirmation = self.confirm_signal_state_pre_wire().await?;
         let stanza_to_send = pending_stanza.confirm(confirmation).into_payload();
 
         // A borrowed id must not register a phash ack-waiter: the waiter map is
