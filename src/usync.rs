@@ -68,7 +68,7 @@ enum DeviceListApplyMode {
 #[derive(Clone, Copy)]
 enum PreparedAccountIdentity {
     Trusted([u8; 32]),
-    /// Keep a group contact rejected even if its conflict disappears later.
+    /// Keep a rejected group contact out of this publication even if trust changes.
     Rejected,
 }
 
@@ -2437,35 +2437,60 @@ impl Client {
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
     ) -> anyhow::Result<PreparedDeviceListIdentities> {
-        let mut prepared = Vec::new();
-        for user in &response.device_lists {
-            if user.key_index_bytes.is_some() && !user.devices.iter().any(|device| device.is_hosted)
+        use futures::{StreamExt, TryStreamExt};
+        let users: Vec<_> = response
+            .device_lists
+            .iter()
+            .filter(|list| {
+                list.key_index_bytes.is_some()
+                    && !list.devices.iter().any(|device| device.is_hosted)
+            })
+            .map(|list| list.user.clone())
+            .collect();
+        // Limit queued account work as well as active IQs. Ordered results keep
+        // duplicate rows in response order. Strict callers stop at the first error.
+        let concurrency = if mode == DeviceListApplyMode::GroupRefresh {
+            crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY
+        } else {
+            1
+        };
+        futures::stream::iter(users)
+            .map(|user| self.prepare_device_list_identity(user, mode))
+            .buffered(concurrency)
+            .try_collect()
+            .await
+    }
+
+    async fn prepare_device_list_identity(
+        &self,
+        user: Jid,
+        mode: DeviceListApplyMode,
+    ) -> anyhow::Result<(Jid, PreparedAccountIdentity)> {
+        let cached = {
+            let (_sessions, _mapping) = self
+                .device_list_identity_guards(std::slice::from_ref(&user))
+                .await?;
+            self.device_list_account_identity(&user).await
+        };
+        let identity = match cached {
+            Ok(Some(identity)) => Ok(identity),
+            Ok(None) => self.ensure_adv_account_identity(&user).await,
+            Err(error) => Err(error),
+        };
+        let prepared = match identity {
+            Ok(identity) => PreparedAccountIdentity::Trusted(identity),
+            Err(error)
+                if mode == DeviceListApplyMode::GroupRefresh
+                    && (error.is::<DeviceListIdentityConflict>()
+                        || error.chain().any(|source| {
+                            source.is::<crate::prekeys::AdvPrimaryBundleError>()
+                        })) =>
             {
-                let cached = {
-                    let (_sessions, _mapping) = self
-                        .device_list_identity_guards(std::slice::from_ref(&user.user))
-                        .await?;
-                    self.device_list_account_identity(&user.user).await
-                };
-                let identity = match cached {
-                    Ok(Some(identity)) => Ok(identity),
-                    Ok(None) => self.ensure_adv_account_identity(&user.user).await,
-                    Err(error) => Err(error),
-                };
-                let identity = match identity {
-                    Ok(identity) => PreparedAccountIdentity::Trusted(identity),
-                    Err(error)
-                        if mode == DeviceListApplyMode::GroupRefresh
-                            && error.is::<DeviceListIdentityConflict>() =>
-                    {
-                        PreparedAccountIdentity::Rejected
-                    }
-                    Err(error) => return Err(error),
-                };
-                prepared.push((user.user.clone(), identity));
+                PreparedAccountIdentity::Rejected
             }
-        }
-        Ok(prepared)
+            Err(error) => return Err(error),
+        };
+        Ok((user, prepared))
     }
 
     /// Inspect both alias directions in one registry batch before learning
