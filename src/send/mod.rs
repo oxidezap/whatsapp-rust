@@ -3680,6 +3680,38 @@ impl Client {
         })
     }
 
+    async fn cold_query_lid_for_pn(&self, to: &Jid) {
+        let sid = self.generate_request_id();
+        let spec = wacore::iq::usync::LidQuerySpec::new(vec![to.to_non_ad()], sid);
+        // Best-effort: WA Web also catches and warns on failure
+        match self.execute(spec).await {
+            Ok(resp) => {
+                for mapping in &resp.lid_mappings {
+                    if let Err(e) = self
+                        .add_lid_pn_mapping(
+                            &mapping.lid,
+                            &mapping.phone_number,
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        )
+                        .await
+                    {
+                        log::warn!(
+                            "Failed to persist LID mapping {} -> {}: {e:?}",
+                            ObservedJid::from(&mapping.phone_number),
+                            mapping.lid
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "LID query failed for {}, falling back to PN: {e:?}",
+                    to.observe()
+                );
+            }
+        }
+    }
+
     /// DM branch of [`Self::send_message_impl`]: pairwise Signal encryption
     /// with device fan-out (also used by status-reaction add-ons).
     async fn send_dm_branch(
@@ -3747,35 +3779,7 @@ impl Client {
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
-                let sid = self.generate_request_id();
-                let spec = wacore::iq::usync::LidQuerySpec::new(vec![to.to_non_ad()], sid);
-                // Best-effort: WA Web also catches and warns on failure
-                match self.execute(spec).await {
-                    Ok(resp) => {
-                        for mapping in &resp.lid_mappings {
-                            if let Err(e) = self
-                                .add_lid_pn_mapping(
-                                    &mapping.lid,
-                                    &mapping.phone_number,
-                                    crate::lid_pn_cache::LearningSource::Usync,
-                                )
-                                .await
-                            {
-                                log::warn!(
-                                    "Failed to persist LID mapping {} -> {}: {e:?}",
-                                    mapping.phone_number,
-                                    mapping.lid
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "LID query failed for {}, falling back to PN: {e:?}",
-                            to.observe()
-                        );
-                    }
-                }
+                Box::pin(self.cold_query_lid_for_pn(&to)).await;
             }
 
             // The LID-vs-PN wire namespace is an account-level decision: the
@@ -3847,7 +3851,7 @@ impl Client {
 
             let mut stores = store_adapter.as_signal_stores();
 
-            let prepared = wacore::send::prepare_dm_stanza(
+            let prepared = Box::pin(wacore::send::prepare_dm_stanza(
                 &*self.runtime,
                 &mut stores,
                 self,
@@ -3864,7 +3868,7 @@ impl Client {
                     devices: &dm_devices,
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
                 },
-            )
+            ))
             .await?;
             (prepared, dm_devices)
         };
