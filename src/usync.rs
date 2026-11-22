@@ -2441,11 +2441,13 @@ impl Client {
         let lookups = response
             .device_lists
             .iter()
-            .filter(|list| {
+            .filter(|list: &&wacore::usync::UserDeviceList| {
                 list.key_index_bytes.is_some()
                     && !list.devices.iter().any(|device| device.is_hosted)
             })
-            .map(|list| self.prepare_device_list_identity(&list.user, mode));
+            .map(|list: &wacore::usync::UserDeviceList| {
+                self.prepare_device_list_identity(&list.user, mode)
+            });
         // Limit queued account work as well as active IQs. Ordered results keep
         // duplicate rows in response order. Strict callers stop at the first error.
         let concurrency = if mode == DeviceListApplyMode::GroupRefresh {
