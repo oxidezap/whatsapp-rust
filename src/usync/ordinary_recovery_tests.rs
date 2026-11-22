@@ -3633,6 +3633,155 @@ async fn stale_reverse_alias_cannot_supply_an_adv_primary() {
     client.signal_shutdown_sync();
 }
 
+#[tokio::test]
+async fn group_refresh_anchor_lookups_overlap_and_keep_the_unavailable_members_devices() {
+    let (client, transport) = create_iq_test_client().await;
+    let users: Vec<_> = (0..=crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY)
+        .map(|i| Jid::pn(format!("1202555{:04}", 110 + i)))
+        .collect();
+    let unavailable = &users[0];
+    client
+        .update_device_list(DeviceListRecord {
+            user: unavailable.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+            raw_id: Some(1),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
+    let refresh = {
+        let client = client.clone();
+        let users = users.clone();
+        tokio::spawn(async move {
+            let response = DeviceListResponse {
+                device_lists: users
+                    .iter()
+                    .flat_map(|user| migration_response(user).device_lists)
+                    .collect(),
+                lid_mappings: vec![],
+            };
+            client
+                .try_process_group_device_list_response(
+                    &response,
+                    &users,
+                    client.device_topology.current(),
+                )
+                .await
+        })
+    };
+    for (chunk, window) in users
+        .chunks(crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY)
+        .enumerate()
+    {
+        let mut requests = vec![];
+        for offset in 0..window.len() {
+            let frame = chunk * crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY + offset;
+            let iq = decode_sent_iq(&transport, frame).await;
+            let node = iq.get();
+            let user = node
+                .get_optional_child("key")
+                .unwrap()
+                .get_optional_child("user")
+                .unwrap()
+                .attrs()
+                .optional_jid("jid")
+                .unwrap();
+            let id = node.attrs().optional_string("id").unwrap().into_owned();
+            requests.push((user, id));
+        }
+        // All requests in this window reached the transport before its first reply.
+        assert_eq!(
+            transport.sent_count(),
+            chunk * crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY + window.len()
+        );
+        for (user, id) in requests.into_iter().rev() {
+            let reply = if user == *unavailable {
+                NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .children([NodeBuilder::new("list").build()])
+                    .build()
+            } else {
+                primary_response(&user, crate::test_utils::adv_test_account(), true)
+            };
+            answer_iq(&client, &id, &reply).await;
+        }
+    }
+    let devices = refresh.await.unwrap().unwrap().unwrap();
+    assert!(devices.contains(&unavailable.with_device(3)));
+    assert!(!devices.contains(&unavailable.with_device(7)));
+    assert!(
+        client
+            .cached_adv_account_identity(unavailable)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for user in &users[1..] {
+        assert!(devices.contains(&user.with_device(7)));
+    }
+    assert_eq!(transport.sent_count(), users.len());
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn group_refresh_anchor_request_errors_and_strict_missing_bundles_abort_publication() {
+    for mode in [
+        DeviceListApplyMode::GroupRefresh,
+        DeviceListApplyMode::StrictRefresh,
+    ] {
+        let (client, transport) = create_iq_test_client().await;
+        let warm = Jid::pn("12025550121");
+        let cold = Jid::pn("12025550122");
+        crate::test_utils::seed_adv_primary(&client, &warm).await;
+        let mut response = migration_response(&warm);
+        response
+            .device_lists
+            .extend(migration_response(&cold).device_lists);
+        let refresh = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .apply_device_list_response(&response, mode, None, None)
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let reply = if mode == DeviceListApplyMode::GroupRefresh {
+            NodeBuilder::new("iq")
+                .attr("type", "error")
+                .children([NodeBuilder::new("error").attr("code", "503").build()])
+                .build()
+        } else {
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("list").build()])
+                .build()
+        };
+        answer_iq(&client, &id, &reply).await;
+        let error = refresh.await.unwrap().unwrap_err();
+        if mode == DeviceListApplyMode::GroupRefresh {
+            assert!(
+                error.chain().any(|source| matches!(
+                    source.downcast_ref::<IqError>(),
+                    Some(IqError::ServerError { code: 503, .. })
+                )),
+                "{error:#}"
+            );
+        } else {
+            assert!(
+                error
+                    .chain()
+                    .any(|source| source.is::<crate::prekeys::AdvPrimaryBundleError>()),
+                "{error:#}"
+            );
+        }
+        assert!(client.load_device_record_for_jid(&warm).await.is_none());
+        client.signal_shutdown_sync();
+    }
+}
+
 /// Reject one contact's trust conflict while valid and omitted peers keep fanout.
 #[tokio::test]
 async fn group_identity_conflicts_retain_only_the_affected_contact() {

@@ -29,6 +29,16 @@ pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
 
 const MIN_PRE_KEY_COUNT: usize = 5;
 
+pub(crate) const ADV_BOOTSTRAP_CONCURRENCY: usize = 8;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AdvPrimaryBundleError {
+    #[error("primary identity unavailable for ADV verification")]
+    Missing,
+    #[error("could not authenticate primary bundle: {0}")]
+    Invalid(#[source] anyhow::Error),
+}
+
 /// Separate from Signal locks: a slow cold lookup must not block a warm
 /// companion waiting for offline-processing admission. Only active flights
 /// remain registered; a lease releases its joiners even when cancelled.
@@ -41,7 +51,7 @@ impl Default for AdvBootstrapRegistry {
     fn default() -> Self {
         Self {
             flights: Default::default(),
-            queries: async_lock::Semaphore::new(8),
+            queries: async_lock::Semaphore::new(ADV_BOOTSTRAP_CONCURRENCY),
         }
     }
 }
@@ -350,10 +360,12 @@ impl Client {
                 None => PreKeyFetchSpec::new(vec![primary.clone()]),
             };
             let response = self.execute(spec).await?;
-            let bundle = response.bundles.get(primary).ok_or_else(|| {
-                anyhow::anyhow!("primary identity unavailable for ADV verification")
-            })?;
-            Ok(*authenticated_primary_identity(bundle)?
+            let bundle = response
+                .bundles
+                .get(primary)
+                .ok_or(AdvPrimaryBundleError::Missing)?;
+            Ok(*authenticated_primary_identity(bundle)
+                .map_err(AdvPrimaryBundleError::Invalid)?
                 .public_key()
                 .public_key_bytes())
         })
