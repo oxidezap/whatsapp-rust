@@ -782,9 +782,7 @@ impl LiveRetention {
     }
 
     pub fn stored(&self, items: &[PendingDelivery]) {
-        let mut state = lock(&self.state);
-        for index in (0..state.reservations.len()).rev() {
-            let reservation = &mut state.reservations[index];
+        lock(&self.state).reservations.retain_mut(|reservation| {
             reservation
                 .entries
                 .retain(|entry| !items.iter().any(|item| same_entry(entry, item)));
@@ -794,13 +792,8 @@ impl LiveRetention {
             reservation
                 .raw
                 .retain(|raw| !items.iter().any(|item| item.origin == Some(raw.origin)));
-            if !reservation.receiving
-                && reservation.entries.is_empty()
-                && reservation.raw.is_empty()
-            {
-                remove(&mut state, index);
-            }
-        }
+            reservation.receiving || !reservation.entries.is_empty() || !reservation.raw.is_empty()
+        });
     }
 }
 #[inline(never)]
