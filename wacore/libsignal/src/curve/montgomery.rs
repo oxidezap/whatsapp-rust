@@ -57,7 +57,7 @@ impl MontgomeryPoint {
         )
     }
     fn mul_bits_be(&self, bits: impl Iterator<Item = bool>) -> ProjectivePoint {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         if std::is_x86_feature_detected!("bmi2") {
             // SAFETY: the CPU supports BMI2, checked just above.
             #[allow(unsafe_code)]
@@ -66,15 +66,56 @@ impl MontgomeryPoint {
         self.mul_bits_be_generic(bits)
     }
 
-    // Baseline x86-64 `mul` writes its product to the fixed `rdx:rax` pair, so
-    // the ladder step, with its ~190 128-bit products, keeps moving operands
-    // through those two registers and spills about a third of its instructions
-    // to the stack. BMI2 `mulx` takes any destination registers. The field
+    // Baseline x86-64 `mul` writes its product to the fixed `rdx:rax` pair;
+    // BMI2 `mulx` takes any destination registers. With it, the ladder runs on
+    // four saturated 64-bit limbs (`FieldElement64`): 16 limb products per
+    // multiplication instead of 25, and fewer live registers, so the step
+    // spills much less to the stack than the radix-2^51 one. The field
     // operations are `#[inline(always)]`, so they are compiled for BMI2 here.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[target_feature(enable = "bmi2")]
     fn mul_bits_be_bmi2(&self, bits: impl Iterator<Item = bool>) -> ProjectivePoint {
-        self.mul_bits_be_generic(bits)
+        use super::field64::FieldElement64 as Fe;
+
+        let affine_u = Fe::from_bytes(&self.0);
+        let mut x0 = (Fe::ONE, Fe::ZERO);
+        let mut x1 = (affine_u, Fe::ONE);
+
+        let mut prev_bit = false;
+        for cur_bit in bits {
+            let choice = Choice::from((prev_bit ^ cur_bit) as u8);
+            Fe::conditional_swap(&mut x0.0, &mut x1.0, choice);
+            Fe::conditional_swap(&mut x0.1, &mut x1.1, choice);
+
+            // Same formulas as `differential_add_and_double`.
+            let (pu, pw) = x0;
+            let (qu, qw) = x1;
+            let t0 = pu.add(&pw);
+            let t1 = pu.sub(&pw);
+            let t2 = qu.add(&qw);
+            let t3 = qu.sub(&qw);
+            let t4 = t0.square();
+            let t5 = t1.square();
+            let t6 = t4.sub(&t5);
+            let t7 = t0.mul(&t3);
+            let t8 = t1.mul(&t2);
+            let t9 = t7.add(&t8);
+            let t10 = t7.sub(&t8);
+            let t15 = t6.mul_small_add(121666, &t5);
+            x0 = (t4.mul(&t5), t6.mul(&t15));
+            x1 = (t9.square(), affine_u.mul(&t10.square()));
+
+            prev_bit = cur_bit;
+        }
+        let choice = Choice::from(prev_bit as u8);
+        Fe::conditional_swap(&mut x0.0, &mut x1.0, choice);
+        Fe::conditional_swap(&mut x0.1, &mut x1.1, choice);
+        prev_bit.zeroize();
+
+        ProjectivePoint {
+            U: x0.0.to_field51(),
+            W: x0.1.to_field51(),
+        }
     }
 
     #[inline(always)]
@@ -233,7 +274,7 @@ fn differential_add_and_double(
     Q.W = t17;  // W_{Q'} = U_D * 4 (W_P U_Q - U_P W_Q)^2
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, target_arch = "x86_64", target_pointer_width = "64"))]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha512};
