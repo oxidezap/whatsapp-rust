@@ -44,18 +44,7 @@ impl GroupCryptoCache {
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         arc_allocation_bytes::<Self>()
             + self.signing.iter().flatten().count() * arc_allocation_bytes::<SigningContext>()
-            + self
-                .verifying
-                .iter()
-                .flatten()
-                .map(|context| {
-                    arc_allocation_bytes::<VerifyingContext>()
-                        + context
-                            .verifying
-                            .as_ref()
-                            .map_or(0, PreparedVerifyingKey::heap_bytes)
-                })
-                .sum::<usize>()
+            + self.verifying.iter().flatten().count() * arc_allocation_bytes::<VerifyingContext>()
     }
     pub(crate) fn prepare(
         cache: &mut Option<Arc<Self>>,

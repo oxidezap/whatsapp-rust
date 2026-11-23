@@ -316,7 +316,6 @@ impl IdentityKeyPair {
 #[derive(Clone, Debug)]
 pub struct PreparedVerifyingKey {
     point: crate::curve::PreparedPoint,
-    encoding: [u8; 32],
 }
 impl PreparedVerifyingKey {
     pub fn new(public: &PublicKey) -> Result<Self> {
@@ -333,19 +332,14 @@ impl PreparedVerifyingKey {
             return Err(CurveError::InvalidKey);
         }
         Ok(Self {
-            point: crate::curve::PreparedPoint::new(p0),
-            encoding: p0.compress().to_bytes(),
+            point: crate::curve::PreparedPoint::new(&p0),
         })
-    }
-    /// Heap owned by this key's precomputed tables.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.point.heap_bytes()
     }
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
         let Some(signature) = crate::curve::ParsedSignature::parse(signature) else {
             return false;
         };
-        let mut encoding = self.encoding;
+        let mut encoding = self.point.encoding();
         encoding[31] |= signature.sign() << 7;
         crate::curve::verify_prepared(&self.point, &encoding, message, &signature)
     }
@@ -532,6 +526,16 @@ mod tests {
         assert_eq!(unreduced[63] & 0xe0, 0);
         assert!(public.verify_signature(b"synthetic", &unreduced));
         assert!(prepared.verify_signature(b"synthetic", &unreduced));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn prepared_verifying_key_is_no_larger_than_point_and_encoding() {
+        // One is cached per sender key, so retained memory scales with it.
+        assert!(
+            size_of::<PreparedVerifyingKey>()
+                <= size_of::<crate::curve::edwards::EdwardsPoint>() + 32
+        );
     }
 
     #[test]

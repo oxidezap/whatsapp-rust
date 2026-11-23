@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-use super::{edwards::EdwardsPoint, scalar::Scalar};
+use super::{edwards::EdwardsPoint, field::FieldElement, scalar::Scalar};
 use sha2::{Digest, Sha512};
 use zeroize::Zeroizing;
 
@@ -57,51 +57,50 @@ impl<'a> ParsedSignature<'a> {
     }
 }
 
-/// A validated verifying point and the precomputed tables its backend uses
-/// for repeated verification.
+/// A validated verifying point, stored affine, and the shifted points its
+/// AVX2 backend fills for repeated verification.
 #[derive(Clone)]
 pub(crate) struct PreparedPoint {
-    point: EdwardsPoint,
-    // Built by the first verification, so keys that are prepared but never
-    // verify, such as a sender key that is stored but never receives a
-    // message, do not pay for them.
+    // Canonical affine coordinates of the point; `y` with the sign of `x` in
+    // bit 255 is its encoding.
+    x: [u8; 32],
+    y: [u8; 32],
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-    segments: std::sync::OnceLock<Option<Box<super::avx2::SegmentTables>>>,
+    segments: super::avx2::SegmentPoints,
 }
 
 impl core::fmt::Debug for PreparedPoint {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PreparedPoint")
-            .field("point", &self.point)
+            .field("encoding", &self.encoding())
             .finish_non_exhaustive()
     }
 }
 
 impl PreparedPoint {
-    pub(crate) fn new(point: EdwardsPoint) -> Self {
+    pub(crate) fn new(point: &EdwardsPoint) -> Self {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         super::avx2::prepare_basepoint();
+        let recip = point.Z.invert();
         Self {
-            point,
+            x: (&point.X * &recip).to_bytes(),
+            y: (&point.Y * &recip).to_bytes(),
             #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-            segments: std::sync::OnceLock::new(),
+            segments: super::avx2::SegmentPoints::new(),
         }
     }
 
-    /// Heap owned by this point, excluding the process-wide basepoint tables.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        if let Some(Some(_)) = self.segments.get() {
-            return size_of::<super::avx2::SegmentTables>();
-        }
-        0
+    pub(crate) fn encoding(&self) -> [u8; 32] {
+        let mut encoding = self.y;
+        encoding[31] |= (self.x[0] & 1) << 7;
+        encoding
     }
 
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-    fn segments(&self) -> Option<&super::avx2::SegmentTables> {
-        self.segments
-            .get_or_init(|| super::avx2::prepare(&self.point))
-            .as_deref()
+    fn point(&self) -> EdwardsPoint {
+        EdwardsPoint::from_affine(
+            FieldElement::from_bytes(&self.x),
+            FieldElement::from_bytes(&self.y),
+        )
     }
 }
 
@@ -140,25 +139,25 @@ pub(crate) fn verify_prepared(
     signature: &ParsedSignature<'_>,
 ) -> bool {
     use subtle::ConstantTimeEq;
+    let point = prepared.point();
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-    if let Some(segments) = prepared.segments() {
+    if std::is_x86_feature_detected!("avx2") {
         let challenge = -challenge(encoding, message, signature);
         // Scalars are reduced, so `verify` multiplies -A by the integer l - h.
         // [l - h](-A) + [s]B = -([l - h]A + [l - s]B) holds for mixed-order A
         // too, because only B is known to have order l. [h]A + [s]B would
         // differ by [l]A for keys with a small-order component.
+        let segments = &prepared.segments;
         let r = if signature.sign() != 0 {
-            -super::avx2::mul_prepared(&challenge, segments, &-signature.scalar)
+            super::avx2::mul_prepared(&challenge, &point, segments, &-signature.scalar).map(|r| -r)
         } else {
-            super::avx2::mul_prepared(&challenge, segments, &signature.scalar)
+            super::avx2::mul_prepared(&challenge, &point, segments, &signature.scalar)
         };
-        return bool::from(r.compress().as_bytes().ct_eq(&signature.bytes[..32]));
+        if let Some(r) = r {
+            return bool::from(r.compress().as_bytes().ct_eq(&signature.bytes[..32]));
+        }
     }
-    let point = if signature.sign() != 0 {
-        -prepared.point
-    } else {
-        prepared.point
-    };
+    let point = if signature.sign() != 0 { -point } else { point };
     verify(&point, encoding, message, signature)
 }
 
@@ -183,9 +182,10 @@ mod tests {
                 &super::super::EIGHT_TORSION[1 + seed as usize % 7],
                 &key,
             );
-            let prepared = PreparedPoint::new(point);
+            let prepared = PreparedPoint::new(&point);
             let message = seed.to_be_bytes();
-            for sign in [0u8, 1] {
+            // Repeated so the unsegmented, filling and loaded paths all run.
+            for sign in [0u8, 1, 0, 1] {
                 let signer = if sign != 0 { -point } else { point };
                 let mut encoding = point.compress().to_bytes();
                 encoding[31] |= sign << 7;
