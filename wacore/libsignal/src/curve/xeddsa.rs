@@ -62,8 +62,11 @@ impl<'a> ParsedSignature<'a> {
 #[derive(Clone)]
 pub(crate) struct PreparedPoint {
     point: EdwardsPoint,
+    // Built by the first verification, so keys that are prepared but never
+    // verify, such as a sender key that is stored but never receives a
+    // message, do not pay for them.
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-    segments: Option<Box<super::avx2::SegmentTables>>,
+    segments: std::sync::OnceLock<Option<Box<super::avx2::SegmentTables>>>,
 }
 
 impl core::fmt::Debug for PreparedPoint {
@@ -76,20 +79,29 @@ impl core::fmt::Debug for PreparedPoint {
 
 impl PreparedPoint {
     pub(crate) fn new(point: EdwardsPoint) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        super::avx2::prepare_basepoint();
         Self {
             point,
             #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-            segments: super::avx2::prepare(&point),
+            segments: std::sync::OnceLock::new(),
         }
     }
 
     /// Heap owned by this point, excluding the process-wide basepoint tables.
     pub(crate) fn heap_bytes(&self) -> usize {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        if self.segments.is_some() {
+        if let Some(Some(_)) = self.segments.get() {
             return size_of::<super::avx2::SegmentTables>();
         }
         0
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    fn segments(&self) -> Option<&super::avx2::SegmentTables> {
+        self.segments
+            .get_or_init(|| super::avx2::prepare(&self.point))
+            .as_deref()
     }
 }
 
@@ -129,7 +141,7 @@ pub(crate) fn verify_prepared(
 ) -> bool {
     use subtle::ConstantTimeEq;
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-    if let Some(segments) = &prepared.segments {
+    if let Some(segments) = prepared.segments() {
         let challenge = -challenge(encoding, message, signature);
         // Scalars are reduced, so `verify` multiplies -A by the integer l - h.
         // [l - h](-A) + [s]B = -([l - h]A + [l - s]B) holds for mixed-order A

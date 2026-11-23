@@ -43,25 +43,40 @@ pub(super) fn prepare(point: &EdwardsPoint) -> Option<Box<SegmentTables>> {
     Some(unsafe { prepare_avx2(point) })
 }
 
+/// Builds the process-wide basepoint tables ahead of the first verification,
+/// which then only builds the tables of its own key.
+pub(super) fn prepare_basepoint() {
+    if BASEPOINT_SEGMENTS.get().is_none() && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: Runtime detection includes the OS support required for AVX2.
+        unsafe { basepoint_avx2() };
+    }
+}
+
 #[target_feature(enable = "avx2")]
-unsafe fn prepare_avx2(point: &EdwardsPoint) -> Box<SegmentTables> {
+unsafe fn basepoint_avx2() -> &'static [NafLookupTable8<CachedPoint>; SEGMENTS - 1] {
     // The closure inherits this function's AVX2 target feature, so the
     // tables are built only by the thread that initializes the cell.
-    let basepoint = &**BASEPOINT_SEGMENTS.get_or_init(|| basepoint_segments_avx2());
+    BASEPOINT_SEGMENTS.get_or_init(|| basepoint_segments_avx2())
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn prepare_avx2(point: &EdwardsPoint) -> Box<SegmentTables> {
+    // SAFETY: This function only runs with AVX2 enabled.
+    let basepoint = unsafe { basepoint_avx2() };
     let mut segment = ExtendedPoint::from(*point);
-    let mut tables = [const { None }; SEGMENTS];
-    for (j, table) in tables.iter_mut().enumerate() {
+    // Filled in place: building the 5 KB tables on the stack and moving them
+    // into the box costs two extra copies.
+    let mut tables = Box::new(SegmentTables {
+        point: core::array::from_fn(|_| NafLookupTable5([CachedPoint::from(segment); 8])),
+        basepoint,
+    });
+    for (j, table) in tables.point.iter_mut().enumerate() {
         if j > 0 {
             segment = shift_segment(segment);
         }
-        let mut multiples = [CachedPoint::from(segment); 8];
-        odd_multiples(segment, &mut multiples);
-        *table = Some(NafLookupTable5(multiples));
+        odd_multiples(segment, &mut table.0);
     }
-    Box::new(SegmentTables {
-        point: tables.map(|table| table.expect("every segment table is built")),
-        basepoint,
-    })
+    tables
 }
 
 // Table construction runs once per key or once per process, so these helpers
