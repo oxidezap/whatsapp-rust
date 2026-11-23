@@ -52,6 +52,21 @@ impl From<DieselOrStore> for StoreError {
     }
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle_bytes = needle.as_bytes();
+    let needle_len = needle_bytes.len();
+    if haystack.len() < needle_len {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle_len)
+        .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+}
+
 /// Check if a Diesel error represents a retriable SQLite lock contention.
 ///
 /// SQLite BUSY (error code 5) and LOCKED (error code 6) both map to
@@ -61,10 +76,8 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
     match error {
         DieselError::DatabaseError(DatabaseErrorKind::Unknown, info) => {
             let msg = info.message();
-            msg.contains("locked")
-                || msg.contains("busy")
-                || msg.contains("LOCKED")
-                || msg.contains("BUSY")
+            contains_ascii_case_insensitive(msg, "locked")
+                || contains_ascii_case_insensitive(msg, "busy")
         }
         _ => false,
     }
@@ -5670,6 +5683,16 @@ mod retry_tests {
         );
         assert!(is_retriable_sqlite_error(&busy));
         assert!(is_retriable_sqlite_error(&locked));
+        let mixed_case_busy = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("database is Busy".to_string()),
+        );
+        let uppercase_locked = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("DATABASE IS LOCKED".to_string()),
+        );
+        assert!(is_retriable_sqlite_error(&mixed_case_busy));
+        assert!(is_retriable_sqlite_error(&uppercase_locked));
         assert!(!is_retriable_sqlite_error(&syntax));
     }
 
