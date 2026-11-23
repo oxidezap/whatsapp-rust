@@ -61,7 +61,10 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
     match error {
         DieselError::DatabaseError(DatabaseErrorKind::Unknown, info) => {
             let msg = info.message();
-            msg.contains("locked") || msg.contains("busy")
+            msg.contains("locked")
+                || msg.contains("busy")
+                || msg.contains("LOCKED")
+                || msg.contains("BUSY")
         }
         _ => false,
     }

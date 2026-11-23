@@ -340,7 +340,11 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     }
 
-    let _ = tx.send(TransportEvent::Disconnected(reason)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tx.send(TransportEvent::Disconnected(reason)),
+    )
+    .await;
 }
 
 /// Wraps an already-upgraded [`WebSocketStream`] into a [`Transport`] + event channel.

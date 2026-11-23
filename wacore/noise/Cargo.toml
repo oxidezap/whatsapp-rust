@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 wacore-binary = { workspace = true }
 wacore-libsignal = { workspace = true }
 waproto = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }

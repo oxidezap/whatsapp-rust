@@ -11,11 +11,33 @@ pub(crate) struct StanzaRouter {
     handlers: HashMap<&'static str, Arc<dyn StanzaHandler>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Handler for tag '{tag}' already registered")]
+pub struct DuplicateHandlerError {
+    pub tag: &'static str,
+}
+
 impl StanzaRouter {
     /// Create a new empty router.
     pub(crate) fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+        }
+    }
+
+    /// Try to register a handler for a specific XML tag.
+    ///
+    /// Returns an error if a handler is already registered for the same tag.
+    #[allow(dead_code)]
+    pub(crate) fn try_register(
+        &mut self,
+        handler: Arc<dyn StanzaHandler>,
+    ) -> Result<(), DuplicateHandlerError> {
+        let tag = handler.tag();
+        if self.handlers.insert(tag, handler).is_some() {
+            Err(DuplicateHandlerError { tag })
+        } else {
+            Ok(())
         }
     }
 
@@ -28,9 +50,8 @@ impl StanzaRouter {
     /// Panics if a handler is already registered for the same tag to prevent
     /// accidental overwrites during initialization.
     pub(crate) fn register(&mut self, handler: Arc<dyn StanzaHandler>) {
-        let tag = handler.tag();
-        if self.handlers.insert(tag, handler).is_some() {
-            panic!("Handler for tag '{}' already registered", tag);
+        if let Err(e) = self.try_register(handler) {
+            panic!("{}", e);
         }
     }
 
@@ -132,6 +153,17 @@ mod tests {
 
         router.register(handler);
         assert_eq!(router.handler_count(), 1);
+    }
+
+    #[test]
+    fn test_router_try_register() {
+        let mut router = StanzaRouter::new();
+        let handler1 = Arc::new(MockHandler::new("test"));
+        let handler2 = Arc::new(MockHandler::new("test"));
+
+        assert!(router.try_register(handler1).is_ok());
+        let err = router.try_register(handler2).unwrap_err();
+        assert_eq!(err.tag, "test");
     }
 
     #[test]
