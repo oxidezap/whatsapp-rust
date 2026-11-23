@@ -34,10 +34,12 @@ impl StanzaRouter {
         handler: Arc<dyn StanzaHandler>,
     ) -> Result<(), DuplicateHandlerError> {
         let tag = handler.tag();
-        if self.handlers.insert(tag, handler).is_some() {
-            Err(DuplicateHandlerError { tag })
-        } else {
-            Ok(())
+        match self.handlers.entry(tag) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(DuplicateHandlerError { tag }),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handler);
+                Ok(())
+            }
         }
     }
 
@@ -161,9 +163,17 @@ mod tests {
         let handler1 = Arc::new(MockHandler::new("test"));
         let handler2 = Arc::new(MockHandler::new("test"));
 
-        assert!(router.try_register(handler1).is_ok());
-        let err = router.try_register(handler2).unwrap_err();
+        assert!(router.try_register(handler1.clone()).is_ok());
+        let err = router.try_register(handler2.clone()).unwrap_err();
         assert_eq!(err.tag, "test");
+        assert_eq!(router.handler_count(), 1);
+
+        // Ensure the original handler is preserved upon rejected duplicate registration
+        let registered = router.handlers.get("test").unwrap();
+        assert!(Arc::ptr_eq(
+            registered,
+            &(handler1 as Arc<dyn StanzaHandler>)
+        ));
     }
 
     #[test]
