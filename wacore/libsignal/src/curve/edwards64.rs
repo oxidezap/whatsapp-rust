@@ -9,9 +9,11 @@ use super::{
     edwards::EdwardsPoint, field64::FieldElement64 as Fe, scalar::Scalar, tables::BASEPOINT_TABLE,
     window::LookupTable,
 };
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable};
 
+/// `repr(C)`: `select` reads each entry as six 16-byte vectors.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct AffineNiels64 {
     y_plus_x: Fe,
     y_minus_x: Fe,
@@ -69,25 +71,56 @@ static BASEPOINT_TABLE64: [[AffineNiels64; 8]; 32] = {
 
 /// Constant-time `x * P_j` lookup from a table of `[P, 2P, ..., 8P]`, for
 /// `x` in `-8..=8`, like `LookupTable::select`.
+///
+/// Every entry is read and masked with SSE2 (part of the x86_64 baseline):
+/// an entry is six 16-byte vectors, so the scan takes 6 loads per entry
+/// instead of 12, keeps its accumulators in registers, and derives the
+/// one-hot masks with vector compares instead of a `subtle` barrier per
+/// entry.
 #[inline(always)]
 fn select(table: &[AffineNiels64; 8], x: i8) -> AffineNiels64 {
+    use core::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_or_si128, _mm_set_epi64x,
+        _mm_set1_epi32, _mm_setzero_si128, _mm_storeu_si128,
+    };
+
     let mask = (x as i16) >> 7;
     let abs = ((x as i16) + mask) ^ mask;
-    let is_zero = (abs as u16).ct_eq(&0);
+
     let mut out = AffineNiels64 {
-        y_plus_x: Fe([is_zero.unwrap_u8() as u64, 0, 0, 0]),
-        y_minus_x: Fe([is_zero.unwrap_u8() as u64, 0, 0, 0]),
+        y_plus_x: Fe::ZERO,
+        y_minus_x: Fe::ZERO,
         xy2d: Fe::ZERO,
     };
-    for (j, point) in table.iter().enumerate() {
-        // The choices are one-hot, so OR-ing the masked entries selects one.
-        let m = ((abs as u16).ct_eq(&(j as u16 + 1)).unwrap_u8() as u64).wrapping_neg();
-        for k in 0..4 {
-            out.y_plus_x.0[k] |= point.y_plus_x.0[k] & m;
-            out.y_minus_x.0[k] |= point.y_minus_x.0[k] & m;
-            out.xy2d.0[k] |= point.xy2d.0[k] & m;
+    // SAFETY: SSE2 is enabled on every x86_64 target. `AffineNiels64` is
+    // `repr(C)` with three `[u64; 4]` fields and no padding, so the 96 bytes
+    // of each table entry and of `out` are six unaligned 16-byte vectors.
+    #[allow(unsafe_code)]
+    unsafe {
+        // All 32-bit lanes are equal, so a lane-wise compare yields an
+        // all-ones or all-zeros vector.
+        let wanted = _mm_set1_epi32(i32::from(abs));
+        // `abs == 0` selects the identity (1, 1, 0).
+        let identity = _mm_and_si128(
+            _mm_cmpeq_epi32(wanted, _mm_setzero_si128()),
+            _mm_set_epi64x(0, 1),
+        );
+        let mut acc = [_mm_setzero_si128(); 6];
+        acc[0] = identity;
+        acc[2] = identity;
+        for (j, point) in table.iter().enumerate() {
+            let m = _mm_cmpeq_epi32(wanted, _mm_set1_epi32(j as i32 + 1));
+            let lanes = (point as *const AffineNiels64).cast::<__m128i>();
+            for (k, acc) in acc.iter_mut().enumerate() {
+                *acc = _mm_or_si128(*acc, _mm_and_si128(m, _mm_loadu_si128(lanes.add(k))));
+            }
+        }
+        let dst = (&mut out as *mut AffineNiels64).cast::<__m128i>();
+        for (k, acc) in acc.iter().enumerate() {
+            _mm_storeu_si128(dst.add(k), *acc);
         }
     }
+
     // -(y + x, y - x, 2dxy) = (y - x, y + x, -2dxy)
     let negative = Choice::from((mask & 1) as u8);
     Fe::conditional_swap(&mut out.y_plus_x, &mut out.y_minus_x, negative);
@@ -195,6 +228,23 @@ pub(super) fn mul_base_bmi2(scalar: &Scalar) -> EdwardsPoint {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha512};
+
+    #[test]
+    fn select_matches_portable_lookup_for_every_digit() {
+        for (table, table64) in BASEPOINT_TABLE.iter().zip(&BASEPOINT_TABLE64) {
+            for x in -8i8..=8 {
+                let got = select(table64, x);
+                let want = table.select(x);
+                for (fe64, fe) in [
+                    (got.y_plus_x, want.y_plus_x),
+                    (got.y_minus_x, want.y_minus_x),
+                    (got.xy2d, want.xy2d),
+                ] {
+                    assert_eq!(fe64.to_field51().to_bytes(), fe.to_bytes(), "digit {x}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn bmi2_mul_base_matches_portable() {
