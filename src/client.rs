@@ -1417,6 +1417,8 @@ pub enum ClientError {
     NotLoggedIn,
     #[error("IQ request failed: {0}")]
     Iq(#[from] crate::request::IqError),
+    #[error("connection changed before peer recovery send")]
+    StaleConnectionGeneration,
     /// Last-resort catch-all for internal failures threaded through `?` that do
     /// not (yet) have a dedicated variant. Formatting retains known typed
     /// diagnostics; `source()` preserves the complete error for downcast.
@@ -1432,6 +1434,7 @@ impl std::fmt::Debug for ClientError {
             Self::Socket(e) => f.debug_tuple("Socket").field(e).finish(),
             Self::EncryptSend(e) => f.debug_tuple("EncryptSend").field(e).finish(),
             Self::Iq(e) => f.debug_tuple("Iq").field(e).finish(),
+            Self::StaleConnectionGeneration => f.write_str("StaleConnectionGeneration"),
             Self::Internal(e) => f
                 .debug_tuple("Internal")
                 .field(&wacore::diagnostics::ErrorSummary(e.as_ref()))

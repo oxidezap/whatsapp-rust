@@ -1875,6 +1875,7 @@ dependencies = [
  "wacore-binary",
  "wacore-libsignal",
  "waproto",
+ "zeroize",
 ]
 
 [[package]]

@@ -22,6 +22,16 @@ pub(crate) fn public(raw: &[u8; 32]) -> Result<PublicKey> {
 }
 #[derive(Clone)]
 pub struct RootKey([u8; 32]);
+impl Zeroize for RootKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+impl Drop for RootKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 impl RootKey {
     pub fn new(key: [u8; 32]) -> Self {
         Self(key)
@@ -34,6 +44,16 @@ impl RootKey {
 pub struct ChainKey {
     key: [u8; 32],
     index: u32,
+}
+impl Zeroize for ChainKey {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+impl Drop for ChainKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 impl ChainKey {
     pub fn new(key: [u8; 32], index: u32) -> Self {

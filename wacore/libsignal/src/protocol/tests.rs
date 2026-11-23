@@ -2411,5 +2411,20 @@ fn activating_another_own_sender_state_rebinds_reservation_before_publication() 
         let reloaded =
             SenderKeyRecord::deserialize(&sender.records[&name].serialize().unwrap()).unwrap();
         assert_eq!(reloaded.inner.states[0].iteration, 65);
-    })
+    });
+}
+
+#[test]
+fn root_key_and_chain_key_zeroize() {
+    use zeroize::Zeroize;
+
+    let mut root = RootKey::new([0x42; 32]);
+    assert_eq!(root.key(), &[0x42; 32]);
+    root.zeroize();
+    assert_eq!(root.key(), &[0; 32]);
+
+    let mut chain = ChainKey::new([0x99; 32], 5);
+    assert_eq!(chain.key(), &[0x99; 32]);
+    chain.zeroize();
+    assert_eq!(chain.key(), &[0; 32]);
 }

@@ -926,6 +926,9 @@ impl OwnedNodeRef {
     /// Return a zero-copy `Bytes` sub-view for a slice that borrows from this
     /// node's backing buffer. Panics if `slice` does not point within the buffer.
     pub fn slice_bytes(&self, slice: &[u8]) -> Bytes {
+        if slice.is_empty() {
+            return Bytes::new();
+        }
         let cart = &self.inner.backing_cart().0;
         let base = cart.as_ptr() as usize;
         let end = base + cart.len();
@@ -1371,5 +1374,16 @@ mod serde_tests {
         let from_ref = serde_json::to_value(&owned_ref).unwrap();
         let from_owned = serde_json::to_value(owned_ref.to_owned_node()).unwrap();
         assert_eq!(from_ref, from_owned);
+    }
+
+    #[test]
+    fn slice_bytes_empty_slice_returns_empty_bytes() {
+        let node = Node::new(Cow::Borrowed("iq"), Attrs::new(), None);
+        let packed = crate::marshal::marshal(&node).unwrap();
+        let node_bytes = crate::util::unpack(&packed).unwrap().into_owned();
+        let owned_ref = OwnedNodeRef::new(Bytes::from(node_bytes)).unwrap();
+
+        let empty = owned_ref.slice_bytes(&[]);
+        assert!(empty.is_empty());
     }
 }

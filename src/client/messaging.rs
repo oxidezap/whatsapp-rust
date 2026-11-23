@@ -166,7 +166,7 @@ impl Client {
             || self.authenticated_generation.load(Ordering::SeqCst) != generation
             || !self.can_reach_server()
         {
-            return Err(anyhow::anyhow!("connection changed before peer recovery send").into());
+            return Err(ClientError::StaleConnectionGeneration);
         }
         let plaintext = self.marshal_node_for_send(node)?;
         wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
