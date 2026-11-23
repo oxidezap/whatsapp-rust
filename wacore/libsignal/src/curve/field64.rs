@@ -1,11 +1,12 @@
 //! Field arithmetic modulo \\(p = 2\^{255} - 19\\) on four saturated 64-bit
-//! limbs, for the x86_64 BMI2 Montgomery ladder only.
+//! limbs, for the x86_64 BMI2 code paths: the Montgomery ladder, fixed-base
+//! scalar multiplication (`edwards64`) and inversion.
 //!
 //! An element is any integer below \\(2\^{256}\\) in its residue class: the
 //! operations fold carries out of bit 256 with \\(2\^{256} \equiv 38\\) and
 //! never canonicalize. Compared with the radix-\\(2\^{51}\\) field, a product
 //! needs 16 limb multiplications instead of 25 and holds four limbs per
-//! operand instead of five, so the ladder step fits in far fewer registers.
+//! operand instead of five, so each step fits in far fewer registers.
 //! All functions are branch-free and `#[inline(always)]`, so they compile
 //! for the BMI2 caller's target features.
 
@@ -44,6 +45,41 @@ impl FieldElement64 {
         });
         limbs[3] &= (1 << 63) - 1;
         Self(limbs)
+    }
+
+    /// Packs radix-2^51 limbs, which may be unreduced as in the constant
+    /// tables. Two carry rounds bring every limb below 2^51, so the packed
+    /// value is below 2^255.
+    pub(super) const fn from_radix51(mut limbs: [u64; 5]) -> Self {
+        const MASK: u64 = (1 << 51) - 1;
+        let mut round = 0;
+        while round < 2 {
+            let mut i = 0;
+            while i < 4 {
+                limbs[i + 1] += limbs[i] >> 51;
+                limbs[i] &= MASK;
+                i += 1;
+            }
+            limbs[0] += 19 * (limbs[4] >> 51);
+            limbs[4] &= MASK;
+            round += 1;
+        }
+        // Only the `19 * carry` of the last round can leave limb 0 at 2^51
+        // or above; the OR below would then lose that bit. Used on constants,
+        // so this fails at compile time.
+        assert!(limbs[0] >> 51 == 0);
+        Self::pack51(limbs)
+    }
+
+    /// Packs radix-2^51 limbs that are each below 2^51.
+    #[inline(always)]
+    const fn pack51(limbs: [u64; 5]) -> Self {
+        Self([
+            limbs[0] | (limbs[1] << 51),
+            (limbs[1] >> 13) | (limbs[2] << 38),
+            (limbs[2] >> 26) | (limbs[3] << 25),
+            (limbs[3] >> 39) | (limbs[4] << 12),
+        ])
     }
 
     /// Splits into radix-2^51 limbs. The top limb takes bits 204..256, so it
@@ -203,6 +239,49 @@ impl FieldElement64 {
     }
 
     #[inline(always)]
+    fn pow2k(&self, k: u32) -> Self {
+        let mut x = *self;
+        for _ in 0..k {
+            x = x.square();
+        }
+        x
+    }
+
+    /// `self^(p - 2)`, with the addition chain of `FieldElement::invert`.
+    /// Zero maps to zero.
+    #[inline(always)]
+    fn invert(&self) -> Self {
+        let t0 = self.square(); // 1
+        let t1 = t0.square().square(); // 3
+        let t2 = self.mul(&t1); // 3,0
+        let t3 = t0.mul(&t2); // 3,1,0
+        let t4 = t3.square(); // 4,2,1
+        let t5 = t2.mul(&t4); // 4..0
+        let t6 = t5.pow2k(5); // 9..5
+        let t7 = t6.mul(&t5); // 9..0
+        let t8 = t7.pow2k(10); // 19..10
+        let t9 = t8.mul(&t7); // 19..0
+        let t10 = t9.pow2k(20); // 39..20
+        let t11 = t10.mul(&t9); // 39..0
+        let t12 = t11.pow2k(10); // 49..10
+        let t13 = t12.mul(&t7); // 49..0
+        let t14 = t13.pow2k(50); // 99..50
+        let t15 = t14.mul(&t13); // 99..0
+        let t16 = t15.pow2k(100); // 199..100
+        let t17 = t16.mul(&t15); // 199..0
+        let t18 = t17.pow2k(50); // 249..50
+        let t19 = t18.mul(&t13); // 249..0
+        t19.pow2k(5).mul(&t3) // 254..5,3,1,0
+    }
+
+    /// `FieldElement::invert` on radix-2^64 limbs. Squarings take 10 limb
+    /// products here instead of 15.
+    #[target_feature(enable = "bmi2")]
+    pub(super) fn invert_bmi2(x: &FieldElement) -> FieldElement {
+        Self::pack51(x.canonical_limbs()).invert().to_field51()
+    }
+
+    #[inline(always)]
     pub(super) fn conditional_swap(a: &mut Self, b: &mut Self, choice: Choice) {
         for i in 0..4 {
             u64::conditional_swap(&mut a.0[i], &mut b.0[i], choice);
@@ -266,6 +345,33 @@ mod tests {
                     encoded(&x.mul_small_add(121666, y)),
                     (&fx.mul121666() + &fy).to_bytes()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn invert_matches_radix_51_field() {
+        if !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        for x in &samples() {
+            let fx = to_fe51(x);
+            let expected = fx.invert_generic().to_bytes();
+            assert_eq!(encoded(&x.invert()), expected);
+            // SAFETY: BMI2 support is checked above.
+            #[allow(unsafe_code)]
+            let fast = unsafe { FieldElement64::invert_bmi2(&fx) };
+            assert_eq!(fast.to_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn table_constants_match_radix_51_field() {
+        for table in &super::super::tables::BASEPOINT_TABLE {
+            for point in &table.0 {
+                for fe in [point.y_plus_x, point.xy2d, point.y_minus_x] {
+                    assert_eq!(encoded(&FieldElement64::from_radix51(fe.0)), fe.to_bytes());
+                }
             }
         }
     }

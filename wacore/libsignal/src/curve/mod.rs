@@ -19,6 +19,8 @@ mod constants;
 #[path = "constants64.rs"]
 mod constants;
 pub(crate) mod edwards;
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod edwards64;
 mod field;
 #[cfg(not(target_pointer_width = "64"))]
 mod field2625;

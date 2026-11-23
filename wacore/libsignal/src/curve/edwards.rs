@@ -110,6 +110,16 @@ impl EdwardsPoint {
         bool::from(p.X.is_zero() & p.Y.ct_eq(&p.Z))
     }
     pub(crate) fn mul_base(scalar: &Scalar) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: the CPU supports BMI2, checked just above.
+            #[allow(unsafe_code)]
+            return unsafe { super::edwards64::mul_base_bmi2(scalar) };
+        }
+        Self::mul_base_generic(scalar)
+    }
+    #[inline(always)]
+    pub(super) fn mul_base_generic(scalar: &Scalar) -> Self {
         let digits = scalar.as_radix_16();
         let table = &constants::BASEPOINT_TABLE;
         let mut point = Self::identity();
