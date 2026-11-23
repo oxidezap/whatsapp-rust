@@ -15,16 +15,7 @@ version = 2
 # Vulnerabilities are fixed by upgrading. A vulnerability exception requires
 # the affected operation is structurally unreachable in this workspace and no
 # fixed dependency exists; the exact boundary must be recorded beside it.
-ignore = [
-    # OxiTLS exposes RSA signing for server/private-key users. wa-fetch is an
-    # HTTP client with no client certificate or private key, so the Marvin
-    # private-key timing path is unreachable. No fixed pure-Rust RSA release
-    # exists; replacing the provider would reintroduce C/assembly TLS.
-    "RUSTSEC-2023-0071",
-    # Compile-time macro dependency of OxiTLS. It contributes no runtime code,
-    # and the current provider has no replacement release without it.
-    "RUSTSEC-2024-0436",
-]
+ignore = []
 
 [licenses]
 version = 2
