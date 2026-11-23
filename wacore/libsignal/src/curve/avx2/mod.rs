@@ -45,18 +45,18 @@ pub(super) fn prepare(point: &EdwardsPoint) -> Option<Box<SegmentTables>> {
 
 #[target_feature(enable = "avx2")]
 unsafe fn prepare_avx2(point: &EdwardsPoint) -> Box<SegmentTables> {
-    let basepoint = match BASEPOINT_SEGMENTS.get() {
-        Some(tables) => &**tables,
-        None => {
-            let tables = basepoint_segments_avx2();
-            &**BASEPOINT_SEGMENTS.get_or_init(|| tables)
-        }
-    };
-    let mut segment = *point;
+    // The closure inherits this function's AVX2 target feature, so the
+    // tables are built only by the thread that initializes the cell.
+    let basepoint = &**BASEPOINT_SEGMENTS.get_or_init(|| basepoint_segments_avx2());
+    let mut segment = ExtendedPoint::from(*point);
     let mut tables = [const { None }; SEGMENTS];
-    for table in &mut tables {
-        *table = Some(NafLookupTable5::<CachedPoint>::from(&segment));
-        segment = shift_segment(segment);
+    for (j, table) in tables.iter_mut().enumerate() {
+        if j > 0 {
+            segment = shift_segment(segment);
+        }
+        let mut multiples = [CachedPoint::from(segment); 8];
+        odd_multiples(segment, &mut multiples);
+        *table = Some(NafLookupTable5(multiples));
     }
     Box::new(SegmentTables {
         point: tables.map(|table| table.expect("every segment table is built")),
@@ -64,32 +64,43 @@ unsafe fn prepare_avx2(point: &EdwardsPoint) -> Box<SegmentTables> {
     })
 }
 
+// Table construction runs once per key or once per process, so these helpers
+// stay out of line to keep the inlined point arithmetic out of the binary.
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 fn basepoint_segments_avx2() -> Box<[NafLookupTable8<CachedPoint>; SEGMENTS - 1]> {
     let mut one = [0; 32];
     one[0] = 1;
-    let mut segment = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(one));
+    let mut segment =
+        ExtendedPoint::from(EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(one)));
     let mut tables = [const { None }; SEGMENTS - 1];
     for table in &mut tables {
         segment = shift_segment(segment);
-        let first = ExtendedPoint::from(segment);
-        let double = first.double();
-        let mut multiples = [CachedPoint::from(first); 64];
-        for i in 0..63 {
-            multiples[i + 1] = (&double + &multiples[i]).into();
-        }
+        let mut multiples = [CachedPoint::from(segment); 64];
+        odd_multiples(segment, &mut multiples);
         *table = Some(NafLookupTable8(multiples));
     }
     Box::new(tables.map(|table| table.expect("every segment table is built")))
 }
 
+/// Fills `multiples` with `first`, `3 first`, `5 first`, ...
 #[target_feature(enable = "avx2")]
-fn shift_segment(point: EdwardsPoint) -> EdwardsPoint {
-    let mut shifted = ExtendedPoint::from(point);
-    for _ in 0..SEGMENT_BITS {
-        shifted = shifted.double();
+#[inline(never)]
+fn odd_multiples(first: ExtendedPoint, multiples: &mut [CachedPoint]) {
+    let double = first.double();
+    multiples[0] = CachedPoint::from(first);
+    for i in 0..multiples.len() - 1 {
+        multiples[i + 1] = CachedPoint::from(&double + &multiples[i]);
     }
-    shifted.into()
+}
+
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+fn shift_segment(mut point: ExtendedPoint) -> ExtendedPoint {
+    for _ in 0..SEGMENT_BITS {
+        point = point.double();
+    }
+    point
 }
 
 /// Computes `a A + b B` with the segment tables of `A`.
@@ -113,25 +124,29 @@ unsafe fn mul_prepared_avx2(a: &Scalar, tables: &SegmentTables, b: &Scalar) -> E
         result = result.double();
         for j in 0..SEGMENTS {
             let digit = a_naf[j * SEGMENT_BITS + i];
-            let table = &tables.point[j];
-            match digit.cmp(&0) {
-                core::cmp::Ordering::Greater => result = &result + &table.select(digit as usize),
-                core::cmp::Ordering::Less => result = &result - &table.select(-digit as usize),
-                core::cmp::Ordering::Equal => {}
+            if digit != 0 {
+                result = &result + &signed_multiple(&tables.point[j].0, digit);
             }
             let digit = b_naf[j * SEGMENT_BITS + i];
-            let table = match j {
-                0 => &constants::BASEPOINT_ODD_LOOKUP_TABLE,
-                _ => &tables.basepoint[j - 1],
-            };
-            match digit.cmp(&0) {
-                core::cmp::Ordering::Greater => result = &result + &table.select(digit as usize),
-                core::cmp::Ordering::Less => result = &result - &table.select(-digit as usize),
-                core::cmp::Ordering::Equal => {}
+            if digit != 0 {
+                let table = match j {
+                    0 => &constants::BASEPOINT_ODD_LOOKUP_TABLE,
+                    _ => &tables.basepoint[j - 1],
+                };
+                result = &result + &signed_multiple(&table.0, digit);
             }
         }
     }
     result.into()
+}
+
+/// Selects `digit * P` from the odd multiples of `P`. A select instead of a
+/// branch keeps LLVM from copying each addition, and its inlined field
+/// multiplications, into separate add and subtract paths.
+#[inline(always)]
+fn signed_multiple(multiples: &[CachedPoint], digit: i8) -> CachedPoint {
+    let point = &multiples[usize::from(digit.unsigned_abs()) / 2];
+    core::hint::select_unpredictable(digit < 0, -point, *point)
 }
 
 pub(super) fn mul(a: &Scalar, point: &EdwardsPoint, b: &Scalar) -> Option<EdwardsPoint> {
