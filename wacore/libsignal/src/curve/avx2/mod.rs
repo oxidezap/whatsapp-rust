@@ -83,8 +83,16 @@ impl SegmentPoints {
             let x = (&point.X * inverse).to_bytes();
             let y = (&point.Y * inverse).to_bytes();
             for i in 0..4 {
-                words[8 * k + i] = u64::from_le_bytes(x[8 * i..8 * i + 8].try_into().unwrap());
-                words[8 * k + 4 + i] = u64::from_le_bytes(y[8 * i..8 * i + 8].try_into().unwrap());
+                words[8 * k + i] = u64::from_le_bytes(
+                    x[8 * i..8 * i + 8]
+                        .try_into()
+                        .expect("coordinate slice has fixed eight-byte length"),
+                );
+                words[8 * k + 4 + i] = u64::from_le_bytes(
+                    y[8 * i..8 * i + 8]
+                        .try_into()
+                        .expect("coordinate slice has fixed eight-byte length"),
+                );
             }
         }
         for (slot, word) in self.0[..15].iter().zip(words) {
