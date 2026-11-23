@@ -57,6 +57,50 @@ impl<'a> ParsedSignature<'a> {
     }
 }
 
+/// A validated verifying point and the precomputed tables its backend uses
+/// for repeated verification.
+#[derive(Clone)]
+pub(crate) struct PreparedPoint {
+    point: EdwardsPoint,
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    segments: Option<Box<super::avx2::SegmentTables>>,
+}
+
+impl core::fmt::Debug for PreparedPoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedPoint")
+            .field("point", &self.point)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedPoint {
+    pub(crate) fn new(point: EdwardsPoint) -> Self {
+        Self {
+            point,
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            segments: super::avx2::prepare(&point),
+        }
+    }
+
+    /// Heap owned by this point, excluding the process-wide basepoint tables.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if self.segments.is_some() {
+            return size_of::<super::avx2::SegmentTables>();
+        }
+        0
+    }
+}
+
+fn challenge(encoding: &[u8; 32], message: &[u8], signature: &ParsedSignature<'_>) -> Scalar {
+    let mut hash = Sha512::new();
+    hash.update(&signature.bytes[..32]);
+    hash.update(encoding);
+    hash.update(message);
+    scalar_hash(hash)
+}
+
 // Callers validate the public key and pass its point and matching encoding
 // with the transported sign. Parsing binds the checked scalar to these bytes.
 #[inline(never)]
@@ -67,13 +111,39 @@ pub(crate) fn verify(
     signature: &ParsedSignature<'_>,
 ) -> bool {
     use subtle::ConstantTimeEq;
-    let mut hash = Sha512::new();
-    hash.update(&signature.bytes[..32]);
-    hash.update(encoding);
-    hash.update(message);
-    let challenge = scalar_hash(hash);
+    let challenge = challenge(encoding, message, signature);
     let r =
         EdwardsPoint::vartime_double_scalar_mul_basepoint(&-challenge, point, &signature.scalar)
             .compress();
     bool::from(r.as_bytes().ct_eq(&signature.bytes[..32]))
+}
+
+// `prepared` holds the positive point; the transported sign selects -A.
+// `encoding` already carries that sign.
+#[inline(never)]
+pub(crate) fn verify_prepared(
+    prepared: &PreparedPoint,
+    encoding: &[u8; 32],
+    message: &[u8],
+    signature: &ParsedSignature<'_>,
+) -> bool {
+    use subtle::ConstantTimeEq;
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    if let Some(segments) = &prepared.segments {
+        let challenge = challenge(encoding, message, signature);
+        // [-h](-A) = [h]A, so the sign flips the scalar instead of the tables.
+        let a = if signature.sign() != 0 {
+            challenge
+        } else {
+            -challenge
+        };
+        let r = super::avx2::mul_prepared(&a, segments, &signature.scalar).compress();
+        return bool::from(r.as_bytes().ct_eq(&signature.bytes[..32]));
+    }
+    let point = if signature.sign() != 0 {
+        -prepared.point
+    } else {
+        prepared.point
+    };
+    verify(&point, encoding, message, signature)
 }

@@ -315,7 +315,7 @@ impl IdentityKeyPair {
 /// Decompresses the public point once for repeated XEdDSA checks.
 #[derive(Clone, Debug)]
 pub struct PreparedVerifyingKey {
-    point: crate::curve::edwards::EdwardsPoint,
+    point: crate::curve::PreparedPoint,
     encoding: [u8; 32],
 }
 impl PreparedVerifyingKey {
@@ -333,24 +333,21 @@ impl PreparedVerifyingKey {
             return Err(CurveError::InvalidKey);
         }
         Ok(Self {
-            point: p0,
+            point: crate::curve::PreparedPoint::new(p0),
             encoding: p0.compress().to_bytes(),
         })
+    }
+    /// Heap owned by this key's precomputed tables.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.point.heap_bytes()
     }
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
         let Some(signature) = crate::curve::ParsedSignature::parse(signature) else {
             return false;
         };
-        let negative;
-        let point = if signature.sign() != 0 {
-            negative = -self.point;
-            &negative
-        } else {
-            &self.point
-        };
         let mut encoding = self.encoding;
         encoding[31] |= signature.sign() << 7;
-        crate::curve::verify(point, &encoding, message, &signature)
+        crate::curve::verify_prepared(&self.point, &encoding, message, &signature)
     }
 }
 /// Keeps the normalized scalar and Edwards encoding for repeated signing.
@@ -535,6 +532,59 @@ mod tests {
         assert_eq!(unreduced[63] & 0xe0, 0);
         assert!(public.verify_signature(b"synthetic", &unreduced));
         assert!(prepared.verify_signature(b"synthetic", &unreduced));
+    }
+
+    #[test]
+    fn prepared_verification_matches_ordinary_verification() {
+        use rand::SeedableRng;
+        let mut random = rand::rngs::StdRng::from_seed([23; 32]);
+        let mut signs = [0usize; 2];
+        for round in 0..64u8 {
+            let pair = KeyPair::generate(&mut random);
+            let prepared = pair.public_key.prepare_verifying_key().unwrap();
+            let message = vec![round; usize::from(round) * 7];
+            let signing = PreparedSigningKey::new(&pair.private_key);
+            for sign in [0u8, 1, 0, 1] {
+                let mut randomness = [0; 64];
+                random.fill_bytes(&mut randomness);
+                // Signal's signer always transports sign 0. Sign 1 signs as
+                // -A, the encoding older XEdDSA implementations could emit.
+                let signature = if sign == 0 {
+                    crate::curve::sign(&signing.scalar, &signing.public, &message, &randomness)
+                } else {
+                    let mut public = signing.public;
+                    public[31] |= 0x80;
+                    let mut signature =
+                        crate::curve::sign(&-signing.scalar, &public, &message, &randomness);
+                    signature[63] |= 0x80;
+                    signature
+                };
+                signs[usize::from(signature[63] >> 7)] += 1;
+                assert!(pair.public_key.verify_signature(&message, &signature));
+                assert!(prepared.verify_signature(&message, &signature));
+                let mut changed_message = message.clone();
+                changed_message.push(1);
+                let mut changed_r = signature;
+                changed_r[usize::from(round) % 32] ^= 1;
+                let mut changed_s = signature;
+                changed_s[32 + usize::from(round) % 31] ^= 1;
+                let mut changed_sign = signature;
+                changed_sign[63] ^= 0x80;
+                for (message, signature) in [
+                    (&changed_message, &signature),
+                    (&message, &changed_r),
+                    (&message, &changed_s),
+                    (&message, &changed_sign),
+                ] {
+                    assert_eq!(
+                        prepared.verify_signature(message, signature),
+                        pair.public_key.verify_signature(message, signature)
+                    );
+                    assert!(!prepared.verify_signature(message, signature));
+                }
+            }
+        }
+        assert!(signs.iter().all(|&count| count > 0), "{signs:?}");
     }
 
     #[test]
