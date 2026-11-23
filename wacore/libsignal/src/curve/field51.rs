@@ -29,6 +29,14 @@ const SIXTEEN_P: [u64; 5] = [
     36028797018963952u64,
 ];
 
+const TWO_P: [u64; 5] = [
+    4503599627370458u64,
+    4503599627370494u64,
+    4503599627370494u64,
+    4503599627370494u64,
+    4503599627370494u64,
+];
+
 #[derive(Copy, Clone)]
 pub(super) struct FieldElement51(pub(super) [u64; 5]);
 
@@ -87,6 +95,20 @@ impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
 }
 
 impl FieldElement51 {
+    /// `self - rhs` without the carry pass of `Sub`, for a difference that only
+    /// feeds `mul_ladder`, `square` or `mul121666`.
+    ///
+    /// Adding 2p instead of 16p only needs `rhs[i] <= 2p[i]` (2^52 - 38 in limb
+    /// 0), and leaves every limb below `self[i] + 2^52`. With both operands
+    /// coming out of a carry chain (limbs < 2^51 + 2^13) that is below 2^53,
+    /// inside the 2^54 those functions accept, so their own carry chain does
+    /// the reduction.
+    #[inline(always)]
+    pub(super) fn sub_ladder(&self, rhs: &Self) -> Self {
+        debug_assert!((0..5).all(|i| rhs.0[i] <= TWO_P[i] && self.0[i] < (1 << 53) - TWO_P[i]));
+        FieldElement51(core::array::from_fn(|i| self.0[i] + TWO_P[i] - rhs.0[i]))
+    }
+
     #[inline(always)]
     #[rustfmt::skip] // keep alignment of c* calculations
     pub(super) fn mul_ladder(&self, rhs: &Self) -> Self {

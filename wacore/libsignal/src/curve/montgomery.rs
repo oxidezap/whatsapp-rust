@@ -196,20 +196,23 @@ fn differential_add_and_double(
     affine_PmQ: &FieldElement,
 ) {
     let t0 = &P.U + &P.W;
-    let t1 = &P.U - &P.W;
+    // Every difference in this step only feeds a multiplication or squaring,
+    // and every input is the output of a field carry chain or `from_bytes`,
+    // so the differences can skip the carry pass of `Sub` (see `sub_ladder`).
+    let t1 = P.U.sub_ladder(&P.W);
     let t2 = &Q.U + &Q.W;
-    let t3 = &Q.U - &Q.W;
+    let t3 = Q.U.sub_ladder(&Q.W);
 
     let t4 = t0.square();   // (U_P + W_P)^2 = U_P^2 + 2 U_P W_P + W_P^2
     let t5 = t1.square();   // (U_P - W_P)^2 = U_P^2 - 2 U_P W_P + W_P^2
 
-    let t6 = &t4 - &t5;     // 4 U_P W_P
+    let t6 = t4.sub_ladder(&t5); // 4 U_P W_P
 
     let t7 = t0.mul_ladder(&t3);     // (U_P + W_P) (U_Q - W_Q) = U_P U_Q + W_P U_Q - U_P W_Q - W_P W_Q
     let t8 = t1.mul_ladder(&t2);     // (U_P - W_P) (U_Q + W_Q) = U_P U_Q - W_P U_Q + U_P W_Q - W_P W_Q
 
     let t9  = &t7 + &t8;    // 2 (U_P U_Q - W_P W_Q)
-    let t10 = &t7 - &t8;    // 2 (W_P U_Q - U_P W_Q)
+    let t10 = t7.sub_ladder(&t8); // 2 (W_P U_Q - U_P W_Q)
 
     let t11 =  t9.square(); // 4 (U_P U_Q - W_P W_Q)^2
     let t12 = t10.square(); // 4 (W_P U_Q - U_P W_Q)^2
