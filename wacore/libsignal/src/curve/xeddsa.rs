@@ -148,11 +148,15 @@ pub(crate) fn verify_prepared(
         // too, because only B is known to have order l. [h]A + [s]B would
         // differ by [l]A for keys with a small-order component.
         let segments = &prepared.segments;
-        let r = if signature.sign() != 0 {
-            super::avx2::mul_prepared(&challenge, &point, segments, &-signature.scalar).map(|r| -r)
+        let (scalar, sign) = if signature.sign() != 0 {
+            (-signature.scalar, true)
         } else {
-            super::avx2::mul_prepared(&challenge, &point, segments, &signature.scalar)
+            (signature.scalar, false)
         };
+        let mut r = super::avx2::mul_prepared(&challenge, &point, segments, &scalar);
+        if sign {
+            r = r.map(|r| -r);
+        }
         if let Some(r) = r {
             return bool::from(r.compress().as_bytes().ct_eq(&signature.bytes[..32]));
         }

@@ -43,6 +43,15 @@ const READY: u64 = 1 << 63;
 /// the same as an unprepared one.
 const SEEN: u64 = 1 << 63;
 
+#[inline(never)]
+fn pack_le_u64s(bytes: &[u8; 32], out: &mut [u64]) {
+    for (i, word) in out.iter_mut().take(4).enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[8 * i..8 * i + 8]);
+        *word = u64::from_le_bytes(b);
+    }
+}
+
 #[allow(clippy::disallowed_types)]
 impl SegmentPoints {
     pub(super) const fn new() -> Self {
@@ -75,6 +84,7 @@ impl SegmentPoints {
 
     /// Concurrent verifications may both store; they store the same
     /// words, and `READY` is published last.
+    #[inline(never)]
     fn store(&self, points: &[EdwardsPoint; SEGMENTS - 1]) {
         let mut inverses = points.map(|point| point.Z);
         FieldElement::invert_batch(&mut inverses);
@@ -82,18 +92,8 @@ impl SegmentPoints {
         for (k, (point, inverse)) in points.iter().zip(&inverses).enumerate() {
             let x = (&point.X * inverse).to_bytes();
             let y = (&point.Y * inverse).to_bytes();
-            for i in 0..4 {
-                words[8 * k + i] = u64::from_le_bytes(
-                    x[8 * i..8 * i + 8]
-                        .try_into()
-                        .expect("coordinate slice has fixed eight-byte length"),
-                );
-                words[8 * k + 4 + i] = u64::from_le_bytes(
-                    y[8 * i..8 * i + 8]
-                        .try_into()
-                        .expect("coordinate slice has fixed eight-byte length"),
-                );
-            }
+            pack_le_u64s(&x, &mut words[8 * k..8 * k + 4]);
+            pack_le_u64s(&y, &mut words[8 * k + 4..8 * k + 8]);
         }
         for (slot, word) in self.0[..15].iter().zip(words) {
             slot.store(word, Ordering::Relaxed);
@@ -195,6 +195,7 @@ pub(super) fn mul_prepared(
 }
 
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn mul_prepared_avx2(
     a: &Scalar,
     point: &EdwardsPoint,
@@ -213,12 +214,7 @@ unsafe fn mul_prepared_avx2(
             shifted
         }
     };
-    let tables = [point, &shifted[0], &shifted[1]].map(|point| {
-        let first = ExtendedPoint::from(*point);
-        let mut multiples = [CachedPoint::from(first); 8];
-        odd_multiples(first, &mut multiples);
-        NafLookupTable5(multiples)
-    });
+    let tables = [point, &shifted[0], &shifted[1]].map(NafLookupTable5::<CachedPoint>::from);
     // Both NAFs are at most 254 digits; the padding keeps the last segment's
     // indices in bounds.
     let mut a_naf = [0; SEGMENTS * SEGMENT_BITS];
@@ -270,6 +266,7 @@ pub(super) fn mul(a: &Scalar, point: &EdwardsPoint, b: &Scalar) -> Option<Edward
 }
 
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 unsafe fn mul_avx2(a: &Scalar, point: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
     let a_naf = a.non_adjacent_form(5);
     let b_naf = b.non_adjacent_form(8);
