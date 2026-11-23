@@ -99,6 +99,16 @@ impl FieldElement {
     }
 
     pub(crate) fn invert(&self) -> FieldElement {
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: the CPU supports BMI2, checked just above.
+            #[allow(unsafe_code)]
+            return unsafe { super::field64::FieldElement64::invert_bmi2(self) };
+        }
+        self.invert_generic()
+    }
+    #[inline(always)]
+    pub(super) fn invert_generic(&self) -> FieldElement {
         // The bits of p-2 = 2^255 -19 -2 are 11010111111...11.
         //
         //                                 nonzero bits of exponent
