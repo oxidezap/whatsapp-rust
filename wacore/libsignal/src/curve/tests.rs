@@ -77,6 +77,41 @@ fn squaring_matches_multiplication_at_limb_bounds() {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn ladder_subtraction_matches_subtraction_at_limb_bounds() {
+    use super::field51::FieldElement51;
+    // Carry-chain outputs: limb 1 can carry up to 2^13 over 2^51.
+    let bounds = [
+        (1u64 << 51) - 1,
+        (1 << 51) + (1 << 13),
+        (1 << 51) - 1,
+        (1 << 51) - 1,
+        (1 << 51) - 1,
+    ];
+    let others = [
+        FieldElement51::from_limbs([0; 5]),
+        FieldElement51::from_limbs([1, 0, 0, 0, 0]),
+        FieldElement51::from_limbs(bounds),
+    ];
+    for index in 0..5 {
+        for value in [0, 1, bounds[index] - 1, bounds[index]] {
+            let mut limbs = bounds;
+            limbs[index] = value;
+            let a = FieldElement51::from_limbs(limbs);
+            for b in others.iter().chain([&a]) {
+                for (x, y) in [(&a, b), (b, &a)] {
+                    let lazy = x.sub_ladder(y);
+                    assert_eq!(lazy.to_bytes(), (x - y).to_bytes());
+                    assert_eq!((&lazy * &lazy).to_bytes(), (&(x - y) * &(x - y)).to_bytes());
+                    assert_eq!(lazy.square().to_bytes(), (x - y).square().to_bytes());
+                    assert_eq!(lazy.mul121666().to_bytes(), (x - y).mul121666().to_bytes());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(not(target_pointer_width = "64"))]
 #[test]
 fn ladder_constant_matches_multiplication_at_limb_bounds() {
