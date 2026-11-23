@@ -770,7 +770,7 @@ mod history_wrapper_tests {
                 proto
             }),
         ];
-        assert_eq!(wrappers.len(), 30, "one row per traversed wrapper");
+        assert_eq!(wrappers.len(), 31, "one row per traversed wrapper");
         for (name, wrap) in wrappers {
             for payload in [history_bundle(), history_notice()] {
                 assert!(
