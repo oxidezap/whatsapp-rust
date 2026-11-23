@@ -649,6 +649,46 @@ impl DmSendHarness {
         });
     }
 
+    /// One warm DM reply quoting a received message, measuring the exact callback-to-send path:
+    /// context building, quoted context info generation, and dispatch through `client.send()`.
+    pub fn warm_reply_quoting(&self) {
+        self.runtime.block_on(async {
+            let quote = wacore::proto_helpers::build_quote_context(
+                "3EB0123456789ABCDEF0",
+                &self.to.to_string(),
+                &wa::Message::text("ping"),
+            );
+            self.client
+                .send(crate::SendRequest::new(
+                    &self.to,
+                    wa::Message::text_with_context("pong", quote),
+                ))
+                .await
+                .expect("offline DM reply must reach the sink");
+        });
+    }
+
+    /// One warm DM message edit, measuring the protocol message wrap,
+    /// cryptographic recipient packaging, and dispatch through `client.edit_message()`.
+    pub fn warm_edit(&self) {
+        self.runtime.block_on(async {
+            let target = crate::MessageRef::new(
+                &self.to,
+                crate::MessageId::new("3EB0123456789ABCDEF0").expect("valid id"),
+                None,
+                true,
+            )
+            .expect("valid target");
+            self.client
+                .edit_message(crate::EditRequest::new(
+                    target,
+                    wa::Message::text("edited bench content"),
+                ))
+                .await
+                .expect("offline DM edit must reach the sink");
+        });
+    }
+
     /// Per-term outcomes of the DM device memo so far; see
     /// [`GroupSendHarness::memo_stats`].
     pub fn memo_stats(&self) -> crate::client::DeviceMemoStats {
