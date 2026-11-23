@@ -92,9 +92,12 @@ fn select(table: &[AffineNiels64; 8], x: i8) -> AffineNiels64 {
         y_minus_x: Fe::ZERO,
         xy2d: Fe::ZERO,
     };
+    // Layout the vector loads and stores below rely on.
+    const _: () = assert!(size_of::<AffineNiels64>() == 96);
     // SAFETY: SSE2 is enabled on every x86_64 target. `AffineNiels64` is
-    // `repr(C)` with three `[u64; 4]` fields and no padding, so the 96 bytes
-    // of each table entry and of `out` are six unaligned 16-byte vectors.
+    // `repr(C)` with three `repr(transparent)` `[u64; 4]` fields and no
+    // padding, so the 96 bytes of each table entry and of `out` are six
+    // unaligned 16-byte vectors.
     #[allow(unsafe_code)]
     unsafe {
         // All 32-bit lanes are equal, so a lane-wise compare yields an

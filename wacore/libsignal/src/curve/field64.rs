@@ -13,7 +13,9 @@
 use super::field::FieldElement;
 use subtle::{Choice, ConditionallySelectable};
 
+/// `repr(transparent)`: `edwards64::select` reads the limbs as raw bytes.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub(super) struct FieldElement64(pub(super) [u64; 4]);
 
 /// `a + b + carry`, returning the low word and the carry out. Written like
