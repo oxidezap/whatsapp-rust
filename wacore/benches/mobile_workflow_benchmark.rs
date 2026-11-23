@@ -134,5 +134,6 @@ fn confirm_durable_checkpoint(bencher: Bencher) {
             workflow
                 .confirm_persisted(*token)
                 .expect("synthetic host acknowledgement");
+            black_box(&*workflow);
         });
 }
