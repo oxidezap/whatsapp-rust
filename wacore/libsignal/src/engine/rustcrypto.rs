@@ -66,6 +66,22 @@ impl CryptoProvider for RustCrypto {
         }
         Ok(shared)
     }
+    fn public_key_and_agreement(
+        &self,
+        private: &[u8; 32],
+        public: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32])> {
+        let (own, shared) = MontgomeryPoint::mul_base_clamped_and_mul_clamped(
+            *private,
+            MontgomeryPoint(*public),
+            *private,
+        );
+        let shared = shared.to_bytes();
+        if bool::from(shared.ct_eq(&[0; 32])) {
+            return Err(Error::Crypto);
+        }
+        Ok((own.to_bytes(), shared))
+    }
     fn sign(
         &self,
         private: &[u8; 32],
@@ -285,6 +301,35 @@ mod tests {
         let expected = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
         assert_eq!(RustCrypto.agreement(&private, &public).unwrap(), expected);
         assert_eq!(RustCrypto.agreement(&private, &alias).unwrap(), expected);
+    }
+
+    #[test]
+    fn public_key_and_agreement_matches_separate_operations() {
+        use sha2::Digest;
+        for seed in 0u32..128 {
+            let wide: [u8; 32] = Sha256::digest(seed.to_le_bytes()).into();
+            let private = Sha256::digest(wide).into();
+            let public = RustCrypto.public_key(&wide).unwrap();
+            assert_eq!(
+                RustCrypto
+                    .public_key_and_agreement(&private, &public)
+                    .unwrap(),
+                (
+                    RustCrypto.public_key(&private).unwrap(),
+                    RustCrypto.agreement(&private, &public).unwrap()
+                ),
+                "seed {seed}"
+            );
+        }
+        let alice = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let bob = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        assert_eq!(
+            RustCrypto.public_key_and_agreement(&alice, &bob).unwrap(),
+            (
+                hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"),
+                hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+            )
+        );
     }
 
     fn hex<const N: usize>(s: &str) -> [u8; N] {

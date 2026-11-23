@@ -22,12 +22,31 @@ impl MontgomeryPoint {
         FieldElement::invert_batch(&mut denominators);
         core::array::from_fn(|i| Self((&numerators[i] * &denominators[i]).to_bytes()))
     }
+    /// Returns `mul_base_clamped(base)` and `point.mul_clamped(scalar)`, sharing
+    /// one field inversion between the two results.
+    pub(crate) fn mul_base_clamped_and_mul_clamped(
+        base: [u8; 32],
+        point: Self,
+        scalar: [u8; 32],
+    ) -> (Self, Self) {
+        let (base_u, base_w) = Self::mul_base_edwards(base).montgomery_coordinates();
+        let product = point.mul_clamped_projective(scalar);
+        let mut denominators = Zeroizing::new([base_w, product.W]);
+        FieldElement::invert_batch(&mut denominators);
+        (
+            Self((&base_u * &denominators[0]).to_bytes()),
+            Self((&product.U * &denominators[1]).to_bytes()),
+        )
+    }
     fn mul_base_edwards(mut bytes: [u8; 32]) -> EdwardsPoint {
         bytes[0] &= 248;
         bytes[31] = (bytes[31] & 127) | 64;
         EdwardsPoint::mul_base(&Zeroizing::new(Scalar::from_bytes_mod_order(bytes)))
     }
-    pub(crate) fn mul_clamped(self, mut bytes: [u8; 32]) -> Self {
+    pub(crate) fn mul_clamped(self, bytes: [u8; 32]) -> Self {
+        self.mul_clamped_projective(bytes).as_affine()
+    }
+    fn mul_clamped_projective(self, mut bytes: [u8; 32]) -> ProjectivePoint {
         bytes[0] &= 248;
         bytes[31] = (bytes[31] & 127) | 64;
         let bytes = Zeroizing::new(bytes);
@@ -37,7 +56,7 @@ impl MontgomeryPoint {
                 .map(|bit| (bytes[bit / 8] >> (bit % 8)) & 1 != 0),
         )
     }
-    fn mul_bits_be(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
+    fn mul_bits_be(&self, bits: impl Iterator<Item = bool>) -> ProjectivePoint {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("bmi2") {
             // SAFETY: the CPU supports BMI2, checked just above.
@@ -54,12 +73,12 @@ impl MontgomeryPoint {
     // operations are `#[inline(always)]`, so they are compiled for BMI2 here.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "bmi2")]
-    fn mul_bits_be_bmi2(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
+    fn mul_bits_be_bmi2(&self, bits: impl Iterator<Item = bool>) -> ProjectivePoint {
         self.mul_bits_be_generic(bits)
     }
 
     #[inline(always)]
-    fn mul_bits_be_generic(&self, bits: impl Iterator<Item = bool>) -> MontgomeryPoint {
+    fn mul_bits_be_generic(&self, bits: impl Iterator<Item = bool>) -> ProjectivePoint {
         // Algorithm 8 of Costello-Smith 2017
         let affine_u = FieldElement::from_bytes(&self.0);
         let mut x0 = ProjectivePoint::identity();
@@ -85,7 +104,7 @@ impl MontgomeryPoint {
         // Don't leave the bit in the stack
         prev_bit.zeroize();
 
-        x0.as_affine()
+        x0
     }
     pub(crate) fn to_edwards(self, sign: u8) -> Option<EdwardsPoint> {
         // The birational map y = (u-1)/(u+1) is undefined at u = -1,
@@ -232,8 +251,9 @@ mod tests {
             };
             // SAFETY: BMI2 support is checked above.
             #[allow(unsafe_code)]
-            let bmi2 = unsafe { point.mul_bits_be_bmi2(bits()) };
-            assert_eq!(bmi2.0, point.mul_bits_be_generic(bits()).0, "seed {seed}");
+            let bmi2 = unsafe { point.mul_bits_be_bmi2(bits()) }.as_affine();
+            let portable = point.mul_bits_be_generic(bits()).as_affine();
+            assert_eq!(bmi2.0, portable.0, "seed {seed}");
         }
     }
 }

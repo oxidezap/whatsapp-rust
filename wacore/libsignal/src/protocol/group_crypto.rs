@@ -198,6 +198,13 @@ impl CryptoProvider for PreparedGroupProvider {
     fn agreement(&self, private: &[u8; 32], public: &[u8; 32]) -> Result<[u8; 32]> {
         RustCrypto.agreement(private, public)
     }
+    fn public_key_and_agreement(
+        &self,
+        private: &[u8; 32],
+        public: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32])> {
+        RustCrypto.public_key_and_agreement(private, public)
+    }
     fn sign(
         &self,
         private: &[u8; 32],
