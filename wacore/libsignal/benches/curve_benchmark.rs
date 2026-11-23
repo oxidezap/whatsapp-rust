@@ -85,6 +85,10 @@ fn verify_prepared(b: divan::Bencher) {
     let signature = RustCrypto
         .sign(&[3; 32], &[5; 128], &mut Fixed)
         .expect("synthetic signing fixture must produce an XEdDSA signature");
+    // The second verification fills the key's shifted points; measure later ones.
+    for _ in 0..2 {
+        assert!(prepared.verify_signature(&[5; 128], &signature));
+    }
     b.bench(|| assert!(prepared.verify_signature(black_box(&[5; 128]), black_box(&signature))));
 }
 
@@ -112,6 +116,11 @@ fn verification_fixtures() -> Vec<VerificationFixture> {
                 let signature = RustCrypto
                     .sign(&[seed; 32], &message, &mut Fixed)
                     .expect("synthetic signing must succeed");
+                // Filled shifted points, as for a cached key that already
+                // verified twice.
+                for _ in 0..2 {
+                    assert!(prepared.verify_signature(&message, &signature));
+                }
                 (prepared, public, message, signature)
             })
         })

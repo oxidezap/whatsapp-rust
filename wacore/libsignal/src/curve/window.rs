@@ -31,7 +31,9 @@ impl LookupTable<AffineNielsPoint> {
         result
     }
 }
+#[derive(Clone)]
 pub(super) struct NafLookupTable5<T>(pub(super) [T; 8]);
+#[derive(Clone)]
 pub(super) struct NafLookupTable8<T>(pub(super) [T; 64]);
 impl<T: Copy> NafLookupTable5<T> {
     pub(super) fn select(&self, x: usize) -> T {

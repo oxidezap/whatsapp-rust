@@ -97,6 +97,14 @@ impl EdwardsPoint {
         // Unroll last iteration so we can go directly as_extended()
         s.double().as_extended()
     }
+    pub(super) fn from_affine(X: FieldElement, Y: FieldElement) -> Self {
+        EdwardsPoint {
+            X,
+            Y,
+            Z: FieldElement::ONE,
+            T: &X * &Y,
+        }
+    }
     pub(crate) fn compress(&self) -> CompressedEdwardsY {
         let recip = self.Z.invert();
         let x = &self.X * &recip;

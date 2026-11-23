@@ -37,7 +37,7 @@ mod scalar29;
 mod scalar52;
 mod tables;
 mod xeddsa;
-pub(crate) use xeddsa::{ParsedSignature, sign, verify};
+pub(crate) use xeddsa::{ParsedSignature, PreparedPoint, sign, verify, verify_prepared};
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[allow(unsafe_code)]
 mod avx2;
