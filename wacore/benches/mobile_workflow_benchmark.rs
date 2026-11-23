@@ -121,7 +121,7 @@ fn restore_verified_checkpoint(bencher: Bencher) {
         .bench_values(|checkpoint| black_box(fixture.restore(black_box(checkpoint))));
 }
 
-#[divan::bench]
+#[divan::bench(sample_count = 50, sample_size = 100)]
 fn confirm_durable_checkpoint(bencher: Bencher) {
     let fixture = Fixture::new();
     bencher
@@ -130,11 +130,9 @@ fn confirm_durable_checkpoint(bencher: Bencher) {
             let token = workflow.pending_persistence().expect("verified checkpoint");
             (workflow, token)
         })
-        .bench_values(|(workflow, token)| {
-            let mut workflow = black_box(workflow);
+        .bench_refs(|(workflow, token)| {
             workflow
-                .confirm_persisted(black_box(token))
+                .confirm_persisted(*token)
                 .expect("synthetic host acknowledgement");
-            black_box(workflow)
         });
 }
