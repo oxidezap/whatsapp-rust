@@ -19,6 +19,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: '3.25.3'
+  SCCACHE_VERSION: 'v0.19.0'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
   # The target dir is restored fresh each run (Swatinem cache), so incremental
@@ -71,6 +72,8 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.

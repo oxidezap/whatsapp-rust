@@ -8,6 +8,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  SCCACHE_VERSION: 'v0.19.0'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
@@ -83,6 +84,8 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
