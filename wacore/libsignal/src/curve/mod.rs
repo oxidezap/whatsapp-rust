@@ -24,6 +24,8 @@ mod field;
 mod field2625;
 #[cfg(target_pointer_width = "64")]
 mod field51;
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod field64;
 mod models;
 pub(crate) mod montgomery;
 pub(crate) mod scalar;
