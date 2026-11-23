@@ -41,6 +41,12 @@ updates:
           - "*"
         update-types:
           - major
+    # zstd in tools/xtask-support must match wasmtime's internal zstd version line
+    # (0.13.x) to prevent duplicate crate bans in tools/oracle-task. Bump by hand
+    # when wasmtime upgrades to zstd 0.14+.
+    ignore:
+      - dependency-name: zstd
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # Not previously configured, and the workflows show it: actions/cache is
   # pinned at both v4 and v5, upload-artifact at v4, v7 and a bare SHA. One
