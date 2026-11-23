@@ -681,6 +681,13 @@ mod history_wrapper_tests {
                     proto
                 })
             }),
+            ("audio_sticker_message", |m| {
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.audio_sticker_message = buffa::MessageField::some(w);
+                    proto
+                })
+            }),
             ("limit_sharing_message", |m| {
                 fp_wrapped(m, |w| {
                     let mut proto = wa::Message::default();

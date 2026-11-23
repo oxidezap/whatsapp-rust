@@ -3625,6 +3625,26 @@ mod stanza_type {
         };
         assert_eq!(media_type_from_message(&lottie), Some("sticker"));
     }
+
+    #[test]
+    fn audio_sticker_classifies_by_inner_sticker() {
+        // Without the unwrap the stanza left as `media` with no mediatype,
+        // the shape the server drops.
+        let audio_sticker = {
+            let mut sticker = wa::Message::default();
+            sticker.sticker_message = buffa::MessageField::some(Default::default());
+            let mut proto = wa::Message::default();
+            proto.audio_sticker_message = buffa::MessageField::some(fpm(sticker));
+            proto
+        };
+        assert_eq!(
+            stanza_type_from_message(&audio_sticker),
+            stanza::MSG_TYPE_MEDIA
+        );
+        assert_eq!(media_type_from_message(&audio_sticker), Some("sticker"));
+        use crate::proto_helpers::MessageExt;
+        assert!(audio_sticker.get_base_message().sticker_message.is_set());
+    }
 }
 
 #[cfg(test)]
