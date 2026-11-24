@@ -5,3 +5,9 @@
 *.proto text eol=lf
 *.desc binary
 *.desc.sha256 text eol=lf
+
+# Test fixture JSONs and data are sha256-hashed or parsed with byte-exact
+# expectations. Force LF so Windows core.autocrlf=true does not mutate them.
+tests/fixtures/** text eol=lf
+wacore/tests/fixtures/** text eol=lf
+

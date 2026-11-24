@@ -33,7 +33,7 @@
 // The numbers *are* this binary's output; there is no logger to route them
 // through, and a measurement harness whose result lands in a log filter would
 // be worse than useless.
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::time::Duration;
 
@@ -46,19 +46,23 @@ use whatsapp_rust_sqlite_storage::{SqliteDatabaseConfig, SqliteStore};
 const SEED_ROWS: usize = 4_000;
 const ROW_BYTES: usize = 1_024;
 
-fn rss_bytes() -> u64 {
-    // smaps_rollup rather than statm: it reports `Rss:` already in kB, so the
-    // reading does not depend on knowing the kernel's page size (which is not
-    // always 4 KiB, and which std cannot report without libc).
-    let rollup =
-        std::fs::read_to_string("/proc/self/smaps_rollup").expect("/proc/self/smaps_rollup");
-    let kib: u64 = rollup
-        .lines()
-        .find_map(|line| line.strip_prefix("Rss:"))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-        .expect("Rss: line");
-    kib * 1024
+fn rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let rollup =
+            std::fs::read_to_string("/proc/self/smaps_rollup").expect("/proc/self/smaps_rollup");
+        let kib: u64 = rollup
+            .lines()
+            .find_map(|line| line.strip_prefix("Rss:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("Rss: line");
+        Some(kib * 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 fn db_err(e: diesel::result::Error) -> wacore::store::error::StoreError {
@@ -222,12 +226,13 @@ async fn main() {
     // and mode 0o700 keeps it that way regardless of umask. Between them,
     // nobody else on the machine can pre-place or swap the database, WAL and
     // shm files this then writes.
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt as _;
     let dir = std::env::temp_dir().join(format!("wa_percon_{}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .expect("exclusive scratch directory");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&dir).expect("exclusive scratch directory");
     // A guard, not a tail cleanup: two of the modes below return early.
     struct ScratchDir(std::path::PathBuf);
     impl Drop for ScratchDir {
@@ -257,7 +262,12 @@ async fn main() {
     // Settle: the seeding store is dropped, and its connection with it, so the
     // baseline is the process without any session on this database.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let before = rss_bytes();
+    let Some(before) = rss_bytes() else {
+        eprintln!(
+            "memory measurements via smaps_rollup are only supported on Linux; mode '{mode}' is unavailable on this platform"
+        );
+        return;
+    };
 
     let mut stores: Vec<SqliteStore> = Vec::with_capacity(sessions);
     let mut after_first = before;
@@ -288,12 +298,12 @@ async fn main() {
             // in this reading, so subtracting it takes the discount out of the
             // per-session figure instead of hiding in it.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            after_first = rss_bytes();
+            after_first = rss_bytes().unwrap_or(before);
         }
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let after = rss_bytes();
+    let after = rss_bytes().unwrap_or(before);
     let delta = after.saturating_sub(before);
     let marginal = after.saturating_sub(after_first);
     let others = sessions.saturating_sub(1);

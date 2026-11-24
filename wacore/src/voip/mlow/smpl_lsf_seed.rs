@@ -691,6 +691,12 @@ mod tests {
         assert_eq!(st1v.cbhalf[0][0].to_bits(), 0x3d93b440, "cbhalf[1][0][0]");
         assert_eq!(st1v.we[0][0][0].to_bits(), 0x3e0ff885, "we[1][0][0][0]");
         assert_eq!(st1v.wie[0][0][0].to_bits(), 0x4062b10f, "wie[1][0][0][0]");
+        #[cfg(target_os = "windows")]
+        assert!(
+            st1v.bits[0].to_bits() == 0x40883c1d || st1v.bits[0].to_bits() == 0x40883c1e,
+            "bits[1][0] (MSVC UCRT vs glibc 1 ULP tolerance)"
+        );
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(st1v.bits[0].to_bits(), 0x40883c1d, "bits[1][0]");
         assert_eq!(
             built.cb.st2(1, 0, 0).num_qlvls[0],

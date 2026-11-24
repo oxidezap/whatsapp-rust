@@ -3788,7 +3788,11 @@ fn client_size_pins_runtime_cache_config_saving() {
     // PersistenceManager already owns the authoritative device and snapshots;
     // the SDK now retains only the same event bus. Future core Device layout
     // changes must not change this SDK budget.
-    let mut expected = (4288 - 1032)
+    #[cfg(target_os = "windows")]
+    let base: usize = 4280;
+    #[cfg(not(target_os = "windows"))]
+    let base: usize = 4288;
+    let mut expected = (base - 1032)
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
