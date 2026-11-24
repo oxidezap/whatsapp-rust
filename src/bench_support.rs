@@ -681,13 +681,8 @@ impl DmSendHarness {
     /// cryptographic recipient packaging, and dispatch through `client.edit_message()`.
     pub fn warm_edit(&self) {
         self.runtime.block_on(async {
-            let target = crate::MessageRef::new(
-                &self.to,
-                self.edit_target_id.clone(),
-                None,
-                true,
-            )
-            .expect("valid target");
+            let target = crate::MessageRef::new(&self.to, self.edit_target_id.clone(), None, true)
+                .expect("valid target");
             self.client
                 .edit_message(crate::EditRequest::new(
                     target,
