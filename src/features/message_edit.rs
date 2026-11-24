@@ -456,14 +456,14 @@ pub fn decrypt_secret_encrypted(
                 proto
             })
         }
-        SecretEncKind::EncComment => wacore::comment::decrypt_comment_with_secret(
+        SecretEncKind::EncComment => Ok(wacore::comment::decrypt_comment_with_secret(
             enc_payload,
             enc_iv,
             message_secret,
             original_msg_id,
             &orig,
             &sender,
-        ),
+        )?),
         _ => {
             let ctx = MessageEditContext {
                 original_msg_id,

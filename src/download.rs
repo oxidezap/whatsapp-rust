@@ -504,11 +504,20 @@ impl DownloadRequestError {
         Self::Other(err.into())
     }
 
+    fn prepare(err: impl Into<anyhow::Error>) -> Self {
+        Self::Prepare(err.into())
+    }
+
     fn writer_io(error: std::io::Error) -> Self {
         Self::WriterIo(error.into())
     }
 
     fn streamed(error: anyhow::Error) -> Self {
+        let error = match error.downcast::<MediaDecryptionError>() {
+            Ok(MediaDecryptionError::Io(io)) => anyhow::Error::from(io),
+            Ok(other) => anyhow::Error::from(other),
+            Err(error) => error,
+        };
         if let Some(policy) = error.chain().find_map(|cause| {
             cause
                 .downcast_ref::<memory::MemoryPolicyCause>()
@@ -1075,7 +1084,7 @@ impl MediaDownloader {
             NO_MEDIA_CONN_REFRESH,
             |_force| async {
                 DownloadUtils::prepare_download_requests(downloadable, &self.route)
-                    .map_err(DownloadRequestError::Prepare)
+                    .map_err(DownloadRequestError::prepare)
             },
             || async {},
             |request| async move {
@@ -1135,7 +1144,7 @@ impl MediaDownloader {
             writer,
             |_force| async {
                 DownloadUtils::prepare_download_requests(downloadable, &self.route)
-                    .map_err(DownloadRequestError::Prepare)
+                    .map_err(DownloadRequestError::prepare)
             },
             || async {},
             |request, writer| async move {
@@ -1274,7 +1283,7 @@ impl Client {
         force_refresh: bool,
     ) -> std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError> {
         DownloadUtils::validate_download_metadata(downloadable)
-            .map_err(|error| DownloadRequestError::Prepare(error.into()))?;
+            .map_err(DownloadRequestError::prepare)?;
         // A static URL is fetched verbatim, so the media-conn IQ would be a round
         // trip whose answer is discarded before a byte of it is read.
         let session_error = |source| DownloadRequestError::Session {
@@ -1286,7 +1295,7 @@ impl Client {
                 downloadable,
                 &self.additional_static_media_hosts,
             )
-            .map_err(DownloadRequestError::Prepare);
+            .map_err(DownloadRequestError::prepare);
         }
         let route = if !force_refresh
             && let Some(route) = self.cached_download_route().await.map_err(session_error)?
@@ -1301,7 +1310,7 @@ impl Client {
             )
         };
         DownloadUtils::prepare_download_requests(downloadable, &route)
-            .map_err(DownloadRequestError::Prepare)
+            .map_err(DownloadRequestError::prepare)
     }
 
     /// Downloads authenticated media into a truncatable writer. The canonical
@@ -1680,7 +1689,7 @@ where
                 hashes.encrypted().is_some(),
                 hashes.plaintext().is_some(),
             )
-            .map_err(DownloadRequestError::streamed)?,
+            .map_err(|e| DownloadRequestError::streamed(e.into()))?,
         );
         const DECRYPT_BATCH_BYTES: usize = 128 * 1024;
         let mut ciphertext = vec![0; DECRYPT_BATCH_BYTES];
@@ -1720,7 +1729,7 @@ where
                 })
                 .await;
             current_writer = Some(writer);
-            result.map_err(DownloadRequestError::streamed)?;
+            result.map_err(|e| DownloadRequestError::streamed(e.into()))?;
             let Some(next_decryptor) = next_decryptor else {
                 break;
             };
@@ -1810,7 +1819,7 @@ where
                         hashes.plaintext(),
                         &mut limited_writer,
                     )
-                    .map_err(DownloadRequestError::streamed)?;
+                    .map_err(|e| DownloadRequestError::streamed(e.into()))?;
                 }
                 MediaDecryption::Plaintext { file_sha256 } => {
                     DownloadUtils::copy_and_validate_plaintext_to_writer(
@@ -1818,7 +1827,7 @@ where
                         file_sha256,
                         &mut limited_writer,
                     )
-                    .map_err(DownloadRequestError::streamed)?;
+                    .map_err(|e| DownloadRequestError::streamed(e.into()))?;
                 }
             }
             drop(limited_writer);
@@ -2817,7 +2826,7 @@ mod tests {
                             downloadable,
                             &MediaRoute::from(&media_conn),
                         )
-                        .map_err(DownloadRequestError::Prepare)
+                        .map_err(DownloadRequestError::prepare)
                     }
                 }
             },
@@ -2894,7 +2903,7 @@ mod tests {
                             downloadable,
                             &MediaRoute::from(&conn),
                         )
-                        .map_err(DownloadRequestError::Prepare)
+                        .map_err(DownloadRequestError::prepare)
                     }
                 }
             },
@@ -2963,7 +2972,7 @@ mod tests {
                             downloadable,
                             &MediaRoute::from(&conn),
                         )
-                        .map_err(DownloadRequestError::Prepare)
+                        .map_err(DownloadRequestError::prepare)
                     }
                 }
             },
@@ -3032,7 +3041,7 @@ mod tests {
                             downloadable,
                             &MediaRoute::from(&media_conn),
                         )
-                        .map_err(DownloadRequestError::Prepare)
+                        .map_err(DownloadRequestError::prepare)
                     }
                 }
             },
@@ -5572,7 +5581,7 @@ mod tests {
                 calls.lock().unwrap().push(force);
                 let requests =
                     DownloadUtils::prepare_download_requests(&params, &MediaRoute::from(&conn))
-                        .map_err(DownloadRequestError::Prepare);
+                        .map_err(DownloadRequestError::prepare);
                 async move { requests }
             };
             let invalidate = || async {
@@ -5656,7 +5665,7 @@ mod tests {
                     };
                     let requests =
                         DownloadUtils::prepare_download_requests(&params, &MediaRoute::new(hosts))
-                            .map_err(DownloadRequestError::Prepare);
+                            .map_err(DownloadRequestError::prepare);
                     async move { requests }
                 };
                 let sink = SharedWriter::new();

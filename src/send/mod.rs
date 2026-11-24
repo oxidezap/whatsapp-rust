@@ -156,6 +156,12 @@ impl From<GroupError> for SendError {
     }
 }
 
+impl From<wacore::secret_enc_addon::AddonError> for SendError {
+    fn from(err: wacore::secret_enc_addon::AddonError) -> Self {
+        SendError::Internal(err.into())
+    }
+}
+
 pub(crate) fn same_group_user(
     left: &Jid,
     right: &Jid,

@@ -3,7 +3,7 @@ pub mod preparation;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use async_lock::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -394,6 +394,64 @@ impl PreparedPatchList {
 pub type BlobDownloadFn<'a> =
     dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + Send + Sync + 'a;
 
+/// Reason a SyncdSnapshotRecovery payload was refused.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SnapshotRecoveryError {
+    #[error("snapshot recovery names no collection")]
+    MissingCollectionName,
+    #[error("snapshot recovery is for {found}, not the {expected} that was asked for")]
+    CollectionMismatch { found: String, expected: String },
+    #[error("snapshot recovery for {collection} carries no version")]
+    MissingVersion { collection: String },
+    #[error("snapshot recovery for {collection} carries no ltHash")]
+    MissingLtHash { collection: String },
+    #[error("snapshot recovery for {collection} carries a {actual}-byte ltHash, not 128")]
+    InvalidLtHashLength { collection: String, actual: usize },
+    #[error("recovery record {record_index} of {collection} carries no key id")]
+    MissingRecordKeyId {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no value")]
+    MissingRecordValue {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no action value")]
+    MissingRecordActionValue {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no MAC")]
+    MissingRecordMac {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries a {actual}-byte MAC, not 32")]
+    InvalidRecordMacLength {
+        collection: String,
+        record_index: usize,
+        actual: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no index")]
+    MissingRecordIndex {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} has an unreadable index: {error}")]
+    UnreadableRecordIndex {
+        collection: String,
+        record_index: usize,
+        error: String,
+    },
+    #[error("recovery record {record_index} of {collection} carries an empty index")]
+    EmptyRecordIndex {
+        collection: String,
+        record_index: usize,
+    },
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppStateSyncError {
@@ -401,6 +459,14 @@ pub enum AppStateSyncError {
     KeyNotFound(String),
     #[error("store error")]
     Store(#[from] crate::store::error::StoreError),
+    #[error("snapshot recovery error: {0}")]
+    SnapshotRecovery(#[from] SnapshotRecoveryError),
+    #[error("external blob was not resolved")]
+    ExternalBlobNotResolved,
+    #[error("no app state sync key available")]
+    NoSyncKeyAvailable,
+    #[error("app state error: {0}")]
+    AppState(#[from] crate::appstate::AppStateError),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
@@ -881,18 +947,22 @@ impl AppStateProcessor {
         let name = recovery
             .collection_name
             .as_deref()
-            .ok_or_else(|| anyhow!("snapshot recovery names no collection"))?;
+            .ok_or(SnapshotRecoveryError::MissingCollectionName)?;
         if name != expected_collection {
-            return Err(anyhow!(
-                "snapshot recovery is for {name}, not the {expected_collection} that was asked for"
-            ));
+            return Err(SnapshotRecoveryError::CollectionMismatch {
+                found: name.to_string(),
+                expected: expected_collection.to_string(),
+            }
+            .into());
         }
 
         let version = recovery
             .version
             .as_option()
             .and_then(|v| v.version)
-            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no version"))?;
+            .ok_or_else(|| SnapshotRecoveryError::MissingVersion {
+                collection: name.to_string(),
+            })?;
 
         // Asked here, before the ltHash is read and before a single record is
         // looked at. Nothing waits for this reply, so the collection can have
@@ -918,26 +988,30 @@ impl AppStateProcessor {
             });
         }
 
-        let lthash = recovery
-            .collection_lthash
-            .as_deref()
-            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no ltHash"))?;
-        let hash: [u8; 128] = lthash.try_into().map_err(|_| {
-            anyhow!(
-                "snapshot recovery for {name} carries a {}-byte ltHash, not 128",
-                lthash.len()
-            )
+        let lthash = recovery.collection_lthash.as_deref().ok_or_else(|| {
+            SnapshotRecoveryError::MissingLtHash {
+                collection: name.to_string(),
+            }
         })?;
+        let hash: [u8; 128] =
+            lthash
+                .try_into()
+                .map_err(|_| SnapshotRecoveryError::InvalidLtHashLength {
+                    collection: name.to_string(),
+                    actual: lthash.len(),
+                })?;
 
         // The keys first, because looking one up may reach the store and the
         // work below may not. Distinct ids only: a collection is usually keyed
         // by one or two, and the cache behind this makes a repeat cheap anyway.
         let mut keys_by_id: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> = HashMap::new();
         for (i, record) in recovery.mutation_records.iter().enumerate() {
-            let key_id = record
-                .key_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no key id"))?;
+            let key_id = record.key_id.as_deref().ok_or_else(|| {
+                SnapshotRecoveryError::MissingRecordKeyId {
+                    collection: name.to_string(),
+                    record_index: i,
+                }
+            })?;
             if !keys_by_id.contains_key(key_id) {
                 let keys = self.get_app_state_key(key_id).await?;
                 keys_by_id.insert(key_id.to_vec(), keys);
@@ -1006,7 +1080,10 @@ impl AppStateProcessor {
                     continue;
                 }
                 let action = record.value.into_option().ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no value")
+                    SnapshotRecoveryError::MissingRecordValue {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    }
                 })?;
                 // The payload itself, not just the envelope around it. A record
                 // whose `SyncActionData` omits its value produces a mutation
@@ -1016,19 +1093,29 @@ impl AppStateProcessor {
                 // update is gone. The snapshot path does not count a value-less
                 // record as part of the collection either.
                 if action.value.is_unset() {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries no action value"
-                    ));
+                    return Err(SnapshotRecoveryError::MissingRecordActionValue {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    }
+                    .into());
                 }
-                let key_id = record.key_id.ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no key id")
-                })?;
+                let key_id =
+                    record
+                        .key_id
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordKeyId {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 // The record's own MAC is the value MAC the store keeps: the
                 // primary sends what it computed over the encrypted form, so
                 // nothing here has to re-encrypt a record to arrive at it.
-                let value_mac = record
-                    .mac
-                    .ok_or_else(|| anyhow!("recovery record {i} of {owned_name} carries no MAC"))?;
+                let value_mac =
+                    record
+                        .mac
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordMac {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 // The store keeps this as a value MAC and a later patch
                 // subtracts it from the ltHash to overwrite or remove the index.
                 // A MAC of the wrong length would be subtracted just the same,
@@ -1036,14 +1123,20 @@ impl AppStateProcessor {
                 // collection behind another MAC failure -- the very thing this
                 // recovery exists to end.
                 if value_mac.len() != 32 {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries a {}-byte MAC, not 32",
-                        value_mac.len()
-                    ));
+                    return Err(SnapshotRecoveryError::InvalidRecordMacLength {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                        actual: value_mac.len(),
+                    }
+                    .into());
                 }
-                let index = action.index.ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no index")
-                })?;
+                let index =
+                    action
+                        .index
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordIndex {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 let keys = keys_by_id
                     .get(&key_id)
                     .expect("every key id was fetched above");
@@ -1060,7 +1153,11 @@ impl AppStateProcessor {
                 // losing a record is exactly the failure this recovery exists to
                 // end, and every other field here is already required.
                 let parsed_index: Vec<String> = serde_json::from_slice(&index).map_err(|e| {
-                    anyhow!("recovery record {i} of {owned_name} has an unreadable index: {e}")
+                    SnapshotRecoveryError::UnreadableRecordIndex {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                        error: e.to_string(),
+                    }
                 })?;
                 // `[]` parses, and then names nothing:
                 // `dispatch_app_state_mutation` returns early on an empty index,
@@ -1068,9 +1165,11 @@ impl AppStateProcessor {
                 // committed and the version written -- the same silent loss the
                 // unreadable index above is refused for, one step further along.
                 if parsed_index.is_empty() {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries an empty index"
-                    ));
+                    return Err(SnapshotRecoveryError::EmptyRecordIndex {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    }
+                    .into());
                 }
 
                 mutations.push(Mutation {
@@ -1258,7 +1357,7 @@ impl AppStateProcessor {
                 blobs
                     .get(position.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                     .cloned()
-                    .ok_or_else(|| anyhow!("external blob was not resolved"))
+                    .ok_or_else(|| anyhow::Error::new(AppStateSyncError::ExternalBlobNotResolved))
             };
             let error = decode_external_blobs(&mut pl, &resolver, true).err();
             PreparedPatchList { list: pl, error }
@@ -1588,7 +1687,7 @@ impl AppStateProcessor {
             .backend
             .get_latest_sync_key_id()
             .await?
-            .ok_or_else(|| anyhow!("No app state sync key available"))?;
+            .ok_or(AppStateSyncError::NoSyncKeyAvailable)?;
         let keys = self.get_app_state_key(&key_id).await?;
 
         // Get current hash state — save base version for the caller
@@ -1766,7 +1865,7 @@ impl AppStateProcessor {
         .await;
         let mut prepared = match processed {
             Ok(prepared) => prepared,
-            Err(error) => return Err(anyhow!("{}", error)),
+            Err(error) => return Err(AppStateSyncError::AppState(error).into()),
         };
         if final_page {
             prepared.mark_bootstrapped();
@@ -1892,7 +1991,7 @@ mod external_blob_tests {
         // (which would apply an empty patch and advance the version).
         let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow!("simulated failure"))
+            Err(anyhow::anyhow!("simulated failure"))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));
@@ -1922,7 +2021,7 @@ mod external_blob_tests {
             error: None,
         };
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow!("simulated failure"))
+            Err(anyhow::anyhow!("simulated failure"))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));

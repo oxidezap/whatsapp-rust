@@ -44,10 +44,10 @@ pub fn derive_vote_encryption_key(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<[u8; 32]> {
-    crate::secret_enc_addon::derive_use_case_secret(
+    Ok(crate::secret_enc_addon::derive_use_case_secret(
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
-    )
+    )?)
 }
 
 /// Encrypt a poll vote given the parent poll's `messageSecret`. Returns
@@ -66,6 +66,7 @@ pub fn encrypt_poll_vote_with_secret(
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
+    .map_err(Into::into)
 }
 
 fn encode_selected_options(selected_option_hashes: &[Vec<u8>]) -> Vec<u8> {
@@ -253,6 +254,7 @@ pub fn decrypt_poll_vote_payload_with_secret(
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
+    .map_err(Into::into)
 }
 
 fn visit_poll_vote_with_secret<F>(

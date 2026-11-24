@@ -7,10 +7,11 @@
 //! proto carrying the comment body; the parent post's key travels in the
 //! outer envelope.
 
-use anyhow::{Result, ensure};
 use waproto::whatsapp as wa;
 
-use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+use crate::secret_enc_addon::{
+    AddonContext, AddonError, ModificationType, decrypt_addon, encrypt_addon,
+};
 
 const GCM_IV_SIZE: usize = 12;
 const MESSAGE_SECRET_SIZE: usize = 32;
@@ -36,12 +37,13 @@ pub fn encrypt_comment_with_secret(
     parent_msg_id: &str,
     parent_sender_jid: &str,
     commenter_jid: &str,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE]), AddonError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(AddonError::InvalidSecretSize {
+            expected: MESSAGE_SECRET_SIZE,
+            got: message_secret.len(),
+        });
+    }
     let plaintext = waproto::codec::message_to_vec(inner);
     encrypt_addon(
         &plaintext,
@@ -59,19 +61,21 @@ pub fn decrypt_comment_with_secret(
     parent_msg_id: &str,
     parent_sender_jid: &str,
     commenter_jid: &str,
-) -> Result<wa::Message> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+) -> Result<wa::Message, AddonError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(AddonError::InvalidSecretSize {
+            expected: MESSAGE_SECRET_SIZE,
+            got: message_secret.len(),
+        });
+    }
     let plaintext = decrypt_addon(
         enc_payload,
         iv,
         message_secret,
         &comment_addon_ctx(parent_msg_id, parent_sender_jid, commenter_jid),
     )?;
-    Ok(waproto::codec::message_decode(&plaintext[..])?)
+    waproto::codec::message_decode(&plaintext[..])
+        .map_err(|e| AddonError::ProtobufDecode(e.to_string()))
 }
 
 #[cfg(test)]

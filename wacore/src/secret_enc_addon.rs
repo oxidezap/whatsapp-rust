@@ -21,7 +21,6 @@
 //! - `PollVote` / `EventResponse` → `stanzaId || 0x00 || modificationSenderJid`
 //! - everything else (edits, reactions, comments, poll add option) → empty
 
-use anyhow::{Result, anyhow};
 use smallvec::SmallVec;
 
 use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
@@ -29,6 +28,26 @@ use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 const GCM_IV_SIZE: usize = 12;
 const GCM_TAG_SIZE: usize = 16;
 pub(crate) const MESSAGE_SECRET_SIZE: usize = 32;
+
+/// Error returned by addon encryption and decryption routines.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AddonError {
+    #[error("invalid messageSecret size: expected {expected}, got {got}")]
+    InvalidSecretSize { expected: usize, got: usize },
+    #[error("invalid IV size: expected {expected}, got {got}")]
+    InvalidIvSize { expected: usize, got: usize },
+    #[error("encrypted payload too short: need at least {need} bytes for tag, got {got}")]
+    PayloadTooShort { need: usize, got: usize },
+    #[error("HKDF expand failed: {0}")]
+    KeyDerivation(String),
+    #[error("AES-GCM encrypt failed: {0}")]
+    EncryptionFailed(String),
+    #[error("addon GCM tag verification failed")]
+    AuthenticationFailed,
+    #[error("protobuf decode failed: {0}")]
+    ProtobufDecode(String),
+}
 
 /// Stack-backed staging buffer for the HKDF `info` string.
 ///
@@ -111,12 +130,13 @@ pub struct AddonContext<'a> {
 pub fn derive_use_case_secret(
     message_secret: &[u8],
     ctx: &AddonContext<'_>,
-) -> Result<[u8; MESSAGE_SECRET_SIZE]> {
-    anyhow::ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "Invalid messageSecret size: expected {MESSAGE_SECRET_SIZE}, got {}",
-        message_secret.len()
-    );
+) -> Result<[u8; MESSAGE_SECRET_SIZE], AddonError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(AddonError::InvalidSecretSize {
+            expected: MESSAGE_SECRET_SIZE,
+            got: message_secret.len(),
+        });
+    }
 
     let mut info = InfoBuffer::with_capacity(
         ctx.stanza_id.len()
@@ -131,7 +151,7 @@ pub fn derive_use_case_secret(
 
     let mut key = [0u8; MESSAGE_SECRET_SIZE];
     crate::crypto::hkdf_sha256_into(message_secret, None, &info, &mut key)
-        .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
+        .map_err(|e| AddonError::KeyDerivation(e.to_string()))?;
     Ok(key)
 }
 
@@ -155,7 +175,7 @@ pub fn encrypt_addon(
     plaintext: &[u8],
     message_secret: &[u8],
     ctx: &AddonContext<'_>,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE]), AddonError> {
     use rand::Rng;
 
     let key = derive_use_case_secret(message_secret, ctx)?;
@@ -168,7 +188,7 @@ pub fn encrypt_addon(
 
     let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
     aes_256_gcm_encrypt(&key, &iv, &aad, plaintext, &mut payload)
-        .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
+        .map_err(|e| AddonError::EncryptionFailed(e.to_string()))?;
 
     Ok((payload, iv))
 }
@@ -182,15 +202,16 @@ pub fn decrypt_addon(
     iv: &[u8],
     message_secret: &[u8],
     ctx: &AddonContext<'_>,
-) -> Result<Vec<u8>> {
-    let nonce: &[u8; GCM_IV_SIZE] = iv
-        .try_into()
-        .map_err(|_| anyhow!("Invalid IV size: expected {GCM_IV_SIZE}, got {}", iv.len()))?;
+) -> Result<Vec<u8>, AddonError> {
+    let nonce: &[u8; GCM_IV_SIZE] = iv.try_into().map_err(|_| AddonError::InvalidIvSize {
+        expected: GCM_IV_SIZE,
+        got: iv.len(),
+    })?;
     if enc_payload.len() < GCM_TAG_SIZE {
-        return Err(anyhow!(
-            "Encrypted payload too short: need at least {GCM_TAG_SIZE} bytes for tag, got {}",
-            enc_payload.len()
-        ));
+        return Err(AddonError::PayloadTooShort {
+            need: GCM_TAG_SIZE,
+            got: enc_payload.len(),
+        });
     }
 
     let key = derive_use_case_secret(message_secret, ctx)?;
@@ -198,7 +219,7 @@ pub fn decrypt_addon(
 
     let mut plaintext = Vec::with_capacity(enc_payload.len().saturating_sub(GCM_TAG_SIZE));
     aes_256_gcm_decrypt(&key, nonce, &aad, enc_payload, &mut plaintext)
-        .map_err(|_| anyhow!("Addon GCM tag verification failed"))?;
+        .map_err(|_| AddonError::AuthenticationFailed)?;
     Ok(plaintext)
 }
 

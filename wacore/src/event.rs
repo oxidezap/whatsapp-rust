@@ -45,6 +45,7 @@ pub fn encrypt_event_response_with_secret(
         message_secret,
         &event_response_addon_ctx(stanza_id, event_creator_jid, responder_jid),
     )
+    .map_err(Into::into)
 }
 
 /// Decrypt an event response given the parent event's `messageSecret`.
@@ -94,6 +95,7 @@ pub fn decrypt_event_response_payload_with_secret(
         message_secret,
         &event_response_addon_ctx(stanza_id, event_creator_jid, responder_jid),
     )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

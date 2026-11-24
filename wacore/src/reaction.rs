@@ -58,6 +58,7 @@ pub fn encrypt_reaction_with_secret(
         message_secret,
         &reaction_addon_ctx(parent_msg_id, parent_sender_jid, reactor_jid),
     )
+    .map_err(Into::into)
 }
 
 /// Decrypt an `enc_reaction_message` payload given the parent's `messageSecret`.

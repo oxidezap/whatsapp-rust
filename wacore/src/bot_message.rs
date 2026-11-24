@@ -15,9 +15,7 @@
 //! `msgID` is the bot reply id, or `bot_info.edit_target_id` when the bot is
 //! editing a prior reply.
 
-use anyhow::{Result, anyhow};
-
-use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
+use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
 const GCM_IV_SIZE: usize = 12;
 const GCM_TAG_SIZE: usize = 16;
@@ -50,6 +48,9 @@ pub enum BotMessageError {
     /// The GCM tag did not verify: wrong secret, wrong context, or tampering.
     #[error("bot message GCM tag verification failed")]
     AuthenticationFailed,
+    /// AES-GCM encryption failed.
+    #[error("AES-GCM encrypt failed: {0}")]
+    EncryptionFailed(#[from] CryptoProviderError),
 }
 
 /// Which stage of [`decrypt_bot_message`] rejected the payload.
@@ -73,7 +74,9 @@ impl BotMessageError {
                 BotMessageFailure::Envelope
             }
             Self::InvalidSecretLength { .. } | Self::KeyDerivation(_) => BotMessageFailure::Secret,
-            Self::AuthenticationFailed => BotMessageFailure::Authentication,
+            Self::AuthenticationFailed | Self::EncryptionFailed(_) => {
+                BotMessageFailure::Authentication
+            }
         }
     }
 }
@@ -175,7 +178,7 @@ pub fn encrypt_bot_message(
     plaintext: &[u8],
     message_secret: &[u8],
     ctx: &BotMessageContext<'_>,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE]), BotMessageError> {
     use rand::Rng;
     let base = derive_base_bot_key(message_secret)?;
     let key = derive_per_message_key(&base, ctx);
@@ -184,8 +187,7 @@ pub fn encrypt_bot_message(
     let mut iv = [0u8; GCM_IV_SIZE];
     rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
     let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
-    aes_256_gcm_encrypt(&key, &iv, &aad, plaintext, &mut payload)
-        .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
+    aes_256_gcm_encrypt(&key, &iv, &aad, plaintext, &mut payload)?;
     Ok((payload, iv))
 }
 

@@ -65,7 +65,7 @@ pub fn encrypt_message_edit(
     ctx: &MessageEditContext<'_>,
 ) -> Result<(Vec<u8>, [u8; IV_SIZE])> {
     let plaintext = waproto::codec::message_to_vec(inner_message);
-    encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
+    encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx()).map_err(Into::into)
 }
 
 /// Decrypt any `secret_encrypted_message` envelope to its inner `Message`.
