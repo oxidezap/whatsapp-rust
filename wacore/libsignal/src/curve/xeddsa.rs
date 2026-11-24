@@ -138,10 +138,10 @@ pub(crate) fn verify_prepared(
     message: &[u8],
     signature: &ParsedSignature<'_>,
 ) -> bool {
-    use subtle::ConstantTimeEq;
     let point = prepared.point();
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     if std::is_x86_feature_detected!("avx2") {
+        use subtle::ConstantTimeEq;
         let challenge = -challenge(encoding, message, signature);
         // Scalars are reduced, so `verify` multiplies -A by the integer l - h.
         // [l - h](-A) + [s]B = -([l - h]A + [l - s]B) holds for mixed-order A
