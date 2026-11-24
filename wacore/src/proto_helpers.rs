@@ -479,6 +479,9 @@ impl MessageExt for wa::Message {
             if !has_other {
                 let mut quoted = wa::Message::default();
                 quoted.conversation = Some(text.clone());
+                if self.message_context_info.is_set() {
+                    quoted.message_context_info = self.message_context_info.clone();
+                }
                 return Box::new(quoted);
             }
         }
@@ -1810,6 +1813,26 @@ mod tests {
         assert!(
             ctx.quoted_message.is_set(),
             "Bot (@bot server) quote chain should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_prepare_for_quote_preserves_message_context_info_on_text() {
+        let mut msg = wa::Message::default();
+        msg.conversation = Some("hello".to_string());
+        msg.message_context_info = buffa::MessageField::some({
+            let mut ctx = wa::MessageContextInfo::default();
+            ctx.message_secret = Some(vec![1, 2, 3]);
+            ctx
+        });
+        let prepared = msg.prepare_for_quote();
+        assert_eq!(prepared.conversation.as_deref(), Some("hello"));
+        assert_eq!(
+            prepared
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(&[1, 2, 3][..])
         );
     }
 

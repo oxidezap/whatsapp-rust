@@ -1382,6 +1382,23 @@ fn build_extra_stanza_nodes(
     Ok(nodes)
 }
 
+#[inline]
+fn chat_jid_key_string(remote_jid: &Jid) -> String {
+    if remote_jid.device == 0 {
+        remote_jid.to_string()
+    } else {
+        let mut buf = String::with_capacity(remote_jid.user.len() + 16);
+        wacore_binary::jid::push_jid_to_string(
+            &remote_jid.user,
+            remote_jid.server,
+            remote_jid.agent,
+            0,
+            &mut buf,
+        );
+        buf
+    }
+}
+
 fn build_revoke_message(
     remote_jid: &Jid,
     from_me: bool,
@@ -1394,7 +1411,7 @@ fn build_revoke_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_non_ad_string());
+                proto.remote_jid = Some(chat_jid_key_string(remote_jid));
                 proto.from_me = Some(from_me);
                 proto.id = Some(message_id);
                 proto.participant = participant;
@@ -1467,7 +1484,7 @@ pub(crate) fn build_edit_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_non_ad_string());
+                proto.remote_jid = Some(chat_jid_key_string(remote_jid));
                 proto.from_me = Some(true);
                 proto.id = Some(message_id);
                 proto.participant = participant;
@@ -6744,6 +6761,42 @@ mod tests {
         // Participant should be the original sender with device number stripped
         assert_eq!(key.participant, Some("236395184570386@lid".to_string()));
         assert_eq!(key.id, Some(message_id));
+    }
+
+    #[test]
+    fn test_build_revoke_and_edit_preserve_agent_while_stripping_device() {
+        let bot_with_device: Jid = "12345.2:1@bot".parse().unwrap();
+        let bot_without_device: Jid = "12345.2@bot".parse().unwrap();
+
+        for jid in [&bot_with_device, &bot_without_device] {
+            let revoke = build_revoke_message(jid, true, "MSG-ID".to_string(), None);
+            let key = revoke
+                .protocol_message
+                .into_option()
+                .unwrap()
+                .key
+                .into_option()
+                .unwrap();
+            assert_eq!(key.remote_jid.as_deref(), Some("12345.2@bot"));
+
+            let mut edit_content = wa::Message::default();
+            edit_content.conversation = Some("edited".to_string());
+            let edit = build_edit_message(
+                jid,
+                "MSG-ID".to_string(),
+                None,
+                Box::new(edit_content),
+                1000,
+            );
+            let key = edit
+                .protocol_message
+                .into_option()
+                .unwrap()
+                .key
+                .into_option()
+                .unwrap();
+            assert_eq!(key.remote_jid.as_deref(), Some("12345.2@bot"));
+        }
     }
 
     // Fictitious JIDs (not real PII):
