@@ -262,7 +262,7 @@ impl Client {
                 to.clone(),
                 id,
                 secret.as_bytes(),
-                Arc::unwrap_or_clone(request.content),
+                *request.content,
                 Some(creator),
                 stanza_id,
             ))
@@ -273,13 +273,8 @@ impl Client {
                 "community announcement group edits require EditRequest::with_secret and the original message secret".into(),
             ));
         }
-        self.edit_message_inner(
-            to.clone(),
-            id,
-            move || Arc::unwrap_or_clone(request.content),
-            stanza_id,
-        )
-        .await
+        self.edit_message_inner(to.clone(), id, move || request.content, stanza_id)
+            .await
     }
 
     /// Explicit raw chat/id escape for hosts composing their own edit addressing.
@@ -302,7 +297,7 @@ impl Client {
         self.edit_message_inner(
             to.into(),
             id.into_string(),
-            move || new_content,
+            move || Box::new(new_content),
             options.stanza_id.map(crate::StanzaId::into_string),
         )
         .await
@@ -317,7 +312,7 @@ impl Client {
         &self,
         to: Jid,
         original_id: String,
-        new_content: impl FnOnce() -> wa::Message,
+        new_content: impl FnOnce() -> Box<wa::Message>,
         request_id: Option<String>,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
@@ -743,7 +738,7 @@ fn build_secret_message_edit_at(
         to,
         original_id.to_string(),
         participant.clone(),
-        new_content,
+        Box::new(new_content),
         timestamp_ms,
     );
 

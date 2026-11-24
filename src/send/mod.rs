@@ -297,7 +297,7 @@ struct SendBranchOutput {
 }
 
 struct GroupBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     edit: Option<EditAttribute>,
@@ -308,7 +308,7 @@ struct GroupBranchRequest<'a> {
 }
 
 struct DmBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     sent_at: SendInstant,
@@ -321,7 +321,7 @@ struct DmBranchRequest<'a> {
 }
 
 struct GroupDirectBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     recipients: &'a [Jid],
@@ -923,7 +923,7 @@ mod group_direct_tests {
         for recipients in [&[][..], &invalid_group_recipient[..]] {
             let result = client
                 .send_group_direct_branch(GroupDirectBranchRequest {
-                    to: group.clone(),
+                    to: &group,
                     message: &message,
                     request_id: "SYNTHETIC-ID",
                     recipients,
@@ -1382,6 +1382,23 @@ fn build_extra_stanza_nodes(
     Ok(nodes)
 }
 
+#[inline]
+fn chat_jid_key_string(remote_jid: &Jid) -> String {
+    if remote_jid.device == 0 {
+        remote_jid.to_string()
+    } else {
+        let mut buf = String::with_capacity(remote_jid.user.len() + 16);
+        wacore_binary::jid::push_jid_to_string(
+            &remote_jid.user,
+            remote_jid.server,
+            remote_jid.agent,
+            0,
+            &mut buf,
+        );
+        buf
+    }
+}
+
 fn build_revoke_message(
     remote_jid: &Jid,
     from_me: bool,
@@ -1394,7 +1411,7 @@ fn build_revoke_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_string());
+                proto.remote_jid = Some(chat_jid_key_string(remote_jid));
                 proto.from_me = Some(from_me);
                 proto.id = Some(message_id);
                 proto.participant = participant;
@@ -1458,7 +1475,7 @@ pub(crate) fn build_edit_message(
     remote_jid: &Jid,
     message_id: String,
     participant: Option<String>,
-    new_content: wa::Message,
+    new_content: Box<wa::Message>,
     timestamp_ms: i64,
 ) -> wa::Message {
     {
@@ -1467,14 +1484,14 @@ pub(crate) fn build_edit_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_string());
+                proto.remote_jid = Some(chat_jid_key_string(remote_jid));
                 proto.from_me = Some(true);
                 proto.id = Some(message_id);
                 proto.participant = participant;
                 proto
             });
             proto_.r#type = Some(wa::message::protocol_message::Type::MessageEdit);
-            proto_.edited_message = buffa::MessageField::some(new_content);
+            proto_.edited_message = buffa::MessageField::from_box(new_content);
             proto_.timestamp_ms = Some(timestamp_ms);
             proto_
         });
@@ -2750,9 +2767,10 @@ impl Client {
                     sent_at: Some(sent_at),
                     request_id: Some(&request_id),
                     edit: Some(edit),
-                    extra_stanza_nodes: wacore::send::message_meta_from_message(&message)
-                        .into_iter()
-                        .collect(),
+                    extra_stanza_nodes: match wacore::send::message_meta_from_message(&message) {
+                        Some(node) => vec![node],
+                        None => Vec::new(),
+                    },
                     borrowed_message_id,
                     ..Default::default()
                 },
@@ -2933,7 +2951,6 @@ impl Client {
                 &generated_request_id
             }
         };
-        let tc_issue_target = to.clone();
 
         // Dispatch to a concrete boxed future per branch: this function's own
         // frame stays small (prologue + epilogue), and a DM send never
@@ -2953,7 +2970,7 @@ impl Client {
             requires_connection_generation_check,
             dm_unreached,
         } = if peer && !to.is_group() {
-            box_send_branch(self.send_peer_branch(to, message, request_id, expected_peer_identity))
+            box_send_branch(self.send_peer_branch(&to, message, request_id, expected_peer_identity))
                 .await?
         } else if let Some(recipients) = group_direct_recipients {
             if !to.is_group() {
@@ -2963,7 +2980,7 @@ impl Client {
                 .into());
             }
             box_send_branch(self.send_group_direct_branch(GroupDirectBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 recipients,
@@ -2971,7 +2988,7 @@ impl Client {
             .await?
         } else if to.is_group() {
             box_send_branch(self.send_group_branch(GroupBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 edit,
@@ -2983,7 +3000,7 @@ impl Client {
             .await?
         } else {
             box_send_branch(self.send_dm_branch(DmBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 sent_at,
@@ -3031,12 +3048,8 @@ impl Client {
         );
         if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
         {
-            Box::pin(self.validate_history_publication(
-                &tc_issue_target,
-                message,
-                group_direct_recipients,
-            ))
-            .await?;
+            Box::pin(self.validate_history_publication(&to, message, group_direct_recipients))
+                .await?;
         }
         if (group_devices.is_some() || requires_connection_generation_check)
             && self
@@ -3055,7 +3068,7 @@ impl Client {
             && let Some(phash) = ack_phash
         {
             // Group refresh and message resend have separate lifetimes.
-            let invalidate_group = tc_issue_target.is_group();
+            let invalidate_group = to.is_group();
             if let Some(devices) = group_devices {
                 let mut waiters = self.response_waiters_guard();
                 let registered_epoch = waiters.current_epoch();
@@ -3064,7 +3077,7 @@ impl Client {
                     crate::client::ResponseWaiter::GroupPhash(
                         crate::client::PhashWaiter {
                             expected: phash,
-                            jid: tc_issue_target.clone(),
+                            jid: to.clone(),
                             invalidate_group_cache: true,
                             dm_devices: None,
                             dm_unreached: Vec::new(),
@@ -3090,7 +3103,7 @@ impl Client {
                 self.register_phash_waiter(
                     request_id,
                     phash,
-                    tc_issue_target.clone(),
+                    to.clone(),
                     invalidate_group,
                     covered_dm_devices,
                     dm_unreached,
@@ -3135,19 +3148,16 @@ impl Client {
         if !borrowed_message_id && let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
-                None => self.dm_sender_identity_for(&tc_issue_target).await,
+                None => self.dm_sender_identity_for(&to).await,
             };
             if let Some(sender) = sender {
-                let is_bot_chat = tc_issue_target.is_bot();
+                let is_bot_chat = to.is_bot();
                 let class = wacore::msg_secret::classify(message, is_bot_chat);
-                Box::pin(self.persist_outbound_msg_secret(
-                    &tc_issue_target,
-                    &sender,
-                    request_id,
-                    secret,
-                    class,
-                    sent_at,
-                ))
+                Box::pin(
+                    self.persist_outbound_msg_secret(
+                        &to, &sender, request_id, secret, class, sent_at,
+                    ),
+                )
                 .await;
             }
         }
@@ -3171,7 +3181,7 @@ impl Client {
         // Fire-and-forget so send_message returns without waiting for the IQ
         if should_issue_tc_token_after_send {
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                let target = tc_issue_target;
+                let target = to;
                 self.runtime
                     .spawn(Box::pin(async move {
                         client.issue_tc_token_after_send(&target).await;
@@ -3189,7 +3199,7 @@ impl Client {
     /// never groups.
     async fn send_peer_branch(
         &self,
-        to: Jid,
+        to: &Jid,
         message: &wa::Message,
         request_id: &str,
         expected_identity: Option<[u8; 32]>,
@@ -3197,7 +3207,7 @@ impl Client {
         let node = {
             // Peer messages are only valid for individual users, not groups
             // Resolve encryption JID and acquire lock ONLY for encryption
-            let encryption_jid = self.resolve_encryption_jid(&to).await;
+            let encryption_jid = self.resolve_encryption_jid(to).await;
             let signal_addr = encryption_jid.to_protocol_address();
 
             let _account_guard = self.lock_companion_account(&encryption_jid).await;
@@ -3236,7 +3246,7 @@ impl Client {
             wacore::send::prepare_peer_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
-                to,
+                to.clone(),
                 &signal_addr,
                 message,
                 request_id,
@@ -3282,7 +3292,7 @@ impl Client {
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self
                 .groups()
-                .routing_info_with_freshness(&to, group_metadata_freshness)
+                .routing_info_with_freshness(to, group_metadata_freshness)
                 .await?;
 
             // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
@@ -3306,7 +3316,7 @@ impl Client {
             // the id is borrowed: it would replace the original message's
             // retry-cache entry, so a retry receipt for it returns this edit.
             if !borrowed_message_id {
-                self.add_recent_message(&to, request_id, message, shared_content.clone())
+                self.add_recent_message(to, request_id, message, shared_content.clone())
                     .await;
             }
 
@@ -3376,7 +3386,7 @@ impl Client {
                 // merely raced the winner's delete->recreate window sees the
                 // fresh record here and downgrades to a warm send instead of
                 // redistributing to every member again.
-                distribution_guard = Some(self.group_distribution_lock(&to).await);
+                distribution_guard = Some(self.group_distribution_lock(to).await);
                 let (key_exists, needs_rotation) = read_sender_key_state().await?;
                 force_skdm = !key_exists || needs_rotation;
                 if force_skdm {
@@ -3432,7 +3442,7 @@ impl Client {
                     }
                     None => self
                         .resolve_skdm_targets_memoized(
-                            &to,
+                            to,
                             &to_str,
                             &group_info_for_memo,
                             &own_sending_jid,
@@ -3457,7 +3467,7 @@ impl Client {
                         // already marked warm by the winner and downgrades to a
                         // plain skmsg send; if the winner failed, the targets
                         // are still cold and this send distributes normally.
-                        distribution_guard = Some(self.group_distribution_lock(&to).await);
+                        distribution_guard = Some(self.group_distribution_lock(to).await);
                         // Force a DB re-read: a concurrent warm send may have
                         // started the cache init before the winner's marking
                         // landed and then published that stale (empty) map,
@@ -3466,7 +3476,7 @@ impl Client {
                         self.sender_key_device_cache.invalidate(&to_str).await;
                         match self
                             .resolve_skdm_targets_memoized(
-                                &to,
+                                to,
                                 &to_str,
                                 &group_info_for_memo,
                                 &own_sending_jid,
@@ -3533,7 +3543,7 @@ impl Client {
                     own_jid,
                     own_lid,
                     account: account_info.as_deref(),
-                    to: &to,
+                    to,
                     message,
                     message_id: request_id,
                     force_distribution: force_skdm,
@@ -3588,7 +3598,7 @@ impl Client {
                         // single-flight guard as a cold send (a warm send that
                         // lost its sender key arrives here without one).
                         if distribution_guard.is_none() {
-                            distribution_guard = Some(self.group_distribution_lock(&to).await);
+                            distribution_guard = Some(self.group_distribution_lock(to).await);
                         }
 
                         // Re-check under the guard: a concurrent retry may have
@@ -3599,7 +3609,7 @@ impl Client {
                         let warm_targets = if key_recreated {
                             self.sender_key_device_cache.invalidate(&to_str).await;
                             self.resolve_skdm_targets_memoized(
-                                &to,
+                                to,
                                 &to_str,
                                 &group_info_for_memo,
                                 &own_sending_jid,
@@ -3631,7 +3641,7 @@ impl Client {
                                 own_jid,
                                 own_lid,
                                 account: account_info.as_deref(),
-                                to: &to,
+                                to,
                                 message,
                                 message_id: request_id,
                                 force_distribution: retry_force,
@@ -3754,7 +3764,7 @@ impl Client {
                     )
                     .await;
                 } else {
-                    self.add_recent_message(&to, request_id, message, shared_content.clone())
+                    self.add_recent_message(to, request_id, message, shared_content.clone())
                         .await;
                 }
             }
@@ -3779,15 +3789,15 @@ impl Client {
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
-                Box::pin(self.cold_query_lid_for_pn(&to)).await;
+                Box::pin(self.cold_query_lid_for_pn(to)).await;
             }
 
             // The LID-vs-PN wire namespace is an account-level decision: the
             // server 400-nacks LID-addressed DMs from accounts that are not
             // 1:1-LID-migrated (issue #941).
-            let recipient_bare = self.resolve_dm_wire_jid(&to).await;
+            let recipient_bare = self.resolve_dm_wire_jid(to).await;
 
-            let stanza_to = dm_stanza_to(&recipient_bare, &to);
+            let stanza_to = dm_stanza_to(&recipient_bare, to);
 
             let peer_recipient_pn = if !is_status_addon {
                 self.resolve_peer_recipient_pn(&stanza_to).await
@@ -3800,7 +3810,7 @@ impl Client {
             // `resolve_dm_devices_memoized` for its freshness contract.
             let dm_devices = self
                 .resolve_dm_devices_memoized(
-                    &to,
+                    to,
                     &recipient_bare,
                     own_jid,
                     device_snapshot.lid.as_ref(),
@@ -3838,7 +3848,7 @@ impl Client {
             // path but WA Web does not attach tctokens to them.
             if !to.is_group() && !to.is_newsletter() && !is_status_addon {
                 should_issue_tc_token_after_send = self
-                    .maybe_include_tc_token(&to, &mut extra_stanza_nodes, sent_at)
+                    .maybe_include_tc_token(to, &mut extra_stanza_nodes, sent_at)
                     .await;
             }
             if should_issue_tc_token_after_send {
@@ -3921,7 +3931,7 @@ impl Client {
 
         let group_info = self
             .groups()
-            .routing_info_with_freshness(&to, crate::cache::Freshness::Refresh)
+            .routing_info_with_freshness(to, crate::cache::Freshness::Refresh)
             .await?;
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_jid = device_snapshot
@@ -4015,7 +4025,7 @@ impl Client {
             .message_context_info
             .is_unset()
             .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
-        self.add_recent_message(&to, request_id, message, shared_content.clone())
+        self.add_recent_message(to, request_id, message, shared_content.clone())
             .await;
         let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
         let mut stores = store_adapter.as_signal_stores();
@@ -4027,7 +4037,7 @@ impl Client {
                 own_jid,
                 own_lid: Some(own_lid),
                 account: device_snapshot.account.as_deref(),
-                to: &to,
+                to,
                 peer_recipient_pn: None,
                 message,
                 message_id: request_id,
@@ -6753,6 +6763,42 @@ mod tests {
         assert_eq!(key.id, Some(message_id));
     }
 
+    #[test]
+    fn test_build_revoke_and_edit_preserve_agent_while_stripping_device() {
+        let bot_with_device: Jid = "12345.2:1@bot".parse().unwrap();
+        let bot_without_device: Jid = "12345.2@bot".parse().unwrap();
+
+        for jid in [&bot_with_device, &bot_without_device] {
+            let revoke = build_revoke_message(jid, true, "MSG-ID".to_string(), None);
+            let key = revoke
+                .protocol_message
+                .into_option()
+                .unwrap()
+                .key
+                .into_option()
+                .unwrap();
+            assert_eq!(key.remote_jid.as_deref(), Some("12345.2@bot"));
+
+            let mut edit_content = wa::Message::default();
+            edit_content.conversation = Some("edited".to_string());
+            let edit = build_edit_message(
+                jid,
+                "MSG-ID".to_string(),
+                None,
+                Box::new(edit_content),
+                1000,
+            );
+            let key = edit
+                .protocol_message
+                .into_option()
+                .unwrap()
+                .key
+                .into_option()
+                .unwrap();
+            assert_eq!(key.remote_jid.as_deref(), Some("12345.2@bot"));
+        }
+    }
+
     // Fictitious JIDs (not real PII):
     //   own PN user = "5500000000000"
     //   own LID user = "111111111111111"
@@ -7817,7 +7863,7 @@ mod tests {
                 &to,
                 "ORIG_ID".to_string(),
                 None,
-                new_content,
+                Box::new(new_content),
                 1_700_000_000_000,
             );
 
@@ -8993,7 +9039,7 @@ mod tests {
         let message =
             pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
         let mut preparing =
-            Box::pin(client.send_peer_branch(peer.clone(), &message, "proof-race", Some(expected)));
+            Box::pin(client.send_peer_branch(&peer, &message, "proof-race", Some(expected)));
         assert!(futures::poll!(&mut preparing).is_pending());
         // A different canonical session owner completes an identity replacement
         // after the primary's preliminary proof check and before encryption.

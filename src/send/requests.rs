@@ -61,7 +61,7 @@ impl SendRequest {
 #[must_use]
 pub struct EditRequest<'a> {
     pub(crate) target: MessageRef<'a>,
-    pub(crate) content: Arc<wa::Message>,
+    pub(crate) content: Box<wa::Message>,
     pub(crate) options: EditOptions,
     pub(crate) encryption: Option<(&'a Jid, &'a MessageSecret)>,
 }
@@ -71,7 +71,7 @@ impl<'a> EditRequest<'a> {
     pub fn new(target: MessageRef<'a>, content: wa::Message) -> Self {
         Self {
             target,
-            content: Arc::new(content),
+            content: Box::new(content),
             options: EditOptions::default(),
             encryption: None,
         }

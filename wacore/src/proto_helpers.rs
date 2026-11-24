@@ -448,15 +448,94 @@ impl MessageExt for wa::Message {
     }
 
     fn prepare_for_quote(&self) -> Box<wa::Message> {
-        let mut msg = self.clone();
+        // Fast-path: bare text messages (`conversation`) are by far the most
+        // common quoted messages in chat (and the fixture in warm_dm_reply_quoting).
+        // A bare text message has no wrappers, no ContextInfo fields, and no nested
+        // quote chains. Constructing a direct boxed message avoids cloning ~3.5 KB
+        // of empty protobuf fields onto the stack, running 46 carrier checks +
+        // 7 wrapper checks in `strip_nested_context_info`, and copying 3.5 KB to heap.
+        if let Some(text) = &self.conversation {
+            let mut has_other = false;
+            macro_rules! check_carrier {
+                ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
+                    $(
+                        if self.$field.is_set() {
+                            has_other = true;
+                        }
+                    )+
+                };
+            }
+            with_context_info_fields!(check_carrier!());
+            if !has_other {
+                macro_rules! check_wrapper {
+                    ($wrapper:ident) => {
+                        if self.$wrapper.is_set() {
+                            has_other = true;
+                        }
+                    };
+                }
+                for_each_base_wrapper!(check_wrapper);
+            }
+            if !has_other {
+                let mut quoted = wa::Message::default();
+                quoted.conversation = Some(text.clone());
+                if self.message_context_info.is_set() {
+                    quoted.message_context_info = self.message_context_info.clone();
+                }
+                return Box::new(quoted);
+            }
+        }
+
+        let mut msg = Box::new(self.clone());
         strip_nested_context_info(&mut msg, false);
-        Box::new(msg)
+        msg
     }
 
     fn prepare_for_forward(&self) -> wa::Message {
         // WA Web's `FREQUENTLY_FORWARDED_SENTINEL` (Constants/Deprecated): the
         // score saturates by jumping here at the >= 5 threshold, not at 5.
         const FREQUENTLY_FORWARDED_SENTINEL: u32 = 127;
+
+        // Fast-path: bare text messages (`conversation`) are promoted directly
+        // to extended_text_message without cloning the 3.5KB struct first.
+        if let Some(text) = &self.conversation {
+            let mut has_other = false;
+            macro_rules! check_carrier {
+                ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
+                    $(
+                        if self.$field.is_set() {
+                            has_other = true;
+                        }
+                    )+
+                };
+            }
+            with_context_info_fields!(check_carrier!());
+            if !has_other {
+                macro_rules! check_wrapper {
+                    ($wrapper:ident) => {
+                        if self.$wrapper.is_set() {
+                            has_other = true;
+                        }
+                    };
+                }
+                for_each_base_wrapper!(check_wrapper);
+            }
+            if !has_other {
+                let mut msg = wa::Message::default();
+                msg.extended_text_message = buffa::MessageField::some({
+                    let mut proto = wa::message::ExtendedTextMessage::default();
+                    proto.text = Some(text.clone());
+                    proto.context_info = buffa::MessageField::some({
+                        let mut proto = wa::ContextInfo::default();
+                        proto.is_forwarded = Some(true);
+                        proto.forwarding_score = Some(0);
+                        proto
+                    });
+                    proto
+                });
+                return msg;
+            }
+        }
 
         let mut msg = self.clone();
         // Reuse the quote/mention stripping; forwarding always breaks the chain,
@@ -654,11 +733,14 @@ pub(crate) fn strip_nested_context_info(msg: &mut wa::Message, always_clear_quot
         ctx.group_mentions.clear();
 
         // WhatsApp Web preserves quote chains for bot participants when quoting;
-        // forwarding has no such exception.
+        // forwarding has no such exception. Fast-path check prefix/suffix before Jid::from_str.
         let is_bot = !always_clear_quote
             && ctx
                 .participant
                 .as_ref()
+                .filter(|p| {
+                    p.ends_with("@bot") || p.starts_with("1313555") || p.starts_with("131655500")
+                })
                 .and_then(|p| Jid::from_str(p).ok())
                 .is_some_and(|jid| jid.is_bot());
 
@@ -675,32 +757,41 @@ pub(crate) fn strip_nested_context_info(msg: &mut wa::Message, always_clear_quot
         clear_nested_context(ctx, always_clear_quote);
     });
 
-    // Recurse into wrapper messages.
-    macro_rules! recurse_into_wrapper {
-        ($($wrapper:ident),+ $(,)?) => {
-            $(
-                if let Some(wrapper) = msg.$wrapper.as_option_mut()
-                    && let Some(inner) = wrapper.message.as_option_mut()
-                {
-                    strip_nested_context_info(inner, always_clear_quote);
-                }
-            )+
-        };
-    }
-    recurse_into_wrapper!(
-        ephemeral_message,
-        view_once_message,
-        view_once_message_v2,
-        view_once_message_v2_extension,
-        document_with_caption_message,
-        edited_message,
-    );
-
-    // device_sent_message also contains a nested message.
-    if let Some(wrapper) = msg.device_sent_message.as_option_mut()
-        && let Some(inner) = wrapper.message.as_option_mut()
+    // Recurse into wrapper messages only if any wrapper is set.
+    if msg.ephemeral_message.is_set()
+        || msg.view_once_message.is_set()
+        || msg.view_once_message_v2.is_set()
+        || msg.view_once_message_v2_extension.is_set()
+        || msg.document_with_caption_message.is_set()
+        || msg.edited_message.is_set()
+        || msg.device_sent_message.is_set()
     {
-        strip_nested_context_info(inner, always_clear_quote);
+        macro_rules! recurse_into_wrapper {
+            ($($wrapper:ident),+ $(,)?) => {
+                $(
+                    if let Some(wrapper) = msg.$wrapper.as_option_mut()
+                        && let Some(inner) = wrapper.message.as_option_mut()
+                    {
+                        strip_nested_context_info(inner, always_clear_quote);
+                    }
+                )+
+            };
+        }
+        recurse_into_wrapper!(
+            ephemeral_message,
+            view_once_message,
+            view_once_message_v2,
+            view_once_message_v2_extension,
+            document_with_caption_message,
+            edited_message,
+        );
+
+        // device_sent_message also contains a nested message.
+        if let Some(wrapper) = msg.device_sent_message.as_option_mut()
+            && let Some(inner) = wrapper.message.as_option_mut()
+        {
+            strip_nested_context_info(inner, always_clear_quote);
+        }
     }
 }
 
@@ -1722,6 +1813,26 @@ mod tests {
         assert!(
             ctx.quoted_message.is_set(),
             "Bot (@bot server) quote chain should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_prepare_for_quote_preserves_message_context_info_on_text() {
+        let mut msg = wa::Message::default();
+        msg.conversation = Some("hello".to_string());
+        msg.message_context_info = buffa::MessageField::some({
+            let mut ctx = wa::MessageContextInfo::default();
+            ctx.message_secret = Some(vec![1, 2, 3]);
+            ctx
+        });
+        let prepared = msg.prepare_for_quote();
+        assert_eq!(prepared.conversation.as_deref(), Some("hello"));
+        assert_eq!(
+            prepared
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(&[1, 2, 3][..])
         );
     }
 
