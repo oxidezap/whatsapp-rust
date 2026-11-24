@@ -203,8 +203,13 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return false;
                 };
-                let Some(current) = scope.run(client, metadata.current()).await else {
-                    return false;
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
                 };
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
@@ -235,8 +240,13 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return false;
                 };
-                let Some(current) = scope.run(client, metadata.current()).await else {
-                    return false;
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
                 };
                 if !scope.is_current(client) {
                     return false;
@@ -272,8 +282,13 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return false;
                 };
-                let Some(current) = scope.run(client, metadata.current()).await else {
-                    return false;
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
                 };
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);

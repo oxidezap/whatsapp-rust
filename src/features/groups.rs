@@ -1228,21 +1228,29 @@ pub(crate) struct GroupMetadataGuard<'a> {
 
 impl GroupMetadataGuard<'_> {
     pub(crate) async fn current(&self) -> Option<Arc<GroupRoutingInfo>> {
+        self.client.get_group_cache().get(self.jid).await
+    }
+
+    pub(crate) async fn current_or_persisted(
+        &self,
+    ) -> anyhow::Result<Option<Arc<GroupRoutingInfo>>> {
         if let Some(info) = self.client.get_group_cache().get(self.jid).await {
-            return Some(info);
+            return Ok(Some(info));
         }
         let jid_str = self.jid.to_string();
         let backend = self.client.persistence_manager.backend();
-        let mut info: GroupRoutingInfo = match backend.get_group_metadata(&jid_str).await {
-            Ok(Some(blob)) => serde_json::from_slice(&blob).ok()?,
-            _ => return None,
-        };
-        Groups::new(self.client)
-            .fill_group_info_pns(&mut info)
-            .await;
-        let info = Arc::new(info);
-        self.cache(Arc::clone(&info)).await;
-        Some(info)
+        match backend.get_group_metadata(&jid_str).await {
+            Ok(Some(blob)) => {
+                let mut info: GroupRoutingInfo = serde_json::from_slice(&blob)
+                    .map_err(|e| anyhow::anyhow!("corrupt group metadata for {}: {e}", self.jid))?;
+                Groups::new(self.client)
+                    .fill_group_info_pns(&mut info)
+                    .await;
+                Ok(Some(Arc::new(info)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn cache(&self, info: Arc<GroupRoutingInfo>) {
@@ -2628,16 +2636,23 @@ impl<'a> Groups<'a> {
             match scope {
                 ParticipantRemovalScope::Group => {
                     let metadata = self.client.lock_group_metadata(jid).await;
-                    if let Some(info) = metadata.current().await {
-                        let mut info = Arc::unwrap_or_clone(info);
-                        info.remove_participants(&accepted);
-                        metadata.publish(Arc::new(info)).await;
-                    } else {
-                        log::debug!(
-                            target: "Client/Group",
-                            "Group metadata not cached for {}: skipping in-place removal",
-                            jid.observe()
-                        );
+                    match metadata.current_or_persisted().await {
+                        Ok(Some(info)) => {
+                            let mut info = Arc::unwrap_or_clone(info);
+                            info.remove_participants(&accepted);
+                            metadata.publish(Arc::new(info)).await;
+                        }
+                        Ok(None) => {
+                            log::debug!(
+                                target: "Client/Group",
+                                "Group metadata not cached or persisted for {}: skipping in-place removal",
+                                jid.observe()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to read group metadata for removal: {e}");
+                            metadata.invalidate().await;
+                        }
                     }
                 }
                 ParticipantRemovalScope::LinkedGroups => {

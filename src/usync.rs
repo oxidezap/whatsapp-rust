@@ -2437,7 +2437,6 @@ impl Client {
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
     ) -> anyhow::Result<PreparedDeviceListIdentities> {
-        use futures::{StreamExt, TryStreamExt};
         let users: Vec<_> = response
             .device_lists
             .iter()
@@ -2447,18 +2446,102 @@ impl Client {
             })
             .map(|list| list.user.clone())
             .collect();
-        // Limit queued account work as well as active IQs. Ordered results keep
-        // duplicate rows in response order. Strict callers stop at the first error.
-        let concurrency = if mode == DeviceListApplyMode::GroupRefresh {
-            crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY
-        } else {
-            1
-        };
-        futures::stream::iter(users)
-            .map(|user| self.prepare_device_list_identity(user, mode))
-            .buffered(concurrency)
-            .try_collect()
-            .await
+
+        let mut results = std::collections::HashMap::with_capacity(users.len());
+        let mut uncached = Vec::new();
+        for user in &users {
+            let cached = {
+                let (_sessions, _mapping) = self
+                    .device_list_identity_guards(std::slice::from_ref(user))
+                    .await?;
+                self.device_list_account_identity(user).await
+            };
+            match cached {
+                Ok(Some(identity)) => {
+                    results.insert(user.clone(), PreparedAccountIdentity::Trusted(identity));
+                }
+                Ok(None) => uncached.push(user.clone()),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !uncached.is_empty() {
+            if mode == DeviceListApplyMode::GroupRefresh {
+                // Batch query uncached identities in bounded chunks rather than
+                // blasting individual queries or unconditionally rejecting them.
+                const GROUP_BOOTSTRAP_CHUNK_SIZE: usize = 25;
+                const MAX_GROUP_BOOTSTRAP: usize = 50;
+
+                let (to_query, to_reject) = if uncached.len() > MAX_GROUP_BOOTSTRAP {
+                    let (q, r) = uncached.split_at(MAX_GROUP_BOOTSTRAP);
+                    (q, r)
+                } else {
+                    (uncached.as_slice(), &[][..])
+                };
+
+                for rejected_user in to_reject {
+                    results.insert(rejected_user.clone(), PreparedAccountIdentity::Rejected);
+                }
+
+                let epoch = self.signal_cache.identity_continuity.primary_snapshot();
+                for chunk in to_query.chunks(GROUP_BOOTSTRAP_CHUNK_SIZE) {
+                    let primaries: Vec<Jid> = chunk
+                        .iter()
+                        .map(wacore::types::jid::adv_account_jid)
+                        .collect();
+                    let spec = wacore::iq::prekeys::PreKeyFetchSpec::with_reason(
+                        primaries.clone(),
+                        wacore::iq::prekeys::PreKeyFetchReason::Identity,
+                    );
+                    match self.execute(spec).await {
+                        Ok(fetch_response) => {
+                            for user in chunk {
+                                let primary = wacore::types::jid::adv_account_jid(user);
+                                if let Some(bundle) = fetch_response.bundles.get(&primary)
+                                    && let Ok(identity_key) =
+                                        crate::prekeys::authenticated_primary_identity(bundle)
+                                {
+                                    let key_bytes = *identity_key.public_key().public_key_bytes();
+                                    let _ = self
+                                        .persist_adv_bootstrap_identity_inner(
+                                            &primary, &key_bytes, epoch,
+                                        )
+                                        .await;
+                                    results.insert(
+                                        user.clone(),
+                                        PreparedAccountIdentity::Trusted(key_bytes),
+                                    );
+                                } else {
+                                    results.insert(user.clone(), PreparedAccountIdentity::Rejected);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!("Group batch identity bootstrap failed: {err}");
+                            for user in chunk {
+                                results.insert(user.clone(), PreparedAccountIdentity::Rejected);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for user in uncached {
+                    let (user, prepared) = self.prepare_device_list_identity(user, mode).await?;
+                    results.insert(user, prepared);
+                }
+            }
+        }
+
+        let ordered = users
+            .into_iter()
+            .map(|user| {
+                let prepared = results
+                    .remove(&user)
+                    .unwrap_or(PreparedAccountIdentity::Rejected);
+                (user, prepared)
+            })
+            .collect();
+        Ok(ordered)
     }
 
     async fn prepare_device_list_identity(
@@ -2474,9 +2557,6 @@ impl Client {
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
-            Ok(None) if mode == DeviceListApplyMode::GroupRefresh => {
-                return Ok((user, PreparedAccountIdentity::Rejected));
-            }
             Ok(None) => self.ensure_adv_account_identity(&user).await,
             Err(error) => Err(error),
         };
@@ -3257,21 +3337,39 @@ mod tests {
     use wacore::types::jid::JidExt;
 
     #[tokio::test]
-    async fn group_refresh_skips_prekey_query_for_uncached_identities() {
+    async fn group_refresh_batches_uncached_identities() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let uncached_user: Jid = "12025550199:0@s.whatsapp.net".parse().unwrap();
+        let response = DeviceListResponse {
+            device_lists: vec![wacore::usync::UserDeviceList {
+                user: uncached_user.clone(),
+                devices: vec![wacore::usync::UsyncDevice::new(0, Some(1))],
+                key_index_bytes: Some(vec![1, 2, 3]),
+                phash: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
 
-        let (user, prepared) = client
-            .prepare_device_list_identity(uncached_user.clone(), DeviceListApplyMode::GroupRefresh)
-            .await
-            .unwrap();
+        let client_clone = client.clone();
+        let fetch = tokio::spawn(async move {
+            client_clone
+                .prepare_device_list_identities(&response, DeviceListApplyMode::GroupRefresh)
+                .await
+        });
 
-        assert_eq!(user, uncached_user);
-        assert!(matches!(prepared, PreparedAccountIdentity::Rejected));
-        assert!(
-            transport.sent().is_empty(),
-            "GroupRefresh must NOT send prekey fetch IQs for uncached users"
-        );
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let answer = wacore_binary::builder::NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &answer).await;
+
+        let prepared = fetch.await.unwrap().unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].0, uncached_user);
+        assert!(matches!(prepared[0].1, PreparedAccountIdentity::Rejected));
+        assert_eq!(transport.sent().len(), 1);
     }
 
     /// Sign fictitious key-index details with the shared test account.
