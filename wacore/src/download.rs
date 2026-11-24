@@ -572,8 +572,66 @@ pub trait DownloadWriter: std::io::Write + std::io::Seek {
 
 impl DownloadWriter for std::fs::File {
     fn truncate(&mut self, len: u64) -> std::io::Result<()> {
-        self.set_len(len)
+        match self.set_len(len) {
+            Ok(()) => Ok(()),
+            #[cfg(windows)]
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                truncate_windows_append_file(self, len).map_err(|_| e)
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+#[cfg(windows)]
+fn truncate_windows_append_file(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            hFile: *mut std::ffi::c_void,
+            lpszFilePath: *mut u16,
+            cchFilePath: u32,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    let handle = file.as_raw_handle();
+    let mut buf = vec![0u16; 1024];
+    let len_copied = unsafe {
+        GetFinalPathNameByHandleW(
+            handle as *mut std::ffi::c_void,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            0,
+        )
+    };
+    if len_copied == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len_copied as usize > buf.len() {
+        buf.resize(len_copied as usize, 0);
+        let res = unsafe {
+            GetFinalPathNameByHandleW(
+                handle as *mut std::ffi::c_void,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                0,
+            )
+        };
+        if res == 0 || res as usize > buf.len() {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let os_str = OsString::from_wide(&buf[..len_copied as usize]);
+    let path = std::path::PathBuf::from(os_str);
+    let reopen = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?;
+    reopen.set_len(len)?;
+    Ok(())
 }
 
 /// Saturating rather than fallible: `Vec::truncate` past the end is a no-op, which

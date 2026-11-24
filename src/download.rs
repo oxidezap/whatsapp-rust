@@ -4947,8 +4947,15 @@ mod tests {
         ));
         std::fs::write(&path, b"stale bytes the caller left behind")
             .expect("fixture write should succeed");
+        #[cfg(not(windows))]
         let file = std::fs::OpenOptions::new()
             .append(true)
+            .open(&path)
+            .expect("append open should succeed");
+        #[cfg(windows)]
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .write(true)
             .open(&path)
             .expect("append open should succeed");
 

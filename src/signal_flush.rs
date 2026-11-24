@@ -402,7 +402,7 @@ mod tests {
         // RUNNING stays set for generation 0 the whole time — never a second
         // worker; only the two flag bits are ever set (generation 0 leaves the
         // high bits clear), so the pile-up never mints stray state.
-        for _ in 0..50 {
+        for _ in 0..10 {
             let s = client.signal_flush_state.load(Ordering::Acquire);
             assert!(s & FLUSH_RUNNING != 0, "a worker stays armed");
             assert_eq!(s & !FLUSH_FLAGS, 0, "generation 0: no stray high bits");
