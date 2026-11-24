@@ -297,7 +297,7 @@ struct SendBranchOutput {
 }
 
 struct GroupBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     edit: Option<EditAttribute>,
@@ -308,7 +308,7 @@ struct GroupBranchRequest<'a> {
 }
 
 struct DmBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     sent_at: SendInstant,
@@ -321,7 +321,7 @@ struct DmBranchRequest<'a> {
 }
 
 struct GroupDirectBranchRequest<'a> {
-    to: Jid,
+    to: &'a Jid,
     message: &'a wa::Message,
     request_id: &'a str,
     recipients: &'a [Jid],
@@ -923,7 +923,7 @@ mod group_direct_tests {
         for recipients in [&[][..], &invalid_group_recipient[..]] {
             let result = client
                 .send_group_direct_branch(GroupDirectBranchRequest {
-                    to: group.clone(),
+                    to: &group,
                     message: &message,
                     request_id: "SYNTHETIC-ID",
                     recipients,
@@ -1394,7 +1394,7 @@ fn build_revoke_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_string());
+                proto.remote_jid = Some(remote_jid.to_non_ad_string());
                 proto.from_me = Some(from_me);
                 proto.id = Some(message_id);
                 proto.participant = participant;
@@ -1458,7 +1458,7 @@ pub(crate) fn build_edit_message(
     remote_jid: &Jid,
     message_id: String,
     participant: Option<String>,
-    new_content: wa::Message,
+    new_content: Box<wa::Message>,
     timestamp_ms: i64,
 ) -> wa::Message {
     {
@@ -1467,14 +1467,14 @@ pub(crate) fn build_edit_message(
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.key = buffa::MessageField::some({
                 let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.to_string());
+                proto.remote_jid = Some(remote_jid.to_non_ad_string());
                 proto.from_me = Some(true);
                 proto.id = Some(message_id);
                 proto.participant = participant;
                 proto
             });
             proto_.r#type = Some(wa::message::protocol_message::Type::MessageEdit);
-            proto_.edited_message = buffa::MessageField::some(new_content);
+            proto_.edited_message = buffa::MessageField::from_box(new_content);
             proto_.timestamp_ms = Some(timestamp_ms);
             proto_
         });
@@ -2750,9 +2750,10 @@ impl Client {
                     sent_at: Some(sent_at),
                     request_id: Some(&request_id),
                     edit: Some(edit),
-                    extra_stanza_nodes: wacore::send::message_meta_from_message(&message)
-                        .into_iter()
-                        .collect(),
+                    extra_stanza_nodes: match wacore::send::message_meta_from_message(&message) {
+                        Some(node) => vec![node],
+                        None => Vec::new(),
+                    },
                     borrowed_message_id,
                     ..Default::default()
                 },
@@ -2933,7 +2934,6 @@ impl Client {
                 &generated_request_id
             }
         };
-        let tc_issue_target = to.clone();
 
         // Dispatch to a concrete boxed future per branch: this function's own
         // frame stays small (prologue + epilogue), and a DM send never
@@ -2953,7 +2953,7 @@ impl Client {
             requires_connection_generation_check,
             dm_unreached,
         } = if peer && !to.is_group() {
-            box_send_branch(self.send_peer_branch(to, message, request_id, expected_peer_identity))
+            box_send_branch(self.send_peer_branch(&to, message, request_id, expected_peer_identity))
                 .await?
         } else if let Some(recipients) = group_direct_recipients {
             if !to.is_group() {
@@ -2963,7 +2963,7 @@ impl Client {
                 .into());
             }
             box_send_branch(self.send_group_direct_branch(GroupDirectBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 recipients,
@@ -2971,7 +2971,7 @@ impl Client {
             .await?
         } else if to.is_group() {
             box_send_branch(self.send_group_branch(GroupBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 edit,
@@ -2983,7 +2983,7 @@ impl Client {
             .await?
         } else {
             box_send_branch(self.send_dm_branch(DmBranchRequest {
-                to,
+                to: &to,
                 message,
                 request_id,
                 sent_at,
@@ -3031,12 +3031,8 @@ impl Client {
         );
         if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
         {
-            Box::pin(self.validate_history_publication(
-                &tc_issue_target,
-                message,
-                group_direct_recipients,
-            ))
-            .await?;
+            Box::pin(self.validate_history_publication(&to, message, group_direct_recipients))
+                .await?;
         }
         if (group_devices.is_some() || requires_connection_generation_check)
             && self
@@ -3055,7 +3051,7 @@ impl Client {
             && let Some(phash) = ack_phash
         {
             // Group refresh and message resend have separate lifetimes.
-            let invalidate_group = tc_issue_target.is_group();
+            let invalidate_group = to.is_group();
             if let Some(devices) = group_devices {
                 let mut waiters = self.response_waiters_guard();
                 let registered_epoch = waiters.current_epoch();
@@ -3064,7 +3060,7 @@ impl Client {
                     crate::client::ResponseWaiter::GroupPhash(
                         crate::client::PhashWaiter {
                             expected: phash,
-                            jid: tc_issue_target.clone(),
+                            jid: to.clone(),
                             invalidate_group_cache: true,
                             dm_devices: None,
                             dm_unreached: Vec::new(),
@@ -3090,7 +3086,7 @@ impl Client {
                 self.register_phash_waiter(
                     request_id,
                     phash,
-                    tc_issue_target.clone(),
+                    to.clone(),
                     invalidate_group,
                     covered_dm_devices,
                     dm_unreached,
@@ -3135,19 +3131,16 @@ impl Client {
         if !borrowed_message_id && let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
-                None => self.dm_sender_identity_for(&tc_issue_target).await,
+                None => self.dm_sender_identity_for(&to).await,
             };
             if let Some(sender) = sender {
-                let is_bot_chat = tc_issue_target.is_bot();
+                let is_bot_chat = to.is_bot();
                 let class = wacore::msg_secret::classify(message, is_bot_chat);
-                Box::pin(self.persist_outbound_msg_secret(
-                    &tc_issue_target,
-                    &sender,
-                    request_id,
-                    secret,
-                    class,
-                    sent_at,
-                ))
+                Box::pin(
+                    self.persist_outbound_msg_secret(
+                        &to, &sender, request_id, secret, class, sent_at,
+                    ),
+                )
                 .await;
             }
         }
@@ -3171,7 +3164,7 @@ impl Client {
         // Fire-and-forget so send_message returns without waiting for the IQ
         if should_issue_tc_token_after_send {
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                let target = tc_issue_target;
+                let target = to;
                 self.runtime
                     .spawn(Box::pin(async move {
                         client.issue_tc_token_after_send(&target).await;
@@ -3189,7 +3182,7 @@ impl Client {
     /// never groups.
     async fn send_peer_branch(
         &self,
-        to: Jid,
+        to: &Jid,
         message: &wa::Message,
         request_id: &str,
         expected_identity: Option<[u8; 32]>,
@@ -3197,7 +3190,7 @@ impl Client {
         let node = {
             // Peer messages are only valid for individual users, not groups
             // Resolve encryption JID and acquire lock ONLY for encryption
-            let encryption_jid = self.resolve_encryption_jid(&to).await;
+            let encryption_jid = self.resolve_encryption_jid(to).await;
             let signal_addr = encryption_jid.to_protocol_address();
 
             let _account_guard = self.lock_companion_account(&encryption_jid).await;
@@ -3236,7 +3229,7 @@ impl Client {
             wacore::send::prepare_peer_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
-                to,
+                to.clone(),
                 &signal_addr,
                 message,
                 request_id,
@@ -7817,7 +7810,7 @@ mod tests {
                 &to,
                 "ORIG_ID".to_string(),
                 None,
-                new_content,
+                Box::new(new_content),
                 1_700_000_000_000,
             );
 
@@ -8993,7 +8986,7 @@ mod tests {
         let message =
             pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
         let mut preparing =
-            Box::pin(client.send_peer_branch(peer.clone(), &message, "proof-race", Some(expected)));
+            Box::pin(client.send_peer_branch(&peer, &message, "proof-race", Some(expected)));
         assert!(futures::poll!(&mut preparing).is_pending());
         // A different canonical session owner completes an identity replacement
         // after the primary's preliminary proof check and before encryption.
