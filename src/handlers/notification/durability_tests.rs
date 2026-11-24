@@ -1325,6 +1325,13 @@ async fn test_membership_approval_mode_does_not_invalidate_cached_group() {
     );
 
     // Only transport acks should be sent, no IQ queries
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport.sent().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
     assert_eq!(
         plaintexts.len(),
@@ -1386,6 +1393,13 @@ async fn test_group_settings_notifications_do_not_invalidate_cache() {
             .unwrap()
             .is_some()
     );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport.sent().len() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
     assert_eq!(
         plaintexts.len(),
