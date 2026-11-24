@@ -3,13 +3,15 @@ use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wacore::net::TransportFactory;
-use whatsapp_rust_tokio_transport::{BoxedStream, StreamDialer, TokioWebSocketTransportFactory};
+use whatsapp_rust_tokio_transport::{
+    BoxedStream, StreamDialer, TokioTransportError, TokioWebSocketTransportFactory,
+};
 
 struct RecordingDialer(Arc<Mutex<Vec<(String, u16)>>>);
 
 #[async_trait]
 impl StreamDialer for RecordingDialer {
-    async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, TokioTransportError> {
         self.0.lock().unwrap().push((host.into(), port));
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "dial sentinel").into())
     }
@@ -74,7 +76,7 @@ struct LocalDialer(std::net::SocketAddr);
 
 #[async_trait]
 impl StreamDialer for LocalDialer {
-    async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, TokioTransportError> {
         assert_eq!(host, "relay.example");
         assert_eq!(port, self.0.port());
         Ok(Box::new(tokio::net::TcpStream::connect(self.0).await?))
@@ -128,7 +130,7 @@ impl Drop for DropFlag {
 
 #[async_trait]
 impl StreamDialer for WaitingDialer {
-    async fn dial(&self, _: &str, _: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, _: &str, _: u16) -> Result<BoxedStream, TokioTransportError> {
         let _stream = tokio::net::TcpStream::connect(self.addr).await?;
         let _flag = DropFlag(self.dropped.clone());
         self.ready.notify_one();

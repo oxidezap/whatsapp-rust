@@ -2081,7 +2081,6 @@ dependencies = [
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-channel",
  "async-trait",
  "bytes",
@@ -2089,6 +2088,7 @@ dependencies = [
  "http",
  "log",
  "rustls",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-websockets",

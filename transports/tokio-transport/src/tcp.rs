@@ -5,14 +5,13 @@
 
 use std::sync::{Arc, Weak};
 
-use anyhow::{Context, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, MutexGuard, watch};
 use wacore::net::{DisconnectReason, Transport, TransportEvent, TransportFactory};
 
-use crate::StreamDialer;
+use crate::{StreamDialer, TokioTransportError};
 
 const READ_CAPACITY: usize = 16 * 1024;
 const EVENT_CAPACITY: usize = 64;
@@ -29,7 +28,7 @@ pub struct TokioTcpTransportFactory {
 }
 
 impl TokioTcpTransportFactory {
-    pub fn new(host: impl Into<String>, port: u16) -> anyhow::Result<Self> {
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, TokioTransportError> {
         let host = host.into();
         // Portable configuration may retain URI brackets, while stream dialers
         // and Tokio's (host, port) resolver expect an unbracketed IPv6 literal.
@@ -37,7 +36,7 @@ impl TokioTcpTransportFactory {
             host.strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
                 .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
-                .context("invalid bracketed IPv6 TCP host")?
+                .ok_or(TokioTransportError::InvalidBracketedIpv6)?
                 .to_string()
         } else {
             host
@@ -52,7 +51,7 @@ impl TokioTcpTransportFactory {
                 && host.parse::<std::net::Ipv6Addr>().is_err())
             || port == 0
         {
-            bail!("TCP destination requires a host without URL syntax and a nonzero port");
+            return Err(TokioTransportError::InvalidTcpDestination);
         }
         Ok(Self {
             host,
@@ -71,14 +70,25 @@ impl TokioTcpTransportFactory {
 impl TransportFactory for TokioTcpTransportFactory {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), wacore::anyhow::Error>
+    {
         if let Some(dialer) = &self.dialer {
-            return Ok(from_byte_stream(dialer.dial(&self.host, self.port).await?));
+            let stream = dialer
+                .dial(&self.host, self.port)
+                .await
+                .map_err(|e| match e {
+                    TokioTransportError::Io(io) => wacore::anyhow::Error::new(io),
+                    TokioTransportError::Custom(c) => wacore::anyhow::Error::from_boxed(c),
+                    other => wacore::anyhow::Error::new(other),
+                })?;
+            return Ok(from_byte_stream(stream));
         }
         let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
             .await
-            .context("TCP connection failed")?;
-        stream.set_nodelay(true).context("setting TCP_NODELAY")?;
+            .map_err(|e| wacore::anyhow::Error::new(e).context("TCP connection failed"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| wacore::anyhow::Error::new(e).context("setting TCP_NODELAY"))?;
         Ok(from_byte_stream(stream))
     }
 }
@@ -132,14 +142,14 @@ impl<W> Drop for DriverRetirement<W> {
 
 #[async_trait]
 impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
-    async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+    async fn send(&self, data: Bytes) -> Result<(), wacore::anyhow::Error> {
         let mut shutdown = self.shutdown.subscribe();
         if *shutdown.borrow() {
-            bail!("TCP transport is closed");
+            return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed));
         }
         let guard = tokio::select! {
             biased;
-            _ = shutdown.changed() => bail!("TCP transport is closed"),
+            _ = shutdown.changed() => return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed)),
             guard = self.writer.lock() => guard,
         };
         let mut retirement = WriteRetirement {
@@ -148,20 +158,26 @@ impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
             armed: true,
         };
         if *shutdown.borrow() {
-            bail!("TCP transport is closed");
+            return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed));
         }
         let writer = retirement
             .writer
             .as_mut()
-            .context("TCP transport is closed")?;
+            .ok_or_else(|| wacore::anyhow::Error::new(TokioTransportError::TcpClosed))?;
         tokio::select! {
             biased;
-            _ = shutdown.changed() => bail!("TCP transport closed during write"),
+            _ = shutdown.changed() => return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosedDuringWrite)),
             result = async {
-                writer.write_all(&data).await.context("TCP write failed")?;
+                writer
+                    .write_all(&data)
+                    .await
+                    .map_err(|e| wacore::anyhow::Error::new(e).context("TCP write failed"))?;
                 // Dialers may return buffered streams. A completed send must
                 // reach the underlying stream before retirement is disarmed.
-                writer.flush().await.context("TCP flush failed")
+                writer
+                    .flush()
+                    .await
+                    .map_err(|e| wacore::anyhow::Error::new(e).context("TCP flush failed"))
             } => result?,
         }
         retirement.armed = false;
@@ -650,9 +666,15 @@ mod tests {
         struct RejectDialer;
         #[async_trait]
         impl StreamDialer for RejectDialer {
-            async fn dial(&self, host: &str, port: u16) -> anyhow::Result<crate::BoxedStream> {
+            async fn dial(
+                &self,
+                host: &str,
+                port: u16,
+            ) -> Result<crate::BoxedStream, TokioTransportError> {
                 assert_eq!((host, port), ("::1", 1234));
-                bail!("synthetic dial failure")
+                Err(TokioTransportError::custom(std::io::Error::other(
+                    "synthetic dial failure",
+                )))
             }
         }
         let factory = TokioTcpTransportFactory::new("[::1]", 1234)
