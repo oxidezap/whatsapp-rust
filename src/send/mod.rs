@@ -10160,15 +10160,15 @@ mod tests {
         let last_index = transport.sent_count() - 1;
         let stanza = crate::test_utils::decode_sent_iq(&transport, last_index).await;
         let node = stanza.get();
-        if let Some(participants) = node.get_optional_child("participants") {
-            if let Some(children) = participants.children() {
-                for child in children {
-                    if let Some(jid) = child.attrs().optional_jid("jid") {
-                        assert!(
-                            !jid.is_hosted(),
-                            "status fanout must not include hosted devices: {jid}"
-                        );
-                    }
+        if let Some(participants) = node.get_optional_child("participants")
+            && let Some(children) = participants.children()
+        {
+            for child in children {
+                if let Some(jid) = child.attrs().optional_jid("jid") {
+                    assert!(
+                        !jid.is_hosted(),
+                        "status fanout must not include hosted devices: {jid}"
+                    );
                 }
             }
         }
