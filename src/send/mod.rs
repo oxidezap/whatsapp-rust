@@ -3818,6 +3818,26 @@ impl Client {
                 )
                 .await?;
 
+            // Status addons (reactions to status@broadcast) borrow this DM branch,
+            // but WA Web excludes hosted devices from status contexts (status_session_address
+            // returns None for @hosted and @hosted.lid).
+            let dm_devices =
+                if is_status_addon && dm_devices.devices().iter().any(|d| d.is_hosted()) {
+                    let filtered: Vec<Jid> = dm_devices
+                        .devices()
+                        .iter()
+                        .filter(|d| !d.is_hosted())
+                        .cloned()
+                        .collect();
+                    std::sync::Arc::new(wacore::send::ResolvedDmDevices::new(
+                        filtered,
+                        own_jid,
+                        device_snapshot.lid.as_ref(),
+                    ))
+                } else {
+                    dm_devices
+                };
+
             // Resolved once per memo entry: the session pre-check, the lock
             // keys and the encrypt fan-out all address the same devices. The
             // list is built from `devices()` itself, so it is parallel by
@@ -10087,6 +10107,71 @@ mod tests {
             result.recipient_fanout.is_none(),
             "a status send must not describe itself in a DM's terms"
         );
+    }
+
+    /// A status reaction to status@broadcast excludes hosted devices (:99@hosted / :99@hosted.lid)
+    /// from the fanout, even when the author's device list includes them.
+    #[tokio::test]
+    async fn a_status_reaction_excludes_hosted_devices() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: peer_pn.user.clone().into(),
+                devices: [
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(99, None).with_hosting(true),
+                ]
+                .into(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed peer device list with hosted device");
+
+        let reaction = {
+            let mut proto = wa::Message::default();
+            proto.reaction_message = buffa::MessageField::some({
+                let mut proto = wa::message::ReactionMessage::default();
+                proto.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.remote_jid = Some(Jid::status_broadcast().to_string());
+                    proto.from_me = Some(false);
+                    proto.id = Some("STATUSPOST_HOSTED".into());
+                    proto.participant = Some(peer_pn.to_string());
+                    proto
+                });
+                proto.text = Some("\u{1f44d}".into());
+                proto
+            });
+            proto
+        };
+
+        let result = client
+            .send_message(Jid::status_broadcast(), reaction)
+            .await
+            .expect("a status reaction fans out to author devices excluding hosted");
+
+        assert_eq!(result.to, Jid::status_broadcast());
+        assert!(result.recipient_fanout.is_none());
+
+        let last_index = transport.sent_count() - 1;
+        let stanza = crate::test_utils::decode_sent_iq(&transport, last_index).await;
+        let node = stanza.get();
+        if let Some(participants) = node.get_optional_child("participants")
+            && let Some(children) = participants.children()
+        {
+            for child in children {
+                if let Some(jid) = child.attrs().optional_jid("jid") {
+                    assert!(
+                        !jid.is_hosted(),
+                        "status fanout must not include hosted devices: {jid}"
+                    );
+                }
+            }
+        }
     }
 
     /// `SendResult::message` is the message as the pipeline encoded it: the

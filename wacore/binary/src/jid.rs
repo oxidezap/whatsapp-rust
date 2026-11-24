@@ -277,6 +277,33 @@ impl Server {
         }
     }
 
+    /// The account-level (non-hosted) server variant for this server:
+    /// `Hosted` -> `Pn`, `HostedLid` -> `Lid`. Other servers return themselves.
+    /// (Matches WA Web `asUserWidOrThrow` / `createUserWidOrThrow` mapping `hosted` -> `c.us` and `hosted.lid` -> `lid`).
+    #[inline]
+    pub fn user_server(self) -> Self {
+        match self {
+            Self::Hosted => Self::Pn,
+            Self::HostedLid => Self::Lid,
+            server => server,
+        }
+    }
+
+    /// Returns the hosted or non-hosted server variant within this server's addressing family:
+    /// - PN family: `is_hosted` ? `Hosted` : `Pn`
+    /// - LID family: `is_hosted` ? `HostedLid` : `Lid`
+    /// - Other: unchanged
+    #[inline]
+    pub fn with_hosting(self, is_hosted: bool) -> Self {
+        match (self, is_hosted) {
+            (Self::Pn | Self::Hosted, true) => Self::Hosted,
+            (Self::Pn | Self::Hosted, false) => Self::Pn,
+            (Self::Lid | Self::HostedLid, true) => Self::HostedLid,
+            (Self::Lid | Self::HostedLid, false) => Self::Lid,
+            (server, _) => server,
+        }
+    }
+
     /// Phone-number-namespaced servers (`@s.whatsapp.net`, `@hosted`).
     /// The PN side of the LID↔PN mapping treats these as a single class.
     #[inline]
@@ -686,13 +713,7 @@ impl Jid {
     /// counterpart on the wire.
     pub fn with_device_hosting(&self, device_id: u16, is_hosted: bool) -> Self {
         let mut jid = self.with_device(device_id);
-        jid.server = match (jid.server, is_hosted) {
-            (Server::Pn | Server::Hosted, true) => Server::Hosted,
-            (Server::Pn | Server::Hosted, false) => Server::Pn,
-            (Server::Lid | Server::HostedLid, true) => Server::HostedLid,
-            (Server::Lid | Server::HostedLid, false) => Server::Lid,
-            (server, _) => server,
-        };
+        jid.server = jid.server.with_hosting(is_hosted);
         jid
     }
 
@@ -700,6 +721,19 @@ impl Jid {
         Self {
             user: self.user.clone(),
             server: self.server,
+            integrator: self.integrator,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the non-AD user JID representing the account for this JID,
+    /// dropping any device/agent and mapping hosted servers to their ordinary
+    /// account counterparts (`Hosted` -> `Pn`, `HostedLid` -> `Lid`).
+    /// (Matches WA Web `asUserWidOrThrow`).
+    pub fn to_user_jid(&self) -> Self {
+        Self {
+            user: self.user.clone(),
+            server: self.server.user_server(),
             integrator: self.integrator,
             ..Default::default()
         }
@@ -2655,6 +2689,26 @@ mod tests {
     }
 
     #[test]
+    fn test_to_user_jid_maps_hosted_to_account_server() {
+        let hosted_pn = Jid::new("5511999999999", Server::Hosted).with_device(99);
+        let user_pn = hosted_pn.to_user_jid();
+        assert_eq!(user_pn.server, Server::Pn);
+        assert_eq!(user_pn.user, "5511999999999");
+        assert_eq!(user_pn.device, 0);
+
+        let hosted_lid = Jid::new("100000012345678", Server::HostedLid).with_device(99);
+        let user_lid = hosted_lid.to_user_jid();
+        assert_eq!(user_lid.server, Server::Lid);
+        assert_eq!(user_lid.user, "100000012345678");
+        assert_eq!(user_lid.device, 0);
+
+        let regular_pn = Jid::pn_device("5511999999999", 3);
+        let user_regular = regular_pn.to_user_jid();
+        assert_eq!(user_regular.server, Server::Pn);
+        assert_eq!(user_regular.device, 0);
+    }
+
+    #[test]
     fn with_device_hosting_preserves_addressing_family() {
         let hosted_pn = Jid::pn("1234567890").with_device_hosting(7, true);
         assert_eq!(hosted_pn.server, Server::Hosted);
@@ -2673,6 +2727,22 @@ mod tests {
 
         let group = Jid::group("123-456").with_device_hosting(10, true);
         assert_eq!(group.server, Server::Group);
+    }
+
+    #[test]
+    fn server_with_hosting_matrix() {
+        assert_eq!(Server::Pn.with_hosting(true), Server::Hosted);
+        assert_eq!(Server::Pn.with_hosting(false), Server::Pn);
+        assert_eq!(Server::Hosted.with_hosting(true), Server::Hosted);
+        assert_eq!(Server::Hosted.with_hosting(false), Server::Pn);
+
+        assert_eq!(Server::Lid.with_hosting(true), Server::HostedLid);
+        assert_eq!(Server::Lid.with_hosting(false), Server::Lid);
+        assert_eq!(Server::HostedLid.with_hosting(true), Server::HostedLid);
+        assert_eq!(Server::HostedLid.with_hosting(false), Server::Lid);
+
+        assert_eq!(Server::Group.with_hosting(true), Server::Group);
+        assert_eq!(Server::Group.with_hosting(false), Server::Group);
     }
 
     #[test]
