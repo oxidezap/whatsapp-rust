@@ -2508,15 +2508,32 @@ impl Client {
                                         crate::prekeys::authenticated_primary_identity(bundle)
                                 {
                                     let key_bytes = *identity_key.public_key().public_key_bytes();
-                                    let _ = self
+                                    match self
                                         .persist_adv_bootstrap_identity_in_epoch(
                                             &primary, &key_bytes, epoch,
                                         )
-                                        .await;
-                                    results.insert(
-                                        user.clone(),
-                                        PreparedAccountIdentity::Trusted(key_bytes),
-                                    );
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            results.insert(
+                                                user.clone(),
+                                                PreparedAccountIdentity::Trusted(key_bytes),
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            results.insert(
+                                                user.clone(),
+                                                PreparedAccountIdentity::Rejected,
+                                            );
+                                        }
+                                        Err(error) if error.is::<DeviceListIdentityConflict>() => {
+                                            results.insert(
+                                                user.clone(),
+                                                PreparedAccountIdentity::Rejected,
+                                            );
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
                                 } else {
                                     results.insert(user.clone(), PreparedAccountIdentity::Rejected);
                                 }
