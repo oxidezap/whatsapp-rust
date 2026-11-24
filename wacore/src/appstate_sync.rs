@@ -616,7 +616,10 @@ impl AppStateProcessor {
         self
     }
 
-    async fn persist_mutation_effects(&self, mutations: &[Mutation]) -> Result<()> {
+    async fn persist_mutation_effects(
+        &self,
+        mutations: &[Mutation],
+    ) -> Result<(), crate::store::error::StoreError> {
         let Some(persistence) = self.mutation_persistence.as_ref() else {
             return Ok(());
         };
@@ -940,7 +943,7 @@ impl AppStateProcessor {
         recovery: wa::SyncdSnapshotRecovery,
         expected_collection: &str,
         still_current: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<RecoveryOutcome> {
+    ) -> Result<RecoveryOutcome, AppStateSyncError> {
         // The response says which collection it is, and the request said which
         // one was asked for. WA Web compares the two and refuses on mismatch;
         // so does this, because the reply is not correlated by anything else.
@@ -1096,8 +1099,7 @@ impl AppStateProcessor {
                     return Err(SnapshotRecoveryError::MissingRecordActionValue {
                         collection: owned_name.clone(),
                         record_index: i,
-                    }
-                    .into());
+                    });
                 }
                 let key_id =
                     record
@@ -1127,8 +1129,7 @@ impl AppStateProcessor {
                         collection: owned_name.clone(),
                         record_index: i,
                         actual: value_mac.len(),
-                    }
-                    .into());
+                    });
                 }
                 let index =
                     action
@@ -1168,8 +1169,7 @@ impl AppStateProcessor {
                     return Err(SnapshotRecoveryError::EmptyRecordIndex {
                         collection: owned_name.clone(),
                         record_index: i,
-                    }
-                    .into());
+                    });
                 }
 
                 mutations.push(Mutation {
@@ -1181,7 +1181,7 @@ impl AppStateProcessor {
                     operation: wa::syncd_mutation::SyncdOperation::SET,
                 });
             }
-            Ok::<_, anyhow::Error>((mutations, macs))
+            Ok((mutations, macs))
         })
         .await?;
 

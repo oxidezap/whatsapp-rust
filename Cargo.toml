@@ -568,6 +568,10 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.wacore-appstate]
 opt-level = "s"
+[profile.release.package.wacore]
+opt-level = "s"
+[profile.release.package.anyhow]
+opt-level = "z"
 [profile.release.package.serde_json]
 opt-level = "s"
 # The bundled SQLite amalgamation (sqlite3.c) — cargo exports OPT_LEVEL to the
