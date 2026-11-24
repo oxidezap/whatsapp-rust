@@ -2474,6 +2474,9 @@ impl Client {
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
+            Ok(None) if mode == DeviceListApplyMode::GroupRefresh => {
+                return Ok((user, PreparedAccountIdentity::Rejected));
+            }
             Ok(None) => self.ensure_adv_account_identity(&user).await,
             Err(error) => Err(error),
         };
@@ -3252,6 +3255,24 @@ mod tests {
     use wacore::libsignal::protocol::{ProtocolAddress, SessionRecord};
     use wacore::store::traits::{DeviceInfo, DeviceListRecord};
     use wacore::types::jid::JidExt;
+
+    #[tokio::test]
+    async fn group_refresh_skips_prekey_query_for_uncached_identities() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let uncached_user: Jid = "12025550199:0@s.whatsapp.net".parse().unwrap();
+
+        let (user, prepared) = client
+            .prepare_device_list_identity(uncached_user.clone(), DeviceListApplyMode::GroupRefresh)
+            .await
+            .unwrap();
+
+        assert_eq!(user, uncached_user);
+        assert!(matches!(prepared, PreparedAccountIdentity::Rejected));
+        assert!(
+            transport.sent().is_empty(),
+            "GroupRefresh must NOT send prekey fetch IQs for uncached users"
+        );
+    }
 
     /// Sign fictitious key-index details with the shared test account.
     pub(super) fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {

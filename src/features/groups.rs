@@ -1228,7 +1228,21 @@ pub(crate) struct GroupMetadataGuard<'a> {
 
 impl GroupMetadataGuard<'_> {
     pub(crate) async fn current(&self) -> Option<Arc<GroupRoutingInfo>> {
-        self.client.get_group_cache().get(self.jid).await
+        if let Some(info) = self.client.get_group_cache().get(self.jid).await {
+            return Some(info);
+        }
+        let jid_str = self.jid.to_string();
+        let backend = self.client.persistence_manager.backend();
+        let mut info: GroupRoutingInfo = match backend.get_group_metadata(&jid_str).await {
+            Ok(Some(blob)) => serde_json::from_slice(&blob).ok()?,
+            _ => return None,
+        };
+        Groups::new(self.client)
+            .fill_group_info_pns(&mut info)
+            .await;
+        let info = Arc::new(info);
+        self.cache(Arc::clone(&info)).await;
+        Some(info)
     }
 
     async fn cache(&self, info: Arc<GroupRoutingInfo>) {
@@ -2619,8 +2633,11 @@ impl<'a> Groups<'a> {
                         info.remove_participants(&accepted);
                         metadata.publish(Arc::new(info)).await;
                     } else {
-                        // Cache expired: can't patch in place, so drop the now-stale blob.
-                        metadata.invalidate().await;
+                        log::debug!(
+                            target: "Client/Group",
+                            "Group metadata not cached for {}: skipping in-place removal",
+                            jid.observe()
+                        );
                     }
                 }
                 ParticipantRemovalScope::LinkedGroups => {
