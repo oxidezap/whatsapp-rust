@@ -622,6 +622,9 @@ pub struct DmSendHarness {
     runtime: tokio::runtime::Runtime,
     client: Arc<Client>,
     to: Jid,
+    to_string: String,
+    quoted_message: wa::Message,
+    edit_target_id: crate::MessageId,
 }
 
 impl DmSendHarness {
@@ -631,10 +634,16 @@ impl DmSendHarness {
             .build()
             .expect("current-thread runtime");
         let (client, to) = runtime.block_on(build_dm_fixture(peer_devices, addressing));
+        let to_string = to.to_string();
+        let quoted_message = wa::Message::text("ping");
+        let edit_target_id = crate::MessageId::new("3EB0123456789ABCDEF0").expect("valid id");
         Self {
             runtime,
             client,
             to,
+            to_string,
+            quoted_message,
+            edit_target_id,
         }
     }
 
@@ -655,8 +664,8 @@ impl DmSendHarness {
         self.runtime.block_on(async {
             let quote = wacore::proto_helpers::build_quote_context(
                 "3EB0123456789ABCDEF0",
-                &self.to.to_string(),
-                &wa::Message::text("ping"),
+                &self.to_string,
+                &self.quoted_message,
             );
             self.client
                 .send(crate::SendRequest::new(
@@ -674,7 +683,7 @@ impl DmSendHarness {
         self.runtime.block_on(async {
             let target = crate::MessageRef::new(
                 &self.to,
-                crate::MessageId::new("3EB0123456789ABCDEF0").expect("valid id"),
+                self.edit_target_id.clone(),
                 None,
                 true,
             )
