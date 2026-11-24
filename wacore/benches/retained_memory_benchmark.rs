@@ -15,6 +15,9 @@ use wacore::types::message::AddressingMode;
 use wacore_binary::CompactString;
 use wacore_binary::jid::{Jid, Server};
 
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     divan::main();
 }

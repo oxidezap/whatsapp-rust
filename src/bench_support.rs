@@ -622,6 +622,9 @@ pub struct DmSendHarness {
     runtime: tokio::runtime::Runtime,
     client: Arc<Client>,
     to: Jid,
+    to_string: String,
+    quoted_message: wa::Message,
+    edit_target_id: crate::MessageId,
 }
 
 impl DmSendHarness {
@@ -631,10 +634,16 @@ impl DmSendHarness {
             .build()
             .expect("current-thread runtime");
         let (client, to) = runtime.block_on(build_dm_fixture(peer_devices, addressing));
+        let to_string = to.to_string();
+        let quoted_message = wa::Message::text("ping");
+        let edit_target_id = crate::MessageId::new("3EB0123456789ABCDEF0").expect("valid id");
         Self {
             runtime,
             client,
             to,
+            to_string,
+            quoted_message,
+            edit_target_id,
         }
     }
 
@@ -646,6 +655,41 @@ impl DmSendHarness {
                 .send_message(self.to.clone(), wa::Message::text("bench"))
                 .await
                 .expect("offline DM send must reach the sink");
+        });
+    }
+
+    /// One warm DM reply quoting a received message, measuring the exact callback-to-send path:
+    /// context building, quoted context info generation, and dispatch through `client.send()`.
+    pub fn warm_reply_quoting(&self) {
+        self.runtime.block_on(async {
+            let quote = wacore::proto_helpers::build_quote_context(
+                "3EB0123456789ABCDEF0",
+                &self.to_string,
+                &self.quoted_message,
+            );
+            self.client
+                .send(crate::SendRequest::new(
+                    &self.to,
+                    wa::Message::text_with_context("pong", quote),
+                ))
+                .await
+                .expect("offline DM reply must reach the sink");
+        });
+    }
+
+    /// One warm DM message edit, measuring the protocol message wrap,
+    /// cryptographic recipient packaging, and dispatch through `client.edit_message()`.
+    pub fn warm_edit(&self) {
+        self.runtime.block_on(async {
+            let target = crate::MessageRef::new(&self.to, self.edit_target_id.clone(), None, true)
+                .expect("valid target");
+            self.client
+                .edit_message(crate::EditRequest::new(
+                    target,
+                    wa::Message::text("edited bench content"),
+                ))
+                .await
+                .expect("offline DM edit must reach the sink");
         });
     }
 

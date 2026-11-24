@@ -23,6 +23,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use whatsapp_rust::bench_support::{DmAddressing, DmSendHarness};
 
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     divan::main();
 }
@@ -73,4 +76,18 @@ fn warm_dm_send_pn_with_known_lid(bencher: divan::Bencher, peer_devices: usize) 
         peer_devices,
     );
     bencher.bench(|| harness.warm_send());
+}
+
+/// A migrated account's reply quoting a received DM message (callback response path).
+#[divan::bench(args = PEER_DEVICES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
+fn warm_dm_reply_quoting(bencher: divan::Bencher, peer_devices: usize) {
+    let harness = shared("warm_dm_reply_quoting", DmAddressing::Lid, peer_devices);
+    bencher.bench(|| harness.warm_reply_quoting());
+}
+
+/// A migrated account editing an earlier sent message.
+#[divan::bench(args = PEER_DEVICES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
+fn warm_dm_edit(bencher: divan::Bencher, peer_devices: usize) {
+    let harness = shared("warm_dm_edit", DmAddressing::Lid, peer_devices);
+    bencher.bench(|| harness.warm_edit());
 }

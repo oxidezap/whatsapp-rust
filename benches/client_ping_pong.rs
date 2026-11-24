@@ -1,5 +1,8 @@
 use whatsapp_rust::bench_support::connected_idle::ping_pong::{PingPong, ROUNDS};
 
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     let _ = env_logger::try_init();
     divan::main();
