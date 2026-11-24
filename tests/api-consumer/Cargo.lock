@@ -2100,8 +2100,8 @@ dependencies = [
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-trait",
+ "thiserror",
  "tokio",
  "ureq",
  "wacore",

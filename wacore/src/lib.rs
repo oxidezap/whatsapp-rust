@@ -1,5 +1,6 @@
 extern crate self as wacore;
 
+pub use anyhow;
 pub use time::Timestamp;
 pub use wacore_appstate as appstate;
 pub use wacore_noise as noise;

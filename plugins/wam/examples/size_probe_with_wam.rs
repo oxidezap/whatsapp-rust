@@ -10,7 +10,7 @@ use whatsapp_rust::{Client, TokioRuntime};
 use whatsapp_rust_plugin_wam::WamPlugin;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> whatsapp_rust::anyhow::Result<()> {
     let persistence = Arc::new(PersistenceManager::new(Arc::new(InMemoryBackend::new())).await?);
     let client = Client::builder()
         .with_runtime(TokioRuntime)

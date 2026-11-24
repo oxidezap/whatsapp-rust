@@ -44,7 +44,10 @@ impl IqSpec for SendBufferSpec<'_> {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(
+        &self,
+        _response: &NodeRef<'_>,
+    ) -> Result<Self::Response, whatsapp_rust::anyhow::Error> {
         Ok(())
     }
 }
