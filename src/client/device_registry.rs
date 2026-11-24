@@ -634,9 +634,7 @@ impl Client {
                 anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
             })?;
             for j in all_dm_jids.iter_mut() {
-                if (j.is_pn() || j.server == Server::Hosted)
-                    && j.is_same_user_as(own_jid)
-                {
+                if (j.is_pn() || j.server == Server::Hosted) && j.is_same_user_as(own_jid) {
                     *j = lid.with_device_hosting(j.device, j.is_hosted());
                 }
             }
@@ -4946,12 +4944,7 @@ mod tests {
     #[tokio::test]
     async fn dm_devices_memo_includes_hosted_devices_with_lid_recipient() {
         let client = create_test_client().await;
-        setup_hosted_device_record(
-            &client,
-            DM_RECIPIENT_LID,
-            &[(0, false), (99, true)],
-        )
-        .await;
+        setup_hosted_device_record(&client, DM_RECIPIENT_LID, &[(0, false), (99, true)]).await;
         setup_hosted_device_record(&client, DM_OWN_PN, &[(0, false), (1, false), (99, true)]).await;
         let recipient = Jid::lid(DM_RECIPIENT_LID);
 
@@ -4973,10 +4966,7 @@ mod tests {
             device_ids_of(resolved.devices(), DM_RECIPIENT_LID),
             vec![0, 99]
         );
-        assert_eq!(
-            device_ids_of(resolved.devices(), DM_OWN_LID),
-            vec![0, 99]
-        );
+        assert_eq!(device_ids_of(resolved.devices(), DM_OWN_LID), vec![0, 99]);
 
         let own_hosted = resolved
             .devices()

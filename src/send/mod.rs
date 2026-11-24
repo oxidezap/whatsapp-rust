@@ -3821,21 +3821,22 @@ impl Client {
             // Status addons (reactions to status@broadcast) borrow this DM branch,
             // but WA Web excludes hosted devices from status contexts (status_session_address
             // returns None for @hosted and @hosted.lid).
-            let dm_devices = if is_status_addon && dm_devices.devices().iter().any(|d| d.is_hosted()) {
-                let filtered: Vec<Jid> = dm_devices
-                    .devices()
-                    .iter()
-                    .filter(|d| !d.is_hosted())
-                    .cloned()
-                    .collect();
-                std::sync::Arc::new(wacore::send::ResolvedDmDevices::new(
-                    filtered,
-                    own_jid,
-                    device_snapshot.lid.as_ref(),
-                ))
-            } else {
-                dm_devices
-            };
+            let dm_devices =
+                if is_status_addon && dm_devices.devices().iter().any(|d| d.is_hosted()) {
+                    let filtered: Vec<Jid> = dm_devices
+                        .devices()
+                        .iter()
+                        .filter(|d| !d.is_hosted())
+                        .cloned()
+                        .collect();
+                    std::sync::Arc::new(wacore::send::ResolvedDmDevices::new(
+                        filtered,
+                        own_jid,
+                        device_snapshot.lid.as_ref(),
+                    ))
+                } else {
+                    dm_devices
+                };
 
             // Resolved once per memo entry: the session pre-check, the lock
             // keys and the encrypt fan-out all address the same devices. The
@@ -10163,7 +10164,10 @@ mod tests {
             if let Some(children) = participants.children() {
                 for child in children {
                     if let Some(jid) = child.attrs().optional_jid("jid") {
-                        assert!(!jid.is_hosted(), "status fanout must not include hosted devices: {jid}");
+                        assert!(
+                            !jid.is_hosted(),
+                            "status fanout must not include hosted devices: {jid}"
+                        );
                     }
                 }
             }
