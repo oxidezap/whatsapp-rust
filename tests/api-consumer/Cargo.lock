@@ -1787,7 +1787,6 @@ dependencies = [
 name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "hex",
  "hkdf",
@@ -1864,7 +1863,6 @@ dependencies = [
 name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "bytes",
  "hkdf",
