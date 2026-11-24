@@ -457,15 +457,15 @@ pub enum SnapshotRecoveryError {
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
     KeyNotFound(String),
-    #[error("store error")]
+    #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
-    #[error("snapshot recovery error: {0}")]
+    #[error("{0}")]
     SnapshotRecovery(#[from] SnapshotRecoveryError),
     #[error("external blob was not resolved")]
     ExternalBlobNotResolved,
     #[error("no app state sync key available")]
     NoSyncKeyAvailable,
-    #[error("app state error: {0}")]
+    #[error("{0}")]
     AppState(#[from] crate::appstate::AppStateError),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
