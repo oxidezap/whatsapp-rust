@@ -1326,11 +1326,18 @@ async fn test_membership_approval_mode_does_not_invalidate_cached_group() {
 
     // Only transport acks should be sent, no IQ queries
     let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
-    for pt in &plaintexts {
-        let unpacked = wacore_binary::util::unpack(pt).unwrap();
-        let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
-        assert_eq!(node.tag(), "ack");
-    }
+    assert_eq!(
+        plaintexts.len(),
+        1,
+        "Expected exactly 1 ACK for membership notification"
+    );
+    let unpacked = wacore_binary::util::unpack(&plaintexts[0]).unwrap();
+    let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+    assert_eq!(node.tag(), "ack");
+    assert_eq!(
+        node.attrs().optional_string("id").as_deref(),
+        Some("mam-off-1")
+    );
 }
 
 #[tokio::test]
@@ -1380,10 +1387,25 @@ async fn test_group_settings_notifications_do_not_invalidate_cache() {
             .is_some()
     );
     let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
-    for pt in &plaintexts {
+    assert_eq!(
+        plaintexts.len(),
+        4,
+        "Expected exactly 4 ACKs for settings notifications"
+    );
+    let expected_ids = [
+        "setting-locked",
+        "setting-unlocked",
+        "setting-announcement",
+        "setting-not_announcement",
+    ];
+    for (i, pt) in plaintexts.iter().enumerate() {
         let unpacked = wacore_binary::util::unpack(pt).unwrap();
         let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
         assert_eq!(node.tag(), "ack");
+        assert_eq!(
+            node.attrs().optional_string("id").as_deref(),
+            Some(expected_ids[i])
+        );
     }
 }
 

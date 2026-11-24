@@ -4120,6 +4120,76 @@ async fn group_refresh_publishes_peers_after_a_cold_bootstrap_alias_conflict() {
     client.signal_shutdown_sync();
 }
 
+/// A conflicting primary identity (PN and LID have different keys) on one participant
+/// must be marked Rejected in GroupRefresh mode, allowing valid participants to publish.
+#[tokio::test]
+async fn group_refresh_publishes_peers_after_a_primary_identity_conflict() {
+    let (client, transport) = create_iq_test_client().await;
+    let bad_phone = Jid::pn("12025550197");
+    let bad_lid = Jid::lid("100000000000197");
+    let good = Jid::pn("12025550198");
+
+    // Seed good user's primary identity
+    crate::test_utils::seed_adv_primary(&client, &good).await;
+
+    // Seed conflicting identities for bad user's PN and LID
+    crate::test_utils::seed_adv_primary(&client, &bad_phone).await;
+    let other_key = [99u8; 32];
+    client
+        .signal_cache
+        .put_identity(
+            &wacore::types::jid::adv_account_jid(&bad_lid).to_protocol_address(),
+            &other_key,
+        )
+        .await;
+
+    // Add bidirectional alias mapping
+    client
+        .lid_pn_cache
+        .add(&crate::lid_pn_cache::LidPnEntry::new(
+            bad_lid.user.to_string(),
+            bad_phone.user.to_string(),
+            crate::lid_pn_cache::LearningSource::Usync,
+        ))
+        .await;
+
+    for user in [&bad_phone, &good] {
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut response = migration_response(&bad_phone);
+    response
+        .device_lists
+        .extend(migration_response(&good).device_lists);
+    let users = [bad_phone.clone(), good.clone()];
+
+    let devices = client
+        .apply_device_list_response(
+            &response,
+            DeviceListApplyMode::GroupRefresh,
+            None,
+            Some(&users),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(devices.contains(&good.with_device(7)), "{devices:?}");
+    assert!(!devices.contains(&bad_phone.with_device(7)));
+    assert!(client.load_device_record_for_jid(&good).await.is_some());
+    assert_eq!(transport.sent_count(), 0);
+    client.signal_shutdown_sync();
+}
+
 /// A store fault must not masquerade as a per-contact trust rejection.
 #[tokio::test]
 async fn group_identity_storage_failure_is_not_partial_success() {

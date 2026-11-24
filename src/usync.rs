@@ -2461,6 +2461,12 @@ impl Client {
                     results.insert(user.clone(), PreparedAccountIdentity::Trusted(identity));
                 }
                 Ok(None) => uncached.push(user.clone()),
+                Err(error)
+                    if mode == DeviceListApplyMode::GroupRefresh
+                        && error.is::<DeviceListIdentityConflict>() =>
+                {
+                    results.insert(user.clone(), PreparedAccountIdentity::Rejected);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -2503,7 +2509,7 @@ impl Client {
                                 {
                                     let key_bytes = *identity_key.public_key().public_key_bytes();
                                     let _ = self
-                                        .persist_adv_bootstrap_identity_inner(
+                                        .persist_adv_bootstrap_identity_in_epoch(
                                             &primary, &key_bytes, epoch,
                                         )
                                         .await;
@@ -2525,8 +2531,14 @@ impl Client {
                     }
                 }
             } else {
-                for user in uncached {
-                    let (user, prepared) = self.prepare_device_list_identity(user, mode).await?;
+                use futures::{StreamExt, TryStreamExt};
+                let stream_results: Vec<(Jid, PreparedAccountIdentity)> =
+                    futures::stream::iter(uncached)
+                        .map(|user| self.prepare_device_list_identity(user, mode))
+                        .buffered(crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY)
+                        .try_collect()
+                        .await?;
+                for (user, prepared) in stream_results {
                     results.insert(user, prepared);
                 }
             }
@@ -2536,7 +2548,8 @@ impl Client {
             .into_iter()
             .map(|user| {
                 let prepared = results
-                    .remove(&user)
+                    .get(&user)
+                    .cloned()
                     .unwrap_or(PreparedAccountIdentity::Rejected);
                 (user, prepared)
             })

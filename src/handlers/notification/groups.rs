@@ -218,7 +218,10 @@ pub(crate) async fn handle_group_notification(
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
-                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on add; ACK withheld: {err}");
+                        return false;
+                    }
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
@@ -251,10 +254,14 @@ pub(crate) async fn handle_group_notification(
                 if !scope.is_current(client) {
                     return false;
                 }
+                let mut publish_err = None;
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
-                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on remove: {err}");
+                        publish_err = Some(err);
+                    }
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
@@ -272,6 +279,10 @@ pub(crate) async fn handle_group_notification(
                     .await
                 {
                     warn!(target: "Client/Group", "Sender-key retirement failed; ACK withheld: {error}");
+                    return false;
+                }
+                if let Some(err) = publish_err {
+                    warn!(target: "Client/Group", "Failed to persist group metadata on remove; ACK withheld: {err}");
                     return false;
                 }
             }
@@ -297,7 +308,10 @@ pub(crate) async fn handle_group_notification(
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
-                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on promote; ACK withheld: {err}");
+                        return false;
+                    }
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: promoted {} participants",

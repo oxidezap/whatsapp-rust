@@ -1276,41 +1276,41 @@ impl GroupMetadataGuard<'_> {
     }
 
     pub(crate) async fn publish(&self, info: Arc<GroupRoutingInfo>) {
-        self.publish_scoped(info, None).await;
+        if let Err(error) = self.publish_scoped(info, None).await {
+            log::warn!("Failed to publish group metadata for {}: {error}", self.jid);
+        }
     }
 
     pub(crate) async fn publish_scoped(
         &self,
         info: Arc<GroupRoutingInfo>,
         scope: Option<crate::client::NotificationScope<'_>>,
-    ) {
+    ) -> anyhow::Result<()> {
         if scope.is_some_and(|scope| !scope.is_current(self.client)) {
-            return;
+            anyhow::bail!("notification scope is no longer current");
         }
         let jid = self.jid.to_string();
-        match serde_json::to_vec(info.as_ref()) {
-            Ok(blob) => {
-                if let Err(error) = self
-                    .client
-                    .persistence_manager
-                    .backend()
-                    .put_group_metadata(&jid, &blob)
-                    .await
-                {
-                    log::warn!("Failed to persist group metadata for {}: {error}", self.jid);
-                }
-            }
-            Err(error) => {
-                log::warn!(
-                    "Failed to serialize group metadata for {}: {error}",
-                    self.jid
-                );
-            }
-        }
+        let blob = serde_json::to_vec(info.as_ref()).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to serialize group metadata for {}: {error}",
+                self.jid
+            )
+        })?;
+
+        let res = self
+            .client
+            .persistence_manager
+            .backend()
+            .put_group_metadata(&jid, &blob)
+            .await;
 
         // Once storage starts, finish cache publication under the same lock.
         // Retirement cannot undo a storage commit.
         self.cache(info).await;
+
+        res.map_err(|error| {
+            anyhow::anyhow!("Failed to persist group metadata for {}: {error}", self.jid)
+        })
     }
 
     /// Drop this group's snapshot, in memory and on disk.
