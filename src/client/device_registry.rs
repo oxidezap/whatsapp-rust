@@ -634,7 +634,7 @@ impl Client {
                 anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
             })?;
             for j in all_dm_jids.iter_mut() {
-                if (j.is_pn() || j.server == Server::Hosted) && j.is_same_user_as(own_jid) {
+                if j.server.is_pn_family() && j.is_same_user_as(own_jid) {
                     *j = lid.with_device_hosting(j.device, j.is_hosted());
                 }
             }
