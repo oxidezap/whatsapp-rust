@@ -3292,7 +3292,7 @@ impl Client {
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self
                 .groups()
-                .routing_info_with_freshness(&to, group_metadata_freshness)
+                .routing_info_with_freshness(to, group_metadata_freshness)
                 .await?;
 
             // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
@@ -3316,7 +3316,7 @@ impl Client {
             // the id is borrowed: it would replace the original message's
             // retry-cache entry, so a retry receipt for it returns this edit.
             if !borrowed_message_id {
-                self.add_recent_message(&to, request_id, message, shared_content.clone())
+                self.add_recent_message(to, request_id, message, shared_content.clone())
                     .await;
             }
 
@@ -3386,7 +3386,7 @@ impl Client {
                 // merely raced the winner's delete->recreate window sees the
                 // fresh record here and downgrades to a warm send instead of
                 // redistributing to every member again.
-                distribution_guard = Some(self.group_distribution_lock(&to).await);
+                distribution_guard = Some(self.group_distribution_lock(to).await);
                 let (key_exists, needs_rotation) = read_sender_key_state().await?;
                 force_skdm = !key_exists || needs_rotation;
                 if force_skdm {
@@ -3442,7 +3442,7 @@ impl Client {
                     }
                     None => self
                         .resolve_skdm_targets_memoized(
-                            &to,
+                            to,
                             &to_str,
                             &group_info_for_memo,
                             &own_sending_jid,
@@ -3467,7 +3467,7 @@ impl Client {
                         // already marked warm by the winner and downgrades to a
                         // plain skmsg send; if the winner failed, the targets
                         // are still cold and this send distributes normally.
-                        distribution_guard = Some(self.group_distribution_lock(&to).await);
+                        distribution_guard = Some(self.group_distribution_lock(to).await);
                         // Force a DB re-read: a concurrent warm send may have
                         // started the cache init before the winner's marking
                         // landed and then published that stale (empty) map,
@@ -3476,7 +3476,7 @@ impl Client {
                         self.sender_key_device_cache.invalidate(&to_str).await;
                         match self
                             .resolve_skdm_targets_memoized(
-                                &to,
+                                to,
                                 &to_str,
                                 &group_info_for_memo,
                                 &own_sending_jid,
@@ -3543,7 +3543,7 @@ impl Client {
                     own_jid,
                     own_lid,
                     account: account_info.as_deref(),
-                    to: &to,
+                    to,
                     message,
                     message_id: request_id,
                     force_distribution: force_skdm,
@@ -3598,7 +3598,7 @@ impl Client {
                         // single-flight guard as a cold send (a warm send that
                         // lost its sender key arrives here without one).
                         if distribution_guard.is_none() {
-                            distribution_guard = Some(self.group_distribution_lock(&to).await);
+                            distribution_guard = Some(self.group_distribution_lock(to).await);
                         }
 
                         // Re-check under the guard: a concurrent retry may have
@@ -3609,7 +3609,7 @@ impl Client {
                         let warm_targets = if key_recreated {
                             self.sender_key_device_cache.invalidate(&to_str).await;
                             self.resolve_skdm_targets_memoized(
-                                &to,
+                                to,
                                 &to_str,
                                 &group_info_for_memo,
                                 &own_sending_jid,
@@ -3641,7 +3641,7 @@ impl Client {
                                 own_jid,
                                 own_lid,
                                 account: account_info.as_deref(),
-                                to: &to,
+                                to,
                                 message,
                                 message_id: request_id,
                                 force_distribution: retry_force,
@@ -3764,7 +3764,7 @@ impl Client {
                     )
                     .await;
                 } else {
-                    self.add_recent_message(&to, request_id, message, shared_content.clone())
+                    self.add_recent_message(to, request_id, message, shared_content.clone())
                         .await;
                 }
             }
@@ -3789,15 +3789,15 @@ impl Client {
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
-                Box::pin(self.cold_query_lid_for_pn(&to)).await;
+                Box::pin(self.cold_query_lid_for_pn(to)).await;
             }
 
             // The LID-vs-PN wire namespace is an account-level decision: the
             // server 400-nacks LID-addressed DMs from accounts that are not
             // 1:1-LID-migrated (issue #941).
-            let recipient_bare = self.resolve_dm_wire_jid(&to).await;
+            let recipient_bare = self.resolve_dm_wire_jid(to).await;
 
-            let stanza_to = dm_stanza_to(&recipient_bare, &to);
+            let stanza_to = dm_stanza_to(&recipient_bare, to);
 
             let peer_recipient_pn = if !is_status_addon {
                 self.resolve_peer_recipient_pn(&stanza_to).await
@@ -3810,7 +3810,7 @@ impl Client {
             // `resolve_dm_devices_memoized` for its freshness contract.
             let dm_devices = self
                 .resolve_dm_devices_memoized(
-                    &to,
+                    to,
                     &recipient_bare,
                     own_jid,
                     device_snapshot.lid.as_ref(),
@@ -3848,7 +3848,7 @@ impl Client {
             // path but WA Web does not attach tctokens to them.
             if !to.is_group() && !to.is_newsletter() && !is_status_addon {
                 should_issue_tc_token_after_send = self
-                    .maybe_include_tc_token(&to, &mut extra_stanza_nodes, sent_at)
+                    .maybe_include_tc_token(to, &mut extra_stanza_nodes, sent_at)
                     .await;
             }
             if should_issue_tc_token_after_send {
@@ -3931,7 +3931,7 @@ impl Client {
 
         let group_info = self
             .groups()
-            .routing_info_with_freshness(&to, crate::cache::Freshness::Refresh)
+            .routing_info_with_freshness(to, crate::cache::Freshness::Refresh)
             .await?;
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_jid = device_snapshot
@@ -4025,7 +4025,7 @@ impl Client {
             .message_context_info
             .is_unset()
             .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
-        self.add_recent_message(&to, request_id, message, shared_content.clone())
+        self.add_recent_message(to, request_id, message, shared_content.clone())
             .await;
         let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
         let mut stores = store_adapter.as_signal_stores();
@@ -4037,7 +4037,7 @@ impl Client {
                 own_jid,
                 own_lid: Some(own_lid),
                 account: device_snapshot.account.as_deref(),
-                to: &to,
+                to,
                 peer_recipient_pn: None,
                 message,
                 message_id: request_id,
