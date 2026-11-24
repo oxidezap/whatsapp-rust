@@ -4892,6 +4892,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn alt_chat_rewrite_hosted_to_hosted_lid_preserves_hosted_variant() {
+        use wacore_binary::Server;
+        let requester = Jid::new("5511999999999", Server::Hosted).with_device(99);
+        let alt_chat = Jid::lid("236395184570387");
+        let resolved = Jid {
+            user: alt_chat.user,
+            server: alt_chat.server.with_hosting(requester.is_hosted()),
+            device: requester.device,
+            agent: requester.agent,
+            integrator: requester.integrator,
+        };
+        assert_eq!(resolved.server, Server::HostedLid);
+        assert_eq!(resolved.user, "236395184570387");
+        assert_eq!(resolved.device, 99);
+        assert!(resolved.is_hosted());
+    }
+
+    #[test]
+    fn alt_chat_rewrite_hosted_lid_to_hosted_pn_preserves_hosted_variant() {
+        use wacore_binary::Server;
+        let requester = Jid::new("236395184570387", Server::HostedLid).with_device(99);
+        let alt_chat = Jid::pn("5511999999999");
+        let resolved = Jid {
+            user: alt_chat.user,
+            server: alt_chat.server.with_hosting(requester.is_hosted()),
+            device: requester.device,
+            agent: requester.agent,
+            integrator: requester.integrator,
+        };
+        assert_eq!(resolved.server, Server::Hosted);
+        assert_eq!(resolved.user, "5511999999999");
+        assert_eq!(resolved.device, 99);
+        assert!(resolved.is_hosted());
+    }
+
     #[tokio::test]
     async fn unknown_participant_rotation_is_durable_before_throttled_return() {
         use wacore::libsignal::protocol::{SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord};
