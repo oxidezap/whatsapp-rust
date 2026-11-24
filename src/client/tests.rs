@@ -3920,7 +3920,6 @@ fn client_size_pins_runtime_cache_config_saving() {
         size_of::<Client>()
     );
 
-
     assert_eq!(
         size_of::<Client>(),
         expected,

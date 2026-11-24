@@ -199,7 +199,12 @@ fn scan(root: &Path, repository: &Path, failures: &mut Vec<String>) {
             let source = std::fs::read_to_string(&path).unwrap();
             let mut visitor = Audit::default();
             visitor.visit_file(&syn::parse_file(&source).unwrap());
-            let relative_str = path.strip_prefix(repository).unwrap().to_str().unwrap().replace('\\', "/");
+            let relative_str = path
+                .strip_prefix(repository)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
             let relative = relative_str.as_str();
             for (function, call) in visitor.calls {
                 let legacy = matches!(

@@ -728,9 +728,7 @@ fn truncate_windows_append_file(file: &std::fs::File, len: u64) -> std::io::Resu
     }
     let os_str = OsString::from_wide(&buf[..len_copied as usize]);
     let path = std::path::PathBuf::from(os_str);
-    let reopen = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)?;
+    let reopen = std::fs::OpenOptions::new().write(true).open(&path)?;
     reopen.set_len(len)?;
     Ok(())
 }
