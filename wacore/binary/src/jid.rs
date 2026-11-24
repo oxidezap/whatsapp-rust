@@ -277,6 +277,18 @@ impl Server {
         }
     }
 
+    /// The account-level (non-hosted) server variant for this server:
+    /// `Hosted` -> `Pn`, `HostedLid` -> `Lid`. Other servers return themselves.
+    /// (Matches WA Web `asUserWidOrThrow` / `createUserWidOrThrow` mapping `hosted` -> `c.us` and `hosted.lid` -> `lid`).
+    #[inline]
+    pub fn user_server(self) -> Self {
+        match self {
+            Self::Hosted => Self::Pn,
+            Self::HostedLid => Self::Lid,
+            server => server,
+        }
+    }
+
     /// Phone-number-namespaced servers (`@s.whatsapp.net`, `@hosted`).
     /// The PN side of the LID↔PN mapping treats these as a single class.
     #[inline]
@@ -700,6 +712,19 @@ impl Jid {
         Self {
             user: self.user.clone(),
             server: self.server,
+            integrator: self.integrator,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the non-AD user JID representing the account for this JID,
+    /// dropping any device/agent and mapping hosted servers to their ordinary
+    /// account counterparts (`Hosted` -> `Pn`, `HostedLid` -> `Lid`).
+    /// (Matches WA Web `asUserWidOrThrow`).
+    pub fn to_user_jid(&self) -> Self {
+        Self {
+            user: self.user.clone(),
+            server: self.server.user_server(),
             integrator: self.integrator,
             ..Default::default()
         }
@@ -2652,6 +2677,26 @@ mod tests {
         assert_eq!(jid.device, 33);
         assert!(jid.is_lid());
         assert!(jid.is_ad());
+    }
+
+    #[test]
+    fn test_to_user_jid_maps_hosted_to_account_server() {
+        let hosted_pn = Jid::new("5511999999999", Server::Hosted).with_device(99);
+        let user_pn = hosted_pn.to_user_jid();
+        assert_eq!(user_pn.server, Server::Pn);
+        assert_eq!(user_pn.user, "5511999999999");
+        assert_eq!(user_pn.device, 0);
+
+        let hosted_lid = Jid::new("100000012345678", Server::HostedLid).with_device(99);
+        let user_lid = hosted_lid.to_user_jid();
+        assert_eq!(user_lid.server, Server::Lid);
+        assert_eq!(user_lid.user, "100000012345678");
+        assert_eq!(user_lid.device, 0);
+
+        let regular_pn = Jid::pn_device("5511999999999", 3);
+        let user_regular = regular_pn.to_user_jid();
+        assert_eq!(user_regular.server, Server::Pn);
+        assert_eq!(user_regular.device, 0);
     }
 
     #[test]

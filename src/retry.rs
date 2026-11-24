@@ -381,24 +381,24 @@ fn resolve_retry_chat_info(
         // 1. Bot + recipient → chat = recipient
         // 2. Peer device + recipient → chat = recipient
         // 3. Peer device without recipient → WA Web aborts (returns null).
-        // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
+        // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_user_jid()
         let is_peer = is_own_account_jid(from, own_pn, own_lid);
 
         let chat = if is_bot && let Some(r) = recipient.as_ref() {
-            r.to_non_ad()
+            r.to_user_jid()
         } else if is_peer {
             match recipient.as_ref() {
-                Some(r) => r.to_non_ad(),
+                Some(r) => r.to_user_jid(),
                 None => {
                     log::warn!("Ignoring peer device retry without recipient attr");
                     return None;
                 }
             }
         } else {
-            from.to_non_ad()
+            from.to_user_jid()
         };
 
-        let requester = if from.device() == 0 && from.agent == 0 {
+        let requester = if from.device() == 0 && from.agent == 0 && !from.is_hosted() {
             chat.clone()
         } else {
             from.clone()
@@ -6304,6 +6304,52 @@ mod tests {
         assert_eq!(info.chat.user, recipient.user);
         assert_eq!(info.chat.device(), 0);
         assert_eq!(info.requester.device(), 5);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_hosted_requester_resolves_to_account_chat() {
+        use wacore_binary::Server;
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt").build();
+        let receipt = make_test_receipt("5511999999999:99@hosted");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        // Chat resolves to the ordinary account key (Server::Pn)
+        assert_eq!(info.chat.server, Server::Pn);
+        assert_eq!(info.chat.user, "5511999999999");
+        assert_eq!(info.chat.device(), 0);
+
+        // Requester preserves the exact retrying hosted device
+        assert_eq!(info.requester.server, Server::Hosted);
+        assert_eq!(info.requester.user, "5511999999999");
+        assert_eq!(info.requester.device(), 99);
+
+        // original_from preserves the raw receipt from
+        assert_eq!(info.original_from.server, Server::Hosted);
+        assert_eq!(info.original_from.device(), 99);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_hosted_lid_requester_resolves_to_account_chat() {
+        use wacore_binary::Server;
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt").build();
+        let receipt = make_test_receipt("236395184570386:99@hosted.lid");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        // Chat resolves to the ordinary account key (Server::Lid)
+        assert_eq!(info.chat.server, Server::Lid);
+        assert_eq!(info.chat.user, "236395184570386");
+        assert_eq!(info.chat.device(), 0);
+
+        // Requester preserves the exact retrying hosted.lid device
+        assert_eq!(info.requester.server, Server::HostedLid);
+        assert_eq!(info.requester.user, "236395184570386");
+        assert_eq!(info.requester.device(), 99);
     }
     include!("retry_conformance_tests.rs");
 }
