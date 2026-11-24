@@ -33,7 +33,7 @@
 // The numbers *are* this binary's output; there is no logger to route them
 // through, and a measurement harness whose result lands in a log filter would
 // be worse than useless.
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::time::Duration;
 
