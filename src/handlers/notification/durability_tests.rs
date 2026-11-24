@@ -1265,3 +1265,256 @@ async fn failed_key_delete_preserves_remove_retry_admission() {
             .all(|(_, warm)| !warm)
     );
 }
+
+#[tokio::test]
+async fn test_membership_approval_mode_does_not_invalidate_cached_group() {
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+
+    let (client, transport) = create_iq_test_client().await;
+    let group: Jid = GROUP.parse().unwrap();
+    let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(GroupRoutingInfo::new(
+        vec![participant.clone()],
+        AddressingMode::Pn,
+    ));
+
+    // Save to both SQLite persistence and memory cache
+    let blob = serde_json::to_vec(info.as_ref()).unwrap();
+    client
+        .persistence_manager
+        .backend()
+        .put_group_metadata(&group.to_string(), &blob)
+        .await
+        .unwrap();
+    client
+        .get_group_cache()
+        .insert(group.clone(), Arc::clone(&info))
+        .await;
+
+    // Send membership_approval_mode notification (state="off")
+    let notif = NodeBuilder::new("notification")
+        .attr("type", "w:gp2")
+        .attr("from", GROUP)
+        .attr("id", "mam-off-1")
+        .attr("t", "1773519041")
+        .children([NodeBuilder::new("membership_approval_mode")
+            .children([NodeBuilder::new("group_join").attr("state", "off").build()])
+            .build()])
+        .build();
+
+    client.process_node(node_to_owned_ref(&notif)).await;
+
+    // In-memory cache must still exist
+    let cached = client.get_group_cache().get(&group).await;
+    assert!(
+        cached.is_some(),
+        "Group cache must not be invalidated by membership_approval_mode"
+    );
+
+    // SQLite persisted metadata must still exist
+    let persisted = client
+        .persistence_manager
+        .backend()
+        .get_group_metadata(&group.to_string())
+        .await
+        .unwrap();
+    assert!(
+        persisted.is_some(),
+        "Persisted group metadata must not be deleted by membership_approval_mode"
+    );
+
+    // Only transport acks should be sent, no IQ queries
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport.sent().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+    assert_eq!(
+        plaintexts.len(),
+        1,
+        "Expected exactly 1 ACK for membership notification"
+    );
+    let unpacked = wacore_binary::util::unpack(&plaintexts[0]).unwrap();
+    let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+    assert_eq!(node.tag(), "ack");
+    assert_eq!(
+        node.attrs().optional_string("id").as_deref(),
+        Some("mam-off-1")
+    );
+}
+
+#[tokio::test]
+async fn test_group_settings_notifications_do_not_invalidate_cache() {
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+
+    let (client, transport) = create_iq_test_client().await;
+    let group: Jid = GROUP.parse().unwrap();
+    let participant: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(GroupRoutingInfo::new(
+        vec![participant.clone()],
+        AddressingMode::Pn,
+    ));
+
+    let blob = serde_json::to_vec(info.as_ref()).unwrap();
+    client
+        .persistence_manager
+        .backend()
+        .put_group_metadata(&group.to_string(), &blob)
+        .await
+        .unwrap();
+    client
+        .get_group_cache()
+        .insert(group.clone(), Arc::clone(&info))
+        .await;
+
+    for action in ["locked", "unlocked", "announcement", "not_announcement"] {
+        let notif = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", GROUP)
+            .attr("id", format!("setting-{action}"))
+            .attr("t", "1773519041")
+            .children([NodeBuilder::new(action).build()])
+            .build();
+        client.process_node(node_to_owned_ref(&notif)).await;
+    }
+
+    assert!(client.get_group_cache().get(&group).await.is_some());
+    assert!(
+        client
+            .persistence_manager
+            .backend()
+            .get_group_metadata(&group.to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport.sent().len() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let plaintexts = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+    assert_eq!(
+        plaintexts.len(),
+        4,
+        "Expected exactly 4 ACKs for settings notifications"
+    );
+    let expected_ids = [
+        "setting-locked",
+        "setting-unlocked",
+        "setting-announcement",
+        "setting-not_announcement",
+    ];
+    for (i, pt) in plaintexts.iter().enumerate() {
+        let unpacked = wacore_binary::util::unpack(pt).unwrap();
+        let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+        assert_eq!(node.tag(), "ack");
+        assert_eq!(
+            node.attrs().optional_string("id").as_deref(),
+            Some(expected_ids[i])
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_add_and_remove_patch_inplace_on_cold_cache() {
+    use wacore::client::context::GroupRoutingInfo;
+    use wacore::types::message::AddressingMode;
+
+    let (client, _) = create_iq_test_client().await;
+    let group: Jid = GROUP.parse().unwrap();
+    let p1: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+    let p2: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+
+    let info = Arc::new(GroupRoutingInfo::new(vec![p1.clone()], AddressingMode::Pn));
+
+    // Seed SQLite backend only, memory cache is COLD (empty)
+    let blob = serde_json::to_vec(info.as_ref()).unwrap();
+    client
+        .persistence_manager
+        .backend()
+        .put_group_metadata(&group.to_string(), &blob)
+        .await
+        .unwrap();
+    assert!(client.get_group_cache().get(&group).await.is_none());
+
+    // Send <add> notification for p2
+    let add_notif = NodeBuilder::new("notification")
+        .attr("type", "w:gp2")
+        .attr("from", GROUP)
+        .attr("id", "add-p2")
+        .attr("t", "1773519041")
+        .children([NodeBuilder::new("add")
+            .children([NodeBuilder::new("participant")
+                .attr("jid", p2.to_string())
+                .build()])
+            .build()])
+        .build();
+
+    client.process_node(node_to_owned_ref(&add_notif)).await;
+
+    // Must have loaded from SQLite, patched p2, and saved to SQLite & cache!
+    let cached = client
+        .get_group_cache()
+        .get(&group)
+        .await
+        .expect("Cached should now be warm");
+    assert!(cached.participants.contains(&p1));
+    assert!(cached.participants.contains(&p2));
+
+    let persisted = client
+        .persistence_manager
+        .backend()
+        .get_group_metadata(&group.to_string())
+        .await
+        .unwrap()
+        .expect("Persisted blob must exist");
+    let persisted_info: GroupRoutingInfo = serde_json::from_slice(&persisted).unwrap();
+    assert!(persisted_info.participants.contains(&p1));
+    assert!(persisted_info.participants.contains(&p2));
+
+    // Invalidate L1 cache again to make it cold before remove
+    client.get_group_cache().invalidate(&group).await;
+    assert!(client.get_group_cache().get(&group).await.is_none());
+
+    // Send <remove> notification for p2
+    let remove_notif = NodeBuilder::new("notification")
+        .attr("type", "w:gp2")
+        .attr("from", GROUP)
+        .attr("id", "remove-p2")
+        .attr("t", "1773519042")
+        .children([NodeBuilder::new("remove")
+            .children([NodeBuilder::new("participant")
+                .attr("jid", p2.to_string())
+                .build()])
+            .build()])
+        .build();
+
+    client.process_node(node_to_owned_ref(&remove_notif)).await;
+
+    let cached = client
+        .get_group_cache()
+        .get(&group)
+        .await
+        .expect("Cached should be warm");
+    assert!(cached.participants.contains(&p1));
+    assert!(!cached.participants.contains(&p2));
+
+    let persisted = client
+        .persistence_manager
+        .backend()
+        .get_group_metadata(&group.to_string())
+        .await
+        .unwrap()
+        .expect("Persisted blob must exist");
+    let persisted_info: GroupRoutingInfo = serde_json::from_slice(&persisted).unwrap();
+    assert!(persisted_info.participants.contains(&p1));
+    assert!(!persisted_info.participants.contains(&p2));
+}

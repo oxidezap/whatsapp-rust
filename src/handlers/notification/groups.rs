@@ -203,8 +203,13 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return false;
                 };
-                let Some(current) = scope.run(client, metadata.current()).await else {
-                    return false;
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
                 };
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
@@ -213,20 +218,21 @@ pub(crate) async fn handle_group_notification(
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
-                    metadata.publish_scoped(Arc::new(info), Some(scope)).await;
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on add; ACK withheld: {err}");
+                        return false;
+                    }
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
                 } else {
-                    // Cache expired: can't patch in place, so drop the now-stale blob.
                     debug!(
                         target: "Client/Group",
-                        "Group cache expired for {}: invalidating persisted metadata (add)",
+                        "No group metadata found for {}: skipping in-place patch (add)",
                         notification.group_jid.observe()
                     );
-                    metadata.invalidate_scoped(Some(scope)).await;
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
@@ -237,29 +243,36 @@ pub(crate) async fn handle_group_notification(
                 else {
                     return false;
                 };
-                let Some(current) = scope.run(client, metadata.current()).await else {
-                    return false;
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
                 };
                 if !scope.is_current(client) {
                     return false;
                 }
+                let mut publish_err = None;
                 if let Some(info) = current {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
-                    metadata.publish(Arc::new(info)).await;
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on remove: {err}");
+                        publish_err = Some(err);
+                    }
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
                 } else {
-                    // Cache expired: can't patch in place, so drop the now-stale blob.
                     debug!(
                         target: "Client/Group",
-                        "Group cache expired for {}: invalidating persisted metadata (remove)",
+                        "No group metadata found for {}: skipping in-place patch (remove)",
                         notification.group_jid.observe()
                     );
-                    metadata.invalidate().await;
                 }
                 if let Err(error) = metadata
                     .rotate_sender_key_on_participant_remove(&users)
@@ -268,6 +281,71 @@ pub(crate) async fn handle_group_notification(
                     warn!(target: "Client/Group", "Sender-key retirement failed; ACK withheld: {error}");
                     return false;
                 }
+                if let Some(err) = publish_err {
+                    warn!(target: "Client/Group", "Failed to persist group metadata on remove; ACK withheld: {err}");
+                    return false;
+                }
+            }
+            GroupNotificationAction::Promote { participants, .. } => {
+                let Some(metadata) = scope
+                    .run(client, client.lock_group_metadata(&notification.group_jid))
+                    .await
+                else {
+                    return false;
+                };
+                let current = match scope.run(client, metadata.current_or_persisted()).await {
+                    Some(Ok(current)) => current,
+                    Some(Err(err)) => {
+                        warn!(target: "Client/Group", "Failed to load group metadata from storage; ACK withheld: {err}");
+                        return false;
+                    }
+                    None => return false,
+                };
+                if let Some(info) = current {
+                    let mut info = Arc::unwrap_or_clone(info);
+                    info.add_participants(
+                        participants
+                            .iter()
+                            .map(|p| (&p.jid, p.phone_number.as_ref())),
+                    );
+                    if let Err(err) = metadata.publish_scoped(Arc::new(info), Some(scope)).await {
+                        warn!(target: "Client/Group", "Failed to persist group metadata on promote; ACK withheld: {err}");
+                        return false;
+                    }
+                    debug!(
+                        target: "Client/Group",
+                        "Patched group cache for {}: promoted {} participants",
+                        notification.group_jid.observe(), participants.len()
+                    );
+                }
+            }
+            GroupNotificationAction::Demote { .. } => {
+                // Roles changed; participant set and routing info remain valid.
+                debug!(
+                    target: "Client/Group",
+                    "Group demote notification for {}: participant routing unchanged",
+                    notification.group_jid.observe()
+                );
+            }
+            GroupNotificationAction::MembershipApprovalMode { enabled, .. } => {
+                debug!(
+                    target: "Client/Group",
+                    "Group membership approval mode changed for {} to {enabled}: retaining cached metadata",
+                    notification.group_jid.observe()
+                );
+            }
+            GroupNotificationAction::Locked { .. }
+            | GroupNotificationAction::Unlocked
+            | GroupNotificationAction::Announce
+            | GroupNotificationAction::NotAnnounce
+            | GroupNotificationAction::Ephemeral { .. }
+            | GroupNotificationAction::MemberAddMode { .. } => {
+                debug!(
+                    target: "Client/Group",
+                    "Group setting updated ({}) for {}: retaining cached metadata",
+                    action.tag_name(),
+                    notification.group_jid.observe()
+                );
             }
             GroupNotificationAction::Modify { .. } => {
                 // A participant changed number / migrated PN<->LID. WA Web

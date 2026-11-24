@@ -295,7 +295,7 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
     n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
 }
 
-fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<IdentityKey> {
+pub(crate) fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<IdentityKey> {
     let identity = *bundle.identity_key()?;
     let signature: &[u8; 64] = bundle
         .signed_pre_key_signature()?
