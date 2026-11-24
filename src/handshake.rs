@@ -58,16 +58,14 @@ pub async fn do_mobile_handshake(
     )
     .map_err(HandshakeError::Mobile)?;
     let hello = handshake.client_hello();
-    let framed = wacore::framing::encode_frame(&hello, Some(session.prologue().as_bytes()))
-        .map_err(HandshakeError::Transport)?;
+    let framed = wacore::framing::encode_frame(&hello, Some(session.prologue().as_bytes()))?;
     transport.send(bytes::Bytes::from(framed)).await?;
     let mut decoder = wacore::framing::FrameDecoder::new();
     let response = recv_frame(&runtime, transport_events, &mut decoder).await?;
     let outcome = handshake
         .receive_server_hello(&response, read_time()?)
         .map_err(HandshakeError::Mobile)?;
-    let finish = wacore::framing::encode_frame(&outcome.client_finish, None)
-        .map_err(HandshakeError::Transport)?;
+    let finish = wacore::framing::encode_frame(&outcome.client_finish, None)?;
     transport.send(bytes::Bytes::from(finish)).await?;
     Ok(Arc::new(NoiseSocket::with_observers(
         runtime,

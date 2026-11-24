@@ -5655,7 +5655,6 @@ dependencies = [
 name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "codspeed-divan-compat",
  "hex",
@@ -5742,7 +5741,6 @@ dependencies = [
 name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "bytes",
  "codspeed-divan-compat",

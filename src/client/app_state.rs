@@ -3042,7 +3042,7 @@ impl Client {
                     }
                 }
                 Err(e) => {
-                    return Err(e.context(format!(
+                    return Err(anyhow::Error::new(e).context(format!(
                         "unreadable app-state patch response for {collection_name}"
                     )));
                 }

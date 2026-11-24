@@ -17,7 +17,6 @@ crate-type = ["rlib"]
 test-util = []
 
 [dependencies]
-anyhow = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
 hkdf = { workspace = true }

@@ -28,6 +28,9 @@ pub enum NoiseError {
 
     #[error("counter exhausted: nonce would be reused after 2^32 messages")]
     CounterExhausted,
+
+    #[error("frame is too large (max: {max}, got: {got})")]
+    FrameTooLarge { max: usize, got: usize },
 }
 
 pub type Result<T> = std::result::Result<T, NoiseError>;
