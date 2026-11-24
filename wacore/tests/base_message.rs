@@ -41,6 +41,7 @@ fn helpers_follow_classified_wrappers_and_edits() {
         question_reply_message,
         spoiler_message,
         lottie_sticker_message,
+        audio_sticker_message,
         limit_sharing_message,
         newsletter_admin_profile_message,
         newsletter_admin_profile_message_v2,

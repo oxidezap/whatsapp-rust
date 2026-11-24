@@ -25,6 +25,7 @@ macro_rules! for_each_classified_fp_wrapper {
         $callback!(question_reply_message);
         $callback!(spoiler_message);
         $callback!(lottie_sticker_message);
+        $callback!(audio_sticker_message);
         $callback!(limit_sharing_message);
         $callback!(newsletter_admin_profile_message);
         $callback!(newsletter_admin_profile_message_v2);
