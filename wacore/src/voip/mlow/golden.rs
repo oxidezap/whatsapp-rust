@@ -177,14 +177,19 @@ fn golden_roundtrip_no_regression() {
     }
 
     assert_eq!(d.samples, GOLDEN_SAMPLES, "output length drifted");
+    #[cfg(target_os = "windows")]
+    let scalar_tol = 5e-2;
+    #[cfg(not(target_os = "windows"))]
+    let scalar_tol = 1e-3;
+
     assert!(
-        (d.rms - GOLDEN_RMS).abs() < 1e-3,
+        (d.rms - GOLDEN_RMS).abs() < scalar_tol,
         "RMS drifted {:.6} vs golden {:.6}",
         d.rms,
         GOLDEN_RMS
     );
     assert!(
-        (d.peak - GOLDEN_PEAK).abs() < 1e-3,
+        (d.peak - GOLDEN_PEAK).abs() < scalar_tol,
         "peak drifted {:.6} vs golden {:.6}",
         d.peak,
         GOLDEN_PEAK
@@ -195,23 +200,6 @@ fn golden_roundtrip_no_regression() {
         d.clip_pct,
         GOLDEN_CLIP
     );
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows MSVC, UCRT transcendentals differ slightly from glibc, causing checksum drift.
-        // Scalars (rms, peak, clip) are verified with slightly relaxed tolerance.
-        assert!(
-            (d.rms - GOLDEN_RMS).abs() < 5e-2,
-            "RMS drifted {:.6} vs golden {:.6}",
-            d.rms,
-            GOLDEN_RMS
-        );
-        assert!(
-            (d.peak - GOLDEN_PEAK).abs() < 5e-2,
-            "peak drifted {:.6} vs golden {:.6}",
-            d.peak,
-            GOLDEN_PEAK
-        );
-    }
     #[cfg(not(target_os = "windows"))]
     {
         assert_eq!(

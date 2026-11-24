@@ -589,18 +589,119 @@ fn truncate_windows_append_file(file: &std::fs::File, len: u64) -> std::io::Resu
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
 
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const FILE_SHARE_READ: u32 = 0x0001;
+    const FILE_SHARE_WRITE: u32 = 0x0002;
+    const FILE_SHARE_DELETE: u32 = 0x0004;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    #[repr(C)]
+    struct ObjectBasicInformation {
+        attributes: u32,
+        granted_access: u32,
+        handle_count: u32,
+        pointer_count: u32,
+        reserved: [u32; 10],
+    }
+
     unsafe extern "system" {
+        fn ReOpenFile(
+            hOriginalFile: *mut std::ffi::c_void,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            dwFlagsAndAttributes: u32,
+        ) -> *mut std::ffi::c_void;
+        fn SetFilePointerEx(
+            hFile: *mut std::ffi::c_void,
+            liDistanceToMove: i64,
+            lpNewFilePointer: *mut i64,
+            dwMoveMethod: u32,
+        ) -> i32;
+        fn SetEndOfFile(hFile: *mut std::ffi::c_void) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetFinalPathNameByHandleW(
             hFile: *mut std::ffi::c_void,
             lpszFilePath: *mut u16,
             cchFilePath: u32,
             dwFlags: u32,
         ) -> u32;
+        fn GetModuleHandleA(lpModuleName: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(
+            hModule: *mut std::ffi::c_void,
+            lpProcName: *const u8,
+        ) -> *mut std::ffi::c_void;
     }
 
     let handle = file.as_raw_handle();
+
+    // 1. Verify that the handle is actually append-capable or write-capable.
+    // If the caller provided a read-only handle, do not permit destructive truncation.
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if !ntdll.is_null() {
+            let proc = GetProcAddress(ntdll, b"NtQueryObject\0".as_ptr());
+            if !proc.is_null() {
+                type NtQueryObjectFn = unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    u32,
+                    *mut std::ffi::c_void,
+                    u32,
+                    *mut u32,
+                ) -> i32;
+                let nt_query_object: NtQueryObjectFn = std::mem::transmute(proc);
+                let mut info = std::mem::MaybeUninit::<ObjectBasicInformation>::uninit();
+                let mut ret_len = 0u32;
+                let status = nt_query_object(
+                    handle as *mut std::ffi::c_void,
+                    0, // ObjectBasicInformation
+                    info.as_mut_ptr() as *mut std::ffi::c_void,
+                    std::mem::size_of::<ObjectBasicInformation>() as u32,
+                    &mut ret_len,
+                );
+                if status >= 0 {
+                    let info = info.assume_init();
+                    if info.granted_access & (FILE_APPEND_DATA | FILE_WRITE_DATA) == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "handle is not writable or append-capable",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Try ReOpenFile to preserve file identity and prevent path-swap / race conditions.
+    unsafe {
+        let reopened = ReOpenFile(
+            handle as *mut std::ffi::c_void,
+            FILE_WRITE_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        );
+        if !reopened.is_null() && reopened != INVALID_HANDLE_VALUE {
+            let mut pos = 0i64;
+            let success = SetFilePointerEx(reopened, len as i64, &mut pos, 0 /* FILE_BEGIN */) != 0
+                && SetEndOfFile(reopened) != 0;
+            let err = if !success {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            CloseHandle(reopened);
+            if success {
+                return Ok(());
+            }
+            if let Some(err) = err {
+                return Err(err);
+            }
+        }
+    }
+
+    // 3. Fallback: resolve path by handle and truncate by reopening.
     let mut buf = vec![0u16; 1024];
-    let len_copied = unsafe {
+    let mut len_copied = unsafe {
         GetFinalPathNameByHandleW(
             handle as *mut std::ffi::c_void,
             buf.as_mut_ptr(),
@@ -613,7 +714,7 @@ fn truncate_windows_append_file(file: &std::fs::File, len: u64) -> std::io::Resu
     }
     if len_copied as usize > buf.len() {
         buf.resize(len_copied as usize, 0);
-        let res = unsafe {
+        len_copied = unsafe {
             GetFinalPathNameByHandleW(
                 handle as *mut std::ffi::c_void,
                 buf.as_mut_ptr(),
@@ -621,7 +722,7 @@ fn truncate_windows_append_file(file: &std::fs::File, len: u64) -> std::io::Resu
                 0,
             )
         };
-        if res == 0 || res as usize > buf.len() {
+        if len_copied == 0 || len_copied as usize > buf.len() {
             return Err(std::io::Error::last_os_error());
         }
     }

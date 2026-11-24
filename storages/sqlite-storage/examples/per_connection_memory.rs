@@ -46,7 +46,7 @@ use whatsapp_rust_sqlite_storage::{SqliteDatabaseConfig, SqliteStore};
 const SEED_ROWS: usize = 4_000;
 const ROW_BYTES: usize = 1_024;
 
-fn rss_bytes() -> u64 {
+fn rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let rollup =
@@ -57,11 +57,11 @@ fn rss_bytes() -> u64 {
             .and_then(|value| value.split_whitespace().next())
             .and_then(|n| n.parse().ok())
             .expect("Rss: line");
-        kib * 1024
+        Some(kib * 1024)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        0
+        None
     }
 }
 
@@ -262,7 +262,12 @@ async fn main() {
     // Settle: the seeding store is dropped, and its connection with it, so the
     // baseline is the process without any session on this database.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let before = rss_bytes();
+    let Some(before) = rss_bytes() else {
+        eprintln!(
+            "memory measurements via smaps_rollup are only supported on Linux; mode '{mode}' is unavailable on this platform"
+        );
+        return;
+    };
 
     let mut stores: Vec<SqliteStore> = Vec::with_capacity(sessions);
     let mut after_first = before;
@@ -293,12 +298,12 @@ async fn main() {
             // in this reading, so subtracting it takes the discount out of the
             // per-session figure instead of hiding in it.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            after_first = rss_bytes();
+            after_first = rss_bytes().unwrap_or(before);
         }
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let after = rss_bytes();
+    let after = rss_bytes().unwrap_or(before);
     let delta = after.saturating_sub(before);
     let marginal = after.saturating_sub(after_first);
     let others = sessions.saturating_sub(1);
