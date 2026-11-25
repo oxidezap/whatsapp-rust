@@ -473,8 +473,6 @@ pub enum AppStateSyncError {
     NoSyncKeyAvailable,
     #[error("{0}")]
     AppState(#[from] crate::appstate::AppStateError),
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
 }
 
 /// One outstanding ask, and the id the answer will carry back.
