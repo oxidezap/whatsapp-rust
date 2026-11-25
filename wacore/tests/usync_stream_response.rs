@@ -242,7 +242,9 @@ fn binary_validation_precedes_semantic_rejections() {
         let error = consume(&spec, &frame).unwrap_err();
         assert!(
             matches!(
-                error.downcast_ref::<wacore_binary::BinaryError>(),
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<wacore_binary::BinaryError>()),
                 Some(wacore_binary::BinaryError::Zlib(_))
             ),
             "{error}"
@@ -252,7 +254,9 @@ fn binary_validation_precedes_semantic_rejections() {
         let error = consume(&spec, &frame).unwrap_err();
         assert!(
             matches!(
-                error.downcast_ref::<wacore_binary::BinaryError>(),
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<wacore_binary::BinaryError>()),
                 Some(wacore_binary::BinaryError::LeftoverData(_))
             ),
             "{error}"
