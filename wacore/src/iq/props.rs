@@ -32,7 +32,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef, NodeStream};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PropsParseError {
     #[error("expected <{expected}>, got <{actual}>")]
@@ -63,6 +63,8 @@ pub enum PropsParseError {
     #[error("conflicting group experiment values")]
     ConflictingGroupValues,
 }
+
+debug_as_display!(PropsParseError);
 
 /// IQ namespace for A/B props.
 pub const PROPS_NAMESPACE: &str = "abt";

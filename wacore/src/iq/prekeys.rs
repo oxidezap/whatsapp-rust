@@ -43,7 +43,7 @@ use crate::prekeys::PreKeyUtils;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PreKeyParseError {
     #[error("{0}")]
@@ -70,6 +70,8 @@ pub enum PreKeyParseError {
     #[error("device-identity must be bytes")]
     InvalidDeviceIdentity,
 }
+
+debug_as_display!(PreKeyParseError);
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 use wacore_binary::{Jid, Server};
