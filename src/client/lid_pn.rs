@@ -1413,7 +1413,10 @@ impl Client {
     /// Backend errors are propagated — callers can distinguish "no mapping"
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
-    pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
+    pub async fn get_lid_pn_entry(
+        &self,
+        jid: &Jid,
+    ) -> wacore::store::error::Result<Option<LidPnEntry>> {
         let is_lid = if jid.server.is_lid_family() {
             true
         } else if jid.server.is_pn_family() {
@@ -1429,7 +1432,7 @@ impl Client {
         &self,
         user: &str,
         is_lid: bool,
-    ) -> Result<Option<LidPnEntry>> {
+    ) -> wacore::store::error::Result<Option<LidPnEntry>> {
         let hit = if is_lid {
             self.lid_pn_cache.get_entry_by_lid(user).await
         } else {

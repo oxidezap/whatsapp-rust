@@ -15,9 +15,6 @@ pub enum PresenceError {
     /// Connection/transport failure sending the `<presence>` stanza.
     #[error("{0}")]
     Client(#[from] ClientError),
-    /// Catch-all for internal failures with no dedicated variant.
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
 }
 
 /// Who announces the account's own `available` presence.

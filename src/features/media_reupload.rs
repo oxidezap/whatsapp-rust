@@ -281,7 +281,12 @@ impl<'a> MediaReupload<'a> {
         // WAWebSendServerErrorReceiptJob only substitutes accountLid for a
         // migrated regular-user chat. A missing mapping keeps the original JID.
         let chat = if req.chat.is_pn() && self.client.is_lid_migrated().await {
-            match self.client.get_lid_pn_entry(&req.chat).await? {
+            match self
+                .client
+                .get_lid_pn_entry(&req.chat)
+                .await
+                .map_err(anyhow::Error::from)?
+            {
                 Some(entry) => Jid::lid(entry.lid.as_ref()),
                 None => req.chat.clone(),
             }

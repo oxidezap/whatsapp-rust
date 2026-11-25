@@ -1817,7 +1817,8 @@ impl<'a> Groups<'a> {
                 let entry = self
                     .client
                     .get_lid_pn_entry(&participant.jid)
-                    .await?
+                    .await
+                    .map_err(anyhow::Error::from)?
                     .ok_or_else(|| {
                         GroupError::InvalidRequest(format!(
                             "missing phone number mapping for LID {}",
