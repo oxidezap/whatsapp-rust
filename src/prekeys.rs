@@ -38,12 +38,28 @@ pub(crate) enum AdvPrimaryBundleError {
     Invalid(#[source] PrimaryIdentityError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub(crate) enum AdvIdentityQueryError {
-    #[error("{0}")]
-    Iq(#[source] Box<crate::request::IqError>),
-    #[error("{0}")]
-    Bundle(#[source] Box<AdvPrimaryBundleError>),
+    Iq(Box<crate::request::IqError>),
+    Bundle(Box<AdvPrimaryBundleError>),
+}
+
+impl std::fmt::Display for AdvIdentityQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Iq(error) => std::fmt::Display::fmt(error, f),
+            Self::Bundle(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for AdvIdentityQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Iq(error) => Some(error.as_ref()),
+            Self::Bundle(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 impl From<crate::request::IqError> for AdvIdentityQueryError {
@@ -1687,6 +1703,13 @@ mod tests {
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
         clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[test]
+    fn primary_query_exposes_the_concrete_iq_error() {
+        use std::error::Error as _;
+        let error = super::AdvIdentityQueryError::from(crate::request::IqError::NotConnected);
+        assert!(error.source().unwrap().is::<crate::request::IqError>());
+    }
 
     #[tokio::test]
     async fn cached_primary_identity_rejects_malformed_bytes() {
