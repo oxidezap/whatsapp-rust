@@ -261,7 +261,7 @@ async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
             .process_parsed_patch_list(list(reference), &resolve, true)
             .await
             .expect_err("resource failure must reach the processor");
-        assert!(error.chain().any(|cause| matches!(
+        assert!(error_sources(&error).any(|cause| matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(_))
         )));

@@ -17,6 +17,27 @@ use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
 use wacore::appstate_sync::{AppStateMutationPersistence, MetadataValidatedPatchList};
 
+fn processing_error_into_anyhow(
+    error: wacore::appstate_sync::AppStateProcessingError,
+) -> anyhow::Error {
+    use wacore::appstate_sync::{
+        AppStatePreparationError, AppStatePreparationErrorKind, AppStateProcessingError,
+        AppStateProcessingErrorKind,
+    };
+    match error.into_kind() {
+        AppStateProcessingErrorKind::Preparation(error) => match error.into_kind() {
+            AppStatePreparationErrorKind::SnapshotIntegrity(error) => anyhow::Error::new(error)
+                .context(wacore::appstate::AppStateError::SnapshotMACMissing),
+            AppStatePreparationErrorKind::Validation(error) => anyhow::Error::new(error),
+            other => anyhow::Error::new(AppStatePreparationError::new(other)),
+        },
+        AppStateProcessingErrorKind::Store(error) => anyhow::Error::new(error),
+        AppStateProcessingErrorKind::Sync(error) => anyhow::Error::new(error),
+        AppStateProcessingErrorKind::AppState(error) => anyhow::Error::new(error),
+        other => anyhow::Error::new(AppStateProcessingError::new(other)),
+    }
+}
+
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
     budget: std::sync::OnceLock<crate::download::memory::MemoryBudget>,
@@ -4288,13 +4309,20 @@ impl Client {
 
     async fn dispatch_committed_mutations_from_error(
         &self,
-        error: anyhow::Error,
+        error: wacore::appstate_sync::AppStateProcessingError,
         event_full_sync: bool,
         log_full_sync: bool,
     ) -> anyhow::Error {
-        let committed = match error.downcast::<wacore::appstate_sync::CommittedMutationsError>() {
-            Ok(committed) => committed,
-            Err(error) => return error,
+        if !matches!(
+            error.kind(),
+            wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(_)
+        ) {
+            return processing_error_into_anyhow(error);
+        }
+        let wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(committed) =
+            error.into_kind()
+        else {
+            unreachable!("checked above")
         };
         let (mutations, state, collection, source) = committed.into_parts();
         Box::pin(self.dispatch_collection_mutations(
@@ -4305,7 +4333,7 @@ impl Client {
             log_full_sync,
         ))
         .await;
-        source
+        processing_error_into_anyhow(source)
     }
 
     /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].

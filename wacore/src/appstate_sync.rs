@@ -3,7 +3,6 @@ pub mod preparation;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_lock::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -31,7 +30,7 @@ pub struct CommittedMutationsError {
     state: HashState,
     collection: WAPatchName,
     #[source]
-    source: anyhow::Error,
+    source: AppStateProcessingError,
 }
 
 impl std::fmt::Debug for CommittedMutationsError {
@@ -48,7 +47,14 @@ impl std::fmt::Debug for CommittedMutationsError {
 
 impl CommittedMutationsError {
     /// Split the committed work from the error that stopped the next patch.
-    pub fn into_parts(self) -> (Vec<Mutation>, HashState, WAPatchName, anyhow::Error) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Mutation>,
+        HashState,
+        WAPatchName,
+        AppStateProcessingError,
+    ) {
         (self.mutations, self.state, self.collection, self.source)
     }
 }
@@ -62,7 +68,7 @@ impl CommittedMutationsError {
 pub struct CommittedPatchListsError {
     results: Vec<(Vec<Mutation>, HashState, PatchList)>,
     #[source]
-    source: anyhow::Error,
+    source: AppStateProcessingError,
 }
 
 impl std::fmt::Debug for CommittedPatchListsError {
@@ -77,17 +83,22 @@ impl std::fmt::Debug for CommittedPatchListsError {
 
 impl CommittedPatchListsError {
     /// Split the committed collection results from the later error.
-    pub fn into_parts(self) -> (Vec<(Vec<Mutation>, HashState, PatchList)>, anyhow::Error) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(Vec<Mutation>, HashState, PatchList)>,
+        AppStateProcessingError,
+    ) {
         (self.results, self.source)
     }
 }
 
 fn committed_mutations_error(
-    source: anyhow::Error,
+    source: AppStateProcessingError,
     mutations: Vec<Mutation>,
     state: &HashState,
     collection: WAPatchName,
-) -> anyhow::Error {
+) -> AppStateProcessingError {
     if mutations.is_empty() {
         source
     } else {
@@ -267,12 +278,24 @@ debug_as_display!(AppStatePreparationErrorKind);
 pub struct AppStatePreparationError(Box<AppStatePreparationErrorKind>);
 
 impl AppStatePreparationError {
-    fn new(kind: AppStatePreparationErrorKind) -> Self {
+    pub fn new(kind: AppStatePreparationErrorKind) -> Self {
         Self(Box::new(kind))
     }
 
     pub fn kind(&self) -> &AppStatePreparationErrorKind {
         &self.0
+    }
+
+    pub fn into_kind(self) -> AppStatePreparationErrorKind {
+        *self.0
+    }
+
+    pub fn validation_error(&self) -> Option<&crate::appstate::validation::ValidationError> {
+        match self.kind() {
+            AppStatePreparationErrorKind::Validation(error)
+            | AppStatePreparationErrorKind::SnapshotIntegrity(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -290,7 +313,7 @@ impl From<ExternalBlobError> for AppStatePreparationError {
 
 impl std::fmt::Display for AppStatePreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&*self.0, formatter)
+        display_error_chain(&*self.0, formatter)
     }
 }
 
@@ -302,13 +325,97 @@ impl std::error::Error for AppStatePreparationError {
     }
 }
 
-fn preparation_into_anyhow(error: AppStatePreparationError) -> anyhow::Error {
-    match *error.0 {
-        AppStatePreparationErrorKind::SnapshotIntegrity(error) => {
-            anyhow::Error::new(error).context(crate::appstate::AppStateError::SnapshotMACMissing)
+#[derive(Error)]
+#[non_exhaustive]
+pub enum AppStateProcessingErrorKind {
+    #[error("{0}")]
+    Preparation(#[source] AppStatePreparationError),
+    #[error("{0}")]
+    Store(#[source] crate::store::error::StoreError),
+    #[error("{0}")]
+    Sync(#[source] AppStateSyncError),
+    #[error("{0}")]
+    AppState(#[source] crate::appstate::AppStateError),
+    #[error("{0}")]
+    CommittedMutations(#[source] CommittedMutationsError),
+    #[error("{0}")]
+    CommittedPatchLists(#[source] CommittedPatchListsError),
+}
+
+debug_as_display!(AppStateProcessingErrorKind);
+
+pub struct AppStateProcessingError(Box<AppStateProcessingErrorKind>);
+
+impl AppStateProcessingError {
+    pub fn new(kind: AppStateProcessingErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &AppStateProcessingErrorKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> AppStateProcessingErrorKind {
+        *self.0
+    }
+
+    pub fn preparation_error(&self) -> Option<&AppStatePreparationError> {
+        match self.kind() {
+            AppStateProcessingErrorKind::Preparation(error) => Some(error),
+            _ => None,
         }
-        AppStatePreparationErrorKind::Validation(error) => anyhow::Error::new(error),
-        other => anyhow::Error::new(AppStatePreparationError::new(other)),
+    }
+}
+
+macro_rules! processing_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for AppStateProcessingError {
+            fn from(error: $source) -> Self {
+                Self::new(AppStateProcessingErrorKind::$variant(error))
+            }
+        })+
+    };
+}
+
+processing_error_from!(
+    AppStatePreparationError => Preparation,
+    crate::store::error::StoreError => Store,
+    AppStateSyncError => Sync,
+    crate::appstate::AppStateError => AppState,
+    CommittedMutationsError => CommittedMutations,
+    CommittedPatchListsError => CommittedPatchLists,
+);
+
+impl std::fmt::Display for AppStateProcessingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        display_error_chain(&*self.0, formatter)
+    }
+}
+
+fn display_error_chain(
+    error: &(dyn std::error::Error + 'static),
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    write!(formatter, "{error}")?;
+    if formatter.alternate() {
+        let mut source = error.source();
+        for _ in 0..16 {
+            let Some(cause) = source else { return Ok(()) };
+            write!(formatter, ": {cause}")?;
+            source = cause.source();
+        }
+        if source.is_some() {
+            formatter.write_str(": ...")?;
+        }
+    }
+    Ok(())
+}
+
+debug_as_display!(AppStateProcessingError);
+
+impl std::error::Error for AppStateProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
     }
 }
 
@@ -365,9 +472,12 @@ fn validate_snapshot_for_processing(
 }
 
 #[cfg(test)]
-fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
-    validate_patch_list_metadata(pl).map_err(preparation_into_anyhow)?;
-    decode_external_blobs(pl, download, true).map_err(preparation_into_anyhow)
+fn download_external_blobs(
+    pl: &mut PatchList,
+    download: &BlobDownloadFn<'_>,
+) -> Result<(), AppStatePreparationError> {
+    validate_patch_list_metadata(pl)?;
+    decode_external_blobs(pl, download, true)
 }
 
 #[inline(never)]
@@ -1028,7 +1138,7 @@ impl AppStateProcessor {
     pub async fn get_app_state_key(
         &self,
         key_id: &[u8],
-    ) -> std::result::Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
+    ) -> Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD_NO_PAD;
         if let Some(cached) = self.key_cache.lock().await.get(key_id) {
@@ -1406,14 +1516,14 @@ impl AppStateProcessor {
     /// then decoding and applying it.
     ///
     /// If a later patch fails after earlier mutations were committed, the error
-    /// downcasts to [`CommittedMutationsError`].
+    /// contains [`AppStateProcessingErrorKind::CommittedMutations`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
         pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let prepared = self.prepare_patch_list(pl, download).await;
         self.process_prepared_patch_list(prepared, validate_macs)
             .await
@@ -1505,10 +1615,10 @@ impl AppStateProcessor {
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let PreparedPatchList { list, error } = prepared;
         if let Some(error) = error {
-            return Err(preparation_into_anyhow(error));
+            return Err(error.into());
         }
         if list.error.is_some() {
             let state = self
@@ -1524,7 +1634,7 @@ impl AppStateProcessor {
     /// Process already-parsed patch lists and download any external blobs.
     ///
     /// If a later collection fails after earlier collections were committed,
-    /// the error downcasts to [`CommittedPatchListsError`]. Its results still
+    /// the error contains [`AppStateProcessingErrorKind::CommittedPatchLists`]. Its results still
     /// require dispatch. The source retains any [`CommittedMutationsError`]
     /// raised within the failed collection.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
@@ -1533,7 +1643,7 @@ impl AppStateProcessor {
         patch_lists: Vec<PatchList>,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>, AppStateProcessingError> {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for pl in patch_lists {
@@ -1563,7 +1673,7 @@ impl AppStateProcessor {
         pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let prepared = self.prepare_patch_list(pl, download).await;
         self.process_one_prepared_patch_list(prepared, validate_macs)
             .await
@@ -1573,7 +1683,7 @@ impl AppStateProcessor {
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let PreparedPatchList {
             list: mut pl,
             error,
@@ -1593,10 +1703,13 @@ impl AppStateProcessor {
         // the caller re-fetches it instead of persisting partial state.
         if let Some(e) = error {
             if matches!(e.kind(), AppStatePreparationErrorKind::SnapshotIntegrity(_)) {
-                return Err(preparation_into_anyhow(e));
+                return Err(e.into());
             }
-            let e = preparation_into_anyhow(e);
-            log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e:#}", pl.name);
+            if let Some(cause) = std::error::Error::source(e.kind()) {
+                log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e}: {cause}", pl.name);
+            } else {
+                log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e}", pl.name);
+            }
             pl.error = Some(CollectionSyncError::Retry {
                 code: 0,
                 text: e.to_string(),
@@ -1615,14 +1728,14 @@ impl AppStateProcessor {
     /// Process one patch list whose external blobs have already been inlined.
     ///
     /// If a later patch fails after earlier mutations were committed, the error
-    /// downcasts to [`CommittedMutationsError`]. Its mutations still require
+    /// contains [`AppStateProcessingErrorKind::CommittedMutations`]. Its mutations still require
     /// dispatch, and its state is the last committed cursor.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,
         mut pl: PatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
@@ -1896,7 +2009,7 @@ impl AppStateProcessor {
         keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
         progress: &mut PatchListProgress,
         validate_macs: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateProcessingError> {
         let collection_name = pl.name.as_str();
         let collection_name_owned = collection_name.to_string();
 
@@ -1916,8 +2029,8 @@ impl AppStateProcessor {
         // Carried as itself rather than flattened to a string: a snapshot MAC
         // that does not match is the one error with an answer -- asking the
         // primary for the collection -- and a caller can only tell it apart
-        // from a missing key or a bad decode by downcasting to it.
-        .map_err(anyhow::Error::new)?;
+        // from a missing key or a bad decode by matching its variant.
+        ?;
 
         let (snapshot, snapshot_state, snapshot_result) = result.into_parts();
         pl.snapshot = Some(snapshot);
@@ -1966,7 +2079,7 @@ impl AppStateProcessor {
         progress: &mut PatchListProgress,
         validate_macs: bool,
         final_page: bool,
-    ) -> Result<wa::SyncdPatch> {
+    ) -> Result<wa::SyncdPatch, AppStateProcessingError> {
         let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
         // Fetch previous value MACs in one backend round-trip instead of a
@@ -2035,11 +2148,11 @@ impl AppStateProcessor {
         &self,
         pl: &mut PatchList,
         download: &BlobDownloadFn<'_>,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Vec<u8>>, AppStateProcessingError> {
         // Check the original metadata before inlining can erase conflicting
         // inline mutations. Owned runtime callers use blocking preparation.
-        validate_patch_list_metadata(pl).map_err(preparation_into_anyhow)?;
-        decode_external_blobs(pl, download, false).map_err(preparation_into_anyhow)?;
+        validate_patch_list_metadata(pl)?;
+        decode_external_blobs(pl, download, false)?;
         Ok(self.get_missing_key_ids(pl).await?)
     }
 }
@@ -2209,11 +2322,7 @@ mod external_blob_tests {
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert_eq!(
-            error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
-                .unwrap()
-                .metric
-                .as_deref(),
+            error.validation_error().unwrap().metric.as_deref(),
             Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
         );
         assert!(pl.patches[0].external_mutations.is_set());
@@ -2547,7 +2656,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2561,7 +2671,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2638,12 +2749,15 @@ mod prepared_validation_tests {
                 .await
                 .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+                error
+                    .preparation_error()
+                    .map(AppStatePreparationError::kind),
+                Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
             ));
             assert!(
                 error
-                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .preparation_error()
+                    .and_then(AppStatePreparationError::validation_error)
                     .is_some()
             );
             let prepared = processor
@@ -2654,12 +2768,15 @@ mod prepared_validation_tests {
                 .await
                 .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+                error
+                    .preparation_error()
+                    .map(AppStatePreparationError::kind),
+                Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
             ));
             assert!(
                 error
-                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .preparation_error()
+                    .and_then(AppStatePreparationError::validation_error)
                     .is_some()
             );
         }
@@ -2686,15 +2803,18 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
             Some("MISSING_SNAPSHOT_MAC")
         );
         assert!(matches!(
-            error.downcast_ref::<crate::appstate::AppStateError>(),
-            Some(crate::appstate::AppStateError::SnapshotMACMissing)
+            error
+                .preparation_error()
+                .map(AppStatePreparationError::kind),
+            Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
@@ -2734,7 +2854,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2773,7 +2894,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
