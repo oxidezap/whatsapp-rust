@@ -784,7 +784,8 @@ impl Client {
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
                 let accepted = client
                     .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
-                    .await?;
+                    .await
+                    .map_err(crate::usync::AdvIdentityPersistenceError::into_anyhow)?;
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
                 anyhow::ensure!(
                     accepted,

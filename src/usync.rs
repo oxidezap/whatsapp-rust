@@ -258,11 +258,31 @@ pub(crate) enum DeviceListIdentityConflict {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum DeviceListIdentityError {
+pub(crate) enum DeviceListIdentityError {
     #[error("{0}")]
     Cached(#[from] crate::prekeys::CachedAdvIdentityError),
     #[error("{0}")]
     Conflict(#[from] DeviceListIdentityConflict),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AdvIdentityPersistenceError {
+    #[error("{0}")]
+    Account(#[from] DeviceListIdentityError),
+    #[error("{0}")]
+    Conflict(#[from] DeviceListIdentityConflict),
+    #[error("{0}")]
+    Persistence(#[from] wacore::store::signal_cache::IdentityPersistenceError),
+}
+
+impl AdvIdentityPersistenceError {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Account(error) => error.into_anyhow(),
+            Self::Conflict(error) => error.into(),
+            Self::Persistence(error) => error.into(),
+        }
+    }
 }
 
 impl DeviceListIdentityError {
@@ -2404,7 +2424,8 @@ impl Client {
         self.runtime.spawn_detached(Box::pin(async move {
             let result = client
                 .persist_adv_bootstrap_identity_inner(&primary, &key, epoch)
-                .await;
+                .await
+                .map_err(AdvIdentityPersistenceError::into_anyhow);
             if let Err(Err(error)) = send.send(result) {
                 warn!("Owned ADV bootstrap failed after caller cancellation: {error:#}");
             }
@@ -2420,15 +2441,14 @@ impl Client {
         primary: &Jid,
         key: &[u8; 32],
         epoch: Option<u64>,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, AdvIdentityPersistenceError> {
         use wacore::types::jid::JidExt;
         let _mapping = self.lid_pn_cache.lock_mutation().await;
         // Retain the paired-account fallback check. The cache transaction below
         // repeats both live Signal anchors after waiting for durable ordering.
         if self
             .device_list_account_identity(primary)
-            .await
-            .map_err(DeviceListIdentityError::into_anyhow)?
+            .await?
             .is_some_and(|current| current != *key)
         {
             return Ok(false);
