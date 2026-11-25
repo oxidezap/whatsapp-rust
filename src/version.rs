@@ -7,7 +7,7 @@ use wacore::types::events::{AppVersionFallback, AppVersionFallbackReason};
 
 pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_meta_sdk_js, parse_sw_js};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum VersionError {
     #[error("HTTP request to {url} failed: {source}")]
@@ -26,6 +26,12 @@ pub enum VersionError {
     Shape(#[from] VersionShapeError),
     #[error("Failed to fetch latest WhatsApp version: {0}")]
     Resolve(#[source] Box<VersionError>),
+}
+
+impl std::fmt::Debug for VersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl VersionError {

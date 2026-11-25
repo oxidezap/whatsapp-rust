@@ -67,6 +67,9 @@ pub enum SendError {
     /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
     #[error("invalid send request: {0}")]
     InvalidRequest(String),
+    /// No requested status recipient resolved to an address.
+    #[error("{0}")]
+    StatusRecipients(#[from] wacore::send::StatusRecipientsError),
     /// A DM could not be encrypted for a single device of the recipient, so
     /// nothing was sent. Distinct from a transport failure: the connection is
     /// fine and the message id was never on the wire, so the useful retry is
