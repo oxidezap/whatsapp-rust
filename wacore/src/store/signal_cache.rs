@@ -1499,7 +1499,11 @@ impl SignalStoreCache {
     /// state with. Conservative on the cache side: any matching key counts
     /// (even a stale/checked-out marker), so it never reports "none" when state
     /// might exist.
-    pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
+    pub async fn has_state_for_user(
+        &self,
+        user: &str,
+        backend: &dyn SignalStore,
+    ) -> crate::store::error::Result<bool> {
         if self.lock_sessions().await.cache.has_user(user) {
             return Ok(true);
         }
@@ -1516,7 +1520,7 @@ impl SignalStoreCache {
         &self,
         user: &str,
         backend: &dyn SignalStore,
-    ) -> Result<Vec<Arc<str>>> {
+    ) -> crate::store::error::Result<Vec<Arc<str>>> {
         let mut addresses = Vec::new();
         addresses.extend(
             self.lock_sessions()
@@ -1714,7 +1718,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<SessionRecord>>> {
+    ) -> crate::store::error::Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1830,7 +1834,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> crate::store::error::Result<bool> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1882,7 +1886,7 @@ impl SignalStoreCache {
         &self,
         addresses: &[ProtocolAddress],
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         let (missing, since) = {
             let state = self.lock_sessions().await;
             let mut missing = Vec::new();
@@ -2037,7 +2041,7 @@ impl SignalStoreCache {
         &self,
         addresses: &[ProtocolAddress],
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         if addresses.len() < 2 {
             return Ok(());
         }
@@ -2075,7 +2079,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<[u8]>>> {
+    ) -> crate::store::error::Result<Option<Arc<[u8]>>> {
         let key = address.as_str();
         // Cache check inside scoped lock so concurrent callers don't queue on
         // the mutex during the backend roundtrip. Mirrors get_session/has_session.

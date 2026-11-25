@@ -26,6 +26,10 @@ pub enum SignalError {
     /// Failed to establish a session before encrypting for devices.
     #[error("{0}")]
     SessionSetup(#[from] wacore::send::SessionSetupError),
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("session check failed: {0}")]
+    SessionCheck(#[source] wacore::store::error::StoreError),
     /// The requested operation is not valid for this input (e.g. a sender-key
     /// or message-secret envelope passed to the pairwise decrypt path).
     #[error("unsupported signal operation: {0}")]
@@ -733,7 +737,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| SignalError::Internal(e.context("session check failed")))?;
+            .map_err(SignalError::SessionCheck)?;
         if exists || !self.migrate_legacy_pairwise_state(jid, &resolved).await? {
             return Ok(exists);
         }
@@ -741,7 +745,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| SignalError::Internal(e.context("session check failed")))
+            .map_err(SignalError::SessionCheck)
     }
 
     /// Delete Signal sessions and identity keys for the given JIDs.
