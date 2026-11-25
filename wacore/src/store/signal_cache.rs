@@ -1510,7 +1510,7 @@ impl SignalStoreCache {
         if self.identities.lock().await.cache.has_user(user) {
             return Ok(true);
         }
-        Ok(backend.has_signal_state_for_user(user).await?)
+        backend.has_signal_state_for_user(user).await
     }
 
     /// Collect cached history before reading durable history, so a concurrent
