@@ -1259,7 +1259,7 @@ impl AppStateProcessor {
     async fn prefetch_keys(
         &self,
         pl: &PatchList,
-    ) -> Result<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>> {
+    ) -> Result<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>, AppStateSyncError> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut keys = HashMap::with_capacity(key_ids.len());
         for key_id in key_ids {
@@ -1268,7 +1268,7 @@ impl AppStateProcessor {
                     keys.insert(key_id.to_vec(), expanded);
                 }
                 Err(AppStateSyncError::KeyNotFound(_)) => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         Ok(keys)
@@ -1750,7 +1750,10 @@ impl AppStateProcessor {
         Ok((patch_bytes, base_version))
     }
 
-    pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
+    pub async fn get_missing_key_ids(
+        &self,
+        pl: &PatchList,
+    ) -> crate::store::error::Result<Vec<Vec<u8>>> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
@@ -1912,7 +1915,7 @@ impl AppStateProcessor {
         // inline mutations. Owned runtime callers use blocking preparation.
         validate_patch_list_metadata(pl)?;
         decode_external_blobs(pl, download, false)?;
-        self.get_missing_key_ids(pl).await
+        Ok(self.get_missing_key_ids(pl).await?)
     }
 }
 
