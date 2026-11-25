@@ -77,34 +77,34 @@ pub enum GroupNodeError {
         value: u64,
     },
     #[error("{0}")]
-    Binary(#[source] Box<wacore_binary::BinaryError>),
+    Binary(#[source] crate::error::BoxedErrorSource<wacore_binary::BinaryError>),
     #[error("{0}")]
-    Structure(#[source] Box<crate::iq::node::IqParseError>),
+    Structure(#[source] crate::error::BoxedErrorSource<crate::iq::node::IqParseError>),
     #[error("{0}")]
     Jid(#[from] wacore_binary::jid::JidError),
     #[error("{0}")]
     Wire(#[from] crate::protocol::UnknownWireValue),
     #[error("{0}")]
-    Context(#[source] Box<super::contextual::IqResponseError>),
+    Context(#[source] crate::error::BoxedErrorSource<super::contextual::IqResponseError>),
     #[error("{0}")]
     Rejection(#[from] super::spec::ContextualRejection),
 }
 
 impl From<wacore_binary::BinaryError> for GroupNodeError {
     fn from(error: wacore_binary::BinaryError) -> Self {
-        Self::Binary(Box::new(error))
+        Self::Binary(crate::error::BoxedErrorSource::new(error))
     }
 }
 
 impl From<crate::iq::node::IqParseError> for GroupNodeError {
     fn from(error: crate::iq::node::IqParseError) -> Self {
-        Self::Structure(Box::new(error))
+        Self::Structure(crate::error::BoxedErrorSource::new(error))
     }
 }
 
 impl From<super::contextual::IqResponseError> for GroupNodeError {
     fn from(error: super::contextual::IqResponseError) -> Self {
-        Self::Context(Box::new(error))
+        Self::Context(crate::error::BoxedErrorSource::new(error))
     }
 }
 
@@ -6091,6 +6091,35 @@ mod tests {
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].jid, sub);
         assert!(result.groups[0].error.is_none());
+    }
+
+    #[test]
+    fn link_subgroups_missing_links_preserves_parser_cause() {
+        let parent = Jid::new("120363000000000001", Server::Group);
+        let response = NodeBuilder::new("iq").build();
+        let error = LinkSubgroupsIq::new(&parent, &[])
+            .parse_response(&response.as_node_ref())
+            .unwrap_err();
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(matches!(
+            source.downcast_ref::<crate::iq::node::IqParseError>(),
+            Some(crate::iq::node::IqParseError::MissingChild { tag }) if tag == "links"
+        ));
+        let binary = GroupNodeError::from(wacore_binary::BinaryError::MissingAttr("id".into()));
+        assert!(
+            std::error::Error::source(&binary)
+                .unwrap()
+                .is::<wacore_binary::BinaryError>()
+        );
+        let context =
+            GroupNodeError::from(super::super::contextual::IqResponseError::MissingChild {
+                tag: "group",
+            });
+        assert!(
+            std::error::Error::source(&context)
+                .unwrap()
+                .is::<super::super::contextual::IqResponseError>()
+        );
     }
 
     #[test]

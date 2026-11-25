@@ -169,7 +169,11 @@ impl EventHandler for Counts {
 struct Commit(Arc<Counts>);
 #[async_trait]
 impl InboundDurabilityHook for Commit {
-    async fn on_messages(&self, _: Arc<Client>, batch: &[InboundMessage]) -> Result<()> {
+    async fn on_messages(
+        &self,
+        _: Arc<Client>,
+        batch: &[InboundMessage],
+    ) -> crate::types::durability_hook::HookResult {
         self.0.committed.fetch_add(batch.len(), Ordering::Relaxed);
         self.0.commit_batches.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1307,9 +1311,8 @@ impl Wire {
     }
 }
 
-#[async_trait]
-impl Transport for Wire {
-    async fn send(&self, data: Bytes) -> std::result::Result<(), crate::transport::TransportError> {
+impl Wire {
+    async fn send_fixture(&self, data: Bytes) -> Result<()> {
         let hello = matches!(
             *self.state.lock().unwrap_or_else(|e| e.into_inner()),
             State::Hello
@@ -1391,6 +1394,13 @@ impl Transport for Wire {
         self.max_batch_frames
             .fetch_max(batch_frames, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Transport for Wire {
+    async fn send(&self, data: Bytes) -> std::result::Result<(), crate::transport::TransportError> {
+        self.send_fixture(data).await
     }
 
     async fn disconnect(&self) {

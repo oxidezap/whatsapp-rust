@@ -237,12 +237,17 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
 fn harness_sha256() -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
+    // The base-only adapter changes the transport error boundary, not the workload.
+    let fixture = include_str!("../src/bench_support/connected_idle.rs").replace(
+        "self.send_fixture(data).await.map_err(anyhow::Error::from_boxed)",
+        "self.send_fixture(data).await",
+    );
     for source in [
         include_bytes!("connected_idle.rs").as_slice(),
         include_bytes!("connected_idle/allocator.rs").as_slice(),
         include_bytes!("connected_idle/process_locks.rs").as_slice(),
         include_bytes!("../src/bench_support.rs").as_slice(),
-        include_bytes!("../src/bench_support/connected_idle.rs").as_slice(),
+        fixture.as_bytes(),
         include_bytes!("../src/bench_support/connected_idle/offline_replay.rs").as_slice(),
         include_bytes!("../src/bench_support/connected_idle/util.rs").as_slice(),
     ] {

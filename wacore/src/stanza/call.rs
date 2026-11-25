@@ -29,10 +29,10 @@ pub enum CallParseError {
     Attributes {
         node: &'static str,
         #[source]
-        source: Box<wacore_binary::BinaryError>,
+        source: crate::error::BoxedErrorSource<wacore_binary::BinaryError>,
     },
     #[error("<audio> missing 'enc': {0}")]
-    MissingAudioEncoding(#[source] Box<wacore_binary::BinaryError>),
+    MissingAudioEncoding(#[source] crate::error::BoxedErrorSource<wacore_binary::BinaryError>),
     #[error("<audio enc={encoding}> missing or invalid 'rate'")]
     InvalidAudioRate { encoding: String },
     #[error("<audio enc={encoding}> 'rate'={rate} overflows u32")]
@@ -41,19 +41,19 @@ pub enum CallParseError {
     MissingCallId {
         node: String,
         #[source]
-        source: Box<wacore_binary::BinaryError>,
+        source: crate::error::BoxedErrorSource<wacore_binary::BinaryError>,
     },
     #[error("<{node}> missing 'call-creator'")]
     MissingCallCreator { node: String },
     #[error("<video> missing or non-numeric 'state'")]
     InvalidVideoState,
     #[error("{0}")]
-    Group(#[source] Box<super::group_call::GroupCallParseError>),
+    Group(#[source] crate::error::BoxedErrorSource<super::group_call::GroupCallParseError>),
 }
 
 impl From<super::group_call::GroupCallParseError> for CallParseError {
     fn from(error: super::group_call::GroupCallParseError) -> Self {
-        Self::Group(Box::new(error))
+        Self::Group(crate::error::BoxedErrorSource::new(error))
     }
 }
 
@@ -118,7 +118,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>, Cal
         .finish()
         .map_err(|source| CallParseError::Attributes {
             node: "call",
-            source: Box::new(source),
+            source: crate::error::BoxedErrorSource::new(source),
         })?;
 
     let is_offer = action_tag == CallActionTag::Offer;
@@ -321,7 +321,9 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec, CallParseErro
     let mut a = node.attrs();
     let enc = a
         .required_string("enc")
-        .map_err(|source| CallParseError::MissingAudioEncoding(Box::new(source)))?
+        .map_err(|source| {
+            CallParseError::MissingAudioEncoding(crate::error::BoxedErrorSource::new(source))
+        })?
         .into_owned();
     let rate_raw = a
         .optional_u64("rate")
@@ -334,7 +336,7 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec, CallParseErro
     })?;
     a.finish().map_err(|source| CallParseError::Attributes {
         node: "audio",
-        source: Box::new(source),
+        source: crate::error::BoxedErrorSource::new(source),
     })?;
     Ok(CallAudioCodec { enc, rate })
 }
@@ -346,7 +348,7 @@ fn finish_call_attrs(
 ) -> Result<(), CallParseError> {
     attrs.finish().map_err(|source| CallParseError::Attributes {
         node,
-        source: Box::new(source),
+        source: crate::error::BoxedErrorSource::new(source),
     })
 }
 
@@ -359,7 +361,7 @@ fn parse_action(
         .required_string("call-id")
         .map_err(|source| CallParseError::MissingCallId {
             node: node.tag.to_string(),
-            source: Box::new(source),
+            source: crate::error::BoxedErrorSource::new(source),
         })?
         .into_owned();
     let call_creator =
@@ -1504,6 +1506,24 @@ mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
+
+    #[test]
+    fn call_parse_errors_expose_boxed_concrete_causes() {
+        let error = CallParseError::MissingAudioEncoding(crate::error::BoxedErrorSource::new(
+            wacore_binary::BinaryError::MissingAttr("enc".into()),
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<wacore_binary::BinaryError>()
+        );
+        let group = CallParseError::from(super::super::group_call::GroupCallParseError::MissingEnc);
+        assert!(
+            std::error::Error::source(&group)
+                .unwrap()
+                .is::<super::super::group_call::GroupCallParseError>()
+        );
+    }
 
     fn fake_caller_lid() -> Jid {
         Jid::new("111111111111111", Server::Lid)

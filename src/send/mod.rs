@@ -241,6 +241,9 @@ impl From<crate::client::SessionEnsureError> for SendError {
             crate::client::SessionEnsureError::PrimaryRejected(rejected) => {
                 Self::PrimaryDeviceRejected(rejected)
             }
+            crate::client::SessionEnsureError::PreKeyFetch(
+                crate::prekeys::PreKeyFetchError::Iq(iq),
+            ) => Self::Iq(iq),
             other => Self::Internal(Box::new(other)),
         }
     }
@@ -4629,6 +4632,49 @@ mod tests {
             wacore::send::PrimaryDeviceRejected::new(406),
         ));
         assert!(matches!(primary, SendError::PrimaryDeviceRejected(_)));
+    }
+
+    #[test]
+    fn prekey_fetch_iq_failures_remain_matchable() {
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::Iq(IqError::Timeout),
+        );
+        assert!(matches!(
+            SendError::from(error),
+            SendError::Iq(IqError::Timeout)
+        ));
+
+        let response = crate::test_utils::node_to_owned_ref(
+            &NodeBuilder::new("iq").attr("type", "error").build(),
+        );
+        let rejected = IqError::ServerError {
+            code: 429,
+            text: "rate limited".into(),
+            error_type: None,
+            backoff: Some(5),
+            response: crate::request::RejectionStanza::from(response),
+        };
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::Iq(rejected),
+        );
+        assert!(matches!(
+            SendError::from(error),
+            SendError::Iq(IqError::ServerError {
+                code: 429,
+                backoff: Some(5),
+                ..
+            })
+        ));
+
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::PrimaryIdentityChanged,
+        );
+        let mapped = SendError::from(error);
+        assert!(matches!(mapped, SendError::Internal(_)));
+        assert!(
+            crate::ErrorChainExt::sources(&mapped)
+                .any(|source| source.is::<crate::prekeys::PreKeyFetchError>())
+        );
     }
 
     #[test]
