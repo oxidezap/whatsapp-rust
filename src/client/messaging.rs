@@ -717,7 +717,7 @@ fn build_secret_message_edit_at(
     message_secret: &[u8],
     new_content: wa::Message,
     timestamp_ms: i64,
-) -> Result<wa::Message, anyhow::Error> {
+) -> Result<wa::Message, wacore::secret_enc_addon::AddonError> {
     use wa::message::secret_encrypted_message::SecretEncType;
     use wacore::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
 
@@ -791,7 +791,7 @@ fn build_secret_message_edit(
     self_jid_str: &str,
     message_secret: &[u8],
     new_content: wa::Message,
-) -> Result<wa::Message, anyhow::Error> {
+) -> Result<wa::Message, wacore::secret_enc_addon::AddonError> {
     build_secret_message_edit_at(
         to,
         original_id,
@@ -807,6 +807,28 @@ fn build_secret_message_edit(
 #[cfg(test)]
 mod secret_message_edit_tests {
     use super::*;
+
+    #[test]
+    fn secret_message_edit_preserves_invalid_secret_error() {
+        let to: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+        let error = build_secret_message_edit(
+            &to,
+            "ORIGINAL",
+            None,
+            "15550000002@s.whatsapp.net",
+            "15550000002@s.whatsapp.net",
+            &[0; 3],
+            wa::Message::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            wacore::secret_enc_addon::AddonError::InvalidSecretSize {
+                expected: 32,
+                got: 3
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn ordinary_edit_inner_frame_is_bounded_and_preserves_login_validation() {
