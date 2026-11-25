@@ -1740,7 +1740,6 @@ version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
- "anyhow",
  "async-channel",
  "async-lock",
  "async-trait",
