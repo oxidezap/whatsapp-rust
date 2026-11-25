@@ -317,8 +317,14 @@ impl wacore::voip_control::transport::RelayTransportProvider for NoRelay {
     async fn factory(
         &self,
         _: &wacore::voip_control::transport::RelayEndpointParams,
-    ) -> Result<Arc<dyn wacore::voip_control::transport::RelayTransportFactory>> {
-        anyhow::bail!("call fixture has no media relay; install a synthetic RelayTransportProvider")
+    ) -> wacore::voip_control::transport::RelayResult<
+        Arc<dyn wacore::voip_control::transport::RelayTransportFactory>,
+    > {
+        Err(
+            wacore::voip_control::transport::RelayTransportError::adapter(std::io::Error::other(
+                "call fixture has no media relay; install a synthetic RelayTransportProvider",
+            )),
+        )
     }
 }
 

@@ -7519,7 +7519,7 @@ mod tests {
         async fn factory(
             &self,
             _relay: &wacore::voip_control::transport::RelayEndpointParams,
-        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+        ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>> {
             Ok(self.factory.clone())
         }
     }
@@ -7684,7 +7684,7 @@ mod tests {
     }
     #[async_trait]
     impl RelayTransport for MockTransport {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> wacore::voip_control::transport::RelayResult<()> {
             self.sent.lock().unwrap().push(data);
             Ok(())
         }
@@ -7694,7 +7694,7 @@ mod tests {
     impl RelayTransportFactory for MockFactory {
         async fn connect(
             &self,
-        ) -> anyhow::Result<(
+        ) -> wacore::voip_control::transport::RelayResult<(
             Arc<dyn RelayTransport>,
             async_channel::Receiver<RelayTransportEvent>,
         )> {
@@ -7719,7 +7719,7 @@ mod tests {
         async fn factory(
             &self,
             relay: &wacore::voip_control::transport::RelayEndpointParams,
-        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+        ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>> {
             self.asked.lock().unwrap().push((
                 relay.addr,
                 relay.ice_ufrag.clone(),
@@ -7838,7 +7838,7 @@ mod tests {
         impl RelayTransportFactory for NeverConnects {
             async fn connect(
                 &self,
-            ) -> anyhow::Result<(
+            ) -> wacore::voip_control::transport::RelayResult<(
                 Arc<dyn RelayTransport>,
                 async_channel::Receiver<RelayTransportEvent>,
             )> {
@@ -7892,9 +7892,14 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
                 let _ = self.release.recv().await;
-                anyhow::bail!("released")
+                Err(
+                    wacore::voip_control::transport::RelayTransportError::adapter(
+                        std::io::Error::other("released"),
+                    ),
+                )
             }
         }
 
@@ -7941,7 +7946,8 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
                 std::future::pending().await
             }
         }
@@ -8000,11 +8006,15 @@ mod tests {
         impl RelayTransportFactory for RefusesToConnect {
             async fn connect(
                 &self,
-            ) -> anyhow::Result<(
+            ) -> wacore::voip_control::transport::RelayResult<(
                 Arc<dyn RelayTransport>,
                 async_channel::Receiver<RelayTransportEvent>,
             )> {
-                anyhow::bail!("ICE gathering produced no candidates")
+                Err(
+                    wacore::voip_control::transport::RelayTransportError::adapter(
+                        std::io::Error::other("ICE gathering produced no candidates"),
+                    ),
+                )
             }
         }
         /// Hands back a factory promptly; it is the dial behind it that refuses.
@@ -8014,7 +8024,8 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
                 Ok(Arc::new(RefusesToConnect))
             }
         }
@@ -8071,7 +8082,8 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
                 std::future::pending().await
             }
         }
@@ -8142,7 +8154,8 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
                 std::future::pending().await
             }
         }
@@ -8177,8 +8190,13 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
-                anyhow::bail!("this browser has no WebRTC")
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
+                Err(
+                    wacore::voip_control::transport::RelayTransportError::adapter(
+                        std::io::Error::other("this browser has no WebRTC"),
+                    ),
+                )
             }
         }
 
@@ -10745,7 +10763,7 @@ mod tests {
     impl RelayTransportFactory for GatedFactory {
         async fn connect(
             &self,
-        ) -> anyhow::Result<(
+        ) -> wacore::voip_control::transport::RelayResult<(
             Arc<dyn RelayTransport>,
             async_channel::Receiver<RelayTransportEvent>,
         )> {
@@ -11079,11 +11097,15 @@ mod tests {
     impl RelayTransportFactory for FailingFactory {
         async fn connect(
             &self,
-        ) -> anyhow::Result<(
+        ) -> wacore::voip_control::transport::RelayResult<(
             Arc<dyn RelayTransport>,
             async_channel::Receiver<RelayTransportEvent>,
         )> {
-            Err(anyhow::anyhow!("relay handshake timeout"))
+            Err(
+                wacore::voip_control::transport::RelayTransportError::adapter(
+                    std::io::Error::other("relay handshake timeout"),
+                ),
+            )
         }
     }
 
@@ -12218,8 +12240,13 @@ mod tests {
             async fn factory(
                 &self,
                 _relay: &wacore::voip_control::transport::RelayEndpointParams,
-            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
-                anyhow::bail!("this browser has no WebRTC")
+            ) -> wacore::voip_control::transport::RelayResult<Arc<dyn RelayTransportFactory>>
+            {
+                Err(
+                    wacore::voip_control::transport::RelayTransportError::adapter(
+                        std::io::Error::other("this browser has no WebRTC"),
+                    ),
+                )
             }
         }
 

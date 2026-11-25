@@ -151,7 +151,7 @@ struct DroppedMedia {
     packets: u32,
 }
 
-type RelaySendFuture = Fuse<BoxFuture<'static, anyhow::Result<()>>>;
+type RelaySendFuture = Fuse<BoxFuture<'static, crate::voip::transport::RelayResult<()>>>;
 
 /// The drive loop's engine-deadline timer. `Runtime::sleep` hands back an owned `'static` future, so
 /// the armed sleep outlives the iteration that armed it.
@@ -1146,7 +1146,7 @@ async fn run_call_with_clock_and_wallclock(
                 data
             };
             let t = transport.clone();
-            let fut: BoxFuture<'static, anyhow::Result<()>> =
+            let fut: BoxFuture<'static, crate::voip::transport::RelayResult<()>> =
                 Box::pin(async move { t.send(data).await });
             sending.future = fut.fuse();
             sending.kind = Some(kind);
@@ -1743,7 +1743,7 @@ mod tests {
     }
     #[async_trait]
     impl RelayTransport for RecordingTransport {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> crate::voip::transport::RelayResult<()> {
             if let Some(answers) = &self.allocate_answers
                 && stun::stun_message_type(&data) == Some(stun::MSG_ALLOCATE_REQUEST)
                 && let Some(transaction_id) = stun::stun_transaction_id(&data)
@@ -1783,7 +1783,7 @@ mod tests {
 
     #[async_trait]
     impl RelayTransport for HangingReconnectTransport {
-        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, _data: Bytes) -> crate::voip::transport::RelayResult<()> {
             Ok(())
         }
 
@@ -1794,7 +1794,7 @@ mod tests {
         async fn reconnect(
             &self,
             _endpoint: std::net::SocketAddr,
-        ) -> anyhow::Result<(
+        ) -> crate::voip::transport::RelayResult<(
             Arc<dyn RelayTransport>,
             async_channel::Receiver<RelayTransportEvent>,
         )> {
@@ -1838,7 +1838,7 @@ mod tests {
 
     #[async_trait]
     impl RelayTransport for HangingDisconnectTransport {
-        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, _data: Bytes) -> crate::voip::transport::RelayResult<()> {
             Ok(())
         }
 
@@ -1850,7 +1850,7 @@ mod tests {
 
     #[async_trait]
     impl RelayTransport for ReconnectTransport {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> crate::voip::transport::RelayResult<()> {
             self.sent.lock().unwrap().push(data);
             Ok(())
         }
@@ -1860,16 +1860,16 @@ mod tests {
         async fn reconnect(
             &self,
             endpoint: std::net::SocketAddr,
-        ) -> anyhow::Result<(
+        ) -> crate::voip::transport::RelayResult<(
             Arc<dyn RelayTransport>,
             async_channel::Receiver<RelayTransportEvent>,
         )> {
             self.reconnects.lock().unwrap().push(endpoint);
-            self.replacement
-                .lock()
-                .unwrap()
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("replacement already consumed"))
+            self.replacement.lock().unwrap().take().ok_or_else(|| {
+                crate::voip::transport::RelayTransportError::adapter(std::io::Error::other(
+                    "replacement already consumed",
+                ))
+            })
         }
     }
 
@@ -2941,11 +2941,13 @@ mod tests {
     }
     #[async_trait]
     impl RelayTransport for FailAfterTransport {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> crate::voip::transport::RelayResult<()> {
             let mut s = self.sent.lock().unwrap();
             s.push(data);
             if s.len() > self.fail_after {
-                anyhow::bail!("send failure (test terminator)");
+                return Err(crate::voip::transport::RelayTransportError::adapter(
+                    std::io::Error::other("send failure (test terminator)"),
+                ));
             }
             Ok(())
         }
@@ -3100,7 +3102,7 @@ mod tests {
     }
     #[async_trait]
     impl RelayTransport for FakeRelay {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> crate::voip::transport::RelayResult<()> {
             self.sent.lock().unwrap().push(data.clone());
             if stun::stun_message_type(&data) != Some(stun::MSG_ALLOCATE_REQUEST) {
                 return Ok(());
@@ -3282,7 +3284,7 @@ mod tests {
         struct WedgedSend;
         #[async_trait]
         impl RelayTransport for WedgedSend {
-            async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            async fn send(&self, _data: Bytes) -> crate::voip::transport::RelayResult<()> {
                 // A congested SCTP / dead link: this write never completes.
                 futures::future::pending().await
             }
@@ -4109,7 +4111,7 @@ mod tests {
         }
         #[async_trait]
         impl RelayTransport for TimedRelay {
-            async fn send(&self, packet: Bytes) -> anyhow::Result<()> {
+            async fn send(&self, packet: Bytes) -> crate::voip::transport::RelayResult<()> {
                 let video = parse_rtp_header(&packet)
                     .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264);
                 // The relay answers the Allocate: our video waits for it.
@@ -4582,10 +4584,11 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let probe = DropProbe(cancelled.clone());
-        let future: BoxFuture<'static, anyhow::Result<()>> = Box::pin(async move {
-            let _probe = probe;
-            futures::future::pending().await
-        });
+        let future: BoxFuture<'static, crate::voip::transport::RelayResult<()>> =
+            Box::pin(async move {
+                let _probe = probe;
+                futures::future::pending().await
+            });
         let mut sending = InFlightSend {
             future: future.fuse(),
             kind: Some(SendBatchKind::Media),
@@ -4808,7 +4811,7 @@ mod tests {
 
     #[async_trait]
     impl RelayTransport for ScheduleRelay {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> crate::voip::transport::RelayResult<()> {
             self.sent
                 .lock()
                 .unwrap()
@@ -5081,23 +5084,23 @@ mod tests {
 
     #[async_trait]
     impl RelayTransport for ClockedReconnectTransport {
-        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, _data: Bytes) -> crate::voip::transport::RelayResult<()> {
             Ok(())
         }
         async fn disconnect(&self) {}
         async fn reconnect(
             &self,
             _endpoint: std::net::SocketAddr,
-        ) -> anyhow::Result<ReplacementRelay> {
+        ) -> crate::voip::transport::RelayResult<ReplacementRelay> {
             *self.migration.lock().unwrap() = Some((
                 self.clock.load(Ordering::Relaxed),
                 self.arms.lock().unwrap().len(),
             ));
-            self.replacement
-                .lock()
-                .unwrap()
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("one reconnect only"))
+            self.replacement.lock().unwrap().take().ok_or_else(|| {
+                crate::voip::transport::RelayTransportError::adapter(std::io::Error::other(
+                    "one reconnect only",
+                ))
+            })
         }
     }
 

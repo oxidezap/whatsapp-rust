@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use log::debug;
@@ -42,7 +44,8 @@ use rtc_sctp::{
 
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::voip::transport::{
-    RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
+    RelayDisconnectReason, RelayResult, RelayTransport, RelayTransportError,
+    RelayTransportErrorKind, RelayTransportEvent, RelayTransportFactory,
 };
 use wacore::voip_control::relay_parse::WEB_CLIENT_RELAY_PORT;
 
@@ -743,7 +746,7 @@ async fn start_relay_media<S: DialDatagram + 'static>(
 
 #[async_trait]
 impl RelayTransport for RelayMediaChannel {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes) -> RelayResult<()> {
         match self.outbound.try_send(data) {
             Ok(()) => Ok(()),
             // The same trade the inbound side makes, in the other direction: a full queue means the
@@ -754,11 +757,13 @@ impl RelayTransport for RelayMediaChannel {
                     self.outbound
                         .send(data)
                         .await
-                        .map_err(|_| anyhow!("relay media channel closed"))?;
+                        .map_err(|_| RelayTransportError::new(RelayTransportErrorKind::Closed))?;
                 }
                 Ok(())
             }
-            Err(async_channel::TrySendError::Closed(_)) => bail!("relay media channel closed"),
+            Err(async_channel::TrySendError::Closed(_)) => {
+                Err(RelayTransportError::new(RelayTransportErrorKind::Closed))
+            }
         }
     }
 
@@ -781,7 +786,7 @@ impl RelayTransport for RelayMediaChannel {
     async fn reconnect(
         &self,
         endpoint: SocketAddr,
-    ) -> Result<(
+    ) -> RelayResult<(
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
@@ -988,7 +993,7 @@ where
 impl RelayTransportFactory for RelayMediaChannelFactory {
     async fn connect(
         &self,
-    ) -> Result<(
+    ) -> RelayResult<(
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
@@ -996,59 +1001,69 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
         // aborting those dials. Cost when the advertised port is the right one is a second UDP
         // socket for the duration of the handshake; trying serially would instead add a full
         // RELAY_CONNECT_TIMEOUT to every call on the other relay family.
-        let dialed = dial_candidates(self.addr);
-        // Whichever candidate is kept is the only record of whether this relay honoured the port it
-        // advertised, so carry the address through rather than reconstruct it. Also tags each error
-        // with its address, which would otherwise name no endpoint at all.
-        let mut candidates: Vec<Pin<Box<dyn Future<Output = Result<DialedRelay>> + Send>>> = dialed
-            .iter()
-            .map(|&addr| {
-                let runtime = self.runtime.clone();
-                let dialer = self.dialer.clone();
-                Box::pin(async move {
-                    match connect_relay_media_via(addr, runtime, dialer).await {
-                        Ok((chan, events)) => Ok((addr, chan, events)),
-                        Err(e) => Err(anyhow!("{addr}: {e}")),
-                    }
-                }) as Pin<Box<dyn Future<Output = _> + Send>>
-            })
-            .collect();
-        let tried = dialed
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        // With the web-client port raced beside the advertised one, the first to answer is not
-        // necessarily the one to keep; see `WEB_CLIENT_PORT_GRACE`.
-        let race: Pin<Box<dyn Future<Output = Result<(DialedRelay, PortChoice)>> + Send + '_>> =
-            match (candidates.pop(), candidates.pop()) {
-                (Some(web_client), Some(advertised)) if candidates.is_empty() => Box::pin(
-                    prefer_web_client_port(&*self.runtime, advertised, web_client),
-                ),
-                (last, previous) => Box::pin(async move {
-                    let all: Vec<_> = candidates.into_iter().chain(previous).chain(last).collect();
-                    futures::future::select_ok(all)
-                        .await
-                        .map(|(won, _)| (won, PortChoice::OnlyCandidate))
-                }),
-            };
-        // Bound the UDP+DTLS+SCTP+DataChannel handshake: a relay whose UDP is reachable but whose
-        // DTLS/SCTP wedges (black-holed endpoint) would otherwise park the caller forever with no
-        // failure surfaced. Matches the old connect_and_allocate's 12s timeout.
-        let ((kept, chan, events), choice) =
-            wacore::runtime::timeout(&*self.runtime, RELAY_CONNECT_TIMEOUT, race)
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} \
+        let result: Result<_> = async {
+            let dialed = dial_candidates(self.addr);
+            // Whichever candidate is kept is the only record of whether this relay honoured the port it
+            // advertised, so carry the address through rather than reconstruct it. Also tags each error
+            // with its address, which would otherwise name no endpoint at all.
+            let mut candidates: Vec<Pin<Box<dyn Future<Output = Result<DialedRelay>> + Send>>> =
+                dialed
+                    .iter()
+                    .map(|&addr| {
+                        let runtime = self.runtime.clone();
+                        let dialer = self.dialer.clone();
+                        Box::pin(async move {
+                            match connect_relay_media_via(addr, runtime, dialer).await {
+                                Ok((chan, events)) => Ok((addr, chan, events)),
+                                Err(e) => Err(anyhow!("{addr}: {e}")),
+                            }
+                        }) as Pin<Box<dyn Future<Output = _> + Send>>
+                    })
+                    .collect();
+            let tried = dialed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            // With the web-client port raced beside the advertised one, the first to answer is not
+            // necessarily the one to keep; see `WEB_CLIENT_PORT_GRACE`.
+            let race: Pin<Box<dyn Future<Output = Result<(DialedRelay, PortChoice)>> + Send + '_>> =
+                match (candidates.pop(), candidates.pop()) {
+                    (Some(web_client), Some(advertised)) if candidates.is_empty() => Box::pin(
+                        prefer_web_client_port(&*self.runtime, advertised, web_client),
+                    ),
+                    (last, previous) => Box::pin(async move {
+                        let all: Vec<_> =
+                            candidates.into_iter().chain(previous).chain(last).collect();
+                        futures::future::select_ok(all)
+                            .await
+                            .map(|(won, _)| (won, PortChoice::OnlyCandidate))
+                    }),
+                };
+            // Bound the UDP+DTLS+SCTP+DataChannel handshake: a relay whose UDP is reachable but whose
+            // DTLS/SCTP wedges (black-holed endpoint) would otherwise park the caller forever with no
+            // failure surfaced. Matches the old connect_and_allocate's 12s timeout.
+            let ((kept, chan, events), choice) =
+                wacore::runtime::timeout(&*self.runtime, RELAY_CONNECT_TIMEOUT, race)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} \
                  (DTLS/SCTP didn't complete); tried {tried}"
-                    )
-                })?
-                .map_err(|e| anyhow!("relay connect: {e}; tried {tried}"))?;
-        // Which ports answered and which was kept diverge per host and per session, so this is the
-        // only place that is observable in production.
-        debug!("{}", connected_message(kept, self.addr, choice));
-        Ok((Arc::new(chan) as Arc<dyn RelayTransport>, events))
+                        )
+                    })?
+                    .map_err(|e| anyhow!("relay connect: {e}; tried {tried}"))?;
+            // Which ports answered and which was kept diverge per host and per session, so this is the
+            // only place that is observable in production.
+            debug!("{}", connected_message(kept, self.addr, choice));
+            Ok((Arc::new(chan) as Arc<dyn RelayTransport>, events))
+        }
+        .await;
+        result.map_err(|error| {
+            RelayTransportError::from_boxed(
+                error.reallocate_into_boxed_dyn_error_without_backtrace(),
+            )
+        })
     }
 }
 
