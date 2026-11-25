@@ -29,7 +29,7 @@ macro_rules! iq_ensure {
 }
 
 /// Typed error returned by generated IQ response parsers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum IqResponseError {
     RequestContextNotIq,
     RequestContextMissingId,
@@ -155,6 +155,12 @@ impl std::fmt::Display for IqResponseError {
             Self::Rejection { module, reason } => write!(f, "{module}: {reason}"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
+    }
+}
+
+impl std::fmt::Debug for IqResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 

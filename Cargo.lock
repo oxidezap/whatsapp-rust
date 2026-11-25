@@ -5542,7 +5542,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-codegen"
 version = "0.2.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=3aa41450675ef29e84591bc4d8435a6156bb40d7#3aa41450675ef29e84591bc4d8435a6156bb40d7"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=8df95cd0cd7cce4a7625d9603409d4aaffe1e48a#8df95cd0cd7cce4a7625d9603409d4aaffe1e48a"
 dependencies = [
  "regex",
  "serde_json",
@@ -5560,7 +5560,7 @@ dependencies = [
 [[package]]
 name = "wa-ir"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=3aa41450675ef29e84591bc4d8435a6156bb40d7#3aa41450675ef29e84591bc4d8435a6156bb40d7"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=8df95cd0cd7cce4a7625d9603409d4aaffe1e48a#8df95cd0cd7cce4a7625d9603409d4aaffe1e48a"
 dependencies = [
  "serde",
 ]
