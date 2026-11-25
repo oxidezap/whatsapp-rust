@@ -3,7 +3,7 @@ pub mod preparation;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_lock::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -225,6 +225,93 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
     macs
 }
 
+#[derive(Error)]
+#[non_exhaustive]
+pub enum AppStatePreparationErrorKind {
+    #[error("{0}")]
+    Validation(#[source] crate::appstate::validation::ValidationError),
+    #[error("{0}")]
+    SnapshotIntegrity(#[source] crate::appstate::validation::ValidationError),
+    #[error("{0}")]
+    ExternalBlob(#[source] ExternalBlobError),
+    #[error("download external snapshot for {name:?}")]
+    DownloadSnapshot {
+        name: WAPatchName,
+        #[source]
+        source: ExternalBlobError,
+    },
+    #[error("decode external snapshot for {name:?}")]
+    DecodeSnapshot {
+        name: WAPatchName,
+        #[source]
+        source: buffa::DecodeError,
+    },
+    #[error("download external mutations for {name:?} v{version}")]
+    DownloadMutations {
+        name: WAPatchName,
+        version: u64,
+        #[source]
+        source: ExternalBlobError,
+    },
+    #[error("decode external mutations for {name:?} v{version}")]
+    DecodeMutations {
+        name: WAPatchName,
+        version: u64,
+        #[source]
+        source: buffa::DecodeError,
+    },
+}
+
+debug_as_display!(AppStatePreparationErrorKind);
+
+pub struct AppStatePreparationError(Box<AppStatePreparationErrorKind>);
+
+impl AppStatePreparationError {
+    fn new(kind: AppStatePreparationErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &AppStatePreparationErrorKind {
+        &self.0
+    }
+}
+
+impl From<crate::appstate::validation::ValidationError> for AppStatePreparationError {
+    fn from(error: crate::appstate::validation::ValidationError) -> Self {
+        Self::new(AppStatePreparationErrorKind::Validation(error))
+    }
+}
+
+impl From<ExternalBlobError> for AppStatePreparationError {
+    fn from(error: ExternalBlobError) -> Self {
+        Self::new(AppStatePreparationErrorKind::ExternalBlob(error))
+    }
+}
+
+impl std::fmt::Display for AppStatePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, formatter)
+    }
+}
+
+debug_as_display!(AppStatePreparationError);
+
+impl std::error::Error for AppStatePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+fn preparation_into_anyhow(error: AppStatePreparationError) -> anyhow::Error {
+    match *error.0 {
+        AppStatePreparationErrorKind::SnapshotIntegrity(error) => {
+            anyhow::Error::new(error).context(crate::appstate::AppStateError::SnapshotMACMissing)
+        }
+        AppStatePreparationErrorKind::Validation(error) => anyhow::Error::new(error),
+        other => anyhow::Error::new(AppStatePreparationError::new(other)),
+    }
+}
+
 /// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
 /// linear scan instead of a sort; above it the sort wins despite allocating
 /// every MAC before deduping.
@@ -241,7 +328,7 @@ struct PatchListProgress {
 /// Validate collection metadata before admitting external downloads.
 /// Large lists belong on a blocking worker, as in [`AppStateProcessor::prepare_patch_list`].
 #[inline(never)]
-pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
+pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<(), AppStatePreparationError> {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     prepared_validation_tests::METADATA_VALIDATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     let name = pl.name;
@@ -261,23 +348,26 @@ pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
 }
 
 #[inline(never)]
-fn validate_snapshot_for_processing(collection: &str, snapshot: &wa::SyncdSnapshot) -> Result<()> {
+fn validate_snapshot_for_processing(
+    collection: &str,
+    snapshot: &wa::SyncdSnapshot,
+) -> Result<(), AppStatePreparationError> {
     crate::appstate::validation::validate_snapshot(collection, snapshot).map_err(|error| {
         if matches!(
             error.metric.as_deref(),
             Some("MISSING_SNAPSHOT_MAC" | "MISSING_SNAPSHOT_KEY_ID")
         ) {
-            anyhow::Error::new(error).context(crate::appstate::AppStateError::SnapshotMACMissing)
+            AppStatePreparationError::new(AppStatePreparationErrorKind::SnapshotIntegrity(error))
         } else {
-            anyhow::Error::new(error)
+            error.into()
         }
     })
 }
 
 #[cfg(test)]
 fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
-    validate_patch_list_metadata(pl)?;
-    decode_external_blobs(pl, download, true)
+    validate_patch_list_metadata(pl).map_err(preparation_into_anyhow)?;
+    decode_external_blobs(pl, download, true).map_err(preparation_into_anyhow)
 }
 
 #[inline(never)]
@@ -285,16 +375,24 @@ fn decode_external_blobs(
     pl: &mut PatchList,
     download: &BlobDownloadFn<'_>,
     validate: bool,
-) -> Result<()> {
+) -> Result<(), AppStatePreparationError> {
     let name = pl.name;
     let collection = name.as_str();
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
-        let data =
-            download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = waproto::codec::syncd_snapshot_decode(&data)
-            .with_context(|| format!("decode external snapshot for {name:?}"))?;
+        let data = download(ext).map_err(|source| {
+            AppStatePreparationError::new(AppStatePreparationErrorKind::DownloadSnapshot {
+                name,
+                source,
+            })
+        })?;
+        let snapshot = waproto::codec::syncd_snapshot_decode(&data).map_err(|source| {
+            AppStatePreparationError::new(AppStatePreparationErrorKind::DecodeSnapshot {
+                name,
+                source,
+            })
+        })?;
         if validate {
             validate_snapshot_for_processing(collection, &snapshot)?;
         }
@@ -308,10 +406,21 @@ fn decode_external_blobs(
                 .as_option()
                 .and_then(|x| x.version)
                 .unwrap_or(0);
-            let data = download(ext)
-                .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = waproto::codec::syncd_mutations_decode(&data)
-                .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
+            let data = download(ext).map_err(|source| {
+                AppStatePreparationError::new(AppStatePreparationErrorKind::DownloadMutations {
+                    name,
+                    version: v,
+                    source,
+                })
+            })?;
+            let ext_mutations =
+                waproto::codec::syncd_mutations_decode(&data).map_err(|source| {
+                    AppStatePreparationError::new(AppStatePreparationErrorKind::DecodeMutations {
+                        name,
+                        version: v,
+                        source,
+                    })
+                })?;
             if validate {
                 for mutation in &ext_mutations.mutations {
                     crate::appstate::validation::validate_mutation(collection, mutation)?;
@@ -351,7 +460,7 @@ fn decode_external_blobs(
 #[derive(Debug)]
 pub struct MetadataValidatedPatchList {
     list: PatchList,
-    error: Option<anyhow::Error>,
+    error: Option<AppStatePreparationError>,
 }
 impl MetadataValidatedPatchList {
     /// Validate an owned list. Large collections belong on a blocking worker.
@@ -376,7 +485,7 @@ impl MetadataValidatedPatchList {
 #[derive(Debug)]
 pub struct PreparedPatchList {
     list: PatchList,
-    error: Option<anyhow::Error>,
+    error: Option<AppStatePreparationError>,
 }
 impl PreparedPatchList {
     pub fn list(&self) -> &PatchList {
@@ -387,7 +496,7 @@ impl PreparedPatchList {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ExternalBlobError {
     #[error("external blob has no directPath")]
@@ -397,6 +506,8 @@ pub enum ExternalBlobError {
     #[error("{0}")]
     Download(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
+
+debug_as_display!(ExternalBlobError);
 
 impl ExternalBlobError {
     pub fn download(error: impl std::error::Error + Send + Sync + 'static) -> Self {
@@ -1397,7 +1508,7 @@ impl AppStateProcessor {
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let PreparedPatchList { list, error } = prepared;
         if let Some(error) = error {
-            return Err(error);
+            return Err(preparation_into_anyhow(error));
         }
         if list.error.is_some() {
             let state = self
@@ -1481,15 +1592,10 @@ impl AppStateProcessor {
         // patch (silent data loss). Mark the collection retryable and skip it, so
         // the caller re-fetches it instead of persisting partial state.
         if let Some(e) = error {
-            if matches!(
-                e.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(
-                    crate::appstate::AppStateError::SnapshotMACMissing
-                        | crate::appstate::AppStateError::SnapshotMACMismatch
-                )
-            ) {
-                return Err(e);
+            if matches!(e.kind(), AppStatePreparationErrorKind::SnapshotIntegrity(_)) {
+                return Err(preparation_into_anyhow(e));
             }
+            let e = preparation_into_anyhow(e);
             log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e:#}", pl.name);
             pl.error = Some(CollectionSyncError::Retry {
                 code: 0,
@@ -1932,8 +2038,8 @@ impl AppStateProcessor {
     ) -> Result<Vec<Vec<u8>>> {
         // Check the original metadata before inlining can erase conflicting
         // inline mutations. Owned runtime callers use blocking preparation.
-        validate_patch_list_metadata(pl)?;
-        decode_external_blobs(pl, download, false)?;
+        validate_patch_list_metadata(pl).map_err(preparation_into_anyhow)?;
+        decode_external_blobs(pl, download, false).map_err(preparation_into_anyhow)?;
         Ok(self.get_missing_key_ids(pl).await?)
     }
 }
@@ -2567,6 +2673,10 @@ mod prepared_validation_tests {
         snapshot.key_id = Default::default();
         let validated = metadata_token(&processor, list(snapshot)).await;
         assert!(!validated.can_download());
+        assert!(matches!(
+            validated.error.as_ref().map(AppStatePreparationError::kind),
+            Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
+        ));
         let prepared = processor
             .prepare_metadata_validated_patch_list(validated, &|_| panic!("invalid metadata"))
             .await;
