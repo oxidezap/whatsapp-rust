@@ -37,7 +37,7 @@ pub fn independent_downloader(
 pub fn bridge_http(
     client: &Client,
     request: whatsapp_rust::http::HttpRequest,
-) -> BoxFuture<'_, whatsapp_rust::anyhow::Result<whatsapp_rust::http::HttpResponse>> {
+) -> BoxFuture<'_, Result<whatsapp_rust::http::HttpResponse, whatsapp_rust::http::HttpError>> {
     Box::pin(async move { client.http_client().execute(request).await })
 }
 
