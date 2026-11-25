@@ -115,7 +115,7 @@ fn bot_metadata_clone_preserves_nested_fields_without_aliasing() {
     let mut original = wa::BotMetadata::default();
     original.persona_id = Some("fixture-persona".into());
     original.session_metadata = Some(session).into();
-    original.ai_conversation_context = Some(vec![1, 2, 3].into());
+    original.ai_conversation_context = Some(vec![1, 2, 3]);
 
     let encoded = original.encode_to_vec();
     let mut cloned = original.clone();
@@ -136,7 +136,7 @@ fn media_message_clone_preserves_nested_data_without_aliasing() {
     context.stanza_id = Some("fixture-stanza".into());
     let mut image = wa::message::ImageMessage::default();
     image.caption = Some("fixture-image".into());
-    image.jpeg_thumbnail = Some(vec![1, 2, 3].into());
+    image.jpeg_thumbnail = Some(vec![1, 2, 3]);
     image.context_info = Some(context).into();
     let mut message = wa::Message::default();
     message.image_message = Some(image).into();
