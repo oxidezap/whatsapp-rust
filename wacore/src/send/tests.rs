@@ -4147,10 +4147,7 @@ mod mark_full_distribution_list {
             .err()
             .expect("a missing sender key must error");
         assert!(
-            matches!(
-                err.downcast_ref::<SignalProtocolError>(),
-                Some(SignalProtocolError::NoSenderKeyState(_))
-            ),
+            matches!(err, SignalProtocolError::NoSenderKeyState(_)),
             "NoSenderKeyState must survive the delegation for the SKDM-redistribution retry, got: {err:#}"
         );
     }

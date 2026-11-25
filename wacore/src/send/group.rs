@@ -583,7 +583,8 @@ pub async fn prepare_group_stanza_resolved(
             &plaintext,
             &mut rand::make_rng::<rand::rngs::StdRng>(),
         )
-        .await?
+        .await
+        .context("group encrypt failed")?
     };
 
     // Release before buffer cleanup and the chain-independent stanza build.

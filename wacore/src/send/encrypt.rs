@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::stats::UnkeyableDevice;
-use anyhow::Context;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use wacore_binary::node::{Attrs, AttrsVec, NodeContent};
@@ -19,16 +18,13 @@ pub async fn encrypt_group_message<S, R>(
     sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
-) -> Result<SerializedCiphertext>
+) -> Result<SerializedCiphertext, crate::libsignal::protocol::SignalProtocolError>
 where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
 {
     // Delegate to the libsignal primitive so the sender-key advance, the wire
-    // gate, and the iteration lease live in exactly one place. `.context` keeps
-    // the concrete SignalProtocolError as the source, so callers can still
-    // downcast NoSenderKeyState to clear stale tracking and retry with SKDM
-    // redistribution.
+    // gate, and the iteration lease live in exactly one place.
     crate::libsignal::protocol::group_encrypt_serialized(
         sender_key_store,
         sender_key_name,
@@ -36,7 +32,6 @@ where
         csprng,
     )
     .await
-    .context("group encrypt failed")
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The
