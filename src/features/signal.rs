@@ -28,6 +28,8 @@ pub enum SignalError {
     SessionSetup(#[from] wacore::send::SessionSetupError),
     #[error("{0}")]
     Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    SenderKeyCache(#[from] wacore::store::signal_cache::SenderKeyCacheError),
     #[error("session check failed: {0}")]
     SessionCheck(#[source] wacore::store::error::StoreError),
     /// The requested operation is not valid for this input (e.g. a sender-key

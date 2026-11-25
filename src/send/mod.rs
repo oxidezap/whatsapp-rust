@@ -70,6 +70,8 @@ pub enum SendError {
     /// No requested status recipient resolved to an address.
     #[error("{0}")]
     StatusRecipients(#[from] wacore::send::StatusRecipientsError),
+    #[error("{0}")]
+    SenderKeyCache(#[source] Box<wacore::store::signal_cache::SenderKeyCacheError>),
     /// A DM could not be encrypted for a single device of the recipient, so
     /// nothing was sent. Distinct from a transport failure: the connection is
     /// fine and the message id was never on the wire, so the useful retry is
@@ -154,6 +156,12 @@ impl From<wacore::send::DmStanzaError> for SendError {
             wacore::send::DmStanzaError::NoRecipient(error) => Self::NoRecipientDevice(error),
             other => Self::Internal(other.into()),
         }
+    }
+}
+
+impl From<wacore::store::signal_cache::SenderKeyCacheError> for SendError {
+    fn from(error: wacore::store::signal_cache::SenderKeyCacheError) -> Self {
+        Self::SenderKeyCache(Box::new(error))
     }
 }
 

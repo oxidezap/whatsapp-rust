@@ -4,15 +4,6 @@ use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum SessionCheckoutError {
-    #[error("session is already checked out")]
-    AlreadyCheckedOut,
-    #[error("{0}")]
-    Store(#[from] crate::store::error::StoreError),
-}
-
 use anyhow::Result;
 use async_lock::Mutex;
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +15,24 @@ use crate::libsignal::protocol::{
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionCheckoutError {
+    #[error("session is already checked out")]
+    AlreadyCheckedOut,
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SenderKeyCacheError {
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+    #[error("{0}")]
+    Signal(#[from] SignalProtocolError),
+}
 
 type StoreIncarnation = [u8; 16];
 
@@ -2572,7 +2581,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<SenderKeyRecord>>> {
+    ) -> std::result::Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> {
         let key = name.cache_key();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -2588,13 +2597,13 @@ impl SignalStoreCache {
             // half of the miss. Errors are held rather than raised, so a
             // concurrent write still wins the re-check below: an unreadable row
             // must not fail an operation the cache can already answer.
-            let decoded: Result<Option<Arc<SenderKeyRecord>>> =
+            let decoded: std::result::Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> =
                 match backend.get_sender_key(key).await {
                     Ok(Some(bytes)) => SenderKeyRecord::deserialize_for_store(&bytes, &incarnation)
                         .map(|record| Some(Arc::new(record)))
-                        .map_err(anyhow::Error::from),
+                        .map_err(SenderKeyCacheError::from),
                     Ok(None) => Ok(None),
-                    Err(error) => Err(anyhow::Error::from(error)),
+                    Err(error) => Err(SenderKeyCacheError::from(error)),
                 };
 
             let mut state = self.sender_keys.lock().await;
@@ -3702,6 +3711,21 @@ mod sender_key_lock_tests {
             .expect("warm load")
             .expect("record present");
         assert_eq!(chain_id_of(&warm), 7);
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_sender_key_keeps_signal_error() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550003@g.us", "19995550004@s.whatsapp.net:0");
+        backend
+            .put_sender_key(name.cache_key(), &[0xff])
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get_sender_key(&name, &backend).await,
+            Err(SenderKeyCacheError::Signal(_))
+        ));
     }
 
     #[tokio::test]
