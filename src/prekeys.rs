@@ -6,7 +6,6 @@
 
 use crate::client::Client;
 use anyhow;
-use anyhow::Context as _;
 use futures::FutureExt as _;
 use log;
 
@@ -48,6 +47,102 @@ pub(crate) enum PrimaryIdentityError {
     #[error("invalid primary signed prekey signature")]
     InvalidSignature,
 }
+
+/// Failure while allocating, persisting or uploading prekeys.
+pub struct PreKeyUploadError(Box<PreKeyUploadErrorKind>);
+
+impl PreKeyUploadError {
+    pub fn new(kind: PreKeyUploadErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &PreKeyUploadErrorKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> PreKeyUploadErrorKind {
+        *self.0
+    }
+}
+
+impl std::fmt::Display for PreKeyUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Debug for PreKeyUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)?;
+        let mut source = std::error::Error::source(&*self.0).and_then(|error| error.source());
+        for _ in 0..16 {
+            let Some(error) = source else { break };
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PreKeyUploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// The operation that prevented a prekey upload.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PreKeyUploadErrorKind {
+    #[error("{0}")]
+    Store(#[source] wacore::store::error::StoreError),
+    #[error("{0}")]
+    Signal(#[source] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Curve(#[source] wacore::libsignal::core::CurveError),
+    #[error("{0}")]
+    Decode(#[source] buffa::DecodeError),
+    #[error("{0}")]
+    Iq(#[source] crate::request::IqError),
+    #[error("failed to flush prekey watermarks: {0}")]
+    FlushWatermarks(#[source] wacore::store::error::StoreError),
+    #[error("failed to flush prekey watermark after mark: {0}")]
+    FlushMarkedWatermark(#[source] wacore::store::error::StoreError),
+    #[error("failed to flush abandon watermark: {0}")]
+    FlushAbandonWatermark(#[source] wacore::store::error::StoreError),
+    #[error("no prekey available to upload")]
+    NoPrekey,
+    #[error("no decodable prekey available to upload")]
+    NoDecodablePrekey,
+    #[error("record missing public key")]
+    MissingPublicKey,
+    #[error("Connection lost during pre-key upload retry")]
+    ConnectionLost,
+}
+
+impl std::fmt::Debug for PreKeyUploadErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+macro_rules! prekey_upload_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for PreKeyUploadError {
+            fn from(error: $source) -> Self {
+                Self::new(PreKeyUploadErrorKind::$variant(error))
+            }
+        })+
+    };
+}
+
+prekey_upload_error_from!(
+    wacore::store::error::StoreError => Store,
+    wacore::libsignal::protocol::SignalProtocolError => Signal,
+    wacore::libsignal::core::CurveError => Curve,
+    buffa::DecodeError => Decode,
+    crate::request::IqError => Iq,
+);
 
 /// Separate from Signal locks: a slow cold lookup must not block a warm
 /// companion waiting for offline-processing admission. Only active flights
@@ -694,7 +789,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), PreKeyUploadError> {
         let has_prekeys = self
             .persistence_manager
             .get_device_snapshot()
@@ -738,16 +833,13 @@ impl Client {
         &self,
         force: bool,
         wanted: Option<usize>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         // Decision is should_upload_pre_keys(force, count), but a forced upload short-circuits
         // and skips the server-count IQ entirely: WA Web's handlePreKeyLow uploads
         // unconditionally, so a stale or transiently-failing count must never block or delay
         // the replenish. Only a non-forced caller queries the count and applies the guard.
         if !force {
-            let server_count = self
-                .get_server_pre_key_count()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let server_count = self.get_server_pre_key_count().await?;
 
             if !should_upload_pre_keys(force, server_count) {
                 log::debug!("Server has {server_count} pre-keys, no upload needed.");
@@ -781,7 +873,7 @@ impl Client {
     )]
     pub(crate) async fn get_or_gen_single_pre_key(
         &self,
-    ) -> Result<(u32, PublicKey), anyhow::Error> {
+    ) -> Result<(u32, PublicKey), PreKeyUploadError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let backend = device_snapshot.backend.clone();
         let max_id = if prekey_watermarks_need_recovery(
@@ -864,10 +956,9 @@ impl Client {
         // Same durability pairing as the batch path: the stored key is
         // durable, so its watermarks must not ride the lazy saver. A failed
         // flush fails the allocation; the retry dance recovers later.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermarks")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushWatermarks(error))
+        })?;
         Ok((id, key_pair.public_key))
     }
 
@@ -881,7 +972,7 @@ impl Client {
         &self,
         _guard: &async_lock::MutexGuard<'_, ()>,
         id: u32,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         if device_snapshot.first_unupload_pre_key_id != id {
             return Ok(());
@@ -904,10 +995,9 @@ impl Client {
                 first_unupload_pre_key_id: next_first,
             })
             .await;
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermark after mark")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushMarkedWatermark(error))
+        })?;
         Ok(())
     }
 
@@ -923,12 +1013,15 @@ impl Client {
             err(Debug)
         )
     )]
-    async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
+    async fn upload_pre_keys_inner(&self) -> Result<(), PreKeyUploadError> {
         let wanted = self.wanted_pre_key_count.load(Ordering::Relaxed);
         self.upload_pre_keys_inner_with_count(wanted).await
     }
 
-    async fn upload_pre_keys_inner_with_count(&self, wanted: usize) -> Result<(), anyhow::Error> {
+    async fn upload_pre_keys_inner_with_count(
+        &self,
+        wanted: usize,
+    ) -> Result<(), PreKeyUploadError> {
         self.upload_pre_keys_pass(true, wanted).await
     }
 
@@ -941,7 +1034,7 @@ impl Client {
         &self,
         allow_collapse_retry: bool,
         configured: usize,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         // INVARIANT: every caller holds `prekey_upload_lock` (login, prekey-low
         // notification, refresh, digest repair), serializing the watermark math
         // with the retry-receipt single-key path.
@@ -1061,10 +1154,9 @@ impl Client {
         // pre-generation watermarks and orphan the stored window. A failed
         // flush aborts the pass: proceeding would upload keys whose
         // accounting is not durable, the exact state this barrier prevents.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermarks")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushWatermarks(error))
+        })?;
 
         // Only the leftover (already-stored) window keys are read back and decoded;
         // the fresh ones are already in `fresh_pre_keys`. On the common connect path
@@ -1096,7 +1188,7 @@ impl Client {
                 );
                 return Box::pin(self.upload_pre_keys_pass(false, configured)).await;
             }
-            anyhow::bail!("no prekey available to upload");
+            return Err(PreKeyUploadError::new(PreKeyUploadErrorKind::NoPrekey));
         }
 
         let pre_key_pairs = if leftover_rows.is_empty() {
@@ -1110,12 +1202,12 @@ impl Client {
             // decode entirely; their public keys never left memory.
             for (id, record) in &leftover_rows {
                 let public_key = waproto::codec::pre_key_record_decode(&record[..])
-                    .map_err(anyhow::Error::from)
+                    .map_err(PreKeyUploadError::from)
                     .and_then(|s| {
-                        let raw = s
-                            .public_key
-                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                        let raw = s.public_key.ok_or_else(|| {
+                            PreKeyUploadError::new(PreKeyUploadErrorKind::MissingPublicKey)
+                        })?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(PreKeyUploadError::from)
                     });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
@@ -1128,7 +1220,9 @@ impl Client {
             pairs
         };
         if pre_key_pairs.is_empty() {
-            anyhow::bail!("no decodable prekey available to upload");
+            return Err(PreKeyUploadError::new(
+                PreKeyUploadErrorKind::NoDecodablePrekey,
+            ));
         }
         let last_id = pre_key_pairs
             .last()
@@ -1162,10 +1256,9 @@ impl Client {
         // crash after a failed IQ would otherwise reload FIRST=window_start
         // and re-offer ids that may already be in the server pool. A failed
         // flush aborts instead of sending with non-durable abandonment.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush abandon watermark")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushAbandonWatermark(error))
+        })?;
 
         self.execute(spec).await?;
 
@@ -1210,7 +1303,7 @@ impl Client {
     pub(crate) async fn upload_pre_keys_with_retry(
         &self,
         force: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         self.upload_pre_keys_with_retry_count(force, None).await
     }
 
@@ -1228,7 +1321,7 @@ impl Client {
         &self,
         force: bool,
         wanted: Option<usize>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         let mut delay_a: u64 = 1;
         let mut delay_b: u64 = 2;
         const MAX_DELAY_SECS: u64 = 610;
@@ -1253,8 +1346,8 @@ impl Client {
                     // Bail if disconnected during retry wait
                     if !self.is_logged_in() {
                         wacore::telemetry::prekey_upload("fail");
-                        return Err(anyhow::anyhow!(
-                            "Connection lost during pre-key upload retry"
+                        return Err(PreKeyUploadError::new(
+                            PreKeyUploadErrorKind::ConnectionLost,
                         ));
                     }
 
@@ -1290,7 +1383,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn refresh_pre_keys(&self) -> Result<(), anyhow::Error> {
+    pub async fn refresh_pre_keys(&self) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry(true).await
     }
@@ -1308,7 +1401,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn refresh_pre_keys_with_count(&self, count: usize) -> Result<(), anyhow::Error> {
+    pub async fn refresh_pre_keys_with_count(&self, count: usize) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry_count(true, Some(count))
             .await
@@ -1324,7 +1417,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn ensure_pre_keys(&self) -> Result<(), anyhow::Error> {
+    pub async fn ensure_pre_keys(&self) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry(false).await
     }
@@ -1348,7 +1441,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
+    pub async fn validate_digest_key(&self) -> Result<(), PreKeyUploadError> {
         // Hold the lock across the whole pass so the 404 re-upload can't race with
         // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on
         // `next_pre_key_id` allocation.
@@ -1551,6 +1644,22 @@ mod tests {
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
         clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[test]
+    fn watermark_failure_preserves_backend_source() {
+        use std::error::Error as _;
+        let backend = wacore::store::error::StoreError::Database(Box::new(std::io::Error::other(
+            "prekey backend failure",
+        )));
+        let error =
+            super::PreKeyUploadError::new(super::PreKeyUploadErrorKind::FlushWatermarks(backend));
+        assert!(matches!(
+            error.kind(),
+            super::PreKeyUploadErrorKind::FlushWatermarks(_)
+        ));
+        assert!(format!("{error:?}").contains("prekey backend failure"));
+        assert!(error.source().and_then(|source| source.source()).is_some());
+    }
 
     #[tokio::test]
     async fn adv_bootstrap_authenticates_primary_prekeys_before_persisting_trust() {

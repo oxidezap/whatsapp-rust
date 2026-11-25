@@ -179,6 +179,8 @@ pub enum RetryRequestError {
     InvalidStanza(#[source] wacore::messages::MessageInfoError),
     #[error("{0}")]
     Client(#[from] ClientError),
+    #[error("{0}")]
+    PreKey(#[from] crate::prekeys::PreKeyUploadError),
     #[error("failed to prepare retry request")]
     Internal(#[from] anyhow::Error),
 }
