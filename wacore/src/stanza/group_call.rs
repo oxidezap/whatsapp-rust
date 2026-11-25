@@ -29,6 +29,67 @@ const MAX_RELAY_TOKENS: usize = 64;
 const MAX_WAITING_ROOM_USERS: usize = 128;
 const MAX_WAITING_ROOM_RETAINED_BYTES: usize = 1024 * 1024;
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupCallBuildError {
+    #[error("call id is required")]
+    MissingCallId,
+    #[error("call stanza id is required")]
+    MissingStanzaId,
+    #[error("call creator is required")]
+    MissingCreator,
+    #[error("group-bound offer requires self and at least one remote participant")]
+    GroupOfferNeedsRemote,
+    #[error("group offer requires self and at least two remote participants")]
+    OfferNeedsTwoRemotes,
+    #[error("group offer has {actual} participants, maximum is {max}", max = GROUP_CALL_MAX_PARTICIPANTS)]
+    TooManyParticipants { actual: usize },
+    #[error("group offer audio rate must be non-zero")]
+    InvalidAudioRate,
+    #[error("group offer group_jid must use @g.us")]
+    InvalidGroupJid,
+    #[error("group invite target is required")]
+    MissingInviteTarget,
+    #[error("group invite requires at least one target device")]
+    MissingInviteDevices,
+    #[error("group invite requires an active roster")]
+    MissingInviteRoster,
+    #[error("group invite device orientation must be quarter turns in 0..=3")]
+    InvalidOrientation,
+    #[error("participant {participant} has no jid")]
+    MissingParticipantJid { participant: usize },
+    #[error("participant {participant} has no devices")]
+    MissingParticipantDevices { participant: usize },
+    #[error("participant {participant} device {device} has no jid")]
+    MissingParticipantDeviceJid { participant: usize, device: usize },
+    #[error("{0}")]
+    DeviceIdentity(#[from] crate::send::DeviceIdentityError),
+    #[error("group epoch transaction id must be non-zero")]
+    MissingTransactionId,
+    #[error("group epoch ciphertext target does not match stanza target")]
+    EpochTargetMismatch,
+    #[error("group epoch ciphertext is empty")]
+    EmptyEpochCiphertext,
+    #[error("unsupported group epoch encryption type")]
+    UnsupportedEpochEncryption,
+    #[error("pre-key group epoch requires device identity")]
+    MissingDeviceIdentity,
+    #[error("call-link token is required")]
+    MissingLinkToken,
+    #[error("call-link capability is required")]
+    MissingLinkCapability,
+    #[error("call request id is required")]
+    MissingRequestId,
+    #[error("waiting-room user is required")]
+    MissingWaitingRoomUser,
+    #[error("raise-hand target is required")]
+    MissingRaiseHandTarget,
+    #[error("screen-share target is required")]
+    MissingScreenShareTarget,
+}
+
+debug_as_display!(GroupCallBuildError);
+
 // Group signaling is control-plane traffic. Marking its entry points cold keeps fat LTO from
 // expanding parser and builder error paths into the default call handler.
 
@@ -74,7 +135,7 @@ pub fn build_active_group_preaccept(
     call_creator: &Jid,
     request_id: &str,
     video: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_preaccept(
         call_id,
@@ -93,7 +154,7 @@ pub fn build_active_group_accept(
     call_creator: &Jid,
     request_id: &str,
     video: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_accept(&AcceptParams {
         call_id,
@@ -113,23 +174,24 @@ pub fn build_active_group_accept(
 
 /// Build an initial group offer in the server-enforced child order.
 #[cold]
-pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result<Node> {
+pub fn build_initial_group_offer(
+    params: &InitialGroupOfferParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     let min_remote = group_call_min_remote_participants(params.group_jid.is_some());
     if params.participants.len() < 1 + min_remote {
         if params.group_jid.is_some() {
-            bail!("group-bound offer requires self and at least one remote participant");
+            return Err(GroupCallBuildError::GroupOfferNeedsRemote);
         }
-        bail!("group offer requires self and at least two remote participants");
+        return Err(GroupCallBuildError::OfferNeedsTwoRemotes);
     }
     if params.participants.len() > GROUP_CALL_MAX_PARTICIPANTS {
-        bail!(
-            "group offer has {} participants, maximum is {GROUP_CALL_MAX_PARTICIPANTS}",
-            params.participants.len()
-        );
+        return Err(GroupCallBuildError::TooManyParticipants {
+            actual: params.participants.len(),
+        });
     }
     if params.audio_rate == 0 {
-        bail!("group offer audio rate must be non-zero");
+        return Err(GroupCallBuildError::InvalidAudioRate);
     }
 
     let users = build_group_users(params.participants, Some(params.call_creator), params.video)?;
@@ -146,7 +208,7 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
     let mut action = call_action("offer", params.call_id, params.call_creator, children);
     if let Some(group_jid) = params.group_jid {
         if group_jid.server != Server::Group {
-            bail!("group offer group_jid must use @g.us");
+            return Err(GroupCallBuildError::InvalidGroupJid);
         }
         action.attrs.insert("group-jid", group_jid);
     }
@@ -159,20 +221,22 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
 
 /// Build a singular offer for a participant joining an already-active call.
 #[cold]
-pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<Node> {
+pub fn build_group_invite_offer(
+    params: &GroupInviteOfferParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     if params.to.user.is_empty() {
-        bail!("group invite target is required");
+        return Err(GroupCallBuildError::MissingInviteTarget);
     }
     if params.target_devices.is_empty() {
-        bail!("group invite requires at least one target device");
+        return Err(GroupCallBuildError::MissingInviteDevices);
     }
     if params.participants.is_empty() {
-        bail!("group invite requires an active roster");
+        return Err(GroupCallBuildError::MissingInviteRoster);
     }
 
     if params.device_orientation > 3 {
-        bail!("group invite device orientation must be quarter turns in 0..=3");
+        return Err(GroupCallBuildError::InvalidOrientation);
     }
 
     let mut children = vec![audio_opus("16000")];
@@ -197,15 +261,19 @@ pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<N
 
 #[cold]
 #[inline(never)]
-fn validate_call_identity(call_id: &str, id: &str, creator: &Jid) -> Result<()> {
+fn validate_call_identity(
+    call_id: &str,
+    id: &str,
+    creator: &Jid,
+) -> Result<(), GroupCallBuildError> {
     if call_id.is_empty() {
-        bail!("call id is required");
+        return Err(GroupCallBuildError::MissingCallId);
     }
     if id.is_empty() {
-        bail!("call stanza id is required");
+        return Err(GroupCallBuildError::MissingStanzaId);
     }
     if creator.user.is_empty() {
-        bail!("call creator is required");
+        return Err(GroupCallBuildError::MissingCreator);
     }
     Ok(())
 }
@@ -216,19 +284,26 @@ fn build_group_users(
     participants: &[GroupCallParticipant],
     video_creator: Option<&Jid>,
     video: bool,
-) -> Result<Vec<Node>> {
+) -> Result<Vec<Node>, GroupCallBuildError> {
     let mut users = Vec::with_capacity(participants.len());
     for (participant_index, participant) in participants.iter().enumerate() {
         if participant.jid.user.is_empty() {
-            bail!("participant {participant_index} has no jid");
+            return Err(GroupCallBuildError::MissingParticipantJid {
+                participant: participant_index,
+            });
         }
         if participant.devices.is_empty() {
-            bail!("participant {participant_index} has no devices");
+            return Err(GroupCallBuildError::MissingParticipantDevices {
+                participant: participant_index,
+            });
         }
         let mut devices = Vec::with_capacity(participant.devices.len());
         for (device_index, device) in participant.devices.iter().enumerate() {
             if device.jid.user.is_empty() {
-                bail!("participant {participant_index} device {device_index} has no jid");
+                return Err(GroupCallBuildError::MissingParticipantDeviceJid {
+                    participant: participant_index,
+                    device: device_index,
+                });
             }
             let mut builder = NodeBuilder::new("device").attr("jid", &device.jid);
             if !device.capability.is_empty() {
@@ -636,7 +711,9 @@ fn parse_indexed_tokens(children: &[NodeRef<'_>], tag: &str) -> Vec<Vec<u8>> {
 
 /// Build one keygen-v2 group epoch delivery.
 #[cold]
-pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
+pub fn build_group_enc_rekey(
+    params: &GroupEncRekeyParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     build_group_enc_rekey_for_role(params, crate::send::SenderIdentityRole::Companion)
 }
 
@@ -645,7 +722,7 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
 pub fn build_group_enc_rekey_for_role(
     params: &GroupEncRekeyParams<'_>,
     sender_role: crate::send::SenderIdentityRole,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     use crate::send::{PrimaryDeviceIdentityPolicy, SenderIdentityRole};
     sender_role.validate()?;
     let device_identity = match sender_role {
@@ -654,22 +731,22 @@ pub fn build_group_enc_rekey_for_role(
     };
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     if params.transaction_id == 0 {
-        bail!("group epoch transaction id must be non-zero");
+        return Err(GroupCallBuildError::MissingTransactionId);
     }
     if params.device_key.device_jid != *params.to {
-        bail!("group epoch ciphertext target does not match stanza target");
+        return Err(GroupCallBuildError::EpochTargetMismatch);
     }
     if params.device_key.ciphertext.is_empty() {
-        bail!("group epoch ciphertext is empty");
+        return Err(GroupCallBuildError::EmptyEpochCiphertext);
     }
     if !matches!(params.device_key.enc_type.as_str(), "msg" | "pkmsg") {
-        bail!("unsupported group epoch encryption type");
+        return Err(GroupCallBuildError::UnsupportedEpochEncryption);
     }
     if params.device_key.enc_type == "pkmsg"
         && device_identity.is_none()
         && sender_role == SenderIdentityRole::Companion
     {
-        bail!("pre-key group epoch requires device identity");
+        return Err(GroupCallBuildError::MissingDeviceIdentity);
     }
     let mut children = vec![
         NodeBuilder::new("encopt").attr("keygen", "2").build(),
@@ -742,7 +819,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
 
 /// Build a call-link creation request.
 #[cold]
-pub fn build_call_link_create(media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_create(
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     build_call_service_request(
         request_id,
         NodeBuilder::new("link_create")
@@ -753,9 +833,13 @@ pub fn build_call_link_create(media: CallLinkMedia, request_id: &str) -> Result<
 
 /// Build a call-link preview request.
 #[cold]
-pub fn build_call_link_query(token: &str, media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_query(
+    token: &str,
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     if token.trim().is_empty() {
-        bail!("call-link token is required");
+        return Err(GroupCallBuildError::MissingLinkToken);
     }
     build_call_service_request(
         request_id,
@@ -768,7 +852,11 @@ pub fn build_call_link_query(token: &str, media: CallLinkMedia, request_id: &str
 
 /// Build a call-link join request with the media capabilities of this client.
 #[cold]
-pub fn build_call_link_join(token: &str, media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_join(
+    token: &str,
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     let capability = if media == CallLinkMedia::Video {
         &CAPABILITY_VIDEO_OFFER
     } else {
@@ -784,12 +872,12 @@ pub fn build_call_link_join_with_capability(
     media: CallLinkMedia,
     request_id: &str,
     capability: &[u8],
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     if token.trim().is_empty() {
-        bail!("call-link token is required");
+        return Err(GroupCallBuildError::MissingLinkToken);
     }
     if capability.is_empty() {
-        bail!("call-link capability is required");
+        return Err(GroupCallBuildError::MissingLinkCapability);
     }
     let mut children = vec![audio_opus("16000")];
     if media == CallLinkMedia::Video {
@@ -820,9 +908,9 @@ pub fn build_call_link_join_with_capability(
 
 #[cold]
 #[inline(never)]
-fn build_call_service_request(request_id: &str, action: Node) -> Result<Node> {
+fn build_call_service_request(request_id: &str, action: Node) -> Result<Node, GroupCallBuildError> {
     if request_id.is_empty() {
-        bail!("call request id is required");
+        return Err(GroupCallBuildError::MissingRequestId);
     }
     Ok(call_wrap(&Jid::new("", Server::Call), request_id, action))
 }
@@ -1025,7 +1113,7 @@ pub fn build_waiting_room_toggle(
     creator: &Jid,
     enabled: bool,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     Ok(build_waiting_room_request(
         "waiting_room_toggle",
@@ -1043,7 +1131,7 @@ pub fn build_waiting_room_heartbeat(
     call_id: &str,
     creator: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     Ok(build_waiting_room_request(
         "heartbeat",
@@ -1062,7 +1150,7 @@ pub fn build_waiting_room_admit(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_admit", call_id, creator, user, request_id)
 }
@@ -1074,7 +1162,7 @@ pub fn build_waiting_room_deny(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_deny", call_id, creator, user, request_id)
 }
@@ -1102,9 +1190,9 @@ fn build_waiting_room_user_action(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     if user.user.is_empty() {
-        bail!("waiting-room user is required");
+        return Err(GroupCallBuildError::MissingWaitingRoomUser);
     }
     Ok(build_waiting_room_request(
         tag,
@@ -1146,10 +1234,10 @@ pub fn build_raise_hand(
     creator: &Jid,
     request_id: &str,
     raised: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     if to.user.is_empty() {
-        bail!("raise-hand target is required");
+        return Err(GroupCallBuildError::MissingRaiseHandTarget);
     }
     Ok(call_wrap(
         to,
@@ -1200,10 +1288,10 @@ pub fn build_screen_share(
     request_id: &str,
     state: ScreenShareState,
     screen_share_id: Option<u32>,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     if to.user.is_empty() {
-        bail!("screen-share target is required");
+        return Err(GroupCallBuildError::MissingScreenShareTarget);
     }
     let mut action = NodeBuilder::new(CallActionTag::ScreenShare.as_str())
         .attr("call-id", call_id)
@@ -1673,12 +1761,14 @@ mod tests {
 
         let err = build_initial_group_offer(&params(None, &pair))
             .expect_err("an ad-hoc call to one person is a 1:1 call");
+        assert!(matches!(err, GroupCallBuildError::OfferNeedsTwoRemotes));
         assert_eq!(
             err.to_string(),
             "group offer requires self and at least two remote participants"
         );
         let err = build_initial_group_offer(&params(Some(&group), &pair[..1]))
             .expect_err("a group-bound call still rings someone");
+        assert!(matches!(err, GroupCallBuildError::GroupOfferNeedsRemote));
         assert_eq!(
             err.to_string(),
             "group-bound offer requires self and at least one remote participant"
