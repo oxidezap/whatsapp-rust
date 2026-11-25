@@ -261,7 +261,7 @@ pub struct IssuePrivacyTokensResponse {
     pub tokens: Vec<ReceivedTcToken>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum TcTokenParseError {
     #[error("<tokens> child not found")]
@@ -281,6 +281,8 @@ pub enum TcTokenParseError {
         source: std::num::ParseIntError,
     },
 }
+
+debug_as_display!(TcTokenParseError);
 
 impl IqSpec for IssuePrivacyTokensSpec {
     type Response = IssuePrivacyTokensResponse;
@@ -469,6 +471,20 @@ pub fn choose_privacy_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_timestamp_debug_and_source_keep_details() {
+        let error = TcTokenParseError::InvalidTimestamp {
+            value: "invalid".into(),
+            source: "invalid".parse::<u64>().unwrap_err(),
+        };
+        assert!(format!("{error:?}").contains("invalid"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<std::num::ParseIntError>()
+        );
+    }
 
     const DUR: i64 = TC_TOKEN_BUCKET_DURATION;
     const BUCKETS: i64 = TC_TOKEN_NUM_BUCKETS;

@@ -5,7 +5,9 @@ use futures::StreamExt;
 use std::{sync::Arc, time::Duration};
 use whatsapp_rust::{test_support::CallFixture, voip::CallHandle};
 
-async fn dormant(fixture: &CallFixture) -> anyhow::Result<CallHandle> {
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+async fn dormant(fixture: &CallFixture) -> Result<CallHandle> {
     let client = fixture.client().clone();
     let peer = fixture.peer().clone();
     let start = tokio::spawn(async move {
@@ -23,7 +25,7 @@ async fn dormant(fixture: &CallFixture) -> anyhow::Result<CallHandle> {
 }
 
 #[tokio::test]
-async fn live_clones_share_acquisition_and_receiver_does_not_retain_client() -> anyhow::Result<()> {
+async fn live_clones_share_acquisition_and_receiver_does_not_retain_client() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let client = Arc::downgrade(fixture.client());
     let call = dormant(&fixture).await?;
@@ -59,7 +61,7 @@ async fn live_clones_share_acquisition_and_receiver_does_not_retain_client() -> 
 }
 
 #[tokio::test]
-async fn shutdown_before_first_acquisition_preserves_sticky_completion() -> anyhow::Result<()> {
+async fn shutdown_before_first_acquisition_preserves_sticky_completion() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let call = dormant(&fixture).await?;
     fixture.shutdown().await?;

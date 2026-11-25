@@ -30,7 +30,7 @@ const GCM_TAG_SIZE: usize = 16;
 pub(crate) const MESSAGE_SECRET_SIZE: usize = 32;
 
 /// Error returned by addon encryption and decryption routines.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddonError {
     #[error("invalid messageSecret size: expected {expected}, got {got}")]
@@ -48,6 +48,8 @@ pub enum AddonError {
     #[error("protobuf decode failed: {0}")]
     ProtobufDecode(String),
 }
+
+debug_as_display!(AddonError);
 
 /// Stack-backed staging buffer for the HKDF `info` string.
 ///

@@ -24,7 +24,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MediaConnParseError {
     #[error("expected <{expected}>, got <{actual}>")]
@@ -41,6 +41,8 @@ pub enum MediaConnParseError {
     #[error("Missing 'auth' attribute in media_conn response")]
     MissingResponseAuth,
 }
+
+debug_as_display!(MediaConnParseError);
 
 /// Media host classification. Unrecognized wire values remain available in
 /// [`HostType::Other`]; future releases may recognize additional classifications.

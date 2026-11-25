@@ -34,7 +34,7 @@ pub enum PlaintextDecodeError {
     MissingHistoryNotification,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum ParticipantHashError {
     #[error("participant list is too large to hash: {0} bytes of rendered JIDs")]
@@ -44,6 +44,8 @@ pub enum ParticipantHashError {
     #[error("phash is not valid utf-8: {0:?}")]
     Utf8(#[source] std::str::Utf8Error),
 }
+
+debug_as_display!(ParticipantHashError);
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

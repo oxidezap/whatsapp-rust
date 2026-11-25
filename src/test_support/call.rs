@@ -471,7 +471,7 @@ impl Wire {
                 };
                 Ok((None, Some(node)))
             }
-            State::Closed => return Err("fixture connection closed".into()),
+            State::Closed => Err("fixture connection closed".into()),
         }
     }
 

@@ -1,7 +1,7 @@
 use crate::iq::usync::{parse_usync_response, project_device_list_response};
 use wacore_binary::{Jid, Node};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum UsyncResponseError {
     #[error("{0}")]
@@ -9,6 +9,8 @@ pub enum UsyncResponseError {
     #[error("{0}")]
     Projection(#[from] crate::iq::usync::UsyncProjectionError),
 }
+
+debug_as_display!(UsyncResponseError);
 
 /// A LID mapping learned from usync response
 #[derive(Debug, Clone)]

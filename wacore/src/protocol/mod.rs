@@ -29,13 +29,15 @@ pub trait ProtocolNode: Sized {
 }
 
 /// A wire value that is not recognized by a closed enum.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {enum_name}: {value}")]
 #[non_exhaustive]
 pub struct UnknownWireValue {
     pub enum_name: &'static str,
     pub value: String,
 }
+
+debug_as_display!(UnknownWireValue);
 
 impl UnknownWireValue {
     pub fn new(enum_name: &'static str, value: &str) -> Self {

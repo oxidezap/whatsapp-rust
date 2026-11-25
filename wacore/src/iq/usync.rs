@@ -240,7 +240,7 @@ const LEGACY_RESULT_PROTOCOLS: &[UsyncProtocolKind] = &[
     UsyncProtocolKind::Devices,
 ];
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum UsyncProjectionError {
     #[error("{}", usync_subprotocol_error_message(.protocol.as_str(), .error))]
@@ -259,6 +259,8 @@ pub enum UsyncProjectionError {
     #[error("device-list response returned no devices for {0}")]
     NoDevices(Jid),
 }
+
+debug_as_display!(UsyncProjectionError);
 
 fn reject_result_errors(
     response: &UsyncResponse,
@@ -1257,6 +1259,13 @@ impl IqSpec for LidQuerySpec {
 mod tests {
     use super::*;
     use wacore_binary::Server;
+
+    #[test]
+    fn projection_error_debug_keeps_the_affected_user() {
+        let user = Jid::pn("12025550123");
+        let error = UsyncProjectionError::MissingUser(user.clone());
+        assert!(format!("{error:?}").contains(&user.to_string()));
+    }
 
     /// Build a dummy key-index-list node for device IDs (used in test fixtures)
     fn build_test_key_index_list_node(device_ids: &[u16]) -> Node {

@@ -33,7 +33,7 @@ pub struct PreKeyUtils;
 #[error("<list> not found in pre-key response")]
 pub struct MissingPreKeyList;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 enum PreKeyBundleError {
     #[error("Expected bytes in node content")]
     ExpectedBytes,
@@ -68,6 +68,8 @@ enum PreKeyBundleError {
     #[error("{0}")]
     Decode(#[from] buffa::DecodeError),
 }
+
+debug_as_display!(PreKeyBundleError);
 
 /// Compute SHA-1 digest of a key bundle for validation against server.
 ///

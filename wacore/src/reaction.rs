@@ -11,7 +11,7 @@ use waproto::whatsapp::message::ReactionMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum ReactionError {
     #[error("message_secret must be 32 bytes, got {0}")]
@@ -21,6 +21,8 @@ pub enum ReactionError {
     #[error("{0}")]
     Decode(#[from] buffa::DecodeError),
 }
+
+debug_as_display!(ReactionError);
 
 const GCM_IV_SIZE: usize = 12;
 const MESSAGE_SECRET_SIZE: usize = 32;

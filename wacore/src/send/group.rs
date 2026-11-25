@@ -68,7 +68,7 @@ impl RequiredSenderKeyDistributionError {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum RequiredDistributionCause {
     #[error("{0}")]
@@ -76,6 +76,8 @@ pub enum RequiredDistributionCause {
     #[error("sender-key distribution encrypted {encrypted} of {required} required targets")]
     Incomplete { encrypted: usize, required: usize },
 }
+
+debug_as_display!(RequiredDistributionCause);
 
 #[derive(thiserror::Error)]
 #[non_exhaustive]

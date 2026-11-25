@@ -26392,8 +26392,7 @@ fn live_admission_refusal_metrics_regression() {
                     &self,
                     _: Arc<Client>,
                     _: &[wacore::types::events::InboundMessage],
-                ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
-                {
+                ) -> crate::types::durability_hook::HookResult {
                     Ok(())
                 }
             }

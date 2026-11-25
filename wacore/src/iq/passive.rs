@@ -31,7 +31,7 @@ use wacore_binary::{NodeContent, NodeRef};
 /// IQ namespace for passive mode.
 pub const PASSIVE_NAMESPACE: &str = "passive";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PassiveModeError {
     #[error("{0}")]
@@ -39,6 +39,8 @@ pub enum PassiveModeError {
     #[error("{0}")]
     Context(#[from] super::contextual::IqResponseError),
 }
+
+debug_as_display!(PassiveModeError);
 
 /// Sets the client's passive/active mode.
 #[derive(Debug, Clone)]
