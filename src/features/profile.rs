@@ -7,7 +7,6 @@ use crate::client::{Client, ClientError};
 use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use crate::store::commands::DeviceCommand;
-use anyhow::Result;
 use log::debug;
 use std::time::Duration;
 use thiserror::Error;
@@ -37,9 +36,6 @@ pub enum ProfileError {
     /// A provided argument is invalid (e.g. an empty push name).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    /// Catch-all for internal failures with no dedicated variant.
-    #[error("{0}")]
-    Internal(#[from] anyhow::Error),
 }
 
 /// Result after the push-name presence was sent and the local name was updated.
