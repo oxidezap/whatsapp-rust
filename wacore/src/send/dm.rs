@@ -1,7 +1,6 @@
 //! 1:1 (DM) stanza preparation and DM retry stanzas.
 
 use super::*;
-use anyhow::Context as _;
 
 fn is_exact_dm_sender_device(device_jid: &Jid, own_jid: &Jid, own_lid: Option<&Jid>) -> bool {
     (device_jid.is_same_user_as(own_jid) && device_jid.device == own_jid.device)
@@ -460,6 +459,15 @@ pub async fn prepare_dm_stanza(
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionPreflightError {
+    #[error("{0}")]
+    Load(#[source] crate::libsignal::protocol::SignalProtocolError),
+    #[error("restoring checked-out session after pairwise retry pre-flight")]
+    Restore(#[source] crate::libsignal::protocol::SignalProtocolError),
+}
+
 /// Returns true if `message_encrypt` on `signal_address` would produce
 /// a pkmsg (no session yet, or session with un-acked pre-key still
 /// pending). Used before `message_encrypt` to fail-fast when `account`
@@ -473,12 +481,13 @@ pub async fn prepare_dm_stanza(
 pub async fn pkmsg_would_be_emitted<S>(
     session_store: &mut S,
     signal_address: &ProtocolAddress,
-) -> Result<bool>
+) -> Result<bool, SessionPreflightError>
 where
     S: crate::libsignal::protocol::SessionStore,
 {
-    let loaded =
-        crate::libsignal::protocol::SessionCheckout::load(session_store, signal_address).await?;
+    let loaded = crate::libsignal::protocol::SessionCheckout::load(session_store, signal_address)
+        .await
+        .map_err(SessionPreflightError::Load)?;
     // Conservative read: treat any failure to interrogate the session as
     // "would be pkmsg" so the caller bails. Silently treating Err as false
     // would let message_encrypt run with a corrupt session and potentially
@@ -495,7 +504,7 @@ where
         session
             .commit()
             .await
-            .context("restoring checked-out session after pairwise retry pre-flight")?;
+            .map_err(SessionPreflightError::Restore)?;
     }
     Ok(needs_pkmsg)
 }

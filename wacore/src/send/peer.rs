@@ -2,6 +2,23 @@
 
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PeerStanzaError {
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    Preflight(#[from] SessionPreflightError),
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+    #[error(
+        "peer pkmsg requires <device-identity> (account is None); refusing before message_encrypt to avoid advancing the sender chain"
+    )]
+    MissingDeviceIdentity,
+    #[error("unexpected peer encryption message type")]
+    UnexpectedCiphertext,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_peer_stanza<S, I>(
     session_store: &mut S,
@@ -11,7 +28,7 @@ pub async fn prepare_peer_stanza<S, I>(
     message: &wa::Message,
     request_id: &str,
     account: Option<&wa::ADVSignedDeviceIdentity>,
-) -> Result<Node>
+) -> Result<Node, PeerStanzaError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -41,7 +58,7 @@ pub async fn prepare_peer_stanza_for_role<S, I>(
     request_id: &str,
     account: Option<&wa::ADVSignedDeviceIdentity>,
     role: SenderIdentityRole,
-) -> Result<Node>
+) -> Result<Node, PeerStanzaError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -72,7 +89,7 @@ pub async fn prepare_peer_stanza_with_options<S, I>(
     request_id: &str,
     account: Option<&wa::ADVSignedDeviceIdentity>,
     options: PeerMessageOptions,
-) -> Result<Node>
+) -> Result<Node, PeerStanzaError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -102,7 +119,7 @@ pub async fn prepare_peer_stanza_with_options_for_role<S, I>(
     account: Option<&wa::ADVSignedDeviceIdentity>,
     options: PeerMessageOptions,
     role: SenderIdentityRole,
-) -> Result<Node>
+) -> Result<Node, PeerStanzaError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -114,10 +131,7 @@ where
         && account.is_none()
         && pkmsg_would_be_emitted(session_store, signal_address).await?
     {
-        bail!(
-            "peer pkmsg requires <device-identity> (account is None); \
-             refusing before message_encrypt to avoid advancing the sender chain"
-        );
+        return Err(PeerStanzaError::MissingDeviceIdentity);
     }
 
     let encrypted_message = crate::libsignal::protocol::message_encrypt_serialized(
@@ -129,7 +143,7 @@ where
     .await?;
 
     let (enc_type, is_prekey, serialized_bytes) = extract_serialized_ciphertext(encrypted_message)
-        .ok_or_else(|| anyhow!("Unexpected peer encryption message type"))?;
+        .ok_or(PeerStanzaError::UnexpectedCiphertext)?;
 
     let enc_node = NodeBuilder::new("enc")
         .attrs([("v", "2"), ("type", enc_type)])

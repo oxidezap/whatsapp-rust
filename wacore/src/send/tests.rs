@@ -2879,8 +2879,8 @@ mod group_retry {
         .await;
         let err = result.expect_err("must refuse before message_encrypt");
         assert!(
-            err.to_string().contains("device-identity"),
-            "error must name <device-identity>; got: {err}"
+            matches!(err, PeerStanzaError::MissingDeviceIdentity),
+            "error must identify the missing device identity; got: {err}"
         );
         assert!(
             !ss.has_session(&addr).await.unwrap(),
@@ -4026,6 +4026,21 @@ mod mark_full_distribution_list {
         ) -> SigResult<()> {
             unreachable!("nothing is stored once the reads fail")
         }
+    }
+
+    #[tokio::test]
+    async fn peer_preflight_preserves_session_store_failure() {
+        let mut store = FailingSessionStore;
+        let address = Jid::pn("15550001000").to_protocol_address();
+        let error = pkmsg_would_be_emitted(&mut store, &address)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SessionPreflightError::Load(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState("load_session", _)
+            )
+        ));
     }
 
     #[derive(Clone)]

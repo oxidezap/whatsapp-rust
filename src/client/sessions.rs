@@ -1246,7 +1246,7 @@ impl Client {
         let device_store = self.persistence_manager.clone();
         let mut adapter = self.signal_adapter_from(device_store);
         let signal_addr = jid.to_protocol_address();
-        wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &signal_addr).await
+        Ok(wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &signal_addr).await?)
     }
 
     /// Check if a session exists for the given JID.
