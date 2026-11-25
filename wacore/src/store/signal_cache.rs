@@ -4,6 +4,15 @@ use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionCheckoutError {
+    #[error("session is already checked out")]
+    AlreadyCheckedOut,
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+}
+
 use anyhow::Result;
 use async_lock::Mutex;
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1603,7 +1612,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<SessionRecord>> {
+    ) -> std::result::Result<Option<SessionRecord>, SessionCheckoutError> {
         let (record, checkout) = self.checkout_session(address, backend).await?;
         if record.is_none() {
             self.cancel_session_checkout(address, checkout);
@@ -1617,7 +1626,8 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<(Option<SessionRecord>, SessionCheckoutKey)> {
+    ) -> std::result::Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>
+    {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1628,7 +1638,7 @@ impl SignalStoreCache {
                     }
                     CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
                     CachedSessionCheckout::Busy => {
-                        anyhow::bail!("session is already checked out")
+                        return Err(SessionCheckoutError::AlreadyCheckedOut);
                     }
                     CachedSessionCheckout::Missing(_) => {}
                 }
@@ -1642,7 +1652,7 @@ impl SignalStoreCache {
                     return Ok((Some(record), checkout));
                 }
                 CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
-                CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+                CachedSessionCheckout::Busy => return Err(SessionCheckoutError::AlreadyCheckedOut),
                 CachedSessionCheckout::Missing(checkout) => checkout,
             };
             // See `UserIndexedCache::removal_seq`: absence alone cannot rule
@@ -1666,7 +1676,7 @@ impl SignalStoreCache {
                 return Ok((Some(record), checkout));
             }
             CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
-            CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+            CachedSessionCheckout::Busy => return Err(SessionCheckoutError::AlreadyCheckedOut),
             CachedSessionCheckout::Missing(checkout) => checkout,
         };
         let backend_result = backend.get_session(key).await?;
@@ -1700,14 +1710,14 @@ impl SignalStoreCache {
     pub fn try_checkout_session(
         &self,
         address: &ProtocolAddress,
-    ) -> Option<Result<(Option<SessionRecord>, SessionCheckoutKey)>> {
+    ) -> Option<
+        std::result::Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>,
+    > {
         let mut state = self.try_lock_sessions()?;
         match state.checkout(address.as_str()) {
             CachedSessionCheckout::Present(record, checkout) => Some(Ok((Some(record), checkout))),
             CachedSessionCheckout::Absent(checkout) => Some(Ok((None, checkout))),
-            CachedSessionCheckout::Busy => {
-                Some(Err(anyhow::anyhow!("session is already checked out")))
-            }
+            CachedSessionCheckout::Busy => Some(Err(SessionCheckoutError::AlreadyCheckedOut)),
             CachedSessionCheckout::Missing(_) => None,
         }
     }
@@ -4581,7 +4591,7 @@ mod sender_key_lock_tests {
             Ok(_) => panic!("a second owner must be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("already checked out"));
+        assert!(matches!(error, SessionCheckoutError::AlreadyCheckedOut));
         assert!(matches!(
             cache.restore_session_from_checkout(
                 &addr,
