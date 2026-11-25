@@ -54,7 +54,8 @@ pub enum MediaReuploadError {
         response: RejectionStanza,
     },
     Retry(Arc<wacore::media_retry::MediaRetryError>),
-    Internal(Arc<anyhow::Error>),
+    Store(Arc<wacore::store::error::StoreError>),
+    ClientUnavailable,
 }
 
 impl std::fmt::Display for MediaReuploadError {
@@ -69,7 +70,8 @@ impl std::fmt::Display for MediaReuploadError {
                 write!(f, "media retry receipt rejected (code: {code:?})")
             }
             Self::Retry(error) => std::fmt::Display::fmt(error, f),
-            Self::Internal(error) => std::fmt::Display::fmt(error, f),
+            Self::Store(error) => std::fmt::Display::fmt(error, f),
+            Self::ClientUnavailable => f.write_str("client is no longer available"),
         }
     }
 }
@@ -81,7 +83,8 @@ impl std::fmt::Debug for MediaReuploadError {
             // through source(), but never format them implicitly in diagnostics.
             Self::Client(_) => f.write_str("Client([REDACTED])"),
             Self::Retry(_) => f.write_str("Retry([REDACTED])"),
-            Self::Internal(_) => f.write_str("Internal([REDACTED])"),
+            Self::Store(_) => f.write_str("Store([REDACTED])"),
+            Self::ClientUnavailable => f.write_str("ClientUnavailable"),
             Self::NotLoggedIn => f.write_str("NotLoggedIn"),
             Self::Conflict(id) => f.debug_tuple("Conflict").field(id).finish(),
             Self::Timeout { phase } => f.debug_struct("Timeout").field("phase", phase).finish(),
@@ -102,7 +105,7 @@ impl std::error::Error for MediaReuploadError {
         match self {
             Self::Client(error) => Some(error.as_ref()),
             Self::Retry(error) => Some(error.as_ref()),
-            Self::Internal(error) => Some(error.as_ref().as_ref()),
+            Self::Store(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -120,9 +123,9 @@ impl From<wacore::media_retry::MediaRetryError> for MediaReuploadError {
     }
 }
 
-impl From<anyhow::Error> for MediaReuploadError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Internal(Arc::new(error))
+impl From<wacore::store::error::StoreError> for MediaReuploadError {
+    fn from(error: wacore::store::error::StoreError) -> Self {
+        Self::Store(Arc::new(error))
     }
 }
 
@@ -230,7 +233,7 @@ impl<'a> MediaReupload<'a> {
             .self_weak
             .get()
             .and_then(Weak::upgrade)
-            .ok_or_else(|| anyhow::anyhow!("client is no longer available"))?;
+            .ok_or(MediaReuploadError::ClientUnavailable)?;
         let target = Arc::new(target);
         let guard = ReuploadGuard {
             client: Arc::downgrade(&client),
@@ -281,12 +284,7 @@ impl<'a> MediaReupload<'a> {
         // WAWebSendServerErrorReceiptJob only substitutes accountLid for a
         // migrated regular-user chat. A missing mapping keeps the original JID.
         let chat = if req.chat.is_pn() && self.client.is_lid_migrated().await {
-            match self
-                .client
-                .get_lid_pn_entry(&req.chat)
-                .await
-                .map_err(anyhow::Error::from)?
-            {
+            match self.client.get_lid_pn_entry(&req.chat).await? {
                 Some(entry) => Jid::lid(entry.lid.as_ref()),
                 None => req.chat.clone(),
             }

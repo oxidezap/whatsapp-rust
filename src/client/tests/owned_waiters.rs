@@ -133,17 +133,19 @@ fn shared_reupload_errors_keep_the_original_typed_cause() {
         .unwrap();
     assert!(std::ptr::eq(source, shared_source));
 
-    let error = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other("fixture")));
+    let error = MediaReuploadError::from(wacore::store::error::StoreError::Database(Box::new(
+        std::io::Error::other("fixture"),
+    )));
     let cloned = error.clone();
     let source = error
         .source()
         .unwrap()
-        .downcast_ref::<std::io::Error>()
+        .downcast_ref::<wacore::store::error::StoreError>()
         .unwrap();
     let shared_source = cloned
         .source()
         .unwrap()
-        .downcast_ref::<std::io::Error>()
+        .downcast_ref::<wacore::store::error::StoreError>()
         .unwrap();
     assert!(std::ptr::eq(source, shared_source));
 }
@@ -827,11 +829,13 @@ async fn reupload_rejections_preserve_the_full_shared_response_and_raw_code() {
 fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
     use std::error::Error;
     let marker = "signed-url-secret-marker";
-    let internal = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other(marker)));
+    let storage = MediaReuploadError::from(wacore::store::error::StoreError::Database(Box::new(
+        std::io::Error::other(marker),
+    )));
     let client = MediaReuploadError::from(ClientError::Internal(anyhow::Error::new(
         std::io::Error::other(marker),
     )));
-    for error in [internal, client] {
+    for error in [storage, client] {
         assert!(!format!("{error:?}").contains(marker));
         let source = error.source().unwrap();
         let io = if let Some(client) = source.downcast_ref::<ClientError>() {
@@ -841,7 +845,11 @@ fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
                 .downcast_ref::<std::io::Error>()
                 .unwrap()
         } else {
-            source.downcast_ref::<std::io::Error>().unwrap()
+            source
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
         };
         assert_eq!(io.to_string(), marker);
     }
