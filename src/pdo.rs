@@ -22,6 +22,18 @@ use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, Mess
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
+#[derive(Debug, thiserror::Error)]
+enum PdoMessageInfoError {
+    #[error("WebMessageInfo missing key")]
+    MissingKey,
+    #[error("MessageKey missing remoteJid")]
+    MissingRemoteJid,
+    #[error("{0}")]
+    InvalidRemoteJid(#[source] wacore_binary::jid::JidError),
+    #[error("{0}")]
+    InvalidParticipantJid(#[source] wacore_binary::jid::JidError),
+}
+
 /// How many unrequested recoveries may wait behind the one being applied.
 const MAX_QUEUED_UNREQUESTED_RECOVERIES: usize = 64;
 
@@ -1796,9 +1808,9 @@ impl Client {
     async fn message_info_from_web_message_info(
         &self,
         web_msg: &wa::WebMessageInfo,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, PdoMessageInfoError> {
         let Some(key) = web_msg.key.as_option() else {
-            anyhow::bail!("WebMessageInfo missing key");
+            return Err(PdoMessageInfoError::MissingKey);
         };
 
         let participant = self.pdo_key_participant(web_msg);
@@ -1831,17 +1843,19 @@ impl Client {
         participant: Option<&str>,
         message_timestamp: Option<u64>,
         push_name: Option<&str>,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, PdoMessageInfoError> {
         let remote_jid: Jid = remote_jid
-            .ok_or_else(|| anyhow::anyhow!("MessageKey missing remoteJid"))?
-            .parse()?;
+            .ok_or(PdoMessageInfoError::MissingRemoteJid)?
+            .parse()
+            .map_err(PdoMessageInfoError::InvalidRemoteJid)?;
         let is_group = remote_jid.is_group();
         let is_from_me = from_me.unwrap_or(false);
 
         // The PDO response handler maps the top-level author, falling back to
         // the normalized key participant, for groups and broadcasts alike.
         let sender = if let Some(p) = participant {
-            p.parse()?
+            p.parse()
+                .map_err(PdoMessageInfoError::InvalidParticipantJid)?
         } else if is_from_me {
             self.persistence_manager
                 .get_device_snapshot()
@@ -1935,7 +1949,7 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{history_sync_on_demand_message, self_peer_target, wa};
+    use super::{PdoMessageInfoError, history_sync_on_demand_message, self_peer_target, wa};
     use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
 
@@ -2113,6 +2127,44 @@ mod tests {
             },
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rejects_missing_keys_and_invalid_addresses() {
+        let client = setup_reconstruct_client().await;
+        let missing = wa::WebMessageInfo::default();
+        assert!(matches!(
+            client.message_info_from_web_message_info(&missing).await,
+            Err(PdoMessageInfoError::MissingKey)
+        ));
+
+        let mut missing_remote = wa::WebMessageInfo::default();
+        missing_remote.key = buffa::MessageField::some(wa::MessageKey::default());
+        assert!(matches!(
+            client
+                .message_info_from_web_message_info(&missing_remote)
+                .await,
+            Err(PdoMessageInfoError::MissingRemoteJid)
+        ));
+
+        let invalid_remote = make_web_msg("not-a-jid", false, "PDO-ID", None);
+        let error = client
+            .message_info_from_web_message_info(&invalid_remote)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PdoMessageInfoError::InvalidRemoteJid(_)));
+        assert!(std::error::Error::source(&error).is_some());
+
+        let invalid_author = make_web_msg("status@broadcast", false, "PDO-ID", Some("not-a-jid"));
+        let error = client
+            .message_info_from_web_message_info(&invalid_author)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PdoMessageInfoError::InvalidParticipantJid(_)
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     /// The reconstruction path preserves the real author for status
