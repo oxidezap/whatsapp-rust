@@ -23,6 +23,9 @@ pub enum SignalError {
     /// A Signal protocol primitive (encrypt/decrypt/session) failed.
     #[error("{0}")]
     Protocol(#[from] SignalProtocolError),
+    /// Failed to establish a session before encrypting for devices.
+    #[error("{0}")]
+    SessionSetup(#[from] wacore::send::SessionSetupError),
     /// The requested operation is not valid for this input (e.g. a sender-key
     /// or message-secret envelope passed to the pairwise decrypt path).
     #[error("unsupported signal operation: {0}")]
