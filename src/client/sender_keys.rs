@@ -322,7 +322,7 @@ impl Client {
         // redelivered remove would see no recipient with the retired chain
         // and skip retrying a backend deletion that may not have committed.
         match failure {
-            Some(error) => Err(error),
+            Some(error) => Err(error.into()),
             None => self.reset_sender_key_device_tracking(group_id).await,
         }
     }

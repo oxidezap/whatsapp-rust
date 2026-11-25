@@ -2758,7 +2758,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
         let _flush_guard = self.flush_lock.lock().await;
@@ -2797,7 +2797,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SenderKeyCacheError> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
         let _flush_guard = self.flush_lock.lock().await;
