@@ -32,9 +32,9 @@ pub enum MappingLearningError {
     #[error("single mapping persistence received multiple rows")]
     InvalidSingleBatch,
     #[error("persisting LID-PN mapping: {0}")]
-    StoreSingle(#[source] wacore::store::error::StoreError),
+    StoreSingle(#[source] Box<wacore::store::error::StoreError>),
     #[error("persisting LID-PN mapping batch: {0}")]
-    StoreBatch(#[source] wacore::store::error::StoreError),
+    StoreBatch(#[source] Box<wacore::store::error::StoreError>),
 }
 
 /// Exclusive upper bound for the device-id range we iterate when migrating
@@ -708,12 +708,12 @@ impl Client {
             backend
                 .put_lid_mapping(&storage[0])
                 .await
-                .map_err(MappingLearningError::StoreSingle)?;
+                .map_err(|error| MappingLearningError::StoreSingle(Box::new(error)))?;
         } else {
             backend
                 .put_lid_mappings(&storage)
                 .await
-                .map_err(MappingLearningError::StoreBatch)?;
+                .map_err(|error| MappingLearningError::StoreBatch(Box::new(error)))?;
         }
 
         for entry in &entries {
