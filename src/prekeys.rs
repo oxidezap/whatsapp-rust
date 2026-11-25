@@ -304,10 +304,6 @@ fn should_upload_pre_keys(force: bool, server_count: usize) -> bool {
     force || server_count < MIN_PRE_KEY_COUNT
 }
 
-fn prekey_record_id((id, _): &(u32, bytes::Bytes)) -> u32 {
-    *id
-}
-
 /// WA Web uses 24-bit PreKey IDs (max 2^24 - 1); IDs wrap modulo this.
 const MAX_PREKEY_ID: u32 = 16_777_215;
 
@@ -925,7 +921,7 @@ impl Client {
             let window_ids: Vec<u32> =
                 (plan.window_start..device_snapshot.next_pre_key_id).collect();
             let mut rows = backend.load_prekeys_batch(&window_ids).await?;
-            rows.sort_unstable_by_key(prekey_record_id);
+            rows.sort_unstable_by_key(|(id, _)| *id);
             if let Some((id, record)) = rows.into_iter().next() {
                 if id != plan.window_start {
                     log::warn!(
@@ -1192,7 +1188,7 @@ impl Client {
         } else {
             backend.load_prekeys_batch(&leftover_ids).await?
         };
-        leftover_rows.sort_unstable_by_key(prekey_record_id);
+        leftover_rows.sort_unstable_by_key(|(id, _)| *id);
 
         if plan.gen_count == 0 && leftover_rows.is_empty() {
             // A fully consumed/missing leftover window with no generation would bail
