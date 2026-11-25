@@ -2459,6 +2459,10 @@ mod group_retry {
             )
             .await;
             let error = result.expect_err("invalid retry must be rejected");
+            assert!(match message_id {
+                "" => matches!(error, PairwiseRetryError::MissingMessageId),
+                _ => matches!(error, PairwiseRetryError::InvalidRetryCount(_)),
+            });
             assert!(
                 error.to_string().contains(expected_error),
                 "unexpected error for {message_id:?}/{retry_count}: {error:#}"

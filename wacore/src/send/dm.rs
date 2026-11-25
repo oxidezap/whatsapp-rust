@@ -540,6 +540,44 @@ pub struct PairwiseRetryRequest<'a> {
     pub pre_encoded: Option<&'a [u8]>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PairwiseRetryError {
+    #[error("pairwise retry encryption target must be a user device JID")]
+    InvalidEncryptionTarget,
+    #[error("direct retry destination must be a user JID")]
+    InvalidDirectDestination,
+    #[error("direct retry recipient must be a user JID")]
+    InvalidDirectRecipient,
+    #[error("participant retry target must be a user device JID")]
+    InvalidParticipant,
+    #[error("group retry requires an addressing mode")]
+    MissingAddressingMode,
+    #[error("broadcast retry must not carry a group addressing mode")]
+    UnexpectedAddressingMode,
+    #[error("participant retry destination must be a group or broadcast list")]
+    InvalidParticipantDestination,
+    #[error("retry message ID must not be empty")]
+    MissingMessageId,
+    #[error(
+        "retry count {0} must be in 1..{max}",
+        max = crate::protocol::retry::MAX_RETRY_COUNT
+    )]
+    InvalidRetryCount(u8),
+    #[error(
+        "pairwise retry pkmsg requires <device-identity> (account is None); refusing before message_encrypt to avoid advancing the sender chain"
+    )]
+    MissingDeviceIdentity,
+    #[error("Unexpected encryption message type for pairwise retry")]
+    UnexpectedCiphertext,
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    Preflight(#[from] SessionPreflightError),
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+}
+
 #[inline]
 fn is_pairwise_user(jid: &Jid) -> bool {
     !jid.is_empty()
@@ -556,18 +594,18 @@ fn is_pairwise_user(jid: &Jid) -> bool {
 fn validate_pairwise_retry_route(
     destination: &PairwiseRetryDestination,
     encryption_jid: &Jid,
-) -> Result<()> {
+) -> Result<(), PairwiseRetryError> {
     if !is_pairwise_user(encryption_jid) {
-        bail!("pairwise retry encryption target must be a user device JID");
+        return Err(PairwiseRetryError::InvalidEncryptionTarget);
     }
 
     match destination {
         PairwiseRetryDestination::Direct { to, recipient } => {
             if !is_pairwise_user(to) {
-                bail!("direct retry destination must be a user JID");
+                return Err(PairwiseRetryError::InvalidDirectDestination);
             }
             if recipient.as_ref().is_some_and(|jid| !is_pairwise_user(jid)) {
-                bail!("direct retry recipient must be a user JID");
+                return Err(PairwiseRetryError::InvalidDirectRecipient);
             }
         }
         PairwiseRetryDestination::Participant {
@@ -576,18 +614,18 @@ fn validate_pairwise_retry_route(
             addressing_mode,
         } => {
             if !is_pairwise_user(participant) {
-                bail!("participant retry target must be a user device JID");
+                return Err(PairwiseRetryError::InvalidParticipant);
             }
             if to.is_group() {
                 if addressing_mode.is_none() {
-                    bail!("group retry requires an addressing mode");
+                    return Err(PairwiseRetryError::MissingAddressingMode);
                 }
             } else if to.is_broadcast_list() {
                 if addressing_mode.is_some() {
-                    bail!("broadcast retry must not carry a group addressing mode");
+                    return Err(PairwiseRetryError::UnexpectedAddressingMode);
                 }
             } else {
-                bail!("participant retry destination must be a group or broadcast list");
+                return Err(PairwiseRetryError::InvalidParticipantDestination);
             }
         }
     }
@@ -605,7 +643,7 @@ pub async fn prepare_pairwise_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
     request: PairwiseRetryRequest<'_>,
-) -> Result<Node>
+) -> Result<Node, PairwiseRetryError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -624,7 +662,7 @@ pub async fn prepare_pairwise_retry_stanza_for_role<S, I>(
     identity_store: &mut I,
     request: PairwiseRetryRequest<'_>,
     role: SenderIdentityRole,
-) -> Result<Node>
+) -> Result<Node, PairwiseRetryError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -641,13 +679,10 @@ where
         pre_encoded,
     } = request;
     if message_id.is_empty() {
-        bail!("retry message ID must not be empty");
+        return Err(PairwiseRetryError::MissingMessageId);
     }
     if !(1..crate::protocol::retry::MAX_RETRY_COUNT).contains(&retry_count) {
-        bail!(
-            "retry count {retry_count} must be in 1..{}",
-            crate::protocol::retry::MAX_RETRY_COUNT
-        );
+        return Err(PairwiseRetryError::InvalidRetryCount(retry_count));
     }
     validate_pairwise_retry_route(&destination, &encryption_jid)?;
 
@@ -661,10 +696,7 @@ where
         && account.is_none()
         && pkmsg_would_be_emitted(session_store, &signal_address).await?
     {
-        bail!(
-            "pairwise retry pkmsg requires <device-identity> (account is None); \
-             refusing before message_encrypt to avoid advancing the sender chain"
-        );
+        return Err(PairwiseRetryError::MissingDeviceIdentity);
     }
 
     let encrypted = crate::libsignal::protocol::message_encrypt_serialized(
@@ -675,8 +707,8 @@ where
     )
     .await?;
 
-    let (enc_type, is_prekey, serialized) = extract_serialized_ciphertext(encrypted)
-        .ok_or_else(|| anyhow!("Unexpected encryption message type for pairwise retry"))?;
+    let (enc_type, is_prekey, serialized) =
+        extract_serialized_ciphertext(encrypted).ok_or(PairwiseRetryError::UnexpectedCiphertext)?;
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
     let mut enc_builder = NodeBuilder::new("enc")
