@@ -1,8 +1,6 @@
 //! PCM and encoded-audio endpoints for WhatsApp calls.
 
 #[cfg(feature = "voip-libopus")]
-use anyhow::{Result, anyhow, ensure};
-#[cfg(feature = "voip-libopus")]
 use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
 #[cfg(feature = "voip-libopus")]
 use wacore::voip::{ForeignCodecError, depacketize_opus_from_mlow, packetize_opus_for_mlow};
@@ -24,6 +22,42 @@ const WA_COMPLEXITY: i32 = 5;
 #[cfg(feature = "voip-libopus")]
 const OPUS_MAX_PACKET_BYTES: usize = 1_275;
 
+#[cfg(feature = "voip-libopus")]
+type Result<T, E = OpusAudioError> = std::result::Result<T, E>;
+
+/// Failure while configuring or using the native Opus codec.
+#[cfg(feature = "voip-libopus")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum OpusAudioError {
+    #[error("opus encoder init: {0}")]
+    EncoderInit(#[source] opus::Error),
+    #[error("opus MLOW-escape encoder init: {0}")]
+    MlowEncoderInit(#[source] opus::Error),
+    #[error("opus set_max_bandwidth: {0}")]
+    MaxBandwidth(#[source] opus::Error),
+    #[error("opus set_bandwidth: {0}")]
+    Bandwidth(#[source] opus::Error),
+    #[error("opus set_bitrate: {0}")]
+    Bitrate(#[source] opus::Error),
+    #[error("opus set_complexity: {0}")]
+    Complexity(#[source] opus::Error),
+    #[error("opus set_dtx: {0}")]
+    Dtx(#[source] opus::Error),
+    #[error("WaOpusEncoder expects exactly {expected} samples, got {actual}")]
+    FrameSize { expected: usize, actual: usize },
+    #[error("opus encode: {0}")]
+    Encode(#[source] opus::Error),
+    #[error("packetize Opus for MLOW: {0}")]
+    Packetize(#[source] wacore::voip::OpusMlowPacketError),
+    #[error("opus decoder init: {0}")]
+    DecoderInit(#[source] opus::Error),
+    #[error("opus decode: {0}")]
+    Decode(#[source] opus::Error),
+    #[error("depacketize Opus from MLOW: {0}")]
+    Depacketize(#[source] wacore::voip::OpusMlowPacketError),
+}
+
 /// Opus encoder with constructors for standard RTP and MLOW's compatible CELT escape.
 #[cfg(feature = "voip-libopus")]
 pub struct WaOpusEncoder {
@@ -36,7 +70,7 @@ pub struct WaOpusEncoder {
 impl WaOpusEncoder {
     pub fn new() -> Result<Self> {
         let mut enc = Encoder::new(WA_SAMPLE_RATE, Channels::Mono, Application::Voip)
-            .map_err(|e| anyhow!("opus encoder init: {e}"))?;
+            .map_err(OpusAudioError::EncoderInit)?;
         Self::finish_init(&mut enc)?;
         Ok(Self {
             enc,
@@ -48,12 +82,12 @@ impl WaOpusEncoder {
     /// Configure libopus for the standard-Opus escape inside WhatsApp's MLOW RTP profile.
     pub fn new_mlow_escape() -> Result<Self> {
         let mut enc = Encoder::new(WA_SAMPLE_RATE, Channels::Mono, Application::LowDelay)
-            .map_err(|e| anyhow!("opus MLOW-escape encoder init: {e}"))?;
+            .map_err(OpusAudioError::MlowEncoderInit)?;
         Self::finish_init(&mut enc)?;
         enc.set_max_bandwidth(Bandwidth::Wideband)
-            .map_err(|e| anyhow!("opus set_max_bandwidth: {e}"))?;
+            .map_err(OpusAudioError::MaxBandwidth)?;
         enc.set_bandwidth(Bandwidth::Wideband)
-            .map_err(|e| anyhow!("opus set_bandwidth: {e}"))?;
+            .map_err(OpusAudioError::Bandwidth)?;
         Ok(Self {
             enc,
             frame_samples: WA_FRAME_SAMPLES,
@@ -63,29 +97,27 @@ impl WaOpusEncoder {
 
     fn finish_init(enc: &mut Encoder) -> Result<()> {
         enc.set_bitrate(Bitrate::Bits(WA_BITRATE))
-            .map_err(|e| anyhow!("opus set_bitrate: {e}"))?;
+            .map_err(OpusAudioError::Bitrate)?;
         enc.set_complexity(WA_COMPLEXITY)
-            .map_err(|e| anyhow!("opus set_complexity: {e}"))?;
-        enc.set_dtx(true)
-            .map_err(|e| anyhow!("opus set_dtx: {e}"))?;
+            .map_err(OpusAudioError::Complexity)?;
+        enc.set_dtx(true).map_err(OpusAudioError::Dtx)?;
         Ok(())
     }
 
     /// Encode one mono frame at the rate selected by the constructor.
     pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>> {
-        ensure!(
-            pcm.len() == self.frame_samples,
-            "WaOpusEncoder expects exactly {} samples, got {}",
-            self.frame_samples,
-            pcm.len()
-        );
+        if pcm.len() != self.frame_samples {
+            return Err(OpusAudioError::FrameSize {
+                expected: self.frame_samples,
+                actual: pcm.len(),
+            });
+        }
         let mut payload = self
             .enc
             .encode_vec(pcm, OPUS_MAX_PACKET_BYTES)
-            .map_err(|e| anyhow!("opus encode: {e}"))?;
+            .map_err(OpusAudioError::Encode)?;
         if self.require_mlow_escape {
-            packetize_opus_for_mlow(&mut payload)
-                .map_err(|e| anyhow!("packetize Opus for MLOW: {e}"))?;
+            packetize_opus_for_mlow(&mut payload).map_err(OpusAudioError::Packetize)?;
         }
         Ok(payload)
     }
@@ -102,8 +134,8 @@ pub struct WaOpusDecoder {
 #[cfg(feature = "voip-libopus")]
 impl WaOpusDecoder {
     pub fn new() -> Result<Self> {
-        let dec = Decoder::new(WA_SAMPLE_RATE, Channels::Mono)
-            .map_err(|e| anyhow!("opus decoder init: {e}"))?;
+        let dec =
+            Decoder::new(WA_SAMPLE_RATE, Channels::Mono).map_err(OpusAudioError::DecoderInit)?;
         Ok(Self {
             dec,
             packet_scratch: Vec::with_capacity(OPUS_MAX_PACKET_BYTES),
@@ -124,7 +156,7 @@ impl WaOpusDecoder {
         pcm_scratch.resize(WA_DECODE_MAX_SAMPLES, 0);
         let n = dec
             .decode(opus, pcm_scratch, false)
-            .map_err(|e| anyhow!("opus decode: {e}"))?;
+            .map_err(OpusAudioError::Decode)?;
         pcm_scratch.truncate(n);
         Ok(pcm_scratch)
     }
@@ -134,7 +166,7 @@ impl WaOpusDecoder {
         self.packet_scratch.clear();
         self.packet_scratch.extend_from_slice(opus);
         depacketize_opus_from_mlow(&mut self.packet_scratch)
-            .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
+            .map_err(OpusAudioError::Depacketize)?;
         Self::decode_packet(&mut self.dec, &mut self.pcm_scratch, &self.packet_scratch)
     }
 }
@@ -231,6 +263,25 @@ impl wacore::voip::ForeignAudioCodec for LibopusAudioCodec {
 #[cfg(all(test, feature = "voip-libopus"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_frame_and_packet_report_typed_errors() {
+        let mut encoder = WaOpusEncoder::new().unwrap();
+        assert!(matches!(
+            encoder.encode(&[]),
+            Err(OpusAudioError::FrameSize {
+                expected: WA_FRAME_SAMPLES,
+                actual: 0
+            })
+        ));
+        let mut decoder = WaOpusDecoder::new().unwrap();
+        let error = decoder.decode_mlow_escape(&[]).unwrap_err();
+        assert!(matches!(
+            error,
+            OpusAudioError::Depacketize(wacore::voip::OpusMlowPacketError::Empty)
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+    }
 
     /// A 440 Hz sine over one 60 ms frame (mono, 16 kHz).
     fn sine_frame() -> Vec<i16> {
