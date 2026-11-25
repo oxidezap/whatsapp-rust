@@ -4,7 +4,6 @@ use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
-use anyhow::Result;
 use async_lock::Mutex;
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
@@ -45,6 +44,27 @@ pub enum IdentityPersistenceError {
     WorkerStopped,
     #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignalCacheFlushError {
+    #[error("{0}")]
+    Store(#[source] Box<crate::store::error::StoreError>),
+    #[error("Corrupted identity key for {address}: expected 32 bytes, got {length}")]
+    InvalidIdentity { address: Arc<str>, length: usize },
+    #[error("sender key serialize for {address}: {source}")]
+    SenderKeySerialization {
+        address: Arc<str>,
+        #[source]
+        source: Box<SignalProtocolError>,
+    },
+}
+
+impl From<crate::store::error::StoreError> for SignalCacheFlushError {
+    fn from(error: crate::store::error::StoreError) -> Self {
+        Self::Store(Box::new(error))
+    }
 }
 
 type StoreIncarnation = [u8; 16];
@@ -1634,7 +1654,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<Option<SessionRecord>, SessionCheckoutError> {
+    ) -> Result<Option<SessionRecord>, SessionCheckoutError> {
         let (record, checkout) = self.checkout_session(address, backend).await?;
         if record.is_none() {
             self.cancel_session_checkout(address, checkout);
@@ -1648,8 +1668,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>
-    {
+    ) -> Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1732,9 +1751,7 @@ impl SignalStoreCache {
     pub fn try_checkout_session(
         &self,
         address: &ProtocolAddress,
-    ) -> Option<
-        std::result::Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>,
-    > {
+    ) -> Option<Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>> {
         let mut state = self.try_lock_sessions()?;
         match state.checkout(address.as_str()) {
             CachedSessionCheckout::Present(record, checkout) => Some(Ok((Some(record), checkout))),
@@ -1828,7 +1845,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         record: SessionRecord,
-    ) -> core::result::Result<(), SessionRecord> {
+    ) -> Result<(), SessionRecord> {
         match self.try_lock_sessions() {
             Some(mut state) => {
                 state.put(address.as_str(), record);
@@ -1984,7 +2001,7 @@ impl SignalStoreCache {
         state: &mut ByteStoreState,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+    ) -> Result<IdentityChange, SignalProtocolError> {
         let previous = state.cache.get(address.as_str()).and_then(Option::as_deref);
         let change = match previous.filter(|bytes| !bytes.is_empty()) {
             None => IdentityChange::NewOrUnchanged,
@@ -2020,7 +2037,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> Option<std::result::Result<IdentityChange, SignalProtocolError>> {
+    ) -> Option<Result<IdentityChange, SignalProtocolError>> {
         let mut state = self.identities.try_lock()?;
         state.cache.get(address.as_str())?;
         Some(self.save_identity_locked(&mut state, address, identity))
@@ -2034,7 +2051,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         identity: &IdentityKey,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+    ) -> Result<IdentityChange, SignalProtocolError> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let since = {
@@ -2164,7 +2181,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_if_absent_or_equal(address, None, data, backend)
             .await
     }
@@ -2178,7 +2195,7 @@ impl SignalStoreCache {
         alias: Option<&ProtocolAddress>,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_in_epoch(
             address,
             alias,
@@ -2197,7 +2214,7 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
         epoch: Option<u64>,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let key: [u8; 32] = data
             .try_into()
             .map_err(|_| IdentityPersistenceError::InvalidBootstrapIdentity)?;
@@ -2284,7 +2301,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, None)
             .await
     }
@@ -2297,7 +2314,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         epoch: Option<u64>,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, Some(epoch))
             .await
     }
@@ -2309,7 +2326,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         authentication_epoch: Option<Option<u64>>,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let cache = Arc::clone(self);
         let identities = identities.to_vec();
         let data = *data;
@@ -2337,7 +2354,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: &dyn SignalStore,
         authentication_epoch: Option<Option<u64>>,
-    ) -> std::result::Result<bool, IdentityPersistenceError> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let mut reloads = 0;
         let (_flush, mut state) = loop {
             // Preloads can be evicted while waiting for an earlier writer.
@@ -2593,7 +2610,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> {
+    ) -> Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> {
         let key = name.cache_key();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -2609,7 +2626,7 @@ impl SignalStoreCache {
             // half of the miss. Errors are held rather than raised, so a
             // concurrent write still wins the re-check below: an unreadable row
             // must not fail an operation the cache can already answer.
-            let decoded: std::result::Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> =
+            let decoded: Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> =
                 match backend.get_sender_key(key).await {
                     Ok(Some(bytes)) => SenderKeyRecord::deserialize_for_store(&bytes, &incarnation)
                         .map(|record| Some(Arc::new(record)))
@@ -2809,7 +2826,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<(), SenderKeyCacheError> {
+    ) -> Result<(), SenderKeyCacheError> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
         let _flush_guard = self.flush_lock.lock().await;
@@ -2867,14 +2884,14 @@ impl SignalStoreCache {
     /// cover capture and confirmation of record writes. Consumed-prekey removal
     /// additionally excludes session mutations through its destructive I/O.
     /// A concurrent mutation stays dirty unless that exact record was persisted.
-    pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
+    pub async fn flush(&self, backend: &dyn SignalStore) -> Result<(), SignalCacheFlushError> {
         let _flush_guard = self.flush_lock.lock().await;
         self.flush_sessions(backend).await?;
         self.flush_identities(backend).await?;
         self.flush_sender_keys(backend).await
     }
 
-    async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_sessions(&self, backend: &dyn SignalStore) -> crate::store::error::Result<()> {
         let (batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -2997,7 +3014,10 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    async fn flush_identities(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_identities(
+        &self,
+        backend: &dyn SignalStore,
+    ) -> Result<(), SignalCacheFlushError> {
         let (batch, versions, deleted) = {
             let state = self.identities.lock().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -3005,10 +3025,10 @@ impl SignalStoreCache {
             for address in &state.dirty {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
-                        anyhow::anyhow!(
-                            "Corrupted identity key for {address}: expected 32 bytes, got {}",
-                            data.len()
-                        )
+                        SignalCacheFlushError::InvalidIdentity {
+                            address: Arc::clone(address),
+                            length: data.len(),
+                        }
                     })?;
                     batch.push((address.clone(), key));
                     versions.push((address.clone(), Arc::downgrade(data)));
@@ -3044,7 +3064,10 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    async fn flush_sender_keys(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_sender_keys(
+        &self,
+        backend: &dyn SignalStore,
+    ) -> Result<(), SignalCacheFlushError> {
         let (batch, versions, deleted) = {
             let state = self.sender_keys.lock().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -3056,8 +3079,9 @@ impl SignalStoreCache {
                         let bytes =
                             record
                                 .serialize_for_store(&state.incarnation)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("sender key serialize for {address}: {e}")
+                                .map_err(|error| SignalCacheFlushError::SenderKeySerialization {
+                                    address: Arc::clone(address),
+                                    source: Box::new(error),
                                 })?;
                         batch.push((address.clone(), bytes::Bytes::from(bytes)));
                         versions.push((address.clone(), Arc::downgrade(record)));
@@ -4931,6 +4955,33 @@ mod identity_save_error_tests {
     use super::*;
 
     #[tokio::test]
+    async fn flush_refuses_corrupt_identity_without_writing_it() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550009999", 0.into());
+        cache.put_identity(&address, &[11; 31]).await;
+        assert!(matches!(
+            cache.flush(&backend).await,
+            Err(SignalCacheFlushError::InvalidIdentity { length: 31, .. })
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn corrupt_identity_saves_report_storage_failure_without_overwriting() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
@@ -6631,7 +6682,7 @@ mod pre_wire_gate_tests {
     async fn run_gated_flush(
         cache: Arc<SignalStoreCache>,
         backend: Arc<DeleteBarrierBackend>,
-    ) -> Result<()> {
+    ) -> Result<(), SignalCacheFlushError> {
         let flush_cache = cache.clone();
         let flush_backend = backend.clone();
         let task = tokio::spawn(async move { flush_cache.flush(flush_backend.as_ref()).await });
