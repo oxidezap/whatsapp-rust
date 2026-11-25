@@ -583,11 +583,17 @@ impl SendContextResolver for MockSendContextResolver {
         crate::client::context::SessionLockGuard::none()
     }
 
-    async fn resolve_devices(&self, _jids: &[Jid]) -> Result<Vec<Jid>> {
+    async fn resolve_devices(
+        &self,
+        _jids: &[Jid],
+    ) -> Result<Vec<Jid>, crate::client::context::SendContextError> {
         Ok(self.devices.clone())
     }
 
-    async fn fetch_prekeys(&self, jids: &[Jid]) -> Result<HashMap<Jid, PreKeyBundle>> {
+    async fn fetch_prekeys(
+        &self,
+        jids: &[Jid],
+    ) -> Result<HashMap<Jid, PreKeyBundle>, crate::client::context::SendContextError> {
         let mut result = HashMap::new();
         for jid in jids {
             if let Some(bundle_opt) = self.prekey_bundles.get(jid)
@@ -602,14 +608,16 @@ impl SendContextResolver for MockSendContextResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<crate::prekeys::PreKeyFetchOutcome> {
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome, crate::client::context::SendContextError> {
         if let Some(code) = self.prekey_error_code {
-            return Err(anyhow::Error::new(crate::request::ServerErrorCode {
-                code,
-                text: "injected pre-key failure".to_string(),
-                error_type: None,
-                backoff: None,
-            }));
+            return Err(crate::client::context::SendContextError::Server(
+                crate::request::ServerErrorCode {
+                    code,
+                    text: "injected pre-key failure".to_string(),
+                    error_type: None,
+                    backoff: None,
+                },
+            ));
         }
         if let Some(probe) = &self.chain_lock_probe {
             probe
@@ -645,7 +653,7 @@ impl SendContextResolver for MockSendContextResolver {
     async fn resolve_group_routing_info(
         &self,
         _jid: &Jid,
-    ) -> Result<std::sync::Arc<GroupRoutingInfo>> {
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>, crate::client::context::SendContextError> {
         unimplemented!("resolve_group_routing_info not needed for send.rs tests")
     }
 
@@ -3650,6 +3658,7 @@ mod stanza_type {
 #[cfg(test)]
 mod device_unregistered_tests {
     use super::is_device_unregistered_error;
+    use crate::client::context::SendContextError;
     use crate::request::ServerErrorCode;
 
     #[test]
@@ -3661,6 +3670,17 @@ mod device_unregistered_tests {
             backoff: None,
         });
         assert!(is_device_unregistered_error(&err));
+    }
+
+    #[test]
+    fn resolver_keeps_server_rejection_in_the_source_chain() {
+        let error = SendContextError::host(ServerErrorCode {
+            code: 406,
+            text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
+        });
+        assert_eq!(error.server_error().map(|server| server.code), Some(406));
     }
 
     #[test]

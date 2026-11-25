@@ -1028,7 +1028,10 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                 server_named = outcome.rejected;
                 outcome.bundles
             }
-            Err(e) if is_device_unregistered_error(&e) => {
+            Err(e)
+                if e.server_error()
+                    .is_some_and(|server| server.code == UNREGISTERED_DEVICE_CODE) =>
+            {
                 // No server prekeys for these devices this round; the next send
                 // re-fetches. Debug, not warn — a batch 406 would otherwise flood the log.
                 log::debug!(
@@ -1048,7 +1051,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                 // Best-effort callers still skip these devices, while a required
                 // distribution can surface the typed server failure without
                 // reconstructing it or reducing the source chain to a string.
-                first_error = Some(e);
+                first_error = Some(e.into());
                 std::collections::HashMap::new()
             }
             Err(e) => {
@@ -1061,7 +1064,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                     UnkeyableDevice::FetchFailed,
                     jids_for_fetch.len() as u64,
                 );
-                return Err(e);
+                return Err(e.into());
             }
         };
 

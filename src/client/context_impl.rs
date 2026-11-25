@@ -2,10 +2,14 @@ use crate::client::Client;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
+use wacore::client::context::{GroupRoutingInfo, SendContextError, SendContextResolver};
 use wacore::iq::prekeys::PreKeyFetchReason;
 use wacore::libsignal::protocol::PreKeyBundle;
 use wacore_binary::Jid;
+
+fn resolver_error(error: anyhow::Error) -> SendContextError {
+    SendContextError::from_boxed(error.into_boxed_dyn_error())
+}
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -15,35 +19,39 @@ impl SendContextResolver for Client {
         &self,
         jid: &Jid,
         bundle: &PreKeyBundle,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendContextError> {
         self.check_prekey_account_identity(jid, bundle)
             .await
-            .map_err(Into::into)
+            .map_err(SendContextError::host)
     }
 
     fn sender_identity_role(&self) -> wacore::send::SenderIdentityRole {
         self.sending_identity_role()
     }
 
-    async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
+    async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, SendContextError> {
         // Only group sends resolve through here.
         self.get_group_user_devices_owned(jids.iter().map(Jid::to_non_ad).collect())
             .await
             .map(|(devices, _)| devices)
+            .map_err(resolver_error)
     }
 
     async fn fetch_prekeys(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    ) -> Result<HashMap<Jid, PreKeyBundle>, SendContextError> {
         // The fan-out has its own batch-level handling; it wants the bundles only.
-        self.fetch_pre_keys(jids, None).await.map(|o| o.bundles)
+        self.fetch_pre_keys(jids, None)
+            .await
+            .map(|o| o.bundles)
+            .map_err(resolver_error)
     }
 
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, SendContextError> {
         self.fetch_pre_keys(jids, Some(PreKeyFetchReason::Identity))
             .await
             .map_err(|e| {
@@ -57,22 +65,25 @@ impl SendContextResolver for Client {
                     ..
                 }) = e.downcast_ref::<crate::request::IqError>()
                 {
-                    return anyhow::Error::new(wacore::request::ServerErrorCode {
+                    return SendContextError::Server(wacore::request::ServerErrorCode {
                         code: *code,
                         text: text.clone(),
                         error_type: error_type.clone(),
                         backoff: *backoff,
                     });
                 }
-                e
+                resolver_error(e)
             })
     }
 
     async fn resolve_group_routing_info(
         &self,
         jid: &Jid,
-    ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
-        Ok(self.groups().routing_info(jid).await?)
+    ) -> Result<Arc<GroupRoutingInfo>, SendContextError> {
+        self.groups()
+            .routing_info(jid)
+            .await
+            .map_err(SendContextError::host)
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {

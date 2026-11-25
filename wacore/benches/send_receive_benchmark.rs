@@ -446,22 +446,29 @@ impl SendContextResolver for MockResolver {
         wacore::client::context::SessionLockGuard::none()
     }
 
-    async fn resolve_devices(&self, _: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
+    async fn resolve_devices(
+        &self,
+        _: &[Jid],
+    ) -> Result<Vec<Jid>, wacore::client::context::SendContextError> {
         Ok(self.0.clone())
     }
-    async fn fetch_prekeys(&self, _: &[Jid]) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    async fn fetch_prekeys(
+        &self,
+        _: &[Jid],
+    ) -> Result<HashMap<Jid, PreKeyBundle>, wacore::client::context::SendContextError> {
         Ok(HashMap::new())
     }
     async fn fetch_prekeys_for_identity_check(
         &self,
         _: &[Jid],
-    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, wacore::client::context::SendContextError>
+    {
         Ok(wacore::prekeys::PreKeyFetchOutcome::default())
     }
     async fn resolve_group_routing_info(
         &self,
         _: &Jid,
-    ) -> Result<std::sync::Arc<GroupRoutingInfo>, anyhow::Error> {
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>, wacore::client::context::SendContextError> {
         Ok(std::sync::Arc::new(GroupRoutingInfo::new(
             self.0.clone(),
             AddressingMode::Pn,
