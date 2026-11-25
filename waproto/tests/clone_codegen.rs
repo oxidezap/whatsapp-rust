@@ -39,11 +39,23 @@ fn generator_drift_fails_closed() {
 
 #[test]
 fn selected_structs_have_separate_pinned_clone_impls() {
-    let source = "#[derive(Clone)] struct Message { field: u8 } #[derive(Clone)] struct ContextInfo { other: u16 }";
-    let output = generate(source, &["Message", "ContextInfo"]).unwrap();
+    let source = "#[derive(Clone)] struct Message { field: u8 } #[derive(Clone)] struct ContextInfo { other: u16 } #[derive(Clone)] struct BotMetadata { nested: String }";
+    let output = generate(source, &["Message", "ContextInfo", "BotMetadata"]).unwrap();
     assert!(output.contains("impl ::core::clone::Clone for Message"));
     assert!(output.contains("impl ::core::clone::Clone for ContextInfo"));
+    assert!(output.contains("impl ::core::clone::Clone for BotMetadata"));
     assert!(output.contains("other: ::core::clone::Clone::clone(&self.other)"));
-    assert_eq!(output.matches("#[inline(never)]").count(), 2);
-    assert!(generate(source, &["Message", "BotMetadata"]).is_err());
+    assert_eq!(output.matches("#[inline(never)]").count(), 3);
+    assert!(generate(source, &["Message", "Missing"]).is_err());
+}
+
+#[test]
+fn nested_targets_are_pinned_in_their_own_module() {
+    let source = "#[derive(Clone)] struct VideoMessage { root: u8 } mod message { #[derive(Clone)] pub struct VideoMessage { data: String } }";
+    let output = generate(source, &["message::VideoMessage"]).unwrap();
+    assert!(output.contains("#[derive(Clone)]\nstruct VideoMessage"));
+    assert!(output.contains("impl ::core::clone::Clone for VideoMessage"));
+    assert!(output.contains("data: ::core::clone::Clone::clone(&self.data)"));
+    assert_eq!(output.matches("#[inline(never)]").count(), 1);
+    assert!(generate(source, &["other::VideoMessage"]).is_err());
 }

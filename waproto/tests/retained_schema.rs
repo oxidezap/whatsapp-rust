@@ -109,6 +109,57 @@ fn message_clone_preserves_retained_and_new_fields_without_aliasing() {
 }
 
 #[test]
+fn bot_metadata_clone_preserves_nested_fields_without_aliasing() {
+    let mut session = wa::BotSessionMetadata::default();
+    session.session_id = Some("fixture-session".into());
+    let mut original = wa::BotMetadata::default();
+    original.persona_id = Some("fixture-persona".into());
+    original.session_metadata = Some(session).into();
+    original.ai_conversation_context = Some(vec![1, 2, 3].into());
+
+    let encoded = original.encode_to_vec();
+    let mut cloned = original.clone();
+    assert_eq!(cloned, original);
+    assert_eq!(cloned.encode_to_vec(), encoded);
+    cloned.session_metadata.as_option_mut().unwrap().session_id = Some("changed".into());
+    assert_eq!(
+        original.session_metadata.session_id.as_deref(),
+        Some("fixture-session")
+    );
+    cloned.clone_from(&original);
+    assert_eq!(cloned, original);
+}
+
+#[test]
+fn media_message_clone_preserves_nested_data_without_aliasing() {
+    let mut context = wa::ContextInfo::default();
+    context.stanza_id = Some("fixture-stanza".into());
+    let mut image = wa::message::ImageMessage::default();
+    image.caption = Some("fixture-image".into());
+    image.jpeg_thumbnail = Some(vec![1, 2, 3].into());
+    image.context_info = Some(context).into();
+    let mut message = wa::Message::default();
+    message.image_message = Some(image).into();
+
+    let encoded = message.encode_to_vec();
+    let mut cloned = message.clone();
+    assert_eq!(cloned, message);
+    assert_eq!(cloned.encode_to_vec(), encoded);
+    cloned
+        .image_message
+        .as_option_mut()
+        .unwrap()
+        .context_info
+        .as_option_mut()
+        .unwrap()
+        .stanza_id = Some("changed".into());
+    assert_eq!(
+        message.image_message.context_info.stanza_id.as_deref(),
+        Some("fixture-stanza")
+    );
+}
+
+#[test]
 fn wallpaper_string_and_argb_encodings_keep_their_distinct_wire_types() {
     use buffa::{MessageView as _, ViewEncode as _};
     use wa::message::{
