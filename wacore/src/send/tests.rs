@@ -3704,7 +3704,7 @@ mod device_unregistered_tests {
 
     #[test]
     fn group_error_preserves_missing_sender_key_for_recovery() {
-        let error = super::GroupStanzaError::GroupEncrypt(Box::new(
+        let error = super::GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(
             crate::libsignal::protocol::SignalProtocolError::NoSenderKeyState("synthetic".into()),
         ));
         assert!(matches!(

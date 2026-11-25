@@ -71,7 +71,9 @@ pub enum SendError {
     #[error("{0}")]
     StatusRecipients(#[from] wacore::send::StatusRecipientsError),
     #[error("{0}")]
-    SenderKeyCache(#[source] Box<wacore::store::signal_cache::SenderKeyCacheError>),
+    SenderKeyCache(
+        #[source] wacore::error::BoxedErrorSource<wacore::store::signal_cache::SenderKeyCacheError>,
+    ),
     #[error("{0}")]
     Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
     /// A DM could not be encrypted for a single device of the recipient, so
@@ -163,7 +165,7 @@ impl From<wacore::send::DmStanzaError> for SendError {
 
 impl From<wacore::store::signal_cache::SenderKeyCacheError> for SendError {
     fn from(error: wacore::store::signal_cache::SenderKeyCacheError) -> Self {
-        Self::SenderKeyCache(Box::new(error))
+        Self::SenderKeyCache(wacore::error::BoxedErrorSource::new(error))
     }
 }
 

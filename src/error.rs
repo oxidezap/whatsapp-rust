@@ -303,4 +303,56 @@ mod boxed_source_tests {
                 .any(|source| source.is::<wacore::send::DeviceEncryptionError>())
         );
     }
+
+    #[test]
+    fn download_error_exposes_download_cause() {
+        let error = crate::download::ClientDownloadError::HostsUnreachable(
+            wacore::error::BoxedErrorSource::new(crate::download::DownloadCause::NoHosts),
+        );
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::download::DownloadCause>())
+        );
+    }
+
+    #[test]
+    fn connection_error_exposes_version_cause() {
+        let error = crate::ConnectError::Version(wacore::error::BoxedErrorSource::new(
+            crate::version::VersionError::Shape(crate::version::VersionShapeError::Field {
+                field: "version",
+                url: "test",
+            }),
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::version::VersionError>())
+        );
+    }
+
+    #[test]
+    fn group_error_exposes_signal_cause() {
+        let error =
+            wacore::send::GroupStanzaError::GroupEncrypt(wacore::error::BoxedErrorSource::new(
+                wacore::libsignal::protocol::SignalProtocolError::InvalidArgument("fixture".into()),
+            ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::libsignal::protocol::SignalProtocolError>())
+        );
+    }
+
+    #[test]
+    fn send_error_exposes_sender_key_cache_cause() {
+        let error = crate::SendError::SenderKeyCache(wacore::error::BoxedErrorSource::new(
+            wacore::store::signal_cache::SenderKeyCacheError::Store(storage_error()),
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::store::signal_cache::SenderKeyCacheError>())
+        );
+    }
 }

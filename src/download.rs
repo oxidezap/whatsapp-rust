@@ -8,6 +8,7 @@ use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_au
 use anyhow::Result;
 use smallvec::SmallVec;
 use std::sync::Arc;
+use wacore::error::BoxedErrorSource;
 use wacore::runtime::Runtime;
 use wacore::sync_marker::MaybeSend;
 
@@ -205,9 +206,9 @@ pub enum DownloadCause {
     #[error("Failed to download from all available media hosts")]
     NoHosts,
     #[error("the refreshed media route names no hosts after CDN rejection")]
-    NoHostsAfterRefresh(#[source] Box<DownloadCause>),
+    NoHostsAfterRefresh(#[source] BoxedErrorSource<DownloadCause>),
     #[error("{0}")]
-    Cleanup(#[source] Box<ClientDownloadError>),
+    Cleanup(#[source] BoxedErrorSource<ClientDownloadError>),
 }
 
 /// Failure to retrieve or decode a sticker pack from the CDN.
@@ -240,28 +241,28 @@ pub enum MediaDownloadError {
     /// The CDN rejected the reference itself (401/403/404/410). The direct path
     /// or its token is expired or revoked; another host cannot serve it either.
     #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    ReferenceRejected(#[source] Box<DownloadCause>),
+    ReferenceRejected(#[source] BoxedErrorSource<DownloadCause>),
     /// Every host in the route failed for a reason other than the reference:
     /// transport failure, unexpected status, or a body that failed to verify.
     #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    HostsUnreachable(#[source] Box<DownloadCause>),
+    HostsUnreachable(#[source] BoxedErrorSource<DownloadCause>),
     /// The local destination could not be truncated, written or rewound.
     /// This is terminal: switching CDN hosts cannot repair the sink.
     #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    WriterIo(#[source] Box<DownloadCause>),
+    WriterIo(#[source] BoxedErrorSource<DownloadCause>),
     /// The route named no hosts, so nothing was ever contacted.
     #[error("the media route names no hosts")]
     NoHosts,
     /// No host was contacted and none could be: the reference is too incomplete
     /// to build a URL from, so the fix is the metadata, not the network.
     #[error("{:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    Other(#[from] Box<DownloadCause>),
+    Other(#[from] BoxedErrorSource<DownloadCause>),
     /// Cleanup failed; `failure` preserves the original classification and source
     /// chain, while `cleanup` explains why the sink may retain unverified bytes.
     #[error("{failure}; failed to clear the writer: {:?}", .cleanup.kind())]
     WriterCleanup {
         #[source]
-        failure: Box<MediaDownloadError>,
+        failure: BoxedErrorSource<MediaDownloadError>,
         cleanup: std::io::Error,
     },
 }
@@ -281,25 +282,25 @@ pub enum ClientDownloadError {
     /// The reference is still rejected after any applicable refresh. Static
     /// URLs have no refreshable route, so their first rejection is final.
     #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    ReferenceRejected(#[source] Box<DownloadCause>),
+    ReferenceRejected(#[source] BoxedErrorSource<DownloadCause>),
     /// Every host failed (transport, status, or integrity); the last cause is
     /// retained, including its HTTP status or decryption error when available.
     #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    HostsUnreachable(#[source] Box<DownloadCause>),
+    HostsUnreachable(#[source] BoxedErrorSource<DownloadCause>),
     /// The local destination could not be truncated, written or rewound.
     /// No further host or media-session refresh is attempted for this failure.
     #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    WriterIo(#[source] Box<DownloadCause>),
+    WriterIo(#[source] BoxedErrorSource<DownloadCause>),
     /// The obtained route has no hosts. No HTTP request was executed.
     #[error("the media route names no hosts")]
     NoHosts,
     /// A forced refresh after rejection yielded no hosts. The prior rejection
     /// remains the source: unlike `NoHosts`, an HTTP exchange already occurred.
     #[error("the refreshed media route names no hosts after CDN rejection: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    NoHostsAfterRefresh(#[source] Box<DownloadCause>),
+    NoHostsAfterRefresh(#[source] BoxedErrorSource<DownloadCause>),
     /// Metadata could not be turned into a request.
     #[error("could not prepare the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    Preparation(#[source] Box<DownloadCause>),
+    Preparation(#[source] BoxedErrorSource<DownloadCause>),
     /// Failed to obtain a session route, or refresh it after a CDN rejection.
     /// The IQ error retains rejection metadata, timeout and transport causes.
     #[error("failed to obtain media session (forced refresh: {force_refresh}): {:?}", MediaErrorDiagnostic(.source))]
@@ -314,7 +315,7 @@ pub enum ClientDownloadError {
     #[error("{failure}; failed to clear the writer: {:?}", .cleanup.kind())]
     WriterCleanup {
         #[source]
-        failure: Box<ClientDownloadError>,
+        failure: BoxedErrorSource<ClientDownloadError>,
         cleanup: std::io::Error,
     },
 }
@@ -440,13 +441,13 @@ impl From<DownloadRequestError> for ClientDownloadError {
         match err {
             DownloadRequestError::ResourcePolicy(e) => Self::ResourcePolicy(e),
             DownloadRequestError::Auth(e) | DownloadRequestError::NotFound(e) => {
-                Self::ReferenceRejected(e)
+                Self::ReferenceRejected(e.into())
             }
-            DownloadRequestError::Other(e) => Self::HostsUnreachable(e),
-            DownloadRequestError::WriterIo(e) => Self::WriterIo(e),
-            DownloadRequestError::Prepare(e) => Self::Preparation(e),
+            DownloadRequestError::Other(e) => Self::HostsUnreachable(e.into()),
+            DownloadRequestError::WriterIo(e) => Self::WriterIo(e.into()),
+            DownloadRequestError::Prepare(e) => Self::Preparation(e.into()),
             DownloadRequestError::NoHosts => Self::NoHosts,
-            DownloadRequestError::NoHostsAfterRefresh(e) => Self::NoHostsAfterRefresh(e),
+            DownloadRequestError::NoHostsAfterRefresh(e) => Self::NoHostsAfterRefresh(e.into()),
             DownloadRequestError::Session {
                 force_refresh,
                 source,
@@ -455,7 +456,7 @@ impl From<DownloadRequestError> for ClientDownloadError {
                 source,
             },
             DownloadRequestError::Cleanup { failure, cleanup } => Self::WriterCleanup {
-                failure: Box::new((*failure).into()),
+                failure: BoxedErrorSource::new((*failure).into()),
                 cleanup,
             },
         }
@@ -467,18 +468,18 @@ impl From<DownloadRequestError> for MediaDownloadError {
         match err {
             DownloadRequestError::ResourcePolicy(e) => Self::ResourcePolicy(e),
             DownloadRequestError::Auth(e) | DownloadRequestError::NotFound(e) => {
-                Self::ReferenceRejected(e)
+                Self::ReferenceRejected(e.into())
             }
-            DownloadRequestError::Other(e) => Self::HostsUnreachable(e),
-            DownloadRequestError::WriterIo(e) => Self::WriterIo(e),
-            DownloadRequestError::Prepare(e) => Self::Other(e),
+            DownloadRequestError::Other(e) => Self::HostsUnreachable(e.into()),
+            DownloadRequestError::WriterIo(e) => Self::WriterIo(e.into()),
+            DownloadRequestError::Prepare(e) => Self::Other(e.into()),
             DownloadRequestError::NoHosts => Self::NoHosts,
             DownloadRequestError::Session { source, .. } => {
-                Self::Other(Box::new(DownloadCause::Session(source)))
+                Self::Other(BoxedErrorSource::new(DownloadCause::Session(source)))
             }
-            DownloadRequestError::NoHostsAfterRefresh(e) => Self::Other(e),
+            DownloadRequestError::NoHostsAfterRefresh(e) => Self::Other(e.into()),
             DownloadRequestError::Cleanup { failure, cleanup } => Self::WriterCleanup {
-                failure: Box::new((*failure).into()),
+                failure: BoxedErrorSource::new((*failure).into()),
                 cleanup,
             },
         }
@@ -648,13 +649,13 @@ impl DownloadRequestError {
             | Self::Prepare(err) => err,
             Self::NoHosts => Box::new(DownloadCause::NoHosts),
             Self::Session { source, .. } => Box::new(DownloadCause::Session(source)),
-            Self::NoHostsAfterRefresh(e) => Box::new(DownloadCause::NoHostsAfterRefresh(e)),
-            Self::Cleanup { failure, cleanup } => Box::new(DownloadCause::Cleanup(Box::new(
-                ClientDownloadError::WriterCleanup {
-                    failure: Box::new((*failure).into()),
+            Self::NoHostsAfterRefresh(e) => Box::new(DownloadCause::NoHostsAfterRefresh(e.into())),
+            Self::Cleanup { failure, cleanup } => Box::new(DownloadCause::Cleanup(
+                BoxedErrorSource::new(ClientDownloadError::WriterCleanup {
+                    failure: BoxedErrorSource::new((*failure).into()),
                     cleanup,
-                },
-            ))),
+                }),
+            )),
         }
     }
 }
@@ -1244,9 +1245,9 @@ impl Client {
         limits: DownloadLimits,
         runtime: &Arc<dyn Runtime>,
     ) -> Result<Vec<u8>, ClientDownloadError> {
-        let media_http = self
-            .media_http_client()
-            .map_err(|error| ClientDownloadError::Preparation(Box::new(error.into())))?;
+        let media_http = self.media_http_client().map_err(|error| {
+            ClientDownloadError::Preparation(BoxedErrorSource::new(error.into()))
+        })?;
         let media_http = &media_http;
         if limits.is_bounded()
             && !self.http_client.supports_streaming()
@@ -2291,19 +2292,21 @@ mod tests {
             };
             let cleanup = || std::io::Error::other(CONTEXT);
             let errors: Vec<Box<dyn Error>> = vec![
-                Box::new(MediaDownloadError::ReferenceRejected(cause())),
-                Box::new(MediaDownloadError::HostsUnreachable(cause())),
-                Box::new(MediaDownloadError::WriterIo(cause())),
-                Box::new(MediaDownloadError::Other(cause())),
+                Box::new(MediaDownloadError::ReferenceRejected(cause().into())),
+                Box::new(MediaDownloadError::HostsUnreachable(cause().into())),
+                Box::new(MediaDownloadError::WriterIo(cause().into())),
+                Box::new(MediaDownloadError::Other(cause().into())),
                 Box::new(MediaDownloadError::WriterCleanup {
-                    failure: Box::new(MediaDownloadError::HostsUnreachable(cause())),
+                    failure: BoxedErrorSource::new(MediaDownloadError::HostsUnreachable(
+                        cause().into(),
+                    )),
                     cleanup: cleanup(),
                 }),
-                Box::new(ClientDownloadError::ReferenceRejected(cause())),
-                Box::new(ClientDownloadError::HostsUnreachable(cause())),
-                Box::new(ClientDownloadError::WriterIo(cause())),
-                Box::new(ClientDownloadError::NoHostsAfterRefresh(cause())),
-                Box::new(ClientDownloadError::Preparation(cause())),
+                Box::new(ClientDownloadError::ReferenceRejected(cause().into())),
+                Box::new(ClientDownloadError::HostsUnreachable(cause().into())),
+                Box::new(ClientDownloadError::WriterIo(cause().into())),
+                Box::new(ClientDownloadError::NoHostsAfterRefresh(cause().into())),
+                Box::new(ClientDownloadError::Preparation(cause().into())),
                 Box::new(ClientDownloadError::MediaSession {
                     force_refresh: true,
                     source: crate::request::IqError::ParseError(
@@ -2312,7 +2315,9 @@ mod tests {
                     ),
                 }),
                 Box::new(ClientDownloadError::WriterCleanup {
-                    failure: Box::new(ClientDownloadError::HostsUnreachable(cause())),
+                    failure: BoxedErrorSource::new(ClientDownloadError::HostsUnreachable(
+                        cause().into(),
+                    )),
                     cleanup: cleanup(),
                 }),
             ];
@@ -6297,10 +6302,10 @@ mod tests {
                 let ClientDownloadError::WriterCleanup { failure, cleanup } = error else {
                     panic!("expected cleanup failure, got {error:?}")
                 };
-                let ClientDownloadError::HostsUnreachable(cause) = *failure else {
+                let ClientDownloadError::HostsUnreachable(cause) = failure.as_ref() else {
                     panic!("cleanup replaced the download cause: {failure:?}");
                 };
-                assert_mac_cause(&cause);
+                assert_mac_cause(cause.as_ref());
                 assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
             } else {
                 let error = downloader(http, &["cdn.example.com"])
@@ -6310,10 +6315,10 @@ mod tests {
                 let MediaDownloadError::WriterCleanup { failure, cleanup } = error else {
                     panic!("expected cleanup failure, got {error:?}")
                 };
-                let MediaDownloadError::HostsUnreachable(cause) = *failure else {
+                let MediaDownloadError::HostsUnreachable(cause) = failure.as_ref() else {
                     panic!("cleanup replaced the download cause: {failure:?}");
                 };
-                assert_mac_cause(&cause);
+                assert_mac_cause(cause.as_ref());
                 assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
             }
             assert!(

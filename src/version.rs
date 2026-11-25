@@ -25,7 +25,7 @@ pub enum VersionError {
     #[error("{0}")]
     Shape(#[from] VersionShapeError),
     #[error("Failed to fetch latest WhatsApp version: {0}")]
-    Resolve(#[source] Box<VersionError>),
+    Resolve(#[source] wacore::error::BoxedErrorSource<VersionError>),
 }
 
 impl std::fmt::Debug for VersionError {
@@ -311,7 +311,11 @@ async fn resolve_version_with_runtime(
                 );
                 return Ok(Some(fallback));
             }
-            Err(e) => return Err(VersionError::Resolve(Box::new(e))),
+            Err(e) => {
+                return Err(VersionError::Resolve(wacore::error::BoxedErrorSource::new(
+                    e,
+                )));
+            }
         };
 
         debug!("Fetched latest version: {}.{}.{}", p, s, t);

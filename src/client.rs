@@ -1503,7 +1503,7 @@ pub enum ConnectError {
     },
     /// The app version could not be resolved.
     #[error("failed to resolve app version")]
-    Version(#[source] Box<crate::version::VersionError>),
+    Version(#[source] wacore::error::BoxedErrorSource<crate::version::VersionError>),
     /// The transport factory could not open a connection.
     #[error("failed to open transport")]
     Transport(#[source] wacore::net::TransportError),

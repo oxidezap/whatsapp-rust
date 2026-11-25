@@ -72,7 +72,7 @@ impl RequiredSenderKeyDistributionError {
 #[non_exhaustive]
 pub enum RequiredDistributionCause {
     #[error("{0}")]
-    Device(#[source] Box<DeviceEncryptionError>),
+    Device(#[source] crate::error::BoxedErrorSource<DeviceEncryptionError>),
     #[error("sender-key distribution encrypted {encrypted} of {required} required targets")]
     Incomplete { encrypted: usize, required: usize },
 }
@@ -83,19 +83,25 @@ pub enum GroupStanzaError {
     #[error("{0}")]
     DeviceIdentity(#[from] DeviceIdentityError),
     #[error("{0}")]
-    Resolver(#[source] Box<crate::client::context::SendContextError>),
+    Resolver(#[source] crate::error::BoxedErrorSource<crate::client::context::SendContextError>),
     #[error("required sender-key distribution has no targets")]
     MissingDistributionTargets,
     #[error("a pre-resolved group encryption address is missing")]
     MissingResolvedAddress,
     #[error("required sender-key session setup failed")]
-    SessionSetup(#[source] Box<SessionSetupError>),
+    SessionSetup(#[source] crate::error::BoxedErrorSource<SessionSetupError>),
     #[error("{0}")]
-    RequiredDistribution(#[source] Box<RequiredSenderKeyDistributionError>),
+    RequiredDistribution(
+        #[source] crate::error::BoxedErrorSource<RequiredSenderKeyDistributionError>,
+    ),
     #[error("{0}")]
-    SenderKeyCreation(#[source] Box<crate::libsignal::protocol::SignalProtocolError>),
+    SenderKeyCreation(
+        #[source] crate::error::BoxedErrorSource<crate::libsignal::protocol::SignalProtocolError>,
+    ),
     #[error("group encrypt failed: {}", crate::diagnostics::ErrorSummary(.0.as_ref()))]
-    GroupEncrypt(#[source] Box<crate::libsignal::protocol::SignalProtocolError>),
+    GroupEncrypt(
+        #[source] crate::error::BoxedErrorSource<crate::libsignal::protocol::SignalProtocolError>,
+    ),
 }
 
 impl GroupStanzaError {
@@ -288,10 +294,13 @@ pub async fn prepare_group_stanza_resolved(
             jids_to_resolve.len()
         );
 
-        let mut resolved_list = resolver
-            .resolve_devices(&jids_to_resolve)
-            .await
-            .map_err(|error| GroupStanzaError::Resolver(Box::new(error)))?;
+        let mut resolved_list =
+            resolver
+                .resolve_devices(&jids_to_resolve)
+                .await
+                .map_err(|error| {
+                    GroupStanzaError::Resolver(crate::error::BoxedErrorSource::new(error))
+                })?;
 
         // For LID groups, convert phone-based device JIDs back to LID format
         // This is necessary because WhatsApp Web expects LID addressing in SKDM <to> nodes
@@ -433,7 +442,9 @@ pub async fn prepare_group_stanza_resolved(
             {
                 Ok(plan) => Some(plan),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(GroupStanzaError::SessionSetup(Box::new(error)));
+                    return Err(GroupStanzaError::SessionSetup(
+                        crate::error::BoxedErrorSource::new(error),
+                    ));
                 }
                 Err(e) => {
                     log::warn!(
@@ -485,7 +496,9 @@ pub async fn prepare_group_stanza_resolved(
             &sender_key_name,
         )
         .await
-        .map_err(|error| GroupStanzaError::SenderKeyCreation(Box::new(error)))?;
+        .map_err(|error| {
+            GroupStanzaError::SenderKeyCreation(crate::error::BoxedErrorSource::new(error))
+        })?;
 
         if let Some(plan) = session_plan {
             let skdm_plaintext_to_encrypt =
@@ -526,7 +539,7 @@ pub async fn prepare_group_stanza_resolved(
                 && (encrypted_devices.len() != distribution_list.len() || first_error.is_some())
             {
                 let error = first_error
-                    .map(RequiredDistributionCause::Device)
+                    .map(|error| RequiredDistributionCause::Device(error.into()))
                     .unwrap_or(RequiredDistributionCause::Incomplete {
                         encrypted: encrypted_devices.len(),
                         required: distribution_list.len(),
@@ -538,9 +551,12 @@ pub async fn prepare_group_stanza_resolved(
                     &encrypted_devices,
                     group_info,
                 );
-                return Err(GroupStanzaError::RequiredDistribution(Box::new(
-                    RequiredSenderKeyDistributionError::new(error, stale_device_users),
-                )));
+                return Err(GroupStanzaError::RequiredDistribution(
+                    crate::error::BoxedErrorSource::new(RequiredSenderKeyDistributionError::new(
+                        error,
+                        stale_device_users,
+                    )),
+                ));
             }
 
             includes_prekey_message |= result_includes_prekey;
@@ -596,7 +612,9 @@ pub async fn prepare_group_stanza_resolved(
             &mut rand::make_rng::<rand::rngs::StdRng>(),
         )
         .await
-        .map_err(|error| GroupStanzaError::GroupEncrypt(Box::new(error)))?
+        .map_err(|error| {
+            GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(error))
+        })?
     } else {
         encrypt_group_message(
             stores.sender_key_store,
@@ -605,7 +623,9 @@ pub async fn prepare_group_stanza_resolved(
             &mut rand::make_rng::<rand::rngs::StdRng>(),
         )
         .await
-        .map_err(|error| GroupStanzaError::GroupEncrypt(Box::new(error)))?
+        .map_err(|error| {
+            GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(error))
+        })?
     };
 
     // Release before buffer cleanup and the chain-independent stanza build.

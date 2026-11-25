@@ -88,12 +88,12 @@ pub enum NativeRelayError {
     Candidate {
         addr: SocketAddr,
         #[source]
-        source: Box<NativeRelayError>,
+        source: wacore::error::BoxedErrorSource<NativeRelayError>,
     },
     #[error("{last}; {other}")]
     BothFailed {
         #[source]
-        last: Box<NativeRelayError>,
+        last: wacore::error::BoxedErrorSource<NativeRelayError>,
         other: Box<NativeRelayError>,
     },
     #[error(
@@ -103,7 +103,7 @@ pub enum NativeRelayError {
     #[error("relay connect: {source}; tried {tried}")]
     AllCandidatesFailed {
         #[source]
-        source: Box<NativeRelayError>,
+        source: wacore::error::BoxedErrorSource<NativeRelayError>,
         tried: String,
     },
 }
@@ -1029,14 +1029,14 @@ where
             .await
             .map(|advertised| (advertised, PortChoice::WebClientFailed))
             .map_err(|error| NativeRelayError::BothFailed {
-                last: Box::new(error),
+                last: wacore::error::BoxedErrorSource::new(error),
                 other: Box::new(web_error),
             }),
         Either::Left((Err(advertised_error), web_client)) => web_client
             .await
             .map(|web_client| (web_client, PortChoice::AdvertisedFailed))
             .map_err(|error| NativeRelayError::BothFailed {
-                last: Box::new(error),
+                last: wacore::error::BoxedErrorSource::new(error),
                 other: Box::new(advertised_error),
             }),
         Either::Left((Ok(advertised), web_client)) => {
@@ -1087,7 +1087,7 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
                                 Ok((chan, events)) => Ok((addr, chan, events)),
                                 Err(source) => Err(NativeRelayError::Candidate {
                                     addr,
-                                    source: Box::new(source),
+                                    source: wacore::error::BoxedErrorSource::new(source),
                                 }),
                             }
                         }) as Pin<Box<dyn Future<Output = _> + Send>>
@@ -1123,7 +1123,7 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
                         tried: tried.clone(),
                     })?
                     .map_err(|source| NativeRelayError::AllCandidatesFailed {
-                        source: Box::new(source),
+                        source: wacore::error::BoxedErrorSource::new(source),
                         tried,
                     })?;
             // Which ports answered and which was kept diverge per host and per session, so this is the

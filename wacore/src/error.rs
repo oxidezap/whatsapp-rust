@@ -4,12 +4,17 @@ use std::fmt;
 ///
 /// This wrapper intentionally does not implement `Error`: the derive must dereference
 /// to the concrete cause rather than expose the box as the source.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct BoxedErrorSource<E>(Box<E>);
 
 impl<E> BoxedErrorSource<E> {
     pub fn new(error: E) -> Self {
         Self(Box::new(error))
+    }
+
+    pub fn into_box(self) -> Box<E> {
+        self.0
     }
 }
 

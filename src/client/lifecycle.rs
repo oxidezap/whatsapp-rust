@@ -1708,7 +1708,9 @@ impl Client {
         };
 
         let version_fallback = match version_result {
-            Ok(resolved) => resolved.map_err(|error| ConnectError::Version(Box::new(error)))?,
+            Ok(resolved) => resolved.map_err(|error| {
+                ConnectError::Version(wacore::error::BoxedErrorSource::new(error))
+            })?,
             // A source that hangs until the timeout is unreachable, just more
             // slowly, so it settles for the same fallback a refused one does
             // rather than failing the connect a blocked host would survive.
