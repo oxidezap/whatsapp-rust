@@ -97,6 +97,19 @@ pub enum NoRecipientDeviceError {
     Unresolved,
 }
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum DmStanzaError {
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    SessionSetup(#[from] SessionSetupError),
+    #[error("{0}")]
+    NoRecipient(#[from] NoRecipientDeviceError),
+    #[error("encryption failed for all {0} own device(s)")]
+    NoOwnDevice(usize),
+}
+
 /// The server named a device 0 as gone while the send was establishing
 /// sessions for it.
 ///
@@ -223,7 +236,7 @@ pub async fn prepare_dm_stanza(
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     request: DmStanzaRequest<'_>,
-) -> Result<PreparedDmStanza> {
+) -> Result<PreparedDmStanza, DmStanzaError> {
     let sender_role = resolver.sender_identity_role();
     sender_role.validate()?;
     let DmStanzaRequest {
@@ -393,9 +406,7 @@ pub async fn prepare_dm_stanza(
     // the message. WA Web's encryptAndSendUserMsg rejects an empty success set
     // too, though it does not distinguish the two halves.
     if participant_nodes.is_empty() && total_devices > 0 {
-        return Err(anyhow!(
-            "encryption failed for all {total_devices} own device(s)"
-        ));
+        return Err(DmStanzaError::NoOwnDevice(total_devices));
     }
 
     // Sized for everything that can follow `<participants>`: the optional

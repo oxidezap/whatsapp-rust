@@ -148,6 +148,15 @@ impl From<ClientError> for SendError {
     }
 }
 
+impl From<wacore::send::DmStanzaError> for SendError {
+    fn from(error: wacore::send::DmStanzaError) -> Self {
+        match error {
+            wacore::send::DmStanzaError::NoRecipient(error) => Self::NoRecipientDevice(error),
+            other => Self::Internal(other.into()),
+        }
+    }
+}
+
 impl From<GroupError> for SendError {
     fn from(err: GroupError) -> Self {
         match err {
@@ -3906,7 +3915,8 @@ impl Client {
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
                 },
             ))
-            .await?;
+            .await
+            .map_err(SendError::from)?;
             (prepared, dm_devices)
         };
         Ok(SendBranchOutput {
@@ -4074,7 +4084,8 @@ impl Client {
                 pre_encoded: shared_content.as_deref().map(Vec::as_slice),
             },
         )
-        .await?;
+        .await
+        .map_err(SendError::from)?;
 
         prepared
             .node
@@ -4490,6 +4501,14 @@ mod tests {
             panic!("expected NoRecipientDevice, got {mapped:?}");
         };
         assert_eq!(*attempted, 2);
+
+        let typed = SendError::from(wacore::send::DmStanzaError::NoRecipient(
+            NoRecipientDeviceError::Unresolved,
+        ));
+        assert!(matches!(
+            typed,
+            SendError::NoRecipientDevice(NoRecipientDeviceError::Unresolved)
+        ));
 
         let unresolved = SendError::from_anyhow(NoRecipientDeviceError::Unresolved.into());
         assert!(matches!(

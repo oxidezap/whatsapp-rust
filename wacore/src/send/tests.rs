@@ -6760,7 +6760,7 @@ mod local_identity_change_on_send {
             with_sessions: &[Jid],
             missing_bundles: &[Jid],
             message_id: &str,
-        ) -> Result<PreparedDmStanza, anyhow::Error> {
+        ) -> Result<PreparedDmStanza, DmStanzaError> {
             let (mut session_store, mut identity_store) = stores_with_sessions(with_sessions).await;
             let mut prekey_store = UnusedPreKeyStore;
             let signed_prekey_store = UnusedSignedPreKeyStore;
@@ -6865,9 +6865,9 @@ mod local_identity_change_on_send {
             .err()
             .expect("a DM that reached no recipient device must not report success");
 
-            let typed = err
-                .downcast_ref::<NoRecipientDeviceError>()
-                .expect("the caller must be able to match on this, not parse it");
+            let DmStanzaError::NoRecipient(typed) = &err else {
+                panic!("the caller must be able to match on this: {err}");
+            };
             assert!(
                 matches!(
                     typed,
@@ -7130,8 +7130,8 @@ mod local_identity_change_on_send {
 
             assert!(
                 matches!(
-                    err.downcast_ref::<NoRecipientDeviceError>(),
-                    Some(NoRecipientDeviceError::Unresolved)
+                    err,
+                    DmStanzaError::NoRecipient(NoRecipientDeviceError::Unresolved)
                 ),
                 "unexpected error: {err:#}"
             );

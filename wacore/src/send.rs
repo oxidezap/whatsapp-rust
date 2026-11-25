@@ -95,6 +95,7 @@ debug_as_display!(
     SessionPreflightError,
     PairwiseRetryError,
     PeerStanzaError,
+    DmStanzaError,
 );
 
 #[cfg(test)]
