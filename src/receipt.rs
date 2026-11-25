@@ -13,6 +13,17 @@ use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReceiptError {
+    #[error("{0}")]
+    MessageRef(#[from] crate::MessageRefError),
+    #[error("Failed to send read receipt: {0}")]
+    Read(#[source] crate::client::ClientError),
+    #[error("Failed to send played receipt: {0}")]
+    Played(#[source] crate::client::ClientError),
+}
+
 /// Max message ids per read/played `<receipt>` stanza. WA Web's
 /// `sendAggregateReceipts` splices ids into chunks of 256 and emits one receipt
 /// per chunk, so a large catch-up doesn't produce one oversized stanza.
@@ -1237,7 +1248,7 @@ impl Client {
     pub async fn mark_message_read(
         &self,
         target: &crate::MessageRef<'_>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ReceiptError> {
         if target.from_me() {
             return Err(crate::MessageRefError::ExpectedIncoming.into());
         }
@@ -1254,7 +1265,7 @@ impl Client {
     pub async fn mark_message_played(
         &self,
         target: &crate::MessageRef<'_>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ReceiptError> {
         if target.from_me() {
             return Err(crate::MessageRefError::ExpectedIncoming.into());
         }
@@ -1275,7 +1286,7 @@ impl Client {
         chat: &Jid,
         sender: Option<&Jid>,
         message_ids: &[&str],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ReceiptError> {
         if message_ids.is_empty() {
             return Ok(());
         }
@@ -1316,9 +1327,7 @@ impl Client {
                 peer_participant_pn.as_ref(),
                 read_receipts_disabled,
             );
-            self.send_node(node)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))?;
+            self.send_node(node).await.map_err(ReceiptError::Read)?;
         }
         Ok(())
     }
@@ -1336,7 +1345,7 @@ impl Client {
         chat: &Jid,
         sender: Option<&Jid>,
         message_ids: &[&str],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ReceiptError> {
         if message_ids.is_empty() {
             return Ok(());
         }
@@ -1354,9 +1363,7 @@ impl Client {
         for chunk in message_ids.chunks(MAX_RECEIPT_IDS_PER_STANZA) {
             let node =
                 build_played_receipt_node(chat, sender, chunk, &timestamp, read_receipts_disabled);
-            self.send_node(node)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))?;
+            self.send_node(node).await.map_err(ReceiptError::Played)?;
         }
         Ok(())
     }
@@ -2523,6 +2530,22 @@ mod tests {
         let collector = Arc::new(TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         (client, collector)
+    }
+
+    #[tokio::test]
+    async fn receipt_send_errors_preserve_connection_failure() {
+        let (client, _) = setup_client_with_collector().await;
+        let chat = Jid::pn("15550001000");
+        assert!(matches!(
+            client.mark_as_read(&chat, None, &["message"]).await,
+            Err(ReceiptError::Read(crate::client::ClientError::NotConnected))
+        ));
+        assert!(matches!(
+            client.mark_as_played(&chat, None, &["message"]).await,
+            Err(ReceiptError::Played(
+                crate::client::ClientError::NotConnected
+            ))
+        ));
     }
 
     async fn setup_client_with_identities() -> (Arc<Client>, Arc<TestEventCollector>) {

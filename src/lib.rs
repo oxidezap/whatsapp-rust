@@ -554,6 +554,7 @@ pub use plugins::{
 };
 pub mod request;
 pub(crate) mod signal_flush;
+pub use receipt::ReceiptError;
 pub use request::{IqEncodeError, IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;

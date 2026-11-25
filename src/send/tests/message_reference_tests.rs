@@ -580,11 +580,12 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
     ));
     assert_eq!(transport.sent_count(), 0);
     let own = MessageRef::new(&dm, MessageId::new("OWN").unwrap(), None, true).unwrap();
-    let err = client.mark_message_read(&own).await.unwrap_err();
-    assert_eq!(
-        err.downcast_ref::<MessageRefError>(),
-        Some(&MessageRefError::ExpectedIncoming)
-    );
+    assert!(matches!(
+        client.mark_message_read(&own).await,
+        Err(crate::ReceiptError::MessageRef(
+            MessageRefError::ExpectedIncoming
+        ))
+    ));
     assert_eq!(transport.sent_count(), 0);
 }
 
