@@ -3661,19 +3661,19 @@ mod stanza_type {
 
 #[cfg(test)]
 mod device_unregistered_tests {
-    use super::is_device_unregistered_error;
+    use super::SessionSetupError;
     use crate::client::context::SendContextError;
     use crate::request::ServerErrorCode;
 
     #[test]
     fn detects_406_server_error_code() {
-        let err = anyhow::Error::new(ServerErrorCode {
+        let err = SessionSetupError::Resolver(SendContextError::Server(ServerErrorCode {
             code: 406,
             text: "not-acceptable".to_string(),
             error_type: None,
             backoff: None,
-        });
-        assert!(is_device_unregistered_error(&err));
+        }));
+        assert_eq!(err.server_error().map(|server| server.code), Some(406));
     }
 
     #[test]
@@ -3685,8 +3685,8 @@ mod device_unregistered_tests {
             backoff: None,
         });
         assert_eq!(error.server_error().map(|server| server.code), Some(406));
-        let error = anyhow::Error::new(super::DeviceEncryptionError::Resolver(error));
-        assert!(is_device_unregistered_error(&error));
+        let error = SessionSetupError::Resolver(error);
+        assert_eq!(error.server_error().map(|server| server.code), Some(406));
     }
 
     #[test]
@@ -3704,19 +3704,21 @@ mod device_unregistered_tests {
 
     #[test]
     fn rejects_non_406_server_error() {
-        let err = anyhow::Error::new(ServerErrorCode {
+        let err = SessionSetupError::Resolver(SendContextError::Server(ServerErrorCode {
             code: 404,
             text: "not-found".to_string(),
             error_type: None,
             backoff: None,
-        });
-        assert!(!is_device_unregistered_error(&err));
+        }));
+        assert_eq!(err.server_error().map(|server| server.code), Some(404));
     }
 
     #[test]
     fn rejects_unrelated_error() {
-        let err = anyhow::anyhow!("some random error");
-        assert!(!is_device_unregistered_error(&err));
+        let err = SessionSetupError::Resolver(SendContextError::host(std::io::Error::other(
+            "some random error",
+        )));
+        assert!(err.server_error().is_none());
     }
 
     #[test]
@@ -3724,15 +3726,17 @@ mod device_unregistered_tests {
         // wacore::IqError::ServerError is NOT the same as ServerErrorCode.
         // This simulates the old bug: if someone wraps wacore IqError directly
         // without the ServerErrorCode wrapper, the check should not match.
-        let err = anyhow::Error::new(crate::request::IqError::ServerError {
-            code: 406,
-            text: "not-acceptable".to_string(),
-            error_type: None,
-            backoff: None,
-        });
+        let err = SessionSetupError::Resolver(SendContextError::host(
+            crate::request::IqError::ServerError {
+                code: 406,
+                text: "not-acceptable".to_string(),
+                error_type: None,
+                backoff: None,
+            },
+        ));
         // This would only match if we also checked IqError (we don't — we use ServerErrorCode)
         // The SendContextResolver impl is responsible for wrapping in ServerErrorCode
-        assert!(!is_device_unregistered_error(&err));
+        assert!(err.server_error().is_none());
     }
 }
 
@@ -6062,8 +6066,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("fan-out succeeds");
+        .await;
 
         assert_eq!(raw.devices.len(), devices.len());
         assert!(raw.includes_prekey_message, "fresh sessions emit pkmsg");
@@ -6098,8 +6101,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("fan-out succeeds despite the sessionless device");
+        .await;
 
         assert_eq!(raw.devices.len(), 1);
         assert_eq!(raw.devices[0].device_jid, device_ok);
@@ -6150,8 +6152,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("the send carries on without the device");
+        .await;
 
         assert!(raw.devices.is_empty());
         assert_eq!(
@@ -6189,8 +6190,7 @@ mod local_identity_change_on_send {
             b"x",
             SessionPlan::assume_ready(0),
         )
-        .await
-        .expect("empty fan-out must succeed, not panic");
+        .await;
 
         assert!(raw.devices.is_empty());
         assert!(!raw.includes_prekey_message);
@@ -7176,7 +7176,6 @@ mod local_identity_change_on_send {
                 plan,
             )
             .await
-            .expect("encrypt fan-out")
         }
 
         /// The reused buffer must name the same device the session phase just
@@ -7366,8 +7365,7 @@ mod local_identity_change_on_send {
                 b"payload",
                 plan,
             )
-            .await
-            .expect("encrypt fan-out");
+            .await;
 
             assert_eq!(
                 raw.devices.len(),

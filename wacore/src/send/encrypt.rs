@@ -78,16 +78,8 @@ pub struct SignalStores<'a> {
     pub signed_prekey_store: &'a (dyn crate::libsignal::protocol::SignedPreKeyStore + Send + Sync),
 }
 
-/// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
-/// Uses typed downcast to `ServerErrorCode` — the shared error type that the
-/// `SendContextResolver` impl wraps server errors in.
 /// The `<error code>` the server attaches to a device it no longer knows.
 pub(crate) const UNREGISTERED_DEVICE_CODE: u16 = 406;
-
-pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
-    crate::request::ServerErrorCode::from_anyhow(err)
-        .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
-}
 
 #[derive(thiserror::Error)]
 #[non_exhaustive]
@@ -561,7 +553,7 @@ pub async fn encrypt_for_devices(
     plaintext_to_encrypt: &[u8],
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
-) -> Result<EncryptResult> {
+) -> Result<EncryptResult, SessionSetupError> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
     let attempt = encrypt_for_devices_with_sessions_detailed(
         runtime,
@@ -572,7 +564,7 @@ pub async fn encrypt_for_devices(
         mediatype,
         plan,
     )
-    .await?;
+    .await;
     report_encrypt_drops(resolver, attempt.unkeyed_at_encrypt);
     Ok(attempt.result)
 }
@@ -642,7 +634,7 @@ pub async fn encrypt_for_devices_into(
     mediatype: Option<&str>,
     participant_nodes: &mut Vec<Node>,
     signal_addresses: Option<&[Jid]>,
-) -> Result<EncryptFanoutSummary> {
+) -> Result<EncryptFanoutSummary, SessionSetupError> {
     let plan =
         ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, signal_addresses)
             .await?;
@@ -656,7 +648,7 @@ pub async fn encrypt_for_devices_into(
         plaintext_to_encrypt,
         plan,
     )
-    .await?;
+    .await;
     report_encrypt_drops(resolver, raw.unkeyed_at_encrypt);
 
     let encrypted_devices = raw.devices.len();
@@ -1315,8 +1307,8 @@ pub async fn encrypt_for_devices_with_sessions(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
     plan: SessionPlan,
-) -> Result<EncryptResult> {
-    Ok(encrypt_for_devices_with_sessions_detailed(
+) -> EncryptResult {
+    encrypt_for_devices_with_sessions_detailed(
         runtime,
         stores,
         devices,
@@ -1325,11 +1317,11 @@ pub async fn encrypt_for_devices_with_sessions(
         mediatype,
         plan,
     )
-    .await?
-    .result)
+    .await
+    .result
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len())))]
 pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -1338,7 +1330,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
     plan: SessionPlan,
-) -> Result<EncryptAttempt> {
+) -> EncryptAttempt {
     let RawEncryptAttempt {
         result: raw,
         first_error,
@@ -1349,7 +1341,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         plaintext_to_encrypt,
         plan,
     )
-    .await?;
+    .await;
     let unkeyed_at_encrypt = raw.unkeyed_at_encrypt;
 
     // Map each ciphertext to the message path's `<to><enc>` node, preserving the
@@ -1370,7 +1362,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         ));
     }
 
-    Ok(EncryptAttempt {
+    EncryptAttempt {
         result: EncryptResult {
             participant_nodes,
             includes_prekey_message: raw.includes_prekey_message,
@@ -1382,7 +1374,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         },
         first_error,
         unkeyed_at_encrypt,
-    })
+    }
 }
 
 /// Node-agnostic core of the encrypt fan-out: pairwise-encrypt
@@ -1398,26 +1390,26 @@ pub async fn encrypt_for_devices_with_sessions_raw(
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     plan: SessionPlan,
-) -> Result<EncryptForDevicesRaw> {
-    Ok(encrypt_for_devices_with_sessions_raw_detailed(
+) -> EncryptForDevicesRaw {
+    encrypt_for_devices_with_sessions_raw_detailed(
         runtime,
         stores,
         devices,
         plaintext_to_encrypt,
         plan,
     )
-    .await?
-    .result)
+    .await
+    .result
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout_raw", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout_raw", level = "debug", skip_all, fields(count = devices.len())))]
 async fn encrypt_for_devices_with_sessions_raw_detailed(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     plan: SessionPlan,
-) -> Result<RawEncryptAttempt> {
+) -> RawEncryptAttempt {
     debug_assert_eq!(
         plan.device_count,
         devices.len(),
@@ -1572,7 +1564,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         }
     }
 
-    Ok(RawEncryptAttempt {
+    RawEncryptAttempt {
         result: EncryptForDevicesRaw {
             devices: encrypted,
             includes_prekey_message,
@@ -1581,7 +1573,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             unkeyed_at_encrypt,
         },
         first_error,
-    })
+    }
 }
 
 #[cfg(test)]

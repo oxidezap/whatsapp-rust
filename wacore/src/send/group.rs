@@ -455,7 +455,11 @@ pub async fn prepare_group_stanza_resolved(
             // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
             // without a sender key never decrypt the skmsg and the revoke is silently dropped.
             let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
-            match encrypt_for_devices_with_sessions_detailed(
+            let EncryptAttempt {
+                result,
+                first_error,
+                unkeyed_at_encrypt,
+            } = encrypt_for_devices_with_sessions_detailed(
                 runtime,
                 stores,
                 distribution_list,
@@ -464,102 +468,75 @@ pub async fn prepare_group_stanza_resolved(
                 None,
                 plan,
             )
-            .await
+            .await;
+            // The SKDM fan-out is the last place a group member can be
+            // dropped, and it happens before the Required check below
+            // can turn the send into an error.
+            report_encrypt_drops(resolver, unkeyed_at_encrypt);
+            let EncryptResult {
+                participant_nodes,
+                includes_prekey_message: result_includes_prekey,
+                encrypted_devices,
+                had_unregistered_device,
+                rejected_devices,
+            } = result;
+            if distribution_policy == SenderKeyDistributionPolicy::Required
+                && (encrypted_devices.len() != distribution_list.len() || first_error.is_some())
             {
-                Ok(EncryptAttempt {
-                    result,
-                    first_error,
-                    unkeyed_at_encrypt,
-                }) => {
-                    // The SKDM fan-out is the last place a group member can be
-                    // dropped, and it happens before the Required check below
-                    // can turn the send into an error.
-                    report_encrypt_drops(resolver, unkeyed_at_encrypt);
-                    let EncryptResult {
-                        participant_nodes,
-                        includes_prekey_message: result_includes_prekey,
-                        encrypted_devices,
-                        had_unregistered_device,
-                        rejected_devices,
-                    } = result;
-                    if distribution_policy == SenderKeyDistributionPolicy::Required
-                        && (encrypted_devices.len() != distribution_list.len()
-                            || first_error.is_some())
-                    {
-                        let error = first_error
-                            .map(|error| anyhow::Error::new(*error))
-                            .unwrap_or_else(|| {
-                                anyhow!(
-                                    "sender-key distribution encrypted {} of {} required targets",
-                                    encrypted_devices.len(),
-                                    distribution_list.len()
-                                )
-                            });
-                        let stale_device_users = stale_users_for(
-                            had_unregistered_device,
-                            &rejected_devices,
-                            Some(distribution_list),
-                            &encrypted_devices,
-                            group_info,
-                        );
-                        return Err(RequiredSenderKeyDistributionError::new(
-                            error,
-                            stale_device_users,
+                let error = first_error
+                    .map(|error| anyhow::Error::new(*error))
+                    .unwrap_or_else(|| {
+                        anyhow!(
+                            "sender-key distribution encrypted {} of {} required targets",
+                            encrypted_devices.len(),
+                            distribution_list.len()
                         )
-                        .into());
-                    }
+                    });
+                let stale_device_users = stale_users_for(
+                    had_unregistered_device,
+                    &rejected_devices,
+                    Some(distribution_list),
+                    &encrypted_devices,
+                    group_info,
+                );
+                return Err(
+                    RequiredSenderKeyDistributionError::new(error, stale_device_users).into(),
+                );
+            }
 
-                    includes_prekey_message |= result_includes_prekey;
-                    if had_unregistered_device {
-                        had_unregistered_devices = true;
-                        skdm_rejected_devices.extend(rejected_devices);
-                    }
-                    skdm_encrypted_devices = encrypted_devices;
+            includes_prekey_message |= result_includes_prekey;
+            if had_unregistered_device {
+                had_unregistered_devices = true;
+                skdm_rejected_devices.extend(rejected_devices);
+            }
+            skdm_encrypted_devices = encrypted_devices;
 
-                    if !participant_nodes.is_empty() {
-                        message_children.push(
-                            NodeBuilder::new("participants")
-                                .children_vec(participant_nodes)
-                                .build(),
-                        );
-                        let device_identity = match distribution_policy {
-                            SenderKeyDistributionPolicy::BestEffort => {
-                                needs_device_identity_for_role(
-                                    includes_prekey_message,
-                                    account,
-                                    sender_role,
-                                )
-                                .ok()
-                                .flatten()
-                            }
-                            SenderKeyDistributionPolicy::Required => {
-                                needs_device_identity_for_role(
-                                    includes_prekey_message,
-                                    account,
-                                    sender_role,
-                                )?
-                            }
-                        };
-                        if let Some(device_identity_bytes) = device_identity {
-                            message_children.push(
-                                NodeBuilder::new("device-identity")
-                                    .bytes(device_identity_bytes)
-                                    .build(),
-                            );
-                        }
-                    }
-                }
-                Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(RequiredSenderKeyDistributionError::new(error, Vec::new()).into());
-                }
-                Err(e) => {
-                    log::warn!(
-                        "SKDM distribution failed for group {}, continuing without it: {e}",
-                        to_jid.observe()
+            if !participant_nodes.is_empty() {
+                message_children.push(
+                    NodeBuilder::new("participants")
+                        .children_vec(participant_nodes)
+                        .build(),
+                );
+                let device_identity = match distribution_policy {
+                    SenderKeyDistributionPolicy::BestEffort => needs_device_identity_for_role(
+                        includes_prekey_message,
+                        account,
+                        sender_role,
+                    )
+                    .ok()
+                    .flatten(),
+                    SenderKeyDistributionPolicy::Required => needs_device_identity_for_role(
+                        includes_prekey_message,
+                        account,
+                        sender_role,
+                    )?,
+                };
+                if let Some(device_identity_bytes) = device_identity {
+                    message_children.push(
+                        NodeBuilder::new("device-identity")
+                            .bytes(device_identity_bytes)
+                            .build(),
                     );
-                    if is_device_unregistered_error(&e) {
-                        had_unregistered_devices = true;
-                    }
                 }
             }
         }

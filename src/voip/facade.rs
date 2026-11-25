@@ -1773,9 +1773,7 @@ async fn fanout_group_epoch_for_generation(
             plan,
         )
         .await
-        .map_err(|error| CallError::Setup(error.to_string()))
     };
-    let encrypted = encrypted?;
     // This path asserts sessions upstream instead of establishing them, so
     // nothing else has counted a device the fan-out could not encrypt for.
     // Recorded before the checks below, which can return early.

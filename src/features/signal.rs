@@ -1685,8 +1685,7 @@ mod tests {
                 None,
                 SessionPlan::assume_ready(devices.len()),
             )
-            .await
-            .unwrap();
+            .await;
             assert_eq!(result.encrypted_devices.len(), devices.len());
             assert_eq!(
                 provider.encrypts.load(Ordering::Relaxed) - before,
