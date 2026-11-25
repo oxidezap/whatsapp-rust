@@ -39,6 +39,26 @@ pub(crate) enum AdvPrimaryBundleError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub(crate) enum AdvIdentityQueryError {
+    #[error("{0}")]
+    Iq(#[source] Box<crate::request::IqError>),
+    #[error("{0}")]
+    Bundle(#[source] Box<AdvPrimaryBundleError>),
+}
+
+impl From<crate::request::IqError> for AdvIdentityQueryError {
+    fn from(error: crate::request::IqError) -> Self {
+        Self::Iq(Box::new(error))
+    }
+}
+
+impl From<AdvPrimaryBundleError> for AdvIdentityQueryError {
+    fn from(error: AdvPrimaryBundleError) -> Self {
+        Self::Bundle(Box::new(error))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum PrimaryIdentityError {
     #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
@@ -463,7 +483,10 @@ impl Client {
     }
 
     /// Read a fresh, signed primary key without publishing a trust change.
-    pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+    pub(crate) async fn fetch_adv_account_identity(
+        &self,
+        jid: &Jid,
+    ) -> Result<[u8; 32], AdvIdentityQueryError> {
         let primary = wacore::types::jid::adv_account_jid(jid);
         self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
             .await
@@ -476,7 +499,7 @@ impl Client {
         &'a self,
         primary: &'a Jid,
         reason: Option<PreKeyFetchReason>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<[u8; 32]>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<[u8; 32], AdvIdentityQueryError>> {
         Box::pin(async move {
             let spec = match reason {
                 Some(reason) => PreKeyFetchSpec::with_reason(vec![primary.clone()], reason),
