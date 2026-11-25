@@ -13,7 +13,6 @@ use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name_for_jid;
 use crate::types::message::PeerMessageOptions;
-use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::collections::HashSet;
@@ -96,6 +95,7 @@ debug_as_display!(
     PairwiseRetryError,
     PeerStanzaError,
     DmStanzaError,
+    GroupStanzaError,
 );
 
 #[cfg(test)]

@@ -3703,6 +3703,18 @@ mod device_unregistered_tests {
     }
 
     #[test]
+    fn group_error_preserves_missing_sender_key_for_recovery() {
+        let error = super::GroupStanzaError::GroupEncrypt(Box::new(
+            crate::libsignal::protocol::SignalProtocolError::NoSenderKeyState("synthetic".into()),
+        ));
+        assert!(matches!(
+            error.signal_error(),
+            Some(crate::libsignal::protocol::SignalProtocolError::NoSenderKeyState(_))
+        ));
+        assert!(format!("{error:?}").contains("sender key state missing"));
+    }
+
+    #[test]
     fn rejects_non_406_server_error() {
         let err = SessionSetupError::Resolver(SendContextError::Server(ServerErrorCode {
             code: 404,
@@ -4592,12 +4604,12 @@ mod mark_full_distribution_list {
             format!("{error:#}").contains("required sender-key distribution failed"),
             "unexpected error chain: {error:#}"
         );
-        let failure = error
-            .downcast_ref::<RequiredSenderKeyDistributionError>()
-            .expect("required failures must retain typed stale-target metadata");
+        let GroupStanzaError::RequiredDistribution(failure) = &error else {
+            panic!("required failures must retain typed stale-target metadata");
+        };
         assert_eq!(failure.stale_device_users(), [requester.user.as_str()]);
         assert_eq!(
-            crate::request::ServerErrorCode::find(error.as_ref()).map(|server| server.code),
+            crate::request::ServerErrorCode::find(&error).map(|server| server.code),
             Some(406),
             "the typed failure must preserve the original server error chain"
         );

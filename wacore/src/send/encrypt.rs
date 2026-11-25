@@ -306,7 +306,7 @@ struct Spawned<T> {
 }
 
 impl<T> Future for Spawned<T> {
-    type Output = std::result::Result<T, SpawnCanceled>;
+    type Output = Result<T, SpawnCanceled>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -351,7 +351,7 @@ impl<T> Drop for Spawned<T> {
 fn spawn_oneshot<F, T>(
     rt: &dyn Runtime,
     fut: F,
-) -> impl Future<Output = std::result::Result<T, SpawnCanceled>> + Send + 'static
+) -> impl Future<Output = Result<T, SpawnCanceled>> + Send + 'static
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -370,7 +370,7 @@ where
 fn spawn_oneshot<F, T>(
     rt: &dyn Runtime,
     fut: F,
-) -> impl Future<Output = std::result::Result<T, SpawnCanceled>> + 'static
+) -> impl Future<Output = Result<T, SpawnCanceled>> + 'static
 where
     F: Future<Output = T> + 'static,
     T: 'static,

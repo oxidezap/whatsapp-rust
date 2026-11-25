@@ -157,6 +157,12 @@ impl From<wacore::send::DmStanzaError> for SendError {
     }
 }
 
+impl From<wacore::send::GroupStanzaError> for SendError {
+    fn from(error: wacore::send::GroupStanzaError) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
 impl From<GroupError> for SendError {
     fn from(err: GroupError) -> Self {
         match err {
@@ -1949,9 +1955,7 @@ impl Client {
         {
             Ok(prepared) => prepared,
             Err(e) => {
-                if let Some(SignalProtocolError::NoSenderKeyState(_)) =
-                    e.downcast_ref::<SignalProtocolError>()
-                {
+                if let Some(SignalProtocolError::NoSenderKeyState(_)) = e.signal_error() {
                     log::warn!("No sender key for status broadcast, forcing distribution.");
 
                     self.reset_sender_key_device_tracking(&to_str).await?;
@@ -3602,9 +3606,7 @@ impl Client {
                     prepared.node
                 }
                 Err(e) => {
-                    if let Some(SignalProtocolError::NoSenderKeyState(_)) =
-                        e.downcast_ref::<SignalProtocolError>()
-                    {
+                    if let Some(SignalProtocolError::NoSenderKeyState(_)) = e.signal_error() {
                         log::warn!(
                             "No sender key for group {}, forcing distribution.",
                             to.observe()
@@ -3685,7 +3687,7 @@ impl Client {
                         group_devices = Some(retry_addressed);
                         retry_prepared.node
                     } else {
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             }

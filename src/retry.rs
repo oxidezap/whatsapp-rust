@@ -1311,14 +1311,12 @@ impl Client {
                 // I/O. The typed failure retains the original source chain and
                 // identifies only users whose pre-key lookup returned 406.
                 drop(distribution_guard);
-                if let Some(failure) =
-                    error.downcast_ref::<wacore::send::RequiredSenderKeyDistributionError>()
-                {
+                if let wacore::send::GroupStanzaError::RequiredDistribution(failure) = &error {
                     for user in failure.stale_device_users() {
                         self.invalidate_device_cache(user).await;
                     }
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         self.send_retry_stanza(
