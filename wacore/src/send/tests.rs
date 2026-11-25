@@ -4597,7 +4597,7 @@ mod mark_full_distribution_list {
             .expect("required failures must retain typed stale-target metadata");
         assert_eq!(failure.stale_device_users(), [requester.user.as_str()]);
         assert_eq!(
-            crate::request::ServerErrorCode::from_anyhow(&error).map(|server| server.code),
+            crate::request::ServerErrorCode::find(error.as_ref()).map(|server| server.code),
             Some(406),
             "the typed failure must preserve the original server error chain"
         );

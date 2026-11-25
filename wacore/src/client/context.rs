@@ -424,13 +424,7 @@ impl SendContextError {
     }
 
     pub fn server_error(&self) -> Option<&crate::request::ServerErrorCode> {
-        let mut cause: &(dyn std::error::Error + 'static) = self;
-        loop {
-            if let Some(server) = cause.downcast_ref::<crate::request::ServerErrorCode>() {
-                return Some(server);
-            }
-            cause = cause.source()?;
-        }
+        crate::request::ServerErrorCode::find(self)
     }
 }
 

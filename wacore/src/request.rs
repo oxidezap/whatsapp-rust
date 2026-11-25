@@ -177,12 +177,7 @@ impl IqError {
     }
 }
 
-/// Lightweight server error that can be embedded in `anyhow::Error` and
-/// downcast from any crate. Used as a shared type across crate boundaries
-/// when `wacore::request::IqError` isn't directly available (e.g., errors
-/// originating from the high-level crate's own `IqError`).
-///
-/// To check a specific code: `err.downcast_ref::<ServerErrorCode>().is_some_and(|e| e.code == 406)`
+/// Server rejection shared across crate boundaries.
 #[derive(Clone, Error)]
 #[error("server error: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
 pub struct ServerErrorCode {
@@ -214,8 +209,13 @@ impl std::fmt::Debug for ServerErrorCode {
 }
 
 impl ServerErrorCode {
-    pub fn from_anyhow(err: &anyhow::Error) -> Option<&Self> {
-        err.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    pub fn find<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+        loop {
+            if let Some(server) = error.downcast_ref::<Self>() {
+                return Some(server);
+            }
+            error = error.source()?;
+        }
     }
 }
 
