@@ -173,6 +173,29 @@ async fn reupload_fixture() -> (Arc<Client>, Arc<CapturingMockTransport>) {
     (client, transport)
 }
 
+#[tokio::test]
+async fn reupload_mapping_failure_preserves_store_error_and_sends_nothing() {
+    use crate::store::release::tests::ProbeBackend;
+    let (mut probe, _) = ProbeBackend::new();
+    probe.fail_before_method = Some(("get_pn_mapping", Arc::new(AtomicBool::new(true))));
+    let (client, transport) =
+        crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(Jid::lid("10000000001"))))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLidMigrated(true))
+        .await;
+    let error = request(client, Jid::pn("15550000002"), "STORE-ERROR", [1; 32])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MediaReuploadError::Store(_)));
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(transport.sent_count(), 0);
+}
+
 async fn request(
     client: Arc<Client>,
     chat: Jid,
