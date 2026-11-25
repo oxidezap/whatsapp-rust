@@ -48,6 +48,22 @@ pub(crate) enum PrimaryIdentityError {
     InvalidSignature,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CachedAdvIdentityError {
+    #[error("{0}")]
+    Store(#[source] Box<wacore::store::error::StoreError>),
+    #[error("invalid stored primary identity")]
+    InvalidStored,
+    #[error("invalid paired primary identity")]
+    InvalidPaired,
+}
+
+impl From<wacore::store::error::StoreError> for CachedAdvIdentityError {
+    fn from(error: wacore::store::error::StoreError) -> Self {
+        Self::Store(Box::new(error))
+    }
+}
+
 /// Failure while allocating, persisting or uploading prekeys.
 pub struct PreKeyUploadError(Box<PreKeyUploadErrorKind>);
 
@@ -567,7 +583,7 @@ impl Client {
     pub(crate) async fn cached_adv_account_identity(
         &self,
         jid: &Jid,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    ) -> Result<Option<[u8; 32]>, CachedAdvIdentityError> {
         use wacore::types::jid::JidExt;
         let primary = wacore::types::jid::adv_account_jid(jid);
         let backend = self.persistence_manager.backend();
@@ -576,9 +592,12 @@ impl Client {
             .get_identity(&primary.to_protocol_address(), &*backend)
             .await?
         {
-            return Ok(Some(identity.as_ref().try_into().map_err(|_| {
-                anyhow::anyhow!("invalid stored primary identity")
-            })?));
+            return Ok(Some(
+                identity
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| CachedAdvIdentityError::InvalidStored)?,
+            ));
         }
         let snapshot = self.persistence_manager.get_device_snapshot();
         let is_self = [snapshot.pn.as_ref(), snapshot.lid.as_ref()]
@@ -591,9 +610,10 @@ impl Client {
                 .as_ref()
                 .and_then(|account| account.account_signature_key.as_deref())
         {
-            return Ok(Some(key.try_into().map_err(|_| {
-                anyhow::anyhow!("invalid paired primary identity")
-            })?));
+            return Ok(Some(
+                key.try_into()
+                    .map_err(|_| CachedAdvIdentityError::InvalidPaired)?,
+            ));
         }
         Ok(None)
     }
@@ -1644,6 +1664,21 @@ mod tests {
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
         clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[tokio::test]
+    async fn cached_primary_identity_rejects_malformed_bytes() {
+        use wacore::types::jid::JidExt;
+        let client = crate::test_utils::create_test_client().await;
+        let user = wacore_binary::Jid::pn("15550000123");
+        client
+            .signal_cache
+            .put_identity(&user.to_protocol_address(), &[1, 2, 3])
+            .await;
+        assert!(matches!(
+            client.cached_adv_account_identity(&user).await,
+            Err(super::CachedAdvIdentityError::InvalidStored)
+        ));
+    }
 
     #[test]
     fn watermark_failure_preserves_backend_source() {

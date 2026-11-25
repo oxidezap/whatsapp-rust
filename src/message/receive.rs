@@ -3858,7 +3858,7 @@ impl Client {
         &self,
         lid: &Jid,
         pn: &str,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    ) -> Result<Option<[u8; 32]>, crate::prekeys::CachedAdvIdentityError> {
         if let Some(identity) = self.cached_adv_account_identity(lid).await? {
             return Ok(Some(identity));
         }
