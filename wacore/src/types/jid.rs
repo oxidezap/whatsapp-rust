@@ -146,11 +146,7 @@ pub fn adv_account_jid(jid: &Jid) -> Jid {
 
 /// Group hosted namespaces with their account family solely for lock ordering.
 fn account_server(server: Server) -> Server {
-    match server {
-        Server::Hosted => Server::Pn,
-        Server::HostedLid => Server::Lid,
-        server => server,
-    }
+    server.user_server()
 }
 
 /// Consistent ordering for deadlock-free multi-lock acquisition.

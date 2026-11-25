@@ -381,24 +381,24 @@ fn resolve_retry_chat_info(
         // 1. Bot + recipient → chat = recipient
         // 2. Peer device + recipient → chat = recipient
         // 3. Peer device without recipient → WA Web aborts (returns null).
-        // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
+        // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_user_jid()
         let is_peer = is_own_account_jid(from, own_pn, own_lid);
 
         let chat = if is_bot && let Some(r) = recipient.as_ref() {
-            r.to_non_ad()
+            r.to_user_jid()
         } else if is_peer {
             match recipient.as_ref() {
-                Some(r) => r.to_non_ad(),
+                Some(r) => r.to_user_jid(),
                 None => {
                     log::warn!("Ignoring peer device retry without recipient attr");
                     return None;
                 }
             }
         } else {
-            from.to_non_ad()
+            from.to_user_jid()
         };
 
-        let requester = if from.device() == 0 && from.agent == 0 {
+        let requester = if from.device() == 0 && from.agent == 0 && !from.is_hosted() {
             chat.clone()
         } else {
             from.clone()
@@ -800,7 +800,7 @@ impl Client {
             let requester = &info.requester;
             info.requester = Jid {
                 user: alt_chat.user,
-                server: alt_chat.server,
+                server: alt_chat.server.with_hosting(requester.is_hosted()),
                 device: requester.device,
                 agent: requester.agent,
                 integrator: requester.integrator,
@@ -4760,6 +4760,175 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn dm_alt_chat_rewrite_hosted_lid_preserves_hosted_server() {
+        use buffa::Message;
+        use wacore::adv::test_util;
+
+        let client = retry_repair_client("retry_repair_dm_alt_chat_hosted").await;
+        let pn: Jid = "12025550124@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "236395184570387@lid".parse().unwrap();
+        let hosted_lid = lid.with_device_hosting(99, true);
+        let hosted_pn = pn.with_device_hosting(99, true);
+        let regular_pn = pn.with_device_hosting(99, false);
+        let msg_id = "DMALTCHATHOSTED001";
+
+        // Generate hosted companion keys with valid ADV proof
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let one_time_prekey = KeyPair::generate(&mut rng);
+        let identity = device.public_key.public_key_bytes();
+        let account_key = account.public_key.public_key_bytes();
+        let prekey_signature = device
+            .private_key
+            .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
+            .unwrap();
+
+        let details = {
+            let mut proto = wa::ADVDeviceIdentity::default();
+            proto.key_index = Some(0);
+            proto.device_type = Some(wa::ADVEncryptionType::HOSTED);
+            proto
+        }
+        .encode_to_vec();
+
+        let signed = test_util::signed_identity(
+            &account,
+            &device,
+            &details,
+            test_util::account_prefix(Some(wa::ADVEncryptionType::HOSTED)),
+            Some(&[6, 6]),
+            true,
+        );
+
+        let keys_node = NodeBuilder::new("keys")
+            .children([
+                NodeBuilder::new("type").bytes(vec![5]).build(),
+                NodeBuilder::new("identity")
+                    .bytes(identity.to_vec())
+                    .build(),
+                OneTimePreKeyNode::new(1, one_time_prekey.public_key.public_key_bytes().to_vec())
+                    .into_node(),
+                SignedPreKeyNode::new(
+                    2,
+                    signed_prekey.public_key.public_key_bytes().to_vec(),
+                    prekey_signature.to_vec(),
+                )
+                .into_node(),
+                NodeBuilder::new("device-identity")
+                    .bytes(waproto::codec::adv_signed_device_identity_to_vec(&signed))
+                    .build(),
+            ])
+            .build();
+
+        // Seed account identity key in cache for ADV validation
+        client
+            .signal_cache
+            .put_identity(
+                &wacore::types::jid::adv_account_jid(&hosted_pn).to_protocol_address(),
+                account_key,
+            )
+            .await;
+        client
+            .signal_cache
+            .put_identity(
+                &wacore::types::jid::adv_account_jid(&hosted_lid).to_protocol_address(),
+                account_key,
+            )
+            .await;
+
+        // Seed device list record with device 99 so device_known is true
+        client
+            .persistence_manager
+            .backend()
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: lid.user.clone().into(),
+                devices: [
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(99, None),
+                ]
+                .into(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Stored under PN key before LID mapping exists
+        client.add_recent_message(&pn, msg_id, &hello(), None).await;
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: lid.user.as_str().into(),
+                phone_number: pn.user.as_str().into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+
+        let extra_nodes = [
+            NodeBuilder::new("registration")
+                .bytes(12345u32.to_be_bytes().to_vec())
+                .build(),
+            keys_node,
+        ];
+
+        let _ = drive_retry(&client, &hosted_lid, None, msg_id, "1", false, extra_nodes).await;
+
+        assert!(
+            has_session(&client, &hosted_pn).await,
+            "alternate hit must install session under hosted PN server, not ordinary PN"
+        );
+        assert!(
+            !has_session(&client, &regular_pn).await,
+            "session must not be installed under non-hosted PN device"
+        );
+        assert!(
+            !has_session(&client, &hosted_lid).await,
+            "session must not remain under receipt's hosted LID namespace on alternate hit"
+        );
+    }
+
+    #[test]
+    fn alt_chat_rewrite_hosted_to_hosted_lid_preserves_hosted_variant() {
+        use wacore_binary::Server;
+        let requester = Jid::new("5511999999999", Server::Hosted).with_device(99);
+        let alt_chat = Jid::lid("236395184570387");
+        let resolved = Jid {
+            user: alt_chat.user,
+            server: alt_chat.server.with_hosting(requester.is_hosted()),
+            device: requester.device,
+            agent: requester.agent,
+            integrator: requester.integrator,
+        };
+        assert_eq!(resolved.server, Server::HostedLid);
+        assert_eq!(resolved.user, "236395184570387");
+        assert_eq!(resolved.device, 99);
+        assert!(resolved.is_hosted());
+    }
+
+    #[test]
+    fn alt_chat_rewrite_hosted_lid_to_hosted_pn_preserves_hosted_variant() {
+        use wacore_binary::Server;
+        let requester = Jid::new("236395184570387", Server::HostedLid).with_device(99);
+        let alt_chat = Jid::pn("5511999999999");
+        let resolved = Jid {
+            user: alt_chat.user,
+            server: alt_chat.server.with_hosting(requester.is_hosted()),
+            device: requester.device,
+            agent: requester.agent,
+            integrator: requester.integrator,
+        };
+        assert_eq!(resolved.server, Server::Hosted);
+        assert_eq!(resolved.user, "5511999999999");
+        assert_eq!(resolved.device, 99);
+        assert!(resolved.is_hosted());
+    }
+
+    #[tokio::test]
     async fn unknown_participant_rotation_is_durable_before_throttled_return() {
         use wacore::libsignal::protocol::{SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord};
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
@@ -6304,6 +6473,52 @@ mod tests {
         assert_eq!(info.chat.user, recipient.user);
         assert_eq!(info.chat.device(), 0);
         assert_eq!(info.requester.device(), 5);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_hosted_requester_resolves_to_account_chat() {
+        use wacore_binary::Server;
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt").build();
+        let receipt = make_test_receipt("5511999999999:99@hosted");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        // Chat resolves to the ordinary account key (Server::Pn)
+        assert_eq!(info.chat.server, Server::Pn);
+        assert_eq!(info.chat.user, "5511999999999");
+        assert_eq!(info.chat.device(), 0);
+
+        // Requester preserves the exact retrying hosted device
+        assert_eq!(info.requester.server, Server::Hosted);
+        assert_eq!(info.requester.user, "5511999999999");
+        assert_eq!(info.requester.device(), 99);
+
+        // original_from preserves the raw receipt from
+        assert_eq!(info.original_from.server, Server::Hosted);
+        assert_eq!(info.original_from.device(), 99);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_hosted_lid_requester_resolves_to_account_chat() {
+        use wacore_binary::Server;
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt").build();
+        let receipt = make_test_receipt("236395184570386:99@hosted.lid");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        // Chat resolves to the ordinary account key (Server::Lid)
+        assert_eq!(info.chat.server, Server::Lid);
+        assert_eq!(info.chat.user, "236395184570386");
+        assert_eq!(info.chat.device(), 0);
+
+        // Requester preserves the exact retrying hosted.lid device
+        assert_eq!(info.requester.server, Server::HostedLid);
+        assert_eq!(info.requester.user, "236395184570386");
+        assert_eq!(info.requester.device(), 99);
     }
     include!("retry_conformance_tests.rs");
 }

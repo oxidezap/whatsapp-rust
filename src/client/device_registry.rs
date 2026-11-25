@@ -602,18 +602,17 @@ impl Client {
 
         let complete = recipient_cached.is_some() && (own_lookup_skipped || own_cached.is_some());
 
-        // Build device list, filter hosted in-place, reuse Vecs
+        // Build device list. In 1:1 user DMs, hosted devices (:99@hosted / :99@hosted.lid)
+        // are included in the fanout for WhatsApp Business Coexistence (WA Web:
+        // WAWebSendUserMsgJob setting chatWidSetToIncludeHostedInFanoutOneToOneChatOnly
+        // and WAWebDBDeviceListFanout).
         let mut all_dm_jids = match recipient_cached {
-            Some(mut devices) => {
-                devices.retain(|j| !j.is_hosted());
-                devices
-            }
+            Some(devices) => devices,
             // No record at all, so use the bare JID and let the server fan out
             None => vec![recipient_bare.clone()],
         };
 
         if let Some(mut own_devices) = own_cached {
-            own_devices.retain(|j| !j.is_hosted());
             all_dm_jids.append(&mut own_devices);
         }
 
@@ -626,16 +625,17 @@ impl Client {
         });
 
         // own_cached is keyed by the bot's PN, so own devices come back
-        // PN-addressed. The server rejects a stanza that mixes PN and LID
-        // participants, so align own devices to LID for a LID recipient
-        // (whatsmeow switches ownID to LID before fanout).
+        // PN-addressed (either Server::Pn or Server::Hosted). The server rejects
+        // a stanza that mixes PN and LID participants, so align own devices to LID
+        // for a LID recipient (whatsmeow switches ownID to LID before fanout;
+        // Server::Pn becomes Server::Lid, Server::Hosted becomes Server::HostedLid).
         if recipient_bare.is_lid() {
             let lid = own_lid.ok_or_else(|| {
                 anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
             })?;
             for j in all_dm_jids.iter_mut() {
-                if j.is_pn() && j.is_same_user_as(own_jid) {
-                    *j = Jid::lid_device(lid.user.clone(), j.device);
+                if j.server.is_pn_family() && j.is_same_user_as(own_jid) {
+                    *j = lid.with_device_hosting(j.device, j.is_hosted());
                 }
             }
         }
@@ -4889,10 +4889,11 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
-    /// Hosted devices stay out of the fan-out (WAWebDBDeviceListFanout), on the
-    /// memoized path exactly as on the cold one.
+    /// Hosted devices are included in 1:1 DM fan-out for WhatsApp Business Coexistence
+    /// (WA Web: WAWebSendUserMsgJob and WAWebDBDeviceListFanout), on the memoized
+    /// path exactly as on the cold one.
     #[tokio::test]
-    async fn dm_devices_memo_excludes_hosted_devices() {
+    async fn dm_devices_memo_includes_hosted_devices() {
         let client = create_test_client().await;
         setup_hosted_device_record(
             &client,
@@ -4906,14 +4907,85 @@ mod tests {
         let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
             .await
             .expect("first resolve");
-        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 5]);
-        assert_eq!(device_ids_of(first.devices(), DM_OWN_PN), vec![0]);
+        assert_eq!(
+            device_ids_of(first.devices(), DM_RECIPIENT_PN),
+            vec![0, 2, 5],
+            "recipient hosted device (:2) is included"
+        );
+        assert_eq!(
+            device_ids_of(first.devices(), DM_OWN_PN),
+            vec![0, 3],
+            "own hosted device (:3) is included"
+        );
+
+        let recipient_hosted = first
+            .devices()
+            .iter()
+            .find(|j| j.user == DM_RECIPIENT_PN && j.device == 2)
+            .expect("recipient hosted device present");
+        assert_eq!(recipient_hosted.server, Server::Hosted);
+
+        let own_hosted = first
+            .devices()
+            .iter()
+            .find(|j| j.user == DM_OWN_PN && j.device == 3)
+            .expect("own hosted device present");
+        assert_eq!(own_hosted.server, Server::Hosted);
 
         let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
             .await
             .expect("second resolve");
         assert_eq!(dm_recomputes(&client), 1);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// When sending to a LID recipient, own hosted devices are properly aligned to
+    /// Server::HostedLid alongside regular companion devices.
+    #[tokio::test]
+    async fn dm_devices_memo_includes_hosted_devices_with_lid_recipient() {
+        let client = create_test_client().await;
+        setup_hosted_device_record(&client, DM_RECIPIENT_LID, &[(0, false), (99, true)]).await;
+        setup_hosted_device_record(&client, DM_OWN_PN, &[(0, false), (1, false), (99, true)]).await;
+        let recipient = Jid::lid(DM_RECIPIENT_LID);
+
+        let own = dm_own_jid();
+        let own_lid = dm_own_lid_jid();
+
+        let resolved = client
+            .resolve_dm_devices_memoized(
+                &recipient,
+                &recipient,
+                &own,
+                Some(&own_lid),
+                crate::cache::Freshness::CachePreferred,
+            )
+            .await
+            .expect("resolve with LID recipient");
+
+        assert_eq!(
+            device_ids_of(resolved.devices(), DM_RECIPIENT_LID),
+            vec![0, 99]
+        );
+        assert_eq!(device_ids_of(resolved.devices(), DM_OWN_LID), vec![0, 99]);
+
+        let own_hosted = resolved
+            .devices()
+            .iter()
+            .find(|j| j.user == DM_OWN_LID && j.device == 99)
+            .expect("own hosted device aligned to LID");
+        assert_eq!(own_hosted.server, Server::HostedLid);
+
+        let recipient_hosted = resolved
+            .devices()
+            .iter()
+            .find(|j| j.user == DM_RECIPIENT_LID && j.device == 99)
+            .expect("recipient hosted device");
+        assert_eq!(recipient_hosted.server, Server::HostedLid);
+
+        assert!(
+            resolved.devices().iter().all(|j| j.server.is_lid_family()),
+            "all devices must belong to the LID family for a LID recipient"
+        );
     }
 
     /// The memo is keyed by recipient only, so the sending identity it was built

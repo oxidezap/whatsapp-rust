@@ -163,7 +163,7 @@ impl crate::stats::HeapSize for ResolvedDmDevices {
 impl ResolvedDmDevices {
     /// Partition `all_devices` into recipient devices and own companions,
     /// dropping the sending device itself. `all_devices` must already be the
-    /// hosted-filtered, deduplicated fan-out set.
+    /// deduplicated fan-out set (including hosted devices for 1:1 coexistence).
     pub fn new(all_devices: Vec<Jid>, own_jid: &Jid, own_lid: Option<&Jid>) -> Self {
         Self {
             partitioned: super::dm::partition_dm_devices(all_devices, own_jid, own_lid),

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use log::{error, info};
+use log::{error, info, warn};
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::*;
 
@@ -119,6 +119,15 @@ fn main() {
                 if text == PING_TRIGGER {
                     handle_text_ping(&ctx).await;
                 } else if let Some(args) = text.strip_prefix(SEND_TRIGGER) {
+                    // Only the linked account may relay: otherwise any contact could
+                    // make it message arbitrary JIDs on its behalf.
+                    if !ctx.info.source.is_from_me {
+                        warn!(
+                            "Ignoring {SEND_TRIGGER} from {}: not sent by this account",
+                            ctx.info.source.sender
+                        );
+                        return;
+                    }
                     handle_send_command(&ctx, args).await;
                 }
             });
@@ -221,6 +230,7 @@ async fn handle_text_ping(ctx: &MessageContext) {
 }
 
 /// Handles `🦀send <jid> <text>`, relaying text to an arbitrary group or DM JID.
+/// Callers must have checked that the command came from the linked account.
 async fn handle_send_command(ctx: &MessageContext, args: &str) {
     let Some((target, text)) = args.trim_start().split_once(char::is_whitespace) else {
         error!("Usage: {SEND_TRIGGER} <jid> <text>");
