@@ -6,7 +6,6 @@
 
 use core::mem::size_of;
 
-use anyhow::{Result, anyhow, bail};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef, Server};
 
@@ -89,6 +88,89 @@ pub enum GroupCallBuildError {
 }
 
 debug_as_display!(GroupCallBuildError);
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupCallParseError {
+    #[error("group_update is missing group_info")]
+    MissingGroupInfo,
+    #[error("unexpected group snapshot envelope")]
+    InvalidSnapshotEnvelope,
+    #[error("group offer rejected with error {0}")]
+    OfferRejected(String),
+    #[error("group_info group-jid does not match offer")]
+    GroupJidMismatch,
+    #[error("group_info call-id does not match offer")]
+    CallIdMismatch,
+    #[error("group_info call-creator does not match offer")]
+    CreatorMismatch,
+    #[error("expected an enc_rekey stanza")]
+    ExpectedEncRekey,
+    #[error("enc_rekey is missing encopt")]
+    MissingEncopt,
+    #[error("enc_rekey is missing enc")]
+    MissingEnc,
+    #[error("unsupported group epoch encryption")]
+    UnsupportedEpochEncryption,
+    #[error("enc_rekey has no ciphertext")]
+    MissingCiphertext,
+    #[error("requested call-link token is empty")]
+    EmptyRequestedToken,
+    #[error("<link_join> ack has neither waiting_room nor group_info")]
+    MissingJoinResult,
+    #[error("waiting-room token differs from the requested call link")]
+    WaitingRoomTokenMismatch,
+    #[error("<link_join> waiting-room-only ack is not enabled")]
+    WaitingRoomNotEnabled,
+    #[error("waiting-room and admitted group identities differ")]
+    WaitingRoomIdentityMismatch,
+    #[error("waiting-room and admitted group media modes differ")]
+    WaitingRoomMediaMismatch,
+    #[error("expected a waiting_room_update stanza")]
+    ExpectedWaitingRoomUpdate,
+    #[error("waiting_room_update is missing waiting_room")]
+    MissingWaitingRoom,
+    #[error("waiting-room update identity mismatch")]
+    WaitingRoomUpdateMismatch,
+    #[error("expected a waiting_room stanza")]
+    ExpectedWaitingRoom,
+    #[error("waiting-room snapshot exceeds the user limit")]
+    WaitingRoomUserLimit,
+    #[error("waiting-room snapshot exceeds the retained-byte limit")]
+    WaitingRoomByteLimit,
+    #[error("expected a user_action stanza")]
+    ExpectedUserAction,
+    #[error("unsupported group user action")]
+    UnsupportedUserAction,
+    #[error("user_action is missing raise_hand")]
+    MissingRaiseHand,
+    #[error("invalid raise-hand-state")]
+    InvalidRaiseHandState,
+    #[error("expected a screen_share stanza")]
+    ExpectedScreenShare,
+    #[error("unsupported screen-share state")]
+    UnsupportedScreenShareState,
+    #[error("unexpected {expected} ack envelope")]
+    InvalidAckEnvelope { expected: String },
+    #[error("{expected} rejected with error {error}")]
+    AckRejected { expected: String, error: String },
+    #[error("<ack type={expected}> missing payload")]
+    MissingAckPayload { expected: String },
+    #[error("unsupported call-link media")]
+    UnsupportedLinkMedia,
+    #[error("unexpected group-call attributes")]
+    UnexpectedAttributes,
+    #[error("missing group-call string attribute")]
+    MissingStringAttribute,
+    #[error("missing or invalid group-call jid")]
+    MissingJidAttribute,
+    #[error("missing group-call integer attribute")]
+    MissingIntegerAttribute,
+    #[error("invalid group-call integer attribute")]
+    InvalidIntegerAttribute,
+}
+
+debug_as_display!(GroupCallParseError);
 
 // Group signaling is control-plane traffic. Marking its entry points cold keeps fat LTO from
 // expanding parser and builder error paths into the default call handler.
@@ -340,20 +422,24 @@ fn build_group_users(
 
 /// Parse the group snapshot embedded in an active-call invitation.
 #[cold]
-pub fn parse_group_invite_snapshot(offer: &NodeRef<'_>) -> Result<Option<GroupCallUpdate>> {
+pub fn parse_group_invite_snapshot(
+    offer: &NodeRef<'_>,
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     parse_group_snapshot(offer, GroupSnapshotEnvelope::Offer)
 }
 
 /// Parse an authoritative `<group_update>` action.
 #[cold]
-pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate> {
+pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate, GroupCallParseError> {
     parse_group_snapshot(node, GroupSnapshotEnvelope::Update)?
-        .ok_or_else(|| group_stanza_error("group_update is missing group_info"))
+        .ok_or(GroupCallParseError::MissingGroupInfo)
 }
 
 /// Parse the group snapshot returned by an initial offer or link join.
 #[cold]
-pub fn parse_initial_group_call_ack(node: &NodeRef<'_>) -> Result<Option<GroupCallUpdate>> {
+pub fn parse_initial_group_call_ack(
+    node: &NodeRef<'_>,
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     parse_group_snapshot(node, GroupSnapshotEnvelope::Ack)
 }
 
@@ -406,14 +492,14 @@ fn offer_ack_status(node: &NodeRef<'_>) -> OfferAckStatus {
 fn parse_group_snapshot(
     node: &NodeRef<'_>,
     envelope: GroupSnapshotEnvelope,
-) -> Result<Option<GroupCallUpdate>> {
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     let expected_tag = match envelope {
         GroupSnapshotEnvelope::Offer => CallActionTag::Offer.as_str(),
         GroupSnapshotEnvelope::Update => CallActionTag::GroupUpdate.as_str(),
         GroupSnapshotEnvelope::Ack => "ack",
     };
     if node.tag != expected_tag {
-        return Err(group_stanza_error("unexpected group snapshot envelope"));
+        return Err(GroupCallParseError::InvalidSnapshotEnvelope);
     }
     // The ack's `error` is a status, not by itself a refusal of the whole call: `0` serves the
     // action and `207` serves it while individual participants fail, and both still deliver the
@@ -424,7 +510,7 @@ fn parse_group_snapshot(
         match offer_ack_status(node) {
             OfferAckStatus::Success | OfferAckStatus::MultiStatus => {}
             OfferAckStatus::Refused(code) => {
-                return Err(anyhow!("group offer rejected with error {code}"));
+                return Err(GroupCallParseError::OfferRejected(code));
             }
         }
     }
@@ -432,9 +518,7 @@ fn parse_group_snapshot(
     let group_info = node.get_optional_child("group_info");
     let Some(group_info) = group_info else {
         return match envelope {
-            GroupSnapshotEnvelope::Update => {
-                Err(group_stanza_error("group_update is missing group_info"))
-            }
+            GroupSnapshotEnvelope::Update => Err(GroupCallParseError::MissingGroupInfo),
             GroupSnapshotEnvelope::Offer | GroupSnapshotEnvelope::Ack => Ok(None),
         };
     };
@@ -459,7 +543,7 @@ fn parse_group_snapshot(
                     .as_ref()
                     .is_some_and(|nested| nested != &group_jid)
                 {
-                    bail!("group_info group-jid does not match offer");
+                    return Err(GroupCallParseError::GroupJidMismatch);
                 }
                 update.group_jid = Some(group_jid);
             }
@@ -467,12 +551,12 @@ fn parse_group_snapshot(
             if let Some(group_call_id) = group_attrs.optional_string("call-id")
                 && group_call_id != update.call_id
             {
-                bail!("group_info call-id does not match offer");
+                return Err(GroupCallParseError::CallIdMismatch);
             }
             if let Some(group_creator) = group_attrs.optional_jid("call-creator")
                 && group_creator != update.call_creator
             {
-                bail!("group_info call-creator does not match offer");
+                return Err(GroupCallParseError::CreatorMismatch);
             }
             if let Some(joinable) = attrs.optional_string("joinable") {
                 update.joinable = joinable.as_ref() == "1";
@@ -506,7 +590,7 @@ fn parse_group_info(
     envelope: GroupSnapshotEnvelope,
     call_id: String,
     call_creator: Jid,
-) -> Result<GroupCallUpdate> {
+) -> Result<GroupCallUpdate, GroupCallParseError> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
     let media = required_string(&mut attrs, "media")?;
@@ -550,7 +634,9 @@ fn parse_group_info(
 
 #[cold]
 #[inline(never)]
-fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
+fn parse_group_participant(
+    node: &NodeRef<'_>,
+) -> Result<GroupCallParticipant, GroupCallParseError> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid")?;
     let pn = attrs.optional_jid("user_pn");
@@ -583,7 +669,7 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
+fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice, GroupCallParseError> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid")?;
     let platform = attrs
@@ -611,7 +697,7 @@ fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
+fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay, GroupCallParseError> {
     let mut attrs = node.attrs();
     let transaction_id = optional_u32(&mut attrs, "transaction-id")?;
     let self_pid = optional_u32(&mut attrs, "self_pid")?;
@@ -651,7 +737,9 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoint> {
+fn parse_group_relay_endpoint(
+    node: &NodeRef<'_>,
+) -> Result<GroupCallRelayEndpoint, GroupCallParseError> {
     let mut attrs = node.attrs();
     let relay_id = required_u32(&mut attrs, "relay_id")?;
     let token_id = required_u32(&mut attrs, "token_id")?;
@@ -775,9 +863,9 @@ pub fn build_group_enc_rekey_for_role(
 
 /// Parse one keygen-v2 group epoch delivery.
 #[cold]
-pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
+pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::EncRekey.as_str() {
-        return Err(group_stanza_error("expected an enc_rekey stanza"));
+        return Err(GroupCallParseError::ExpectedEncRekey);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -786,10 +874,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
     finish_attrs(&attrs)?;
     let encopt = node
         .get_optional_child("encopt")
-        .ok_or_else(|| group_stanza_error("enc_rekey is missing encopt"))?;
+        .ok_or(GroupCallParseError::MissingEncopt)?;
     let enc = node
         .get_optional_child("enc")
-        .ok_or_else(|| group_stanza_error("enc_rekey is missing enc"))?;
+        .ok_or(GroupCallParseError::MissingEnc)?;
     let mut encopt_attrs = encopt.attrs();
     let key_generation = required_u32(&mut encopt_attrs, "keygen")?;
     let mut enc_attrs = enc.attrs();
@@ -799,12 +887,12 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
         || encryption_version != 2
         || !matches!(encryption_type.as_str(), "msg" | "pkmsg")
     {
-        bail!("unsupported group epoch encryption");
+        return Err(GroupCallParseError::UnsupportedEpochEncryption);
     }
     let ciphertext = enc
         .content_bytes()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| group_stanza_error("enc_rekey has no ciphertext"))?
+        .ok_or(GroupCallParseError::MissingCiphertext)?
         .to_vec();
     Ok(GroupCallEncRekey::builder()
         .call_id(call_id)
@@ -917,7 +1005,7 @@ fn build_call_service_request(request_id: &str, action: Node) -> Result<Node, Gr
 
 /// Parse a link-creation response.
 #[cold]
-pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
+pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink, GroupCallParseError> {
     let child = validated_call_ack_child(node, "link_create")?;
     let mut attrs = child.attrs();
     let token = required_string(&mut attrs, "token")?;
@@ -927,7 +1015,9 @@ pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
 
 /// Parse a link-preview response.
 #[cold]
-pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> {
+pub fn parse_call_link_query_ack(
+    node: &NodeRef<'_>,
+) -> Result<CallLinkPreview, GroupCallParseError> {
     let child = validated_call_ack_child(node, "link_query")?;
     let mut attrs = child.attrs();
     let token = required_string(&mut attrs, "token")?;
@@ -954,9 +1044,12 @@ pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> 
 
 /// Parse a link join that either admitted this endpoint or placed it in a waiting room.
 #[cold]
-pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Result<CallLinkJoin> {
+pub fn parse_call_link_join_ack(
+    node: &NodeRef<'_>,
+    requested_token: &str,
+) -> Result<CallLinkJoin, GroupCallParseError> {
     if requested_token.is_empty() {
-        bail!("requested call-link token is empty");
+        return Err(GroupCallParseError::EmptyRequestedToken);
     }
     validate_call_ack(node, "link_join")?;
     let waiting = node
@@ -979,26 +1072,26 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Re
             false,
             false,
         ),
-        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+        (None, None) => return Err(GroupCallParseError::MissingJoinResult),
     };
     if waiting
         .as_ref()
         .is_some_and(|waiting| waiting.link_token != requested_token)
     {
-        bail!("waiting-room token differs from the requested call link");
+        return Err(GroupCallParseError::WaitingRoomTokenMismatch);
     }
     if group.is_none() && !waiting_room_enabled {
-        bail!("<link_join> waiting-room-only ack is not enabled");
+        return Err(GroupCallParseError::WaitingRoomNotEnabled);
     }
     if let Some(group) = &group
         && (group.call_id != call_id || group.call_creator != call_creator)
     {
-        bail!("waiting-room and admitted group identities differ");
+        return Err(GroupCallParseError::WaitingRoomIdentityMismatch);
     }
     if let Some(group) = &group
         && group.media != media.as_str()
     {
-        bail!("waiting-room and admitted group media modes differ");
+        return Err(GroupCallParseError::WaitingRoomMediaMismatch);
     }
     Ok(CallLinkJoin {
         token: requested_token.to_string(),
@@ -1018,7 +1111,7 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Re
 /// The read loop uses this to bind pre-registration controls to the exact call while the request
 /// task is still asleep. Full token, media, roster, and creator validation remains in
 /// [`parse_call_link_join_ack`].
-pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
+pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String, GroupCallParseError> {
     validate_call_ack(node, "link_join")?;
     let waiting_call_id = node
         .get_optional_child("waiting_room")
@@ -1030,17 +1123,17 @@ pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
         .transpose()?;
     match (waiting_call_id, group_call_id) {
         (Some(waiting), Some(group)) if waiting == group => Ok(waiting),
-        (Some(_), Some(_)) => bail!("waiting-room and admitted group identities differ"),
+        (Some(_), Some(_)) => Err(GroupCallParseError::WaitingRoomIdentityMismatch),
         (Some(call_id), None) | (None, Some(call_id)) => Ok(call_id),
-        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+        (None, None) => Err(GroupCallParseError::MissingJoinResult),
     }
 }
 
 /// Parse one authoritative waiting-room update action.
 #[cold]
-pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
+pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::WaitingRoomUpdate.as_str() {
-        return Err(group_stanza_error("expected a waiting_room_update stanza"));
+        return Err(GroupCallParseError::ExpectedWaitingRoomUpdate);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -1048,19 +1141,19 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     finish_attrs(&attrs)?;
     let waiting = node
         .get_optional_child("waiting_room")
-        .ok_or_else(|| group_stanza_error("waiting_room_update is missing waiting_room"))?;
+        .ok_or(GroupCallParseError::MissingWaitingRoom)?;
     let room = parse_waiting_room(waiting)?;
     if room.call_id != call_id || room.call_creator != creator {
-        bail!("waiting-room update identity mismatch");
+        return Err(GroupCallParseError::WaitingRoomUpdateMismatch);
     }
     Ok(room)
 }
 
 #[cold]
 #[inline(never)]
-fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
+fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom, GroupCallParseError> {
     if node.tag != "waiting_room" {
-        return Err(group_stanza_error("expected a waiting_room stanza"));
+        return Err(GroupCallParseError::ExpectedWaitingRoom);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -1077,7 +1170,7 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
             continue;
         }
         if users.len() >= MAX_WAITING_ROOM_USERS {
-            bail!("waiting-room snapshot exceeds the user limit");
+            return Err(GroupCallParseError::WaitingRoomUserLimit);
         }
         let mut attrs = child.attrs();
         let user = WaitingRoomUser::builder()
@@ -1090,7 +1183,7 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
             .saturating_add(size_of::<WaitingRoomUser>())
             .saturating_add(user.heap_bytes());
         if retained_bytes > MAX_WAITING_ROOM_RETAINED_BYTES {
-            bail!("waiting-room snapshot exceeds the retained-byte limit");
+            return Err(GroupCallParseError::WaitingRoomByteLimit);
         }
         users.push(user);
     }
@@ -1168,17 +1261,17 @@ pub fn build_waiting_room_deny(
 }
 
 /// Validate the service acknowledgement for a waiting-room approval toggle.
-pub fn parse_waiting_room_toggle_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_toggle_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_toggle")
 }
 
 /// Validate the service acknowledgement for admitting one waiting user.
-pub fn parse_waiting_room_admit_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_admit_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_admit")
 }
 
 /// Validate the service acknowledgement for denying one waiting user.
-pub fn parse_waiting_room_deny_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_deny_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_deny")
 }
 
@@ -1255,9 +1348,9 @@ pub fn build_raise_hand(
 
 /// Parse a persistent raise/lower-hand transition.
 #[cold]
-pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
+pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::RaiseHand.as_str() {
-        return Err(group_stanza_error("expected a user_action stanza"));
+        return Err(GroupCallParseError::ExpectedUserAction);
     }
     let mut attrs = node.attrs();
     let action = required_string(&mut attrs, "action")?;
@@ -1265,17 +1358,17 @@ pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
     let _ = required_jid(&mut attrs, "call-creator")?;
     finish_attrs(&attrs)?;
     if action != "raise_hand" {
-        return Err(group_stanza_error("unsupported group user action"));
+        return Err(GroupCallParseError::UnsupportedUserAction);
     }
     let state = node
         .get_optional_child("raise_hand")
-        .ok_or_else(|| group_stanza_error("user_action is missing raise_hand"))?
+        .ok_or(GroupCallParseError::MissingRaiseHand)?
         .attrs()
         .optional_string("raise-hand-state");
     match state.as_deref() {
         Some("1") => Ok(true),
         Some("0") => Ok(false),
-        _ => bail!("invalid raise-hand-state"),
+        _ => Err(GroupCallParseError::InvalidRaiseHandState),
     }
 }
 
@@ -1306,18 +1399,18 @@ pub fn build_screen_share(
 
 /// Parse one versioned screen-share transition.
 #[cold]
-pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
+pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::ScreenShare.as_str() {
-        return Err(group_stanza_error("expected a screen_share stanza"));
+        return Err(GroupCallParseError::ExpectedScreenShare);
     }
     let mut attrs = node.attrs();
     let _ = required_string(&mut attrs, "call-id")?;
     let _ = required_jid(&mut attrs, "call-creator")?;
     let state_value = required_u32(&mut attrs, "screenshare_state")?;
-    let state_code = i32::try_from(state_value)
-        .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
+    let state_code =
+        i32::try_from(state_value).map_err(|_| GroupCallParseError::UnsupportedScreenShareState)?;
     let state = ScreenShareState::try_from(state_code)
-        .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
+        .map_err(|_| GroupCallParseError::UnsupportedScreenShareState)?;
     let version = required_u32(&mut attrs, "version")?;
     let screen_share_id = optional_u32(&mut attrs, "screen_share_id")?;
     finish_attrs(&attrs)?;
@@ -1336,21 +1429,26 @@ pub fn build_call_control_ack(original: &NodeRef<'_>, action_type: &str) -> Opti
 
 #[cold]
 #[inline(never)]
-fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<()> {
+fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<(), GroupCallParseError> {
     let class = node.get_attr("class").map(|value| value.as_str());
     let response_type = node.get_attr("type").map(|value| value.as_str());
     if node.tag != "ack"
         || class.as_deref() != Some("call")
         || response_type.as_deref() != Some(expected_type)
     {
-        bail!("unexpected {expected_type} ack envelope");
+        return Err(GroupCallParseError::InvalidAckEnvelope {
+            expected: expected_type.to_owned(),
+        });
     }
     if let Some(error) = node
         .get_attr("error")
         .map(|value| value.as_str())
         .filter(|error| !error.is_empty())
     {
-        bail!("{expected_type} rejected with error {error}");
+        return Err(GroupCallParseError::AckRejected {
+            expected: expected_type.to_owned(),
+            error: error.to_string(),
+        });
     }
     Ok(())
 }
@@ -1359,16 +1457,17 @@ fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<()> {
 fn validated_call_ack_child<'a, 'b>(
     node: &'b NodeRef<'a>,
     expected_type: &str,
-) -> Result<&'b NodeRef<'a>> {
+) -> Result<&'b NodeRef<'a>, GroupCallParseError> {
     validate_call_ack(node, expected_type)?;
     node.get_optional_child(expected_type)
-        .ok_or_else(|| anyhow!("<ack type={expected_type}> missing payload"))
+        .ok_or_else(|| GroupCallParseError::MissingAckPayload {
+            expected: expected_type.to_owned(),
+        })
 }
 
 #[inline(never)]
-fn parse_call_link_media(value: String) -> Result<CallLinkMedia> {
-    CallLinkMedia::try_from(value.as_str())
-        .map_err(|_| group_stanza_error("unsupported call-link media"))
+fn parse_call_link_media(value: String) -> Result<CallLinkMedia, GroupCallParseError> {
+    CallLinkMedia::try_from(value.as_str()).map_err(|_| GroupCallParseError::UnsupportedLinkMedia)
 }
 
 #[inline(never)]
@@ -1377,46 +1476,51 @@ fn bool_attr(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> bool {
 }
 
 #[inline(never)]
-fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>) -> Result<()> {
+fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>) -> Result<(), GroupCallParseError> {
     attrs
         .finish()
-        .map_err(|_| group_stanza_error("unexpected group-call attributes"))
+        .map_err(|_| GroupCallParseError::UnexpectedAttributes)
 }
 
-fn required_string(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<String> {
+fn required_string(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<String, GroupCallParseError> {
     attrs
         .optional_string(name)
         .filter(|value| !value.is_empty())
         .map(|value| value.into_owned())
-        .ok_or_else(|| group_stanza_error("missing group-call string attribute"))
+        .ok_or(GroupCallParseError::MissingStringAttribute)
 }
 
 #[inline(never)]
-fn required_jid(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Jid> {
+fn required_jid(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<Jid, GroupCallParseError> {
     attrs
         .optional_jid(name)
-        .ok_or_else(|| group_stanza_error("missing or invalid group-call jid"))
+        .ok_or(GroupCallParseError::MissingJidAttribute)
 }
 
 #[inline(never)]
-fn required_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<u32> {
-    optional_u32(attrs, name)?
-        .ok_or_else(|| group_stanza_error("missing group-call integer attribute"))
+fn required_u32(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<u32, GroupCallParseError> {
+    optional_u32(attrs, name)?.ok_or(GroupCallParseError::MissingIntegerAttribute)
 }
 
-fn optional_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Option<u32>> {
+fn optional_u32(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<Option<u32>, GroupCallParseError> {
     let Some(raw) = attrs.optional_string(name) else {
         return Ok(None);
     };
     raw.parse::<u32>()
         .map(Some)
-        .map_err(|_| group_stanza_error("invalid group-call integer attribute"))
-}
-
-#[cold]
-#[inline(never)]
-fn group_stanza_error(message: &'static str) -> anyhow::Error {
-    anyhow::Error::msg(message)
+        .map_err(|_| GroupCallParseError::InvalidIntegerAttribute)
 }
 
 #[cold]
@@ -2026,6 +2130,7 @@ mod tests {
             .build();
         let error = parse_initial_group_call_ack(&ack.as_node_ref())
             .expect_err("a refusal is not a snapshot");
+        assert!(matches!(&error, GroupCallParseError::OfferRejected(code) if code == "427"));
         assert!(
             error.to_string().contains("rejected with error 427"),
             "unexpected parse error: {error:#}"

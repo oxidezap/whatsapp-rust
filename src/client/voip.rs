@@ -1728,12 +1728,18 @@ impl Voip<'_> {
             WaitingRoomUserAction::Admit => (
                 build_waiting_room_admit(call_id, call_creator, user, &request_id),
                 parse_waiting_room_admit_ack
-                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+                    as fn(
+                        &wacore_binary::NodeRef<'_>,
+                    )
+                        -> Result<(), wacore::stanza::group_call::GroupCallParseError>,
             ),
             WaitingRoomUserAction::Deny => (
                 build_waiting_room_deny(call_id, call_creator, user, &request_id),
                 parse_waiting_room_deny_ack
-                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+                    as fn(
+                        &wacore_binary::NodeRef<'_>,
+                    )
+                        -> Result<(), wacore::stanza::group_call::GroupCallParseError>,
             ),
         };
         execute_call_service_request(
@@ -2192,7 +2198,9 @@ async fn execute_call_service_request<T>(
     client: &Client,
     request_id: &str,
     request: Node,
-    parse: impl FnOnce(&wacore_binary::NodeRef<'_>) -> anyhow::Result<T>,
+    parse: impl FnOnce(
+        &wacore_binary::NodeRef<'_>,
+    ) -> Result<T, wacore::stanza::group_call::GroupCallParseError>,
 ) -> Result<T, CallError> {
     let (tx, response) = futures::channel::oneshot::channel();
     let cleanup_generation = client
