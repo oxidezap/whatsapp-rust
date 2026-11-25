@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PeerStanzaError {
     #[error("{0}")]

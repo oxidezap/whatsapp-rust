@@ -3699,6 +3699,7 @@ mod device_unregistered_tests {
             ),
         };
         assert!(format!("{error:#}").contains("invalid state in load_session"));
+        assert!(format!("{error:?}").contains("invalid state in load_session"));
     }
 
     #[test]

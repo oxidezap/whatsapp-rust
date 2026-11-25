@@ -89,7 +89,7 @@ pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
         .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionSetupError {
     #[error("{0}")]
@@ -159,7 +159,7 @@ struct RawEncryptAttempt {
     first_error: Option<Box<DeviceEncryptionError>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum DeviceEncryptionError {
     #[error("failed to encrypt for {address}: {}", crate::diagnostics::ErrorSummary(.source))]

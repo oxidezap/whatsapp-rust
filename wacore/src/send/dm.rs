@@ -459,7 +459,7 @@ pub async fn prepare_dm_stanza(
     })
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionPreflightError {
     #[error("{0}")]
@@ -540,7 +540,7 @@ pub struct PairwiseRetryRequest<'a> {
     pub pre_encoded: Option<&'a [u8]>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PairwiseRetryError {
     #[error("pairwise retry encryption target must be a user device JID")]
