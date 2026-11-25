@@ -20,9 +20,6 @@ use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Instant;
 
-#[cfg(test)]
-use anyhow::bail;
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use log::debug;
@@ -56,6 +53,77 @@ const SCTP_PORT: u16 = 5000;
 /// The pre-negotiated DataChannel's stream id. Both ends open it directly, because a pre-negotiated
 /// channel carries no DCEP handshake -- which is why WA Web uses one.
 const MEDIA_STREAM_ID: StreamId = 0;
+
+type Result<T, E = NativeRelayError> = std::result::Result<T, E>;
+
+/// Failure while establishing the native relay media channel.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NativeRelayError {
+    #[error("dtls connect: {0}")]
+    DtlsConnect(String),
+    #[error("dtls crypto provider: {0}")]
+    DtlsProvider(String),
+    #[error("dtls self-signed cert: {0}")]
+    DtlsCertificate(String),
+    #[error("dtls config: {0}")]
+    DtlsConfig(String),
+    #[error("bind udp: {0}")]
+    BindUdp(#[source] io::Error),
+    #[error("connect udp to relay: {0}")]
+    ConnectUdp(#[source] io::Error),
+    #[error("local udp addr: {0}")]
+    LocalAddress(#[source] io::Error),
+    #[error("datagram dialer: {detail}")]
+    Dialer {
+        detail: String,
+        #[source]
+        source: RelayTransportError,
+    },
+    #[error("{0}")]
+    Handshake(String),
+    #[error("relay media driver stopped before the channel opened")]
+    DriverStopped,
+    #[error("{addr}: {source}")]
+    Candidate {
+        addr: SocketAddr,
+        #[source]
+        source: Box<NativeRelayError>,
+    },
+    #[error("{last}; {other}")]
+    BothFailed {
+        #[source]
+        last: Box<NativeRelayError>,
+        other: Box<NativeRelayError>,
+    },
+    #[error(
+        "relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} (DTLS/SCTP didn't complete); tried {tried}"
+    )]
+    Timeout { tried: String },
+    #[error("relay connect: {source}; tried {tried}")]
+    AllCandidatesFailed {
+        #[source]
+        source: Box<NativeRelayError>,
+        tried: String,
+    },
+}
+
+fn dialer_failure(source: RelayTransportError) -> NativeRelayError {
+    let mut detail = source.to_string();
+    let mut previous = detail.clone();
+    let mut cause = std::error::Error::source(&source);
+    for _ in 0..16 {
+        let Some(error) = cause else { break };
+        let next = error.to_string();
+        if next != previous {
+            detail.push_str(": ");
+            detail.push_str(&next);
+        }
+        previous = next;
+        cause = error.source();
+    }
+    NativeRelayError::Dialer { detail, source }
+}
 
 /// The shape WA Web opens the media channel with (`ordered=false, maxRetransmits=0`), and the shape
 /// this transport has to keep. Real-time RTP must NOT ride a reliable, ordered SCTP stream: a single
@@ -122,7 +190,7 @@ impl RelayStack {
         let config = dtls_config(true, Some(remote))?;
         let mut dtls = DtlsEndpoint::new(local, TransportProtocol::UDP, None);
         dtls.connect(now, remote, Arc::new(config), None)
-            .map_err(|e| anyhow!("dtls connect: {e}"))?;
+            .map_err(|error| NativeRelayError::DtlsConnect(error.to_string()))?;
         // The dialling end initiates the association too, so its SCTP endpoint needs no server
         // config: nothing will ever arrive on it that this side did not ask for.
         let sctp = SctpEndpoint::new(
@@ -459,9 +527,9 @@ fn dtls_config(
     remote: Option<SocketAddr>,
 ) -> Result<rtc_dtls::config::HandshakeConfig> {
     let provider = rtc_dtls::crypto_provider::default_provider()
-        .map_err(|e| anyhow!("dtls crypto provider: {e}"))?;
+        .map_err(|error| NativeRelayError::DtlsProvider(error.to_string()))?;
     let cert = Certificate::generate_self_signed(vec!["wa-voip".to_owned()], provider.crypto())
-        .map_err(|e| anyhow!("dtls self-signed cert: {e}"))?;
+        .map_err(|error| NativeRelayError::DtlsCertificate(error.to_string()))?;
     DtlsConfigBuilder::default()
         .with_crypto_provider(provider)
         .with_certificates(vec![cert])
@@ -470,7 +538,7 @@ fn dtls_config(
         // library's empty-server-name warn.
         .with_server_name("localhost".to_owned())
         .build(is_client, remote)
-        .map_err(|e| anyhow!("dtls config: {e}"))
+        .map_err(|error| NativeRelayError::DtlsConfig(error.to_string()))
 }
 
 /// The SCTP parameters of a relay association. Everything else is the crate's default, which is
@@ -597,7 +665,7 @@ pub type BoxedDatagram = Box<dyn DialDatagram>;
 /// detached tasks running.
 #[async_trait]
 pub trait DatagramDialer: Send + Sync {
-    async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram>;
+    async fn dial(&self, relay: SocketAddr) -> RelayResult<BoxedDatagram>;
 }
 
 /// Send one datagram on `socket`.
@@ -651,8 +719,7 @@ impl RelayMediaChannel {
 /// Connect the full media stack to one relay endpoint.
 ///
 /// Returns once the driver reports the media channel open, so a caller holding the `Ok` can send on
-/// it. The multi-step setup is kept on `anyhow` for per-step `.context()`; the factory wraps the
-/// aggregate, since a connect failure is fatal for the call.
+/// it. The error retains the failing setup step and its source.
 pub async fn connect_relay_media(
     relay_addr: SocketAddr,
     runtime: Arc<dyn Runtime>,
@@ -673,12 +740,7 @@ async fn connect_relay_media_via(
     async_channel::Receiver<RelayTransportEvent>,
 )> {
     if let Some(dialer) = dialer {
-        // `{e:#}`: the candidate error is flattened to one line upstream, and the dialer's own
-        // reason is the part worth keeping.
-        let flow = dialer
-            .dial(relay_addr)
-            .await
-            .map_err(|e| anyhow!("datagram dialer: {e:#}"))?;
+        let flow = dialer.dial(relay_addr).await.map_err(dialer_failure)?;
         return start_relay_media(flow, relay_addr, runtime, Some(dialer)).await;
     }
     // Bind in the relay's address family so an IPv6 relay is reachable (WA relays are IPv4 today,
@@ -688,11 +750,13 @@ async fn connect_relay_media_via(
     } else {
         "0.0.0.0:0"
     };
-    let socket = UdpSocket::bind(bind_addr).await.context("bind udp")?;
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(NativeRelayError::BindUdp)?;
     socket
         .connect(relay_addr)
         .await
-        .context("connect udp to relay")?;
+        .map_err(NativeRelayError::ConnectUdp)?;
     start_relay_media(socket, relay_addr, runtime, None).await
 }
 
@@ -709,7 +773,9 @@ async fn start_relay_media<S: DialDatagram + 'static>(
     RelayMediaChannel,
     async_channel::Receiver<RelayTransportEvent>,
 )> {
-    let local_addr = socket.local_addr().context("local udp addr")?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(NativeRelayError::LocalAddress)?;
     let stack = RelayStack::connect(local_addr, relay_addr, now())?;
 
     let (outbound_tx, outbound_rx) = async_channel::bounded(RELAY_SEND_CAP);
@@ -737,10 +803,8 @@ async fn start_relay_media<S: DialDatagram + 'static>(
     // loop expects to read off the stream, so waiting here does not consume that event.
     match open_rx.recv().await {
         Ok(Ok(())) => Ok((channel, events_rx)),
-        Ok(Err(e)) => Err(anyhow!("{e}")),
-        Err(_) => Err(anyhow!(
-            "relay media driver stopped before the channel opened"
-        )),
+        Ok(Err(error)) => Err(NativeRelayError::Handshake(error)),
+        Err(_) => Err(NativeRelayError::DriverStopped),
     }
 }
 
@@ -964,11 +1028,17 @@ where
         Either::Right((Err(web_error), advertised)) => advertised
             .await
             .map(|advertised| (advertised, PortChoice::WebClientFailed))
-            .map_err(|error| anyhow!("{error}; {web_error}")),
+            .map_err(|error| NativeRelayError::BothFailed {
+                last: Box::new(error),
+                other: Box::new(web_error),
+            }),
         Either::Left((Err(advertised_error), web_client)) => web_client
             .await
             .map(|web_client| (web_client, PortChoice::AdvertisedFailed))
-            .map_err(|error| anyhow!("{error}; {advertised_error}")),
+            .map_err(|error| NativeRelayError::BothFailed {
+                last: Box::new(error),
+                other: Box::new(advertised_error),
+            }),
         Either::Left((Ok(advertised), web_client)) => {
             let left = WEB_CLIENT_PORT_GRACE_CUTOFF.saturating_sub(started.elapsed());
             if left.is_zero() {
@@ -1015,7 +1085,10 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
                         Box::pin(async move {
                             match connect_relay_media_via(addr, runtime, dialer).await {
                                 Ok((chan, events)) => Ok((addr, chan, events)),
-                                Err(e) => Err(anyhow!("{addr}: {e}")),
+                                Err(source) => Err(NativeRelayError::Candidate {
+                                    addr,
+                                    source: Box::new(source),
+                                }),
                             }
                         }) as Pin<Box<dyn Future<Output = _> + Send>>
                     })
@@ -1046,24 +1119,20 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
             let ((kept, chan, events), choice) =
                 wacore::runtime::timeout(&*self.runtime, RELAY_CONNECT_TIMEOUT, race)
                     .await
-                    .map_err(|_| {
-                        anyhow!(
-                            "relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} \
-                 (DTLS/SCTP didn't complete); tried {tried}"
-                        )
+                    .map_err(|_| NativeRelayError::Timeout {
+                        tried: tried.clone(),
                     })?
-                    .map_err(|e| anyhow!("relay connect: {e}; tried {tried}"))?;
+                    .map_err(|source| NativeRelayError::AllCandidatesFailed {
+                        source: Box::new(source),
+                        tried,
+                    })?;
             // Which ports answered and which was kept diverge per host and per session, so this is the
             // only place that is observable in production.
             debug!("{}", connected_message(kept, self.addr, choice));
             Ok((Arc::new(chan) as Arc<dyn RelayTransport>, events))
         }
         .await;
-        result.map_err(|error| {
-            RelayTransportError::from_boxed(
-                error.reallocate_into_boxed_dyn_error_without_backtrace(),
-            )
-        })
+        result.map_err(RelayTransportError::adapter)
     }
 }
 
@@ -1335,6 +1404,21 @@ async fn finish(
 mod tests {
     use super::*;
 
+    #[test]
+    fn dialer_failure_preserves_nested_diagnostics_and_source() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("proxy connection failed")]
+        struct ProxyError(#[source] io::Error);
+        let error = dialer_failure(RelayTransportError::adapter(ProxyError(io::Error::other(
+            "route refused",
+        ))));
+        assert_eq!(
+            error.to_string(),
+            "datagram dialer: proxy connection failed: route refused"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
     /// A relay that advertises 3478 must still be tried on the web client port, since which of the
     /// two a host actually serves is not visible in the offer.
     #[test]
@@ -1417,7 +1501,7 @@ mod tests {
         let kept = prefer_web_client_port(
             &runtime,
             dial(80, Ok("advertised")),
-            dial(200, Err(anyhow!("refused"))),
+            dial(200, Err(NativeRelayError::Handshake("refused".into()))),
         )
         .await
         .expect("a relay");
@@ -1429,7 +1513,10 @@ mod tests {
         let runtime = crate::runtime_impl::TokioRuntime;
         let kept = prefer_web_client_port(
             &runtime,
-            dial(10, Err(anyhow!("advertised: timed out"))),
+            dial(
+                10,
+                Err(NativeRelayError::Handshake("advertised: timed out".into())),
+            ),
             dial(300, Ok("web client")),
         )
         .await
@@ -1449,8 +1536,14 @@ mod tests {
         );
         let error = prefer_web_client_port::<&str, _, _>(
             &runtime,
-            dial(10, Err(anyhow!("advertised: refused"))),
-            dial(20, Err(anyhow!("web client: refused"))),
+            dial(
+                10,
+                Err(NativeRelayError::Handshake("advertised: refused".into())),
+            ),
+            dial(
+                20,
+                Err(NativeRelayError::Handshake("web client: refused".into())),
+            ),
         )
         .await
         .expect_err("no relay");
@@ -2455,14 +2548,24 @@ mod datagram_dialer {
 
     #[async_trait]
     impl DatagramDialer for RoutingDialer {
-        async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram> {
+        async fn dial(&self, relay: SocketAddr) -> RelayResult<BoxedDatagram> {
             self.dialed.lock().unwrap().push(relay);
             let Some(to) = self.routes.lock().unwrap().get(&relay).copied() else {
-                bail!("no route to {relay}");
+                return Err(RelayTransportError::adapter(io::Error::other(format!(
+                    "no route to {relay}"
+                ))));
             };
-            let socket = UdpSocket::bind("127.0.0.1:0").await?;
-            socket.connect(to).await?;
-            self.locals.lock().unwrap().push(socket.local_addr()?);
+            let socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .map_err(RelayTransportError::adapter)?;
+            socket
+                .connect(to)
+                .await
+                .map_err(RelayTransportError::adapter)?;
+            self.locals
+                .lock()
+                .unwrap()
+                .push(socket.local_addr().map_err(RelayTransportError::adapter)?);
             Ok(Box::new(CountingFlow {
                 socket,
                 sent: self.sent.clone(),
@@ -2787,18 +2890,25 @@ mod datagram_dialer {
 
     #[async_trait]
     impl DatagramDialer for InstrumentedDialer {
-        async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram> {
+        async fn dial(&self, relay: SocketAddr) -> RelayResult<BoxedDatagram> {
             // Lives exactly as long as this future: dropped when the dial returns or is cancelled.
             let _dialing = Alive::new(&self.dials);
             match self.answers.get(&relay).copied() {
-                None => bail!("no route to {relay}"),
+                None => Err(RelayTransportError::adapter(io::Error::other(format!(
+                    "no route to {relay}"
+                )))),
                 Some(Answer::Never) => std::future::pending().await,
                 Some(Answer::Silently) => Ok(Box::new(SilentFlow {
                     _alive: Alive::new(&self.flows),
                 })),
                 Some(Answer::Via(to)) => {
-                    let socket = UdpSocket::bind("127.0.0.1:0").await?;
-                    socket.connect(to).await?;
+                    let socket = UdpSocket::bind("127.0.0.1:0")
+                        .await
+                        .map_err(RelayTransportError::adapter)?;
+                    socket
+                        .connect(to)
+                        .await
+                        .map_err(RelayTransportError::adapter)?;
                     Ok(Box::new(LiveFlow {
                         socket,
                         _alive: Alive::new(&self.flows),
@@ -3011,9 +3121,14 @@ mod datagram_dialer {
 
     #[async_trait]
     impl DatagramDialer for GatedDialer {
-        async fn dial(&self, _relay: SocketAddr) -> Result<BoxedDatagram> {
-            let socket = UdpSocket::bind("127.0.0.1:0").await?;
-            socket.connect(self.to).await?;
+        async fn dial(&self, _relay: SocketAddr) -> RelayResult<BoxedDatagram> {
+            let socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .map_err(RelayTransportError::adapter)?;
+            socket
+                .connect(self.to)
+                .await
+                .map_err(RelayTransportError::adapter)?;
             Ok(Box::new(GatedFlow {
                 socket,
                 gate: self.gate.clone(),

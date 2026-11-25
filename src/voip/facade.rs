@@ -8232,9 +8232,11 @@ mod tests {
         async fn dial(
             &self,
             relay: SocketAddr,
-        ) -> anyhow::Result<crate::voip::transport::BoxedDatagram> {
+        ) -> wacore::voip::transport::RelayResult<crate::voip::transport::BoxedDatagram> {
             self.dialed.lock().unwrap().push(relay);
-            anyhow::bail!("refused {relay}")
+            Err(wacore::voip::transport::RelayTransportError::adapter(
+                std::io::Error::other(format!("refused {relay}")),
+            ))
         }
     }
 
