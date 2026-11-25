@@ -72,6 +72,8 @@ pub enum SendError {
     StatusRecipients(#[from] wacore::send::StatusRecipientsError),
     #[error("{0}")]
     SenderKeyCache(#[source] Box<wacore::store::signal_cache::SenderKeyCacheError>),
+    #[error("{0}")]
+    Store(#[source] Box<wacore::store::error::StoreError>),
     /// A DM could not be encrypted for a single device of the recipient, so
     /// nothing was sent. Distinct from a transport failure: the connection is
     /// fine and the message id was never on the wire, so the useful retry is

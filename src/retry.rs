@@ -514,7 +514,7 @@ impl Client {
             if !self
                 .jids_share_user_identity(&request.chat, routing_chat)
                 .await
-                .map_err(SendError::from_anyhow)?
+                .map_err(|error| SendError::Store(Box::new(error)))?
             {
                 return Err(SendError::InvalidRequest(
                     "direct retransmission chat does not match its routing identity".into(),
@@ -5562,6 +5562,28 @@ mod tests {
             .expect_err("a normal remote user cannot declare a recipient route");
         assert!(matches!(error, SendError::InvalidRequest(_)));
         assert!(error.to_string().contains("local device or bot"));
+    }
+
+    #[tokio::test]
+    async fn direct_retransmission_reports_identity_store_failure() {
+        use crate::store::release::tests::ProbeBackend;
+        let (mut probe, _) = ProbeBackend::new();
+        probe.fail_before_method = Some((
+            "get_lid_mapping",
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        let (client, _) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let request = MessageRetransmission::new(
+            Jid::pn("12025550107"),
+            Jid::lid("100000000000107"),
+            wa::Message::default(),
+            crate::MessageId::new("DIRECT-STORE-FAILURE").unwrap(),
+            1,
+        );
+        let error = client.retransmit_message(request).await.unwrap_err();
+        assert!(matches!(error, SendError::Store(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[tokio::test]

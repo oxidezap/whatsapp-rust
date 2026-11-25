@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
 use log::debug;
 use wacore::iq::usync::LidQuerySpec;
 use wacore::store::traits::{LidPnMappingEntry, SignalStore};
@@ -1060,7 +1059,7 @@ impl Client {
         pn: &str,
         lid: &str,
         _guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> Result<bool> {
+    ) -> wacore::store::error::Result<bool> {
         let forward = self.lid_pn_cache.get_current_lid(pn).await;
         let reverse = self.lid_pn_cache.get_phone_number(lid).await;
         if forward.as_deref().is_some_and(|current| current != lid)
@@ -1475,7 +1474,11 @@ impl Client {
     /// suffixes and resolving PN/LID aliases through the canonical mapping
     /// cache-aside path. Hosted namespaces belong to their corresponding PN or
     /// LID family; unrelated namespaces only match exactly.
-    pub(crate) async fn jids_share_user_identity(&self, left: &Jid, right: &Jid) -> Result<bool> {
+    pub(crate) async fn jids_share_user_identity(
+        &self,
+        left: &Jid,
+        right: &Jid,
+    ) -> wacore::store::error::Result<bool> {
         if left.is_same_chat_as(right) {
             return Ok(true);
         }
