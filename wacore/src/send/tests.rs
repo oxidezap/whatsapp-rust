@@ -5488,17 +5488,18 @@ mod mark_full_distribution_list {
         };
         let resolver = MockSendContextResolver::new();
 
-        assert!(
+        assert!(matches!(
             ensure_sessions_for_devices(
                 &TokioTestRuntime,
                 &mut stores,
                 &resolver,
                 &[first, second]
             )
-            .await
-            .is_err(),
-            "a store that cannot answer still fails the session half"
-        );
+            .await,
+            Err(SessionSetupError::Signal(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState("has_session", _)
+            ))
+        ));
 
         assert_eq!(
             resolver.captured_unkeyable(),

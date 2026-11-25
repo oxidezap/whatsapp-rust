@@ -89,6 +89,24 @@ pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
         .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionSetupError {
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Resolver(#[from] crate::client::context::SendContextError),
+}
+
+impl SessionSetupError {
+    pub fn server_error(&self) -> Option<&crate::request::ServerErrorCode> {
+        match self {
+            Self::Resolver(error) => error.server_error(),
+            Self::Signal(_) => None,
+        }
+    }
+}
+
 pub struct EncryptResult {
     pub participant_nodes: Vec<Node>,
     pub includes_prekey_message: bool,
@@ -759,12 +777,12 @@ async fn has_session_or_report(
     addr: &ProtocolAddress,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
-) -> Result<bool> {
+) -> Result<bool, crate::libsignal::protocol::SignalProtocolError> {
     match wacore_libsignal::protocol::has_session(session_store, addr).await {
         Ok(present) => Ok(present),
         Err(error) => {
             resolver.on_unkeyable_devices(UnkeyableDevice::SessionLookup, devices.len() as u64);
-            Err(error.into())
+            Err(error)
         }
     }
 }
@@ -845,7 +863,7 @@ pub async fn ensure_sessions_for_devices(
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, None).await
 }
 
@@ -859,7 +877,7 @@ pub async fn ensure_sessions_for_devices_resolved(
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     ensure_sessions_for_devices_guarded(
         runtime,
         stores,
@@ -879,7 +897,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
     session_guard: crate::client::context::SessionLockGuard,
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     // A list that is not parallel to `devices` cannot be indexed by device;
     // resolving per device is always correct, so that is the fallback in
     // every build rather than a debug-only assertion that would make a

@@ -391,14 +391,17 @@ pub async fn prepare_group_stanza_resolved(
             {
                 Ok(plan) => Some(plan),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(error.context("required sender-key session setup failed"));
+                    return Err(anyhow::Error::new(error)
+                        .context("required sender-key session setup failed"));
                 }
                 Err(e) => {
                     log::warn!(
                         "SKDM session setup failed for group {}, continuing without distribution: {e}",
                         to_jid.observe()
                     );
-                    if is_device_unregistered_error(&e) {
+                    if e.server_error()
+                        .is_some_and(|error| error.code == UNREGISTERED_DEVICE_CODE)
+                    {
                         had_unregistered_devices = true;
                     }
                     None
