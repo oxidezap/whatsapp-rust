@@ -36,7 +36,17 @@ pub(crate) enum AdvPrimaryBundleError {
     #[error("primary identity unavailable for ADV verification")]
     Missing,
     #[error("could not authenticate primary bundle: {0}")]
-    Invalid(#[source] anyhow::Error),
+    Invalid(#[source] PrimaryIdentityError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrimaryIdentityError {
+    #[error("{0}")]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("invalid primary signed prekey signature length")]
+    InvalidSignatureLength,
+    #[error("invalid primary signed prekey signature")]
+    InvalidSignature,
 }
 
 /// Separate from Signal locks: a slow cold lookup must not block a warm
@@ -295,17 +305,19 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
     n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
 }
 
-pub(crate) fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<IdentityKey> {
+pub(crate) fn authenticated_primary_identity(
+    bundle: &PreKeyBundle,
+) -> Result<IdentityKey, PrimaryIdentityError> {
     let identity = *bundle.identity_key()?;
     let signature: &[u8; 64] = bundle
         .signed_pre_key_signature()?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid primary signed prekey signature length"))?;
+        .map_err(|_| PrimaryIdentityError::InvalidSignatureLength)?;
     if !identity
         .public_key()
         .verify_signature(&bundle.signed_pre_key_public()?.serialize(), signature)
     {
-        anyhow::bail!("invalid primary signed prekey signature");
+        return Err(PrimaryIdentityError::InvalidSignature);
     }
     Ok(identity)
 }
@@ -314,8 +326,8 @@ fn authenticate_cold_primary_bundles(
     outcome: &mut wacore::prekeys::PreKeyFetchOutcome,
     companions: &[Jid],
     primaries: &[Jid],
-    mut authenticate: impl FnMut(&PreKeyBundle) -> anyhow::Result<IdentityKey>,
-) -> anyhow::Result<()> {
+    mut authenticate: impl FnMut(&PreKeyBundle) -> Result<IdentityKey, PrimaryIdentityError>,
+) -> Result<(), PrimaryIdentityError> {
     // Validate every primary before publication. The fetch owns its immutable
     // bundles, so publishing can read their keys without repeating crypto.
     for primary in primaries {
