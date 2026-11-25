@@ -11,42 +11,6 @@ fn resolver_error(error: anyhow::Error) -> SendContextError {
     SendContextError::from_boxed(error.reallocate_into_boxed_dyn_error_without_backtrace())
 }
 
-#[cfg(test)]
-mod resolver_error_tests {
-    use super::resolver_error;
-    use crate::ErrorChainExt;
-
-    #[test]
-    fn preserves_iq_timeout_and_server_rejection() {
-        for context in [false, true] {
-            let timeout = anyhow::Error::new(crate::request::IqError::Timeout);
-            let timeout = if context {
-                timeout.context("device lookup")
-            } else {
-                timeout
-            };
-            assert!(resolver_error(timeout).is_timeout());
-
-            let rejection = anyhow::Error::new(crate::test_utils::server_error_iq(
-                429,
-                "rate-overlimit",
-                Some("wait"),
-                Some(7),
-            ));
-            let rejection = if context {
-                rejection.context("device lookup")
-            } else {
-                rejection
-            };
-            let error = resolver_error(rejection);
-            let server = error.server_rejection().expect("typed rejection");
-            assert_eq!(server.code, 429);
-            assert_eq!(server.error_type, Some("wait"));
-            assert_eq!(server.backoff, Some(7));
-        }
-    }
-}
-
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SendContextResolver for Client {
@@ -180,6 +144,42 @@ impl Client {
             SenderIdentityRole::Unknown
         } else {
             SenderIdentityRole::Companion
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolver_error_tests {
+    use super::resolver_error;
+    use crate::ErrorChainExt;
+
+    #[test]
+    fn preserves_iq_timeout_and_server_rejection() {
+        for context in [false, true] {
+            let timeout = anyhow::Error::new(crate::request::IqError::Timeout);
+            let timeout = if context {
+                timeout.context("device lookup")
+            } else {
+                timeout
+            };
+            assert!(resolver_error(timeout).is_timeout());
+
+            let rejection = anyhow::Error::new(crate::test_utils::server_error_iq(
+                429,
+                "rate-overlimit",
+                Some("wait"),
+                Some(7),
+            ));
+            let rejection = if context {
+                rejection.context("device lookup")
+            } else {
+                rejection
+            };
+            let error = resolver_error(rejection);
+            let server = error.server_rejection().expect("typed rejection");
+            assert_eq!(server.code, 429);
+            assert_eq!(server.error_type, Some("wait"));
+            assert_eq!(server.backoff, Some(7));
         }
     }
 }
