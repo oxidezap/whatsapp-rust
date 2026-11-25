@@ -1736,7 +1736,7 @@ fn required_child_text(
 ) -> Result<CompactString, UsyncParseError> {
     required_child(node, tag)?
         .content_as_string()
-        .ok_or_else(|| UsyncParseError::MissingText(tag))
+        .ok_or(UsyncParseError::MissingText(tag))
 }
 
 fn optional_child_text(node: &NodeRef<'_>, tag: &str) -> Option<CompactString> {

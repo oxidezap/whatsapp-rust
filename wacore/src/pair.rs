@@ -265,22 +265,16 @@ impl PairUtils {
                     source: PairCryptoCause::HmacInit(e),
                 }
             })?;
-        let details_bytes = hmac_container
-            .details
-            .as_deref()
-            .ok_or_else(|| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: PairCryptoCause::MissingHmacDetails,
-            })?;
-        let hmac_bytes = hmac_container
-            .hmac
-            .as_deref()
-            .ok_or_else(|| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: PairCryptoCause::MissingHmac,
-            })?;
+        let details_bytes = hmac_container.details.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingHmacDetails,
+        })?;
+        let hmac_bytes = hmac_container.hmac.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingHmac,
+        })?;
 
         if is_hosted_account {
             mac.update(&ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE);
@@ -311,15 +305,11 @@ impl PairUtils {
             .account_signature
             .as_deref()
             .unwrap_or_default();
-        let inner_details_bytes =
-            signed_identity
-                .details
-                .as_deref()
-                .ok_or_else(|| PairCryptoError {
-                    code: 500,
-                    text: "internal-error",
-                    source: PairCryptoCause::MissingIdentityDetails,
-                })?;
+        let inner_details_bytes = signed_identity.details.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingIdentityDetails,
+        })?;
         let identity_details = waproto::codec::adv_device_identity_decode(inner_details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
@@ -348,7 +338,7 @@ impl PairUtils {
             });
         }
 
-        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+        let key_index = identity_details.key_index.ok_or(PairCryptoError {
             code: 500,
             text: "internal-error",
             source: PairCryptoCause::MissingKeyIndex,

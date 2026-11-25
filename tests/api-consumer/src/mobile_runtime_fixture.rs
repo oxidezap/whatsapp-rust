@@ -99,12 +99,16 @@ struct SuppliedHttp {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl HttpClient for SuppliedHttp {
-    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
+    async fn execute(
+        &self,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let durable = self
             .backend
             .load()
-            .await?
+            .await
+            .map_err(whatsapp_rust::http::HttpError::adapter)?
             .expect("keys durable before HTTP");
         let binding = durable
             .mobile_session
@@ -115,16 +119,20 @@ impl HttpClient for SuppliedHttp {
                 .registration_checkpoint
                 .as_ref()
                 .expect("durable reservation"),
-        )?;
+        )
+        .map_err(whatsapp_rust::http::HttpError::adapter)?;
         let identity = whatsapp_rust::mobile::RegistrationIdentity::from_public_keys(
             durable.identity_key.public_key.public_key_bytes(),
             durable.noise_key.public_key.public_key_bytes(),
         );
         let restored = whatsapp_rust::mobile::RegistrationWorkflow::restore(
             checkpoint,
-            super::mock_environment(4443)?.binding(),
+            super::mock_environment(4443)
+                .map_err(whatsapp_rust::http::HttpError::adapter)?
+                .binding(),
             identity,
-        )?;
+        )
+        .map_err(whatsapp_rust::http::HttpError::adapter)?;
         assert!(matches!(
             restored.stage(),
             RegistrationStage::OutcomeUnknown { .. }
