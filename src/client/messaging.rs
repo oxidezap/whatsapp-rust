@@ -462,7 +462,7 @@ impl Client {
         to: &Jid,
         server_id: u64,
         reaction: &str,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, ClientError> {
         let request_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
 
         let stanza = NodeBuilder::new("message")

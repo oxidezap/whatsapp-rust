@@ -824,6 +824,19 @@ async fn review_live_newsletter_context_does_not_infer_ownership() {
 }
 
 #[tokio::test]
+async fn newsletter_reaction_preserves_disconnected_client_error() {
+    let client = crate::test_utils::create_test_client().await;
+    let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+    assert!(matches!(
+        client
+            .newsletter()
+            .send_reaction_raw(&channel, 42, "👍")
+            .await,
+        Err(crate::NewsletterError::Client(ClientError::NotConnected))
+    ));
+}
+
+#[tokio::test]
 async fn review_raw_newsletter_reaction_preserves_status_delegation() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let chat = Jid::status_broadcast();
