@@ -50,14 +50,14 @@ pub enum IdentityPersistenceError {
 #[non_exhaustive]
 pub enum SignalCacheFlushError {
     #[error("{0}")]
-    Store(#[source] Box<crate::store::error::StoreError>),
+    Store(#[source] crate::error::BoxedErrorSource<crate::store::error::StoreError>),
     #[error("Corrupted identity key for {address}: expected 32 bytes, got {length}")]
     InvalidIdentity { address: Arc<str>, length: usize },
     #[error("sender key serialize for {address}: {source}")]
     SenderKeySerialization {
         address: Arc<str>,
         #[source]
-        source: Box<SignalProtocolError>,
+        source: crate::error::BoxedErrorSource<SignalProtocolError>,
     },
 }
 
@@ -70,7 +70,7 @@ debug_as_display!(
 
 impl From<crate::store::error::StoreError> for SignalCacheFlushError {
     fn from(error: crate::store::error::StoreError) -> Self {
-        Self::Store(Box::new(error))
+        Self::Store(crate::error::BoxedErrorSource::new(error))
     }
 }
 
@@ -3088,7 +3088,7 @@ impl SignalStoreCache {
                                 .serialize_for_store(&state.incarnation)
                                 .map_err(|error| SignalCacheFlushError::SenderKeySerialization {
                                     address: Arc::clone(address),
-                                    source: Box::new(error),
+                                    source: crate::error::BoxedErrorSource::new(error),
                                 })?;
                         batch.push((address.clone(), bytes::Bytes::from(bytes)));
                         versions.push((address.clone(), Arc::downgrade(record)));

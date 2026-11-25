@@ -26,6 +26,7 @@ pub mod companion_reg;
 pub mod crypto;
 pub mod diagnostics;
 pub mod download;
+pub mod error;
 pub mod identity_verification;
 pub mod iq;
 pub mod protocol;

@@ -87,7 +87,7 @@ pub(crate) enum PrimaryIdentityError {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CachedAdvIdentityError {
     #[error("{0}")]
-    Store(#[source] Box<wacore::store::error::StoreError>),
+    Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
     #[error("invalid stored primary identity")]
     InvalidStored,
     #[error("invalid paired primary identity")]
@@ -96,7 +96,7 @@ pub(crate) enum CachedAdvIdentityError {
 
 impl From<wacore::store::error::StoreError> for CachedAdvIdentityError {
     fn from(error: wacore::store::error::StoreError) -> Self {
-        Self::Store(Box::new(error))
+        Self::Store(wacore::error::BoxedErrorSource::new(error))
     }
 }
 

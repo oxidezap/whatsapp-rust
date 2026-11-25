@@ -253,3 +253,54 @@ impl ErrorChainExt for dyn StdError + Send + Sync + 'static {
         self
     }
 }
+
+#[cfg(test)]
+mod boxed_source_tests {
+    use super::ErrorChainExt;
+    use wacore::store::error::StoreError;
+
+    fn storage_error() -> StoreError {
+        StoreError::Io(std::io::Error::other("synthetic storage failure"))
+    }
+
+    #[test]
+    fn mapping_error_exposes_store_error() {
+        let error = crate::MappingLearningError::StoreBatch(wacore::error::BoxedErrorSource::new(
+            storage_error(),
+        ));
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn send_error_exposes_store_error() {
+        let error = crate::SendError::Store(wacore::error::BoxedErrorSource::new(storage_error()));
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn cached_identity_exposes_store_error() {
+        let error = crate::prekeys::CachedAdvIdentityError::from(storage_error());
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn signal_flush_exposes_store_error() {
+        let error = wacore::store::signal_cache::SignalCacheFlushError::from(storage_error());
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn failed_recipient_exposes_device_error() {
+        let error = wacore::send::NoRecipientDeviceError::EncryptionFailed {
+            attempted: 1,
+            source: wacore::error::BoxedErrorSource::new(
+                wacore::send::DeviceEncryptionError::NoCiphertext,
+            ),
+        };
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::send::DeviceEncryptionError>())
+        );
+    }
+}

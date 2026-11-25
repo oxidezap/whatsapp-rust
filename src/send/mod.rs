@@ -73,7 +73,7 @@ pub enum SendError {
     #[error("{0}")]
     SenderKeyCache(#[source] Box<wacore::store::signal_cache::SenderKeyCacheError>),
     #[error("{0}")]
-    Store(#[source] Box<wacore::store::error::StoreError>),
+    Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
     /// A DM could not be encrypted for a single device of the recipient, so
     /// nothing was sent. Distinct from a transport failure: the connection is
     /// fine and the message id was never on the wire, so the useful retry is
@@ -4500,7 +4500,9 @@ mod tests {
 
         let failed: anyhow::Error = NoRecipientDeviceError::EncryptionFailed {
             attempted: 2,
-            source: Box::new(wacore::send::DeviceEncryptionError::NoCiphertext),
+            source: wacore::error::BoxedErrorSource::new(
+                wacore::send::DeviceEncryptionError::NoCiphertext,
+            ),
         }
         .into();
         // Wrapped the way the send path bubbles it: through `?` under context.

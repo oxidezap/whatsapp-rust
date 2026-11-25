@@ -514,7 +514,7 @@ impl Client {
             if !self
                 .jids_share_user_identity(&request.chat, routing_chat)
                 .await
-                .map_err(|error| SendError::Store(Box::new(error)))?
+                .map_err(|error| SendError::Store(wacore::error::BoxedErrorSource::new(error)))?
             {
                 return Err(SendError::InvalidRequest(
                     "direct retransmission chat does not match its routing identity".into(),

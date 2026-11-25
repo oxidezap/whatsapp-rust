@@ -89,7 +89,7 @@ pub enum NoRecipientDeviceError {
     EncryptionFailed {
         attempted: usize,
         #[source]
-        source: Box<DeviceEncryptionError>,
+        source: crate::error::BoxedErrorSource<DeviceEncryptionError>,
     },
     /// The fan-out held no device for the recipient to begin with. Distinct
     /// from the above: nothing was attempted, so there is no per-device cause.
@@ -139,7 +139,9 @@ impl NoRecipientDeviceError {
             // A device can also drop out without an error (an encrypt that
             // produced an unsupported ciphertext type), so the source is
             // synthesised rather than left absent.
-            source: source.unwrap_or_else(|| Box::new(DeviceEncryptionError::NoCiphertext)),
+            source: source
+                .unwrap_or_else(|| Box::new(DeviceEncryptionError::NoCiphertext))
+                .into(),
         }
     }
 }
