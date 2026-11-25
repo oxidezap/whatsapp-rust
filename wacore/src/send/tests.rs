@@ -3686,6 +3686,18 @@ mod device_unregistered_tests {
     }
 
     #[test]
+    fn device_encryption_diagnostic_includes_signal_failure() {
+        let error = super::DeviceEncryptionError::Encrypt {
+            address: "synthetic-device".into(),
+            source: crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                "load_session",
+                "session store is unavailable".into(),
+            ),
+        };
+        assert!(format!("{error:#}").contains("invalid state in load_session"));
+    }
+
+    #[test]
     fn rejects_non_406_server_error() {
         let err = anyhow::Error::new(ServerErrorCode {
             code: 404,

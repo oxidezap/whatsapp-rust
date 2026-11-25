@@ -144,13 +144,13 @@ struct RawEncryptAttempt {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DeviceEncryptionError {
-    #[error("failed to encrypt for {address}")]
+    #[error("failed to encrypt for {address}: {}", crate::diagnostics::ErrorSummary(.source))]
     Encrypt {
         address: String,
         #[source]
         source: crate::libsignal::protocol::SignalProtocolError,
     },
-    #[error("failed to process pre-key bundle for {address}")]
+    #[error("failed to process pre-key bundle for {address}: {}", crate::diagnostics::ErrorSummary(.source))]
     SessionSetup {
         address: String,
         #[source]
