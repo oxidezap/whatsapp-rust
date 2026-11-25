@@ -1058,8 +1058,8 @@ mod tests {
             patches: vec![status_patch],
             ..list
         };
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
-            Err(anyhow::anyhow!("unexpected external blob"))
+        let download = |_ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError> {
+            Err(wacore::appstate_sync::ExternalBlobError::download(std::io::Error::other("unexpected external blob")))
         };
 
         let error = processor
@@ -2725,7 +2725,7 @@ mod tests {
         };
 
         let snapshot_bytes = bytes::Bytes::from(snapshot_bytes);
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
+        let download = |_ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError> {
             Ok(snapshot_bytes.clone())
         };
 

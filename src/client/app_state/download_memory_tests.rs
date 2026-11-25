@@ -106,8 +106,14 @@ async fn client(
     (client, http)
 }
 
-fn is_memory_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+fn error_sources<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |cause| cause.source())
+}
+
+fn is_memory_error(error: &wacore::appstate_sync::ExternalBlobError) -> bool {
+    error_sources(error).any(|cause| {
         matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(
@@ -244,7 +250,7 @@ async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
             .prefetch_validated_for_test(&[list(reference.clone())])
             .await;
         let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
-        assert!(error.chain().any(|cause| matches!(
+        assert!(error_sources(&error).any(|cause| matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(_))
         )));
@@ -297,9 +303,7 @@ async fn cryptographic_failure_is_preserved_and_releases_capacity() {
         .await;
     let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
     assert!(
-        error
-            .chain()
-            .any(|cause| cause.is::<MediaDecryptionError>()),
+        error_sources(&error).any(|cause| cause.is::<MediaDecryptionError>()),
         "{error:?}"
     );
     let retry = client

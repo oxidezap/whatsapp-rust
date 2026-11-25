@@ -387,12 +387,31 @@ impl PreparedPatchList {
     }
 }
 
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ExternalBlobError {
+    #[error("external blob has no directPath")]
+    MissingDirectPath,
+    #[error("external blob not pre-downloaded: {0}")]
+    NotPrefetched(String),
+    #[error("{0}")]
+    Download(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl ExternalBlobError {
+    pub fn download(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Download(Box::new(error))
+    }
+}
+
 /// External-blob resolver as a trait object, so the large download/decode/apply
 /// bodies below instantiate once instead of per closure type. Returns `Bytes`
 /// so a resolver serving from a prefetch map hands out a refcount instead of
 /// copying the blob.
-pub type BlobDownloadFn<'a> =
-    dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + Send + Sync + 'a;
+pub type BlobDownloadFn<'a> = dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes, ExternalBlobError>
+    + Send
+    + Sync
+    + 'a;
 
 /// Reason a SyncdSnapshotRecovery payload was refused.
 #[derive(Error)]
@@ -1347,7 +1366,7 @@ impl AppStateProcessor {
                 Err(error) => {
                     return PreparedPatchList {
                         list: pl,
-                        error: Some(error),
+                        error: Some(error.into()),
                     };
                 }
             }
@@ -1361,7 +1380,9 @@ impl AppStateProcessor {
                 blobs
                     .get(position.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                     .cloned()
-                    .ok_or_else(|| anyhow::Error::new(AppStateSyncError::ExternalBlobNotResolved))
+                    .ok_or_else(|| {
+                        ExternalBlobError::download(AppStateSyncError::ExternalBlobNotResolved)
+                    })
             };
             let error = decode_external_blobs(&mut pl, &resolver, true).err();
             PreparedPatchList { list: pl, error }
@@ -1997,8 +2018,10 @@ mod external_blob_tests {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
         let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow::anyhow!("simulated failure"))
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Err(ExternalBlobError::download(std::io::Error::other(
+                "simulated failure",
+            )))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));
@@ -2009,7 +2032,7 @@ mod external_blob_tests {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
         let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
@@ -2027,8 +2050,10 @@ mod external_blob_tests {
             snapshot_ref: None,
             error: None,
         };
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow::anyhow!("simulated failure"))
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Err(ExternalBlobError::download(std::io::Error::other(
+                "simulated failure",
+            )))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));
@@ -2048,7 +2073,7 @@ mod external_blob_tests {
         };
         let fetches = std::sync::atomic::AtomicUsize::new(0);
         // An empty buffer decodes as a `SyncdMutations` with no mutations.
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(bytes::Bytes::new())
         };
@@ -2061,8 +2086,9 @@ mod external_blob_tests {
     #[test]
     fn no_external_refs_is_ok() {
         let mut pl = pl_with_snapshot_ref(None);
-        let download =
-            |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> { Ok(bytes::Bytes::new()) };
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Ok(bytes::Bytes::new())
+        };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
     }
 
@@ -2072,7 +2098,7 @@ mod external_blob_tests {
         let mut patch = valid_external_patch();
         patch.mutations.push(wa::SyncdMutation::default());
         pl.patches.push(patch);
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             panic!("invalid patch reached downloader")
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();

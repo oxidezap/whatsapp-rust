@@ -80,16 +80,22 @@ impl std::error::Error for BlobDownloadFailure {
 
 fn external_blob_resolver(
     blobs: &PrefetchedBlobs,
-) -> impl Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + '_ {
+) -> impl Fn(
+    &wa::ExternalBlobReference,
+) -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError>
++ '_ {
+    use wacore::appstate_sync::ExternalBlobError;
     move |ext| {
         let path = ext
             .direct_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
+            .ok_or(ExternalBlobError::MissingDirectPath)?;
         match blobs.get(path) {
             Some(Ok(blob)) => Ok(blob.clone()),
-            Some(Err(error)) => Err(BlobDownloadFailure(error.clone()).into()),
-            None => Err(anyhow::anyhow!("external blob not pre-downloaded: {path}")),
+            Some(Err(error)) => Err(ExternalBlobError::download(BlobDownloadFailure(
+                error.clone(),
+            ))),
+            None => Err(ExternalBlobError::NotPrefetched(path.clone())),
         }
     }
 }
