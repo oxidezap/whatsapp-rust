@@ -195,7 +195,7 @@ pub enum IqError {
     // Boxed to break the `ClientError::Iq(IqError)` <-> `IqError::ClientState`
     // type cycle (both would otherwise be infinitely sized).
     #[error("client state prevented send: {0}")]
-    ClientState(#[source] Box<ClientError>),
+    ClientState(#[source] wacore::error::BoxedErrorSource<ClientError>),
     #[error("received disconnect node during IQ wait: {}", wacore_binary::diagnostics::NodeSummary::from(.0.as_ref()))]
     Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
@@ -927,7 +927,9 @@ impl Client {
                 // The send future only ever yields the transport/state errors
                 // above; any other (incl. future #[non_exhaustive]) variant is
                 // surfaced as a client-state failure.
-                other => Err(IqError::ClientState(Box::new(other))),
+                other => Err(IqError::ClientState(wacore::error::BoxedErrorSource::new(
+                    other,
+                ))),
             };
         }
 

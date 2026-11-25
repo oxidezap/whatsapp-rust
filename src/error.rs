@@ -355,4 +355,16 @@ mod boxed_source_tests {
                 .any(|source| source.is::<wacore::store::signal_cache::SenderKeyCacheError>())
         );
     }
+
+    #[test]
+    fn iq_error_exposes_client_state_cause() {
+        let error = crate::request::IqError::ClientState(wacore::error::BoxedErrorSource::new(
+            crate::ClientError::NotConnected,
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::ClientError>())
+        );
+    }
 }
