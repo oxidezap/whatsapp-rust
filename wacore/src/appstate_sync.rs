@@ -1704,7 +1704,7 @@ impl AppStateProcessor {
         &self,
         collection_name: &str,
         mutations: Vec<wa::SyncdMutation>,
-    ) -> Result<(Vec<u8>, u64)> {
+    ) -> Result<(Vec<u8>, u64), AppStateSyncError> {
         use crate::appstate::hash::generate_patch_mac;
 
         // Get active key
