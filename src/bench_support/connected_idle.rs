@@ -1074,9 +1074,7 @@ impl HttpClient for NoHttp {
         &self,
         _: HttpRequest,
     ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
-        Err(crate::http::HttpError::adapter(std::io::Error::other(
-            "connected idle fixture forbids HTTP",
-        )))
+        Err(std::io::Error::other("connected idle fixture forbids HTTP").into())
     }
 }
 
@@ -1322,13 +1320,13 @@ impl Transport for Wire {
         while !remaining.is_empty() {
             batch_frames += 1;
             if remaining.len() < 3 {
-                return Err("short fixture frame".into());
+                return Err(std::io::Error::other("short fixture frame").into());
             }
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
                 | usize::from(remaining[2]);
             if remaining.len() < 3 + length {
-                return Err("truncated fixture frame".into());
+                return Err(std::io::Error::other("truncated fixture frame").into());
             }
             let (response, node, logged_in) = self.frame(&remaining[3..3 + length])?;
             if let Some(node) = &node {

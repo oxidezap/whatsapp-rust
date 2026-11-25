@@ -5,6 +5,7 @@ mod compatibility;
 mod consumers;
 mod mobile_apk;
 mod package_consumers;
+mod retention_harness;
 mod session_retention;
 mod size;
 mod size_baseline;

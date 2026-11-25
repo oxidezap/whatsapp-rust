@@ -8,6 +8,11 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Adapt the shared retention harness to the checked-out base interfaces.
+    AdaptRetentionHarness {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Compare process-isolated connected retention against matched baseline executables.
     SessionRetention {
         #[arg(long)]
@@ -239,6 +244,9 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
+        Task::AdaptRetentionHarness { root: target } => {
+            super::retention_harness::run(target.as_deref().unwrap_or(root))?
+        }
         Task::SessionRetention {
             base_executable,
             head_executable,
