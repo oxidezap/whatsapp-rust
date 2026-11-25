@@ -165,10 +165,20 @@ pub enum SenderIdentityRole {
     MobilePrimary(PrimaryDeviceIdentityPolicy),
     Unknown,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DeviceIdentityError {
+    #[error("unknown sending identity role")]
+    UnknownRole,
+    #[error("pkmsg requires <device-identity> but no ADV account is present")]
+    MissingAccount,
+}
+
 impl SenderIdentityRole {
-    pub fn validate(self) -> Result<()> {
+    pub fn validate(self) -> Result<(), DeviceIdentityError> {
         if self == Self::Unknown {
-            bail!("unknown sending identity role");
+            return Err(DeviceIdentityError::UnknownRole);
         }
         Ok(())
     }
@@ -181,7 +191,7 @@ pub fn needs_device_identity_for_role(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,
     role: SenderIdentityRole,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, DeviceIdentityError> {
     role.validate()?;
     if !includes_prekey {
         return Ok(None);
@@ -192,9 +202,7 @@ pub fn needs_device_identity_for_role(
             Ok(account.map(waproto::codec::adv_signed_device_identity_to_vec))
         }
         SenderIdentityRole::Companion => {
-            let acc = account.ok_or_else(|| {
-                anyhow!("pkmsg requires <device-identity> but no ADV account is present")
-            })?;
+            let acc = account.ok_or(DeviceIdentityError::MissingAccount)?;
             Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
         }
         SenderIdentityRole::Unknown => unreachable!("validated above"),
@@ -211,7 +219,7 @@ pub fn needs_device_identity_for_role(
 pub fn needs_device_identity(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, DeviceIdentityError> {
     needs_device_identity_for_role(includes_prekey, account, SenderIdentityRole::Companion)
 }
 
@@ -1755,15 +1763,19 @@ mod sender_identity_role_tests {
     fn explicit_primary_profiles_and_unknown_role_do_not_weaken_companions() {
         let account = wa::ADVSignedDeviceIdentity::default();
         for prekey in [false, true] {
-            assert!(
-                needs_device_identity_for_role(prekey, None, SenderIdentityRole::Unknown).is_err()
-            );
+            assert!(matches!(
+                needs_device_identity_for_role(prekey, None, SenderIdentityRole::Unknown),
+                Err(DeviceIdentityError::UnknownRole)
+            ));
             assert!(
                 needs_device_identity_for_role(prekey, Some(&account), SenderIdentityRole::Unknown)
                     .is_err()
             );
         }
-        assert!(needs_device_identity(true, None).is_err());
+        assert!(matches!(
+            needs_device_identity(true, None),
+            Err(DeviceIdentityError::MissingAccount)
+        ));
         for policy in [
             PrimaryDeviceIdentityPolicy::Omit,
             PrimaryDeviceIdentityPolicy::AttachWhenAvailable,

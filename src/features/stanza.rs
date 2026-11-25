@@ -173,6 +173,8 @@ pub enum RetryRequestError {
     MissingAttribute(&'static str),
     #[error("the local device identity is unavailable")]
     MissingLocalIdentity,
+    #[error("{0}")]
+    DeviceIdentity(#[from] wacore::send::DeviceIdentityError),
     #[error("invalid message stanza")]
     InvalidStanza(#[source] wacore::messages::MessageInfoError),
     #[error("{0}")]
