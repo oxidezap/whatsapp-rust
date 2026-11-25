@@ -3060,7 +3060,10 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl crate::transport::Transport for PrimaryStartupCloseRecorder {
-        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+        async fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             Ok(())
         }
 
@@ -3247,7 +3250,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for RecordingCloseTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 Ok(())
             }
 

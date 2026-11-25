@@ -2338,7 +2338,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for CountingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -2370,8 +2370,8 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for FailingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("transport down"))
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
+            Err("transport down".into())
         }
         async fn disconnect(&self) {}
     }
@@ -3922,7 +3922,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 if self.gate_next_send.swap(false, Ordering::AcqRel) {
                     self.started
                         .send(())
@@ -5037,7 +5037,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 self.release.recv().await?;
                 Ok(())
@@ -5176,7 +5176,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for BlockingTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 futures::future::pending().await
             }
@@ -5309,7 +5309,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 self.started
                     .send(())
                     .await

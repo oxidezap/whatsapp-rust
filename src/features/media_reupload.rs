@@ -53,6 +53,7 @@ pub enum MediaReuploadError {
         code: Option<u16>,
         response: RejectionStanza,
     },
+    Retry(Arc<wacore::media_retry::MediaRetryError>),
     Internal(Arc<anyhow::Error>),
 }
 
@@ -67,6 +68,7 @@ impl std::fmt::Display for MediaReuploadError {
             Self::Rejected { code, .. } => {
                 write!(f, "media retry receipt rejected (code: {code:?})")
             }
+            Self::Retry(error) => std::fmt::Display::fmt(error, f),
             Self::Internal(error) => std::fmt::Display::fmt(error, f),
         }
     }
@@ -78,6 +80,7 @@ impl std::fmt::Debug for MediaReuploadError {
             // Opaque causes may include keys or signed URLs. Keep them available
             // through source(), but never format them implicitly in diagnostics.
             Self::Client(_) => f.write_str("Client([REDACTED])"),
+            Self::Retry(_) => f.write_str("Retry([REDACTED])"),
             Self::Internal(_) => f.write_str("Internal([REDACTED])"),
             Self::NotLoggedIn => f.write_str("NotLoggedIn"),
             Self::Conflict(id) => f.debug_tuple("Conflict").field(id).finish(),
@@ -98,6 +101,7 @@ impl std::error::Error for MediaReuploadError {
         // A derived source on Arc<ClientError> exposes the Arc as the cause.
         match self {
             Self::Client(error) => Some(error.as_ref()),
+            Self::Retry(error) => Some(error.as_ref()),
             Self::Internal(error) => Some(error.as_ref().as_ref()),
             _ => None,
         }
@@ -107,6 +111,12 @@ impl std::error::Error for MediaReuploadError {
 impl From<ClientError> for MediaReuploadError {
     fn from(error: ClientError) -> Self {
         Self::Client(Arc::new(error))
+    }
+}
+
+impl From<wacore::media_retry::MediaRetryError> for MediaReuploadError {
+    fn from(error: wacore::media_retry::MediaRetryError) -> Self {
+        Self::Retry(Arc::new(error))
     }
 }
 

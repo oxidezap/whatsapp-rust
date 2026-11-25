@@ -116,6 +116,7 @@ impl PairDeviceSpec {
 }
 impl IqSpec for PairDeviceSpec {
     type Response = PairDeviceAcknowledgement;
+    type Error = PrimaryLinkError;
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut children = vec![
             NodeBuilder::new("ref")
@@ -156,7 +157,7 @@ impl IqSpec for PairDeviceSpec {
             NodeBuilder::new("pair-device").children(children).build(),
         )
     }
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         result(response)?;
         let mut candidates = Vec::new();
         for child in response.children().unwrap_or_default() {
@@ -166,7 +167,7 @@ impl IqSpec for PairDeviceSpec {
                 candidates.extend(child.get_children_by_tag("device"));
             }
             if candidates.len() > 1 {
-                return Err(PrimaryLinkError::InvalidResponse("ambiguous device result").into());
+                return Err(PrimaryLinkError::InvalidResponse("ambiguous device result"));
             }
         }
         let device = candidates
@@ -202,14 +203,15 @@ impl PublishKeyIndexListSpec {
 }
 impl IqSpec for PublishKeyIndexListSpec {
     type Response = ();
+    type Error = PrimaryLinkError;
     fn build_iq(&self) -> InfoQuery<'static> {
         query(
             &self.server,
             key_index_node(&self.signed, self.timestamp_seconds),
         )
     }
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), anyhow::Error> {
-        result(response).map_err(Into::into)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), Self::Error> {
+        result(response)
     }
 }
 
@@ -238,6 +240,7 @@ impl RemovePrimaryCompanionSpec {
 }
 impl IqSpec for RemovePrimaryCompanionSpec {
     type Response = ();
+    type Error = PrimaryLinkError;
     fn build_iq(&self) -> InfoQuery<'static> {
         query(
             &self.server,
@@ -247,8 +250,8 @@ impl IqSpec for RemovePrimaryCompanionSpec {
                 .build(),
         )
     }
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), anyhow::Error> {
-        result(response).map_err(Into::into)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), Self::Error> {
+        result(response)
     }
 }
 
@@ -271,6 +274,7 @@ impl RemoveAllCompanionsSpec {
 }
 impl IqSpec for RemoveAllCompanionsSpec {
     type Response = ();
+    type Error = PrimaryLinkError;
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut node = NodeBuilder::new("remove-companion-device")
             .attr("all", "true")
@@ -280,8 +284,8 @@ impl IqSpec for RemoveAllCompanionsSpec {
         }
         query(&self.server, node.build())
     }
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), anyhow::Error> {
-        result(response).map_err(Into::into)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), Self::Error> {
+        result(response)
     }
 }
 
@@ -309,6 +313,7 @@ impl PrimaryHelloSpec {
 }
 impl IqSpec for PrimaryHelloSpec {
     type Response = ();
+    type Error = PrimaryLinkError;
     fn build_iq(&self) -> InfoQuery<'static> {
         query(
             &self.server,
@@ -328,8 +333,8 @@ impl IqSpec for PrimaryHelloSpec {
                 .build(),
         )
     }
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), anyhow::Error> {
-        result(response).map_err(Into::into)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<(), Self::Error> {
+        result(response)
     }
 }
 

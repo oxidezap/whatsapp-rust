@@ -897,7 +897,7 @@ mod tests {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingDisconnect {
-        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
 
@@ -911,7 +911,7 @@ mod tests {
 
     #[async_trait]
     impl crate::transport::Transport for PanickingDisconnect {
-        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
 

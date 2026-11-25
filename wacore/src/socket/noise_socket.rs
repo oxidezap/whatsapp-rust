@@ -593,7 +593,10 @@ mod tests {
     struct DummyTransport;
     #[async_trait]
     impl Transport for DummyTransport {
-        async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::net::TransportError> {
             Ok(())
         }
         async fn disconnect(&self) {}

@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
-use wacore::anyhow::Result;
+use wacore::net::HttpError;
+type Result<T> = std::result::Result<T, HttpError>;
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 use wacore::stats::HttpResourceReport;
 
@@ -20,12 +21,18 @@ pub enum UreqHttpError {
     StreamingUnsupportedMethod(String),
     #[error("Upload streaming only supports POST, got: {0}")]
     UploadStreamingUnsupportedMethod(String),
-    #[error(transparent)]
+    #[error("{0}")]
     Ureq(#[from] ureq::Error),
-    #[error(transparent)]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
+    #[error("{0}")]
     Join(#[from] tokio::task::JoinError),
+}
+
+impl From<UreqHttpError> for HttpError {
+    fn from(error: UreqHttpError) -> Self {
+        Self::adapter(error)
+    }
 }
 
 /// Default per-response transport cap (2 GiB), independent of media policy.
@@ -423,6 +430,19 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn adapter_error_retains_the_concrete_io_source() {
+        use std::error::Error;
+        let error = HttpError::from(UreqHttpError::Io(std::io::Error::other("fixture")));
+        let adapter = error.source().expect("adapter source");
+        assert!(adapter.is::<UreqHttpError>());
+        assert!(
+            adapter
+                .source()
+                .is_some_and(|source| source.is::<std::io::Error>())
+        );
+    }
 
     #[test]
     fn default_connect_budget_preserves_custom_agent_policy() {

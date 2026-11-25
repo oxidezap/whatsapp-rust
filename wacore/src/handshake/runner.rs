@@ -27,7 +27,7 @@ pub enum HandshakeError {
     #[error("Mobile handshake error: {0}")]
     Mobile(#[from] crate::mobile::MobileSessionError),
     #[error("Transport error: {0}")]
-    Transport(#[from] anyhow::Error),
+    Transport(#[from] crate::net::TransportError),
     #[error("Framing error: {0}")]
     Framing(#[from] NoiseError),
     #[error("Core handshake error: {0}")]
@@ -337,7 +337,10 @@ mod mobile_boundary_tests {
     struct NoTransport;
     #[async_trait::async_trait]
     impl Transport for NoTransport {
-        async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            _: bytes::Bytes,
+        ) -> std::result::Result<(), crate::net::TransportError> {
             panic!("mobile credentials must never be sent by the Web runner")
         }
         async fn disconnect(&self) {

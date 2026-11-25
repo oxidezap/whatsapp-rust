@@ -3254,10 +3254,13 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for CountingTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
                 if self.failure_after.is_some_and(|limit| attempt >= limit) {
-                    return Err(anyhow::anyhow!("injected transport send failure"));
+                    return Err("injected transport send failure".into());
                 }
                 Ok(())
             }
@@ -3295,7 +3298,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for BlockingTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 let _ = self.release.recv().await;
                 Ok(())
@@ -4832,7 +4838,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for CountingTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -5724,7 +5730,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for OkTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 Ok(())
             }
             async fn disconnect(&self) {}

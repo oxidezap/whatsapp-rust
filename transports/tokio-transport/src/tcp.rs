@@ -70,25 +70,20 @@ impl TokioTcpTransportFactory {
 impl TransportFactory for TokioTcpTransportFactory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), wacore::anyhow::Error>
-    {
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        wacore::net::TransportError,
+    > {
         if let Some(dialer) = &self.dialer {
-            let stream = dialer
-                .dial(&self.host, self.port)
-                .await
-                .map_err(|e| match e {
-                    TokioTransportError::Io(io) => wacore::anyhow::Error::new(io),
-                    TokioTransportError::Custom(c) => wacore::anyhow::Error::from_boxed(c),
-                    other => wacore::anyhow::Error::new(other),
-                })?;
+            let stream = dialer.dial(&self.host, self.port).await?;
             return Ok(from_byte_stream(stream));
         }
         let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
             .await
-            .map_err(|e| wacore::anyhow::Error::new(e).context("TCP connection failed"))?;
+            .map_err(TokioTransportError::TcpConnect)?;
         stream
             .set_nodelay(true)
-            .map_err(|e| wacore::anyhow::Error::new(e).context("setting TCP_NODELAY"))?;
+            .map_err(TokioTransportError::TcpNoDelay)?;
         Ok(from_byte_stream(stream))
     }
 }
@@ -142,14 +137,14 @@ impl<W> Drop for DriverRetirement<W> {
 
 #[async_trait]
 impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
-    async fn send(&self, data: Bytes) -> Result<(), wacore::anyhow::Error> {
+    async fn send(&self, data: Bytes) -> Result<(), wacore::net::TransportError> {
         let mut shutdown = self.shutdown.subscribe();
         if *shutdown.borrow() {
-            return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed));
+            return Err(TokioTransportError::TcpClosed.into());
         }
         let guard = tokio::select! {
             biased;
-            _ = shutdown.changed() => return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed)),
+            _ = shutdown.changed() => return Err(TokioTransportError::TcpClosed.into()),
             guard = self.writer.lock() => guard,
         };
         let mut retirement = WriteRetirement {
@@ -158,26 +153,26 @@ impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
             armed: true,
         };
         if *shutdown.borrow() {
-            return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosed));
+            return Err(TokioTransportError::TcpClosed.into());
         }
         let writer = retirement
             .writer
             .as_mut()
-            .ok_or_else(|| wacore::anyhow::Error::new(TokioTransportError::TcpClosed))?;
+            .ok_or(TokioTransportError::TcpClosed)?;
         tokio::select! {
             biased;
-            _ = shutdown.changed() => return Err(wacore::anyhow::Error::new(TokioTransportError::TcpClosedDuringWrite)),
+            _ = shutdown.changed() => return Err(TokioTransportError::TcpClosedDuringWrite.into()),
             result = async {
                 writer
                     .write_all(&data)
                     .await
-                    .map_err(|e| wacore::anyhow::Error::new(e).context("TCP write failed"))?;
+                    .map_err(TokioTransportError::TcpWrite)?;
                 // Dialers may return buffered streams. A completed send must
                 // reach the underlying stream before retirement is disarmed.
                 writer
                     .flush()
                     .await
-                    .map_err(|e| wacore::anyhow::Error::new(e).context("TCP flush failed"))
+                    .map_err(TokioTransportError::TcpFlush)
             } => result?,
         }
         retirement.armed = false;

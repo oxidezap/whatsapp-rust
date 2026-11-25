@@ -86,6 +86,14 @@ mod tag_contract {
     }
 }
 
+#[test]
+fn closed_wire_enum_reports_the_unknown_value() {
+    let error = DeviceNotificationType::try_from("future").unwrap_err();
+    assert_eq!(error.enum_name, "DeviceNotificationType");
+    assert_eq!(error.value, "future");
+    assert_eq!(error.to_string(), "unknown DeviceNotificationType: future");
+}
+
 fn assert_roundtrip<T>(values: &[T])
 where
     T: serde::Serialize + for<'de> serde::Deserialize<'de> + PartialEq + std::fmt::Debug + Clone,
@@ -887,4 +895,45 @@ fn connect_failure_reason_serializes_as_int_and_roundtrips() {
         let back: ConnectFailureReason = serde_json::from_value(json).unwrap();
         assert_eq!(back, value);
     }
+}
+
+#[test]
+fn derived_protocol_node_reports_typed_parse_failures() {
+    use wacore::protocol::{ProtocolNode, ProtocolNodeError};
+
+    #[derive(Debug, wacore::ProtocolNode)]
+    #[protocol(tag = "fixture")]
+    struct Fixture {
+        #[attr(name = "id", u32)]
+        id: u32,
+        #[attr(name = "kind", string_enum)]
+        kind: DeviceNotificationType,
+    }
+
+    let wrong = NodeBuilder::new("other").build();
+    assert!(matches!(
+        Fixture::try_from_node_ref(&wrong.as_node_ref()),
+        Err(ProtocolNodeError::UnexpectedTag {
+            expected: "fixture",
+            ..
+        })
+    ));
+    let missing = NodeBuilder::new("fixture").build();
+    assert!(matches!(
+        Fixture::try_from_node_ref(&missing.as_node_ref()),
+        Err(ProtocolNodeError::MissingAttribute { name: "id" })
+    ));
+    let overflow = NodeBuilder::new("fixture").attr("id", "4294967296").build();
+    assert!(matches!(
+        Fixture::try_from_node_ref(&overflow.as_node_ref()),
+        Err(ProtocolNodeError::AttributeOverflow { name: "id" })
+    ));
+    let unknown = NodeBuilder::new("fixture")
+        .attr("id", "1")
+        .attr("kind", "future")
+        .build();
+    assert!(matches!(
+        Fixture::try_from_node_ref(&unknown.as_node_ref()),
+        Err(ProtocolNodeError::UnknownWireValue(error)) if error.value == "future"
+    ));
 }

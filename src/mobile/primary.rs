@@ -2843,7 +2843,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl crate::transport::Transport for FailCheckpointAfterWrite {
-        async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             crate::transport::Transport::send(self.inner.as_ref(), data).await?;
             // Arm storage failure synchronously after the real Noise frame was
             // accepted, before the sender can checkpoint its completed dispatch.

@@ -117,7 +117,7 @@ struct SpanWatchingTransport {
 
 #[async_trait]
 impl Transport for SpanWatchingTransport {
-    async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+    async fn send(&self, data: Bytes) -> Result<(), whatsapp_rust::transport::TransportError> {
         self.send_spans.lock().unwrap().push(current_span_scope());
         self.sent.lock().unwrap().push(data);
         Ok(())

@@ -59,7 +59,10 @@ struct RecordingTransport {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl whatsapp_rust::transport::Transport for RecordingTransport {
-    async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
+    async fn send(
+        &self,
+        data: bytes::Bytes,
+    ) -> Result<(), whatsapp_rust::transport::TransportError> {
         self.writes.lock().expect("writes mutex").push(data);
         Ok(())
     }

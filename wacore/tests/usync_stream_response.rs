@@ -22,7 +22,9 @@ fn consume<S: IqStreamSpec<Response = DeviceListResponse>>(
     stream
         .open()?
         .ok_or_else(|| anyhow::anyhow!("missing root"))?;
-    let response = spec.consume_response(&mut stream)?;
+    let response = spec
+        .consume_response(&mut stream)
+        .map_err(Into::<anyhow::Error>::into)?;
     stream.finish()?;
     Ok(response)
 }
@@ -31,7 +33,7 @@ fn equivalent<S: IqStreamSpec<Response = DeviceListResponse>>(spec: &S, node: &N
     let expected = spec
         .parse_response(&node.as_node_ref())
         .map(|r| format!("{r:?}"))
-        .map_err(|e| e.to_string());
+        .map_err(|e| Into::<anyhow::Error>::into(e).to_string());
     let plain = marshal(node).unwrap();
     for frame in [&plain, &compressed(&plain)] {
         let actual = consume(spec, frame)

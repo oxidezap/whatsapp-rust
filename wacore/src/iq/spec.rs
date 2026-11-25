@@ -8,6 +8,9 @@ pub trait IqSpec {
     /// The output type produced by parsing the IQ response.
     type Response;
 
+    /// Error produced by this specification's response parser.
+    type Error: std::error::Error + Send + Sync + 'static;
+
     /// Build the IQ stanza for this spec.
     fn build_iq(&self) -> InfoQuery<'static>;
 
@@ -30,7 +33,7 @@ pub trait IqSpec {
         &self,
         _request_id: &str,
         _out: &mut Vec<u8>,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<bool, wacore_binary::error::BinaryError> {
         Ok(false)
     }
 
@@ -38,7 +41,7 @@ pub trait IqSpec {
     fn parse_response(
         &self,
         response: &wacore_binary::NodeRef<'_>,
-    ) -> Result<Self::Response, anyhow::Error>;
+    ) -> Result<Self::Response, Self::Error>;
 
     /// Opt into the full response contract, including error stanzas and the
     /// immutable request after its final ID was assigned. Legacy specs keep
@@ -60,7 +63,7 @@ pub trait IqSpec {
         &self,
         response: &wacore_binary::NodeRef<'_>,
         _request: &wacore_binary::NodeRef<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
+    ) -> Result<Self::Response, Self::Error> {
         self.parse_response(response)
     }
 }
@@ -91,16 +94,23 @@ pub trait IqStreamSpec: IqSpec {
     fn consume_response(
         &self,
         stream: &mut wacore_binary::NodeStream<'_>,
-    ) -> Result<Self::Response, anyhow::Error>;
+    ) -> Result<Self::Response, Self::Error>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ContextualRejection {
+    #[error("{0}")]
+    Iq(#[from] crate::request::IqError),
+    #[error("contextual contract returned a rejection outside an error stanza")]
+    NotErrorStanza,
 }
 
 /// Preserve the existing public IQ error classification after the generated
 /// contract admitted its particular code/text pair and payload.
-pub(super) fn contextual_rejection(response: &wacore_binary::NodeRef<'_>) -> anyhow::Error {
+pub(super) fn contextual_rejection(response: &wacore_binary::NodeRef<'_>) -> ContextualRejection {
     match crate::request::RequestUtils::new(String::new()).parse_iq_response(response) {
         Err(error) => error.into(),
-        Ok(()) => {
-            anyhow::anyhow!("contextual contract returned a rejection outside an error stanza")
-        }
+        Ok(()) => ContextualRejection::NotErrorStanza,
     }
 }

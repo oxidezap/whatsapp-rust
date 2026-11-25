@@ -35,6 +35,21 @@ struct DomainFailure {
     code: u16,
 }
 
+mod metrics_spec_error {
+    use super::{DomainFailure, FixtureParseError};
+
+    #[derive(Debug, thiserror::Error)]
+    pub(super) enum MetricsSpecError {
+        #[error("ordinary parser context")]
+        Context(#[source] FixtureParseError),
+        #[error("{0}")]
+        Core(#[from] wacore::request::IqError),
+        #[error("GraphQL domain context")]
+        Domain(#[source] DomainFailure),
+    }
+}
+use metrics_spec_error::MetricsSpecError;
+
 struct CheckedParseSpec {
     handle: PrometheusHandle,
     before: [u64; 3],
@@ -46,12 +61,17 @@ struct CheckedParseSpec {
 
 impl IqSpec for CheckedParseSpec {
     type Response = ();
+    type Error = MetricsSpecError;
 
     fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
         ProfilePictureSpec::preview(&Jid::pn("15550000001")).build_iq()
     }
 
-    fn encode_iq_direct(&self, id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+    fn encode_iq_direct(
+        &self,
+        id: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, wacore_binary::error::BinaryError> {
         if !self.direct {
             return Ok(false);
         }
@@ -61,7 +81,7 @@ impl IqSpec for CheckedParseSpec {
         Ok(true)
     }
 
-    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), anyhow::Error> {
+    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), Self::Error> {
         // Detect an early success even if another error increment later masks it.
         assert_eq!(counts(&self.handle), self.before);
         // The existing timer measures send/wait, not the spec parser.
@@ -71,15 +91,11 @@ impl IqSpec for CheckedParseSpec {
         );
         match self.kind {
             ParseKind::Success => Ok(()),
-            ParseKind::ContextualFailure => {
-                Err(anyhow::Error::new(FixtureParseError(self.marker.clone()))
-                    .context("ordinary parser context"))
-            }
+            ParseKind::ContextualFailure => Err(MetricsSpecError::Context(FixtureParseError(
+                self.marker.clone(),
+            ))),
             ParseKind::CoreTimeout => Err(wacore::request::IqError::Timeout.into()),
-            ParseKind::DomainFailure => {
-                Err(anyhow::Error::new(DomainFailure { code: 429 })
-                    .context("GraphQL domain context"))
-            }
+            ParseKind::DomainFailure => Err(MetricsSpecError::Domain(DomainFailure { code: 429 })),
         }
     }
 }
@@ -88,18 +104,19 @@ struct StreamSpec;
 
 impl IqSpec for StreamSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
         ProfilePictureSpec::preview(&Jid::pn("15550000001")).build_iq()
     }
 
-    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), anyhow::Error> {
+    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), Self::Error> {
         panic!("streaming must not call the tree parser")
     }
 }
 
 impl IqStreamSpec for StreamSpec {
-    fn consume_response(&self, _: &mut wacore_binary::NodeStream<'_>) -> Result<(), anyhow::Error> {
+    fn consume_response(&self, _: &mut wacore_binary::NodeStream<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -203,16 +220,32 @@ async fn check_outcomes(handle: PrometheusHandle) {
                     ParseKind::ContextualFailure => {
                         assert_eq!(error.to_string(), "ordinary parser context");
                         assert!(Arc::ptr_eq(
-                            &error.downcast_ref::<FixtureParseError>().unwrap().0,
+                            &error
+                                .as_ref()
+                                .sources()
+                                .find_map(|cause| cause.downcast_ref::<FixtureParseError>())
+                                .unwrap()
+                                .0,
                             &marker
                         ));
                     }
                     ParseKind::CoreTimeout => assert!(matches!(
-                        error.downcast_ref::<wacore::request::IqError>(),
+                        error
+                            .as_ref()
+                            .sources()
+                            .find_map(|cause| cause.downcast_ref::<wacore::request::IqError>()),
                         Some(wacore::request::IqError::Timeout)
                     )),
                     ParseKind::DomainFailure => {
-                        assert_eq!(error.downcast_ref::<DomainFailure>().unwrap().code, 429)
+                        assert_eq!(
+                            error
+                                .as_ref()
+                                .sources()
+                                .find_map(|cause| cause.downcast_ref::<DomainFailure>())
+                                .unwrap()
+                                .code,
+                            429
+                        )
                     }
                     ParseKind::Success => unreachable!(),
                 }

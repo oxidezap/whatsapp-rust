@@ -1254,7 +1254,7 @@ mod tests {
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
             ),
-            anyhow::Error,
+            crate::transport::TransportError,
         > {
             self.started
                 .send(())
@@ -1264,7 +1264,7 @@ mod tests {
                 .recv()
                 .await
                 .map_err(|_| anyhow::anyhow!("transport release closed"))?;
-            Err(anyhow::anyhow!("injected transport stop"))
+            Err("injected transport stop".into())
         }
     }
 

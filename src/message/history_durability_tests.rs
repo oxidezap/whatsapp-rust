@@ -876,7 +876,7 @@ impl crate::http::HttpClient for BufferedHistoryHttp {
     async fn execute(
         &self,
         request: crate::http::HttpRequest,
-    ) -> anyhow::Result<crate::http::HttpResponse> {
+    ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
         assert!(request.url.contains("cdn.example.invalid"));
         Ok(crate::http::HttpResponse::new(200, self.0.clone()))
     }

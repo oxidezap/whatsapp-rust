@@ -191,7 +191,7 @@ struct PendingAttempt {
     endpoint: RegistrationEndpointPath,
     method: Option<VerificationMethod>,
     deadline_ms: u64,
-    exchange: Option<BoxFuture<'static, anyhow::Result<HttpResponse>>>,
+    exchange: Option<BoxFuture<'static, Result<HttpResponse, crate::http::HttpError>>>,
     response: Option<RegistrationResponse>,
     // Retain a completed HTTP status across cancellation/recovery. An error
     // status is not a qualified registration outcome and never permits resend.

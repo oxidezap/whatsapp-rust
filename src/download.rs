@@ -4,7 +4,8 @@ use crate::http::{
     HTTP_STATUS_UNAUTHORIZED, HttpClient, HttpStatusError,
 };
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
-use anyhow::{Result, anyhow};
+#[cfg(test)]
+use anyhow::Result;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use wacore::runtime::Runtime;
@@ -61,7 +62,7 @@ impl DownloadParams {
         file_enc_sha256: &[u8],
         file_length: u64,
         media_type: MediaType,
-    ) -> std::result::Result<Self, DownloadPreparationError> {
+    ) -> Result<Self, DownloadPreparationError> {
         if !media_type.is_encrypted() {
             return Err(DownloadPreparationError::RequiresPlaintext);
         }
@@ -92,7 +93,7 @@ impl DownloadParams {
         file_sha256: &[u8],
         file_length: u64,
         media_type: MediaType,
-    ) -> std::result::Result<Self, DownloadPreparationError> {
+    ) -> Result<Self, DownloadPreparationError> {
         if media_type == MediaType::MusicArtwork {
             return Err(DownloadPreparationError::RequiresEncryption);
         }
@@ -177,6 +178,52 @@ impl ExpectedMediaHashes {
     }
 }
 
+/// A specific cause retained across media host retries.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DownloadCause {
+    #[error("{0}")]
+    Policy(#[from] DownloadPolicyError),
+    #[error("{context}")]
+    Status {
+        context: String,
+        #[source]
+        status: HttpStatusError,
+    },
+    #[error("{0}")]
+    Http(#[from] crate::http::HttpError),
+    #[error("{0}")]
+    Decryption(#[from] MediaDecryptionError),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Preparation(#[from] DownloadPreparationError),
+    #[error("{0}")]
+    Profile(#[from] crate::upload::MediaProfileError),
+    #[error("{0}")]
+    Session(#[from] crate::request::IqError),
+    #[error("Failed to download from all available media hosts")]
+    NoHosts,
+    #[error("the refreshed media route names no hosts after CDN rejection")]
+    NoHostsAfterRefresh(#[source] Box<DownloadCause>),
+    #[error("{0}")]
+    Cleanup(#[source] Box<ClientDownloadError>),
+}
+
+/// Failure to retrieve or decode a sticker pack from the CDN.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FetchStickerPackError {
+    #[error("{0}")]
+    Profile(#[from] crate::upload::MediaProfileError),
+    #[error("sticker pack request failed: {0}")]
+    Http(#[from] crate::http::HttpError),
+    #[error("sticker pack endpoint returned status {}", .0.status)]
+    Status(#[source] HttpStatusError),
+    #[error("{0}")]
+    Parse(#[from] wacore::sticker_pack::StickerPackError),
+}
+
 /// Why a media download failed, for callers that have no session to refresh.
 ///
 /// [`Client`] downloads return [`ClientDownloadError`], which also represents
@@ -193,22 +240,22 @@ pub enum MediaDownloadError {
     /// The CDN rejected the reference itself (401/403/404/410). The direct path
     /// or its token is expired or revoked; another host cannot serve it either.
     #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    ReferenceRejected(#[source] anyhow::Error),
+    ReferenceRejected(#[source] Box<DownloadCause>),
     /// Every host in the route failed for a reason other than the reference:
     /// transport failure, unexpected status, or a body that failed to verify.
     #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    HostsUnreachable(#[source] anyhow::Error),
+    HostsUnreachable(#[source] Box<DownloadCause>),
     /// The local destination could not be truncated, written or rewound.
     /// This is terminal: switching CDN hosts cannot repair the sink.
     #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    WriterIo(#[source] anyhow::Error),
+    WriterIo(#[source] Box<DownloadCause>),
     /// The route named no hosts, so nothing was ever contacted.
     #[error("the media route names no hosts")]
     NoHosts,
     /// No host was contacted and none could be: the reference is too incomplete
     /// to build a URL from, so the fix is the metadata, not the network.
     #[error("{:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    Other(#[from] anyhow::Error),
+    Other(#[from] Box<DownloadCause>),
     /// Cleanup failed; `failure` preserves the original classification and source
     /// chain, while `cleanup` explains why the sink may retain unverified bytes.
     #[error("{failure}; failed to clear the writer: {:?}", .cleanup.kind())]
@@ -234,25 +281,25 @@ pub enum ClientDownloadError {
     /// The reference is still rejected after any applicable refresh. Static
     /// URLs have no refreshable route, so their first rejection is final.
     #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    ReferenceRejected(#[source] anyhow::Error),
+    ReferenceRejected(#[source] Box<DownloadCause>),
     /// Every host failed (transport, status, or integrity); the last cause is
     /// retained, including its HTTP status or decryption error when available.
     #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    HostsUnreachable(#[source] anyhow::Error),
+    HostsUnreachable(#[source] Box<DownloadCause>),
     /// The local destination could not be truncated, written or rewound.
     /// No further host or media-session refresh is attempted for this failure.
     #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    WriterIo(#[source] anyhow::Error),
+    WriterIo(#[source] Box<DownloadCause>),
     /// The obtained route has no hosts. No HTTP request was executed.
     #[error("the media route names no hosts")]
     NoHosts,
     /// A forced refresh after rejection yielded no hosts. The prior rejection
     /// remains the source: unlike `NoHosts`, an HTTP exchange already occurred.
     #[error("the refreshed media route names no hosts after CDN rejection: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    NoHostsAfterRefresh(#[source] anyhow::Error),
+    NoHostsAfterRefresh(#[source] Box<DownloadCause>),
     /// Metadata could not be turned into a request.
     #[error("could not prepare the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
-    Preparation(#[source] anyhow::Error),
+    Preparation(#[source] Box<DownloadCause>),
     /// Failed to obtain a session route, or refresh it after a CDN rejection.
     /// The IQ error retains rejection metadata, timeout and transport causes.
     #[error("failed to obtain media session (forced refresh: {force_refresh}): {:?}", MediaErrorDiagnostic(.source))]
@@ -426,7 +473,9 @@ impl From<DownloadRequestError> for MediaDownloadError {
             DownloadRequestError::WriterIo(e) => Self::WriterIo(e),
             DownloadRequestError::Prepare(e) => Self::Other(e),
             DownloadRequestError::NoHosts => Self::NoHosts,
-            DownloadRequestError::Session { source, .. } => Self::Other(source.into()),
+            DownloadRequestError::Session { source, .. } => {
+                Self::Other(Box::new(DownloadCause::Session(source)))
+            }
             DownloadRequestError::NoHostsAfterRefresh(e) => Self::Other(e),
             DownloadRequestError::Cleanup { failure, cleanup } => Self::WriterCleanup {
                 failure: Box::new((*failure).into()),
@@ -439,17 +488,17 @@ impl From<DownloadRequestError> for MediaDownloadError {
 #[derive(Debug)]
 enum DownloadRequestError {
     ResourcePolicy(DownloadPolicyError),
-    Auth(anyhow::Error),
+    Auth(Box<DownloadCause>),
     /// 404/410: the media reference expired or was not found.
-    NotFound(anyhow::Error),
-    Other(anyhow::Error),
-    WriterIo(anyhow::Error),
+    NotFound(Box<DownloadCause>),
+    Other(Box<DownloadCause>),
+    WriterIo(Box<DownloadCause>),
     /// The request list could not be built, so no host was ever contacted and
     /// no host ever could be: the reference itself is incomplete.
-    Prepare(anyhow::Error),
+    Prepare(Box<DownloadCause>),
     /// No request was ever executed: the route carried no hosts.
     NoHosts,
-    NoHostsAfterRefresh(anyhow::Error),
+    NoHostsAfterRefresh(Box<DownloadCause>),
     Session {
         force_refresh: bool,
         source: crate::request::IqError,
@@ -490,35 +539,41 @@ impl DownloadRequestError {
     /// consumer parsing this text.
     ///
     /// [`ErrorChainExt::http_status`]: crate::error::ErrorChainExt::http_status
-    fn refused(status_code: u16, context: String) -> anyhow::Error {
-        HttpStatusError {
-            status: status_code,
-        }
-        .into_error(context)
+    fn refused(status_code: u16, context: String) -> Box<DownloadCause> {
+        Box::new(DownloadCause::Status {
+            context,
+            status: HttpStatusError {
+                status: status_code,
+            },
+        })
     }
 
     /// For failures with no HTTP status at all — a socket that never connected,
     /// a body that would not decrypt. `http_status()` reports `None` for these,
     /// which is how a caller tells our bug from the CDN's.
-    fn other(err: impl Into<anyhow::Error>) -> Self {
-        Self::Other(err.into())
+    fn other(err: impl Into<DownloadCause>) -> Self {
+        Self::Other(Box::new(err.into()))
     }
 
-    fn prepare(err: impl Into<anyhow::Error>) -> Self {
-        Self::Prepare(err.into())
+    fn prepare(err: impl Into<DownloadCause>) -> Self {
+        Self::Prepare(Box::new(err.into()))
     }
 
     fn writer_io(error: std::io::Error) -> Self {
-        Self::WriterIo(error.into())
+        Self::WriterIo(Box::new(DownloadCause::Io(error)))
     }
 
-    fn streamed(error: anyhow::Error) -> Self {
-        let error = match error.downcast::<MediaDecryptionError>() {
-            Ok(MediaDecryptionError::Io(io)) => anyhow::Error::from(io),
-            Ok(other) => anyhow::Error::from(other),
-            Err(error) => error,
-        };
-        if let Some(policy) = error.chain().find_map(|cause| {
+    fn streamed(error: MediaDecryptionError) -> Self {
+        match error {
+            MediaDecryptionError::Io(error) => Self::streamed_io(error),
+            error => Self::other(error),
+        }
+    }
+
+    fn streamed_io(error: std::io::Error) -> Self {
+        use crate::error::ErrorChainExt;
+
+        if let Some(policy) = error.sources().find_map(|cause| {
             cause
                 .downcast_ref::<memory::MemoryPolicyCause>()
                 .or_else(|| {
@@ -531,11 +586,10 @@ impl DownloadRequestError {
             return Self::ResourcePolicy(policy.0);
         }
         let tagged = error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
+            .get_ref()
             .is_some_and(|cause| cause.is::<WriterIoCause>());
         if !tagged {
-            if let Some(policy) = error.chain().find_map(|e| {
+            if let Some(policy) = error.sources().find_map(|e| {
                 e.downcast_ref::<BudgetPolicyCause>().or_else(|| {
                     e.downcast_ref::<std::io::Error>()?
                         .get_ref()?
@@ -544,25 +598,20 @@ impl DownloadRequestError {
             }) {
                 return Self::ResourcePolicy(policy.0);
             }
-            return Self::Other(error);
+            return Self::other(error);
         }
         // Strip the private origin tag: direct downcasts must expose the same
         // original OS code and message as buffered writer failures.
-        match error.downcast::<std::io::Error>() {
-            Ok(error) => {
-                let kind = error.kind();
-                match error
-                    .into_inner()
-                    .map(|inner| inner.downcast::<WriterIoCause>())
-                {
-                    Some(Ok(cause)) => Self::writer_io(cause.0),
-                    // Defensive fallbacks retain available causes without a
-                    // panic; the immutable tag check above excludes them.
-                    Some(Err(cause)) => Self::writer_io(std::io::Error::new(kind, cause)),
-                    None => Self::writer_io(kind.into()),
-                }
-            }
-            Err(error) => Self::WriterIo(error),
+        let kind = error.kind();
+        match error
+            .into_inner()
+            .map(|inner| inner.downcast::<WriterIoCause>())
+        {
+            Some(Ok(cause)) => Self::writer_io(cause.0),
+            // Defensive fallbacks retain available causes without a
+            // panic; the immutable tag check above excludes them.
+            Some(Err(cause)) => Self::writer_io(std::io::Error::new(kind, cause)),
+            None => Self::writer_io(kind.into()),
         }
     }
 
@@ -578,39 +627,39 @@ impl DownloadRequestError {
     /// WA Web treats 403/404/410 as terminal download errors; refreshing hosts
     /// cannot re-sign that reference. Retain our bounded 401 recovery only.
     fn should_refresh_route(&self) -> bool {
-        matches!(self, Self::Auth(error) if error.downcast_ref::<HttpStatusError>()
-            .is_some_and(|status| status.status == HTTP_STATUS_UNAUTHORIZED))
+        matches!(self, Self::Auth(error) if crate::error::ErrorChainExt::http_status(error.as_ref())
+            == Some(HTTP_STATUS_UNAUTHORIZED))
     }
 
-    fn no_hosts(previous_rejection: Option<anyhow::Error>) -> Self {
+    fn no_hosts(previous_rejection: Option<Box<DownloadCause>>) -> Self {
         match previous_rejection {
             Some(cause) => Self::NoHostsAfterRefresh(cause),
             None => Self::NoHosts,
         }
     }
 
-    fn into_anyhow(self) -> anyhow::Error {
+    fn into_cause(self) -> Box<DownloadCause> {
         match self {
-            Self::ResourcePolicy(e) => e.into(),
+            Self::ResourcePolicy(e) => Box::new(DownloadCause::Policy(e)),
             Self::Auth(err)
             | Self::NotFound(err)
             | Self::Other(err)
             | Self::WriterIo(err)
             | Self::Prepare(err) => err,
-            Self::NoHosts => anyhow!("Failed to download from all available media hosts"),
-            Self::Session { source, .. } => source.into(),
-            Self::NoHostsAfterRefresh(e) => ClientDownloadError::NoHostsAfterRefresh(e).into(),
-            Self::Cleanup { failure, cleanup } => {
-                anyhow::Error::new(ClientDownloadError::WriterCleanup {
+            Self::NoHosts => Box::new(DownloadCause::NoHosts),
+            Self::Session { source, .. } => Box::new(DownloadCause::Session(source)),
+            Self::NoHostsAfterRefresh(e) => Box::new(DownloadCause::NoHostsAfterRefresh(e)),
+            Self::Cleanup { failure, cleanup } => Box::new(DownloadCause::Cleanup(Box::new(
+                ClientDownloadError::WriterCleanup {
                     failure: Box::new((*failure).into()),
                     cleanup,
-                })
-            }
+                },
+            ))),
         }
     }
 }
 
-fn validate_download_status(status_code: u16) -> std::result::Result<(), DownloadRequestError> {
+fn validate_download_status(status_code: u16) -> Result<(), DownloadRequestError> {
     if status_code < HTTP_STATUS_REDIRECTION_START {
         return Ok(());
     }
@@ -630,7 +679,7 @@ fn decrypt_or_validate_buffered_body(
     body: &mut Vec<u8>,
     decryption: &MediaDecryption,
     hashes: &ExpectedMediaHashes,
-) -> std::result::Result<(), DownloadRequestError> {
+) -> Result<(), DownloadRequestError> {
     decrypt_or_validate_buffered_body_with_provider(None, body, decryption, hashes)
 }
 
@@ -639,7 +688,7 @@ fn decrypt_or_validate_buffered_body_with_provider(
     body: &mut Vec<u8>,
     decryption: &MediaDecryption,
     hashes: &ExpectedMediaHashes,
-) -> std::result::Result<(), DownloadRequestError> {
+) -> Result<(), DownloadRequestError> {
     match decryption {
         MediaDecryption::Encrypted {
             media_key,
@@ -690,19 +739,18 @@ async fn download_media_with_retry<
     mut prepare_requests: PrepareRequests,
     mut invalidate_media_conn: InvalidateMediaConn,
     mut execute_request: ExecuteRequest,
-) -> std::result::Result<Vec<u8>, DownloadRequestError>
+) -> Result<Vec<u8>, DownloadRequestError>
 where
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
-    PrepareRequestsFut: Future<
-        Output = std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError>,
-    >,
+    PrepareRequestsFut:
+        Future<Output = Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError>>,
     InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
     InvalidateMediaConnFut: Future<Output = ()>,
     ExecuteRequest: FnMut(wacore::download::DownloadRequest) -> ExecuteRequestFut,
-    ExecuteRequestFut: Future<Output = std::result::Result<Vec<u8>, DownloadRequestError>>,
+    ExecuteRequestFut: Future<Output = Result<Vec<u8>, DownloadRequestError>>,
 {
     let mut force_refresh = false;
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut last_err: Option<Box<DownloadCause>> = None;
     let mut last_rejection = None;
 
     for attempt in 0..=max_refresh_attempts {
@@ -722,7 +770,7 @@ where
                 Err(err) if err.should_refresh_route() && attempt < max_refresh_attempts => {
                     // An empty refreshed route is not the same as never making
                     // a request: retain the rejection that triggered this refresh.
-                    last_rejection = Some(err.into_anyhow());
+                    last_rejection = Some(err.into_cause());
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_route = true;
@@ -730,7 +778,7 @@ where
                 }
                 Err(err) if err.is_auth() || err.is_not_found() => return Err(err),
                 Err(err) => {
-                    let err = err.into_anyhow();
+                    let err = err.into_cause();
                     // Transport error text can include the signed URL too.
                     // Preserve the cause for callers without printing it here.
                     log_download_retry(&request, &err);
@@ -760,7 +808,7 @@ trait StoreBufferedBody<W> {
         body: Vec<u8>,
         wire_len: usize,
         budget: &DownloadBudget,
-    ) -> std::result::Result<(), DownloadRequestError>;
+    ) -> Result<(), DownloadRequestError>;
 }
 
 struct WriteBufferedBody;
@@ -771,13 +819,13 @@ impl<W: DownloadWriter> StoreBufferedBody<W> for WriteBufferedBody {
         body: Vec<u8>,
         _: usize,
         budget: &DownloadBudget,
-    ) -> std::result::Result<(), DownloadRequestError> {
+    ) -> Result<(), DownloadRequestError> {
         use std::io::Write;
 
         budget
             .writer(WriterIoOrigin(writer))
             .write_all(&body)
-            .map_err(|error| DownloadRequestError::streamed(error.into()))
+            .map_err(DownloadRequestError::streamed_io)
     }
 }
 
@@ -791,7 +839,7 @@ impl StoreBufferedBody<MemoryWriter> for AdoptBufferedBody {
         body: Vec<u8>,
         wire_len: usize,
         budget: &DownloadBudget,
-    ) -> std::result::Result<(), DownloadRequestError> {
+    ) -> Result<(), DownloadRequestError> {
         budget
             .check_cancelled()
             .map_err(DownloadRequestError::ResourcePolicy)?;
@@ -806,8 +854,8 @@ enum WriterAttempt<W, T> {
     Failed(W, DownloadRequestError),
 }
 
-impl<W> From<(W, std::result::Result<(), DownloadRequestError>)> for WriterAttempt<W, W> {
-    fn from((writer, result): (W, std::result::Result<(), DownloadRequestError>)) -> Self {
+impl<W> From<(W, Result<(), DownloadRequestError>)> for WriterAttempt<W, W> {
+    fn from((writer, result): (W, Result<(), DownloadRequestError>)) -> Self {
         match result {
             Ok(()) => Self::Verified(writer),
             Err(error) => Self::Failed(writer, error),
@@ -816,7 +864,7 @@ impl<W> From<(W, std::result::Result<(), DownloadRequestError>)> for WriterAttem
 }
 
 impl<W> WriterAttempt<W, W> {
-    fn into_parts(self) -> (W, std::result::Result<(), DownloadRequestError>) {
+    fn into_parts(self) -> (W, Result<(), DownloadRequestError>) {
         match self {
             Self::Verified(writer) => (writer, Ok(())),
             Self::Failed(writer, error) => (writer, Err(error)),
@@ -841,21 +889,20 @@ async fn download_to_writer_with_retry<
     mut prepare_requests: PrepareRequests,
     mut invalidate_media_conn: InvalidateMediaConn,
     mut execute_request: ExecuteRequest,
-) -> std::result::Result<T, DownloadRequestError>
+) -> Result<T, DownloadRequestError>
 where
     W: DownloadWriter + MaybeSend + 'static,
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
-    PrepareRequestsFut: Future<
-        Output = std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError>,
-    >,
+    PrepareRequestsFut:
+        Future<Output = Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError>>,
     InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
     InvalidateMediaConnFut: Future<Output = ()>,
     ExecuteRequest: FnMut(wacore::download::DownloadRequest, W) -> ExecuteRequestFut,
-    ExecuteRequestFut: Future<Output = Result<Attempt>>,
+    ExecuteRequestFut: Future<Output = Result<Attempt, Box<DownloadCause>>>,
     Attempt: Into<WriterAttempt<W, T>>,
 {
     let mut force_refresh = false;
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut last_err: Option<Box<DownloadCause>> = None;
     let mut last_rejection = None;
 
     for attempt in 0..=max_refresh_attempts {
@@ -889,7 +936,7 @@ where
                     return Err(discard_failed_write(runtime, writer, err).await);
                 }
                 err if err.should_refresh_route() && attempt < max_refresh_attempts => {
-                    last_rejection = Some(err.into_anyhow());
+                    last_rejection = Some(err.into_cause());
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_route = true;
@@ -899,7 +946,7 @@ where
                     return Err(discard_failed_write(runtime, writer, err).await);
                 }
                 err => {
-                    let err = err.into_anyhow();
+                    let err = err.into_cause();
                     log_download_retry(&request, &err);
                     last_err = Some(err);
                 }
@@ -926,7 +973,7 @@ async fn execute_request_into_memory(
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
     capacity: usize,
-) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+) -> Result<Vec<u8>, DownloadRequestError> {
     let mut hashes = hashes;
     let cancellation = hashes
         .budget
@@ -952,7 +999,7 @@ async fn execute_request_into_memory(
         {
             Ok(WriterAttempt::Verified(data)) => Ok(data),
             Ok(WriterAttempt::Failed(_, error)) => Err(error),
-            Err(error) => Err(DownloadRequestError::other(error)),
+            Err(error) => Err(DownloadRequestError::Other(error)),
         };
     }
     if http_client.supports_streaming() {
@@ -960,7 +1007,7 @@ async fn execute_request_into_memory(
         match streaming_download_and_decrypt(http_client, runtime, request, hashes, writer).await {
             Ok((writer, Ok(()))) => Ok(writer.into_parts().0),
             Ok((_, Err(e))) => Err(e),
-            Err(e) => Err(DownloadRequestError::other(e)),
+            Err(e) => Err(DownloadRequestError::Other(e)),
         }
     } else if hashes
         .budget
@@ -1068,7 +1115,7 @@ impl MediaDownloader {
         &self,
         downloadable: &dyn Downloadable,
         limits: DownloadLimits,
-    ) -> std::result::Result<Vec<u8>, MediaDownloadError> {
+    ) -> Result<Vec<u8>, MediaDownloadError> {
         if limits.is_bounded()
             && !self.http_client.supports_streaming()
             && !(downloadable.is_encrypted() && self.http_client.supports_async_streaming())
@@ -1124,7 +1171,7 @@ impl MediaDownloader {
         downloadable: &dyn Downloadable,
         writer: W,
         limits: DownloadLimits,
-    ) -> std::result::Result<W, MediaDownloadError> {
+    ) -> Result<W, MediaDownloadError> {
         if limits.is_bounded() && !self.http_client.supports_streaming() {
             return Err(discard_failed_write(
                 &self.runtime,
@@ -1182,7 +1229,7 @@ impl Client {
         &self,
         downloadable: &dyn Downloadable,
         limits: DownloadLimits,
-    ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
+    ) -> Result<Vec<u8>, ClientDownloadError> {
         self.download_with_runtime(downloadable, limits, &self.runtime)
             .await
     }
@@ -1196,10 +1243,10 @@ impl Client {
         downloadable: &dyn Downloadable,
         limits: DownloadLimits,
         runtime: &Arc<dyn Runtime>,
-    ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
+    ) -> Result<Vec<u8>, ClientDownloadError> {
         let media_http = self
             .media_http_client()
-            .map_err(ClientDownloadError::Preparation)?;
+            .map_err(|error| ClientDownloadError::Preparation(Box::new(error.into())))?;
         let media_http = &media_http;
         if limits.is_bounded()
             && !self.http_client.supports_streaming()
@@ -1252,26 +1299,26 @@ impl Client {
         &self,
         pack_id: &str,
         locale: &str,
-    ) -> Result<wacore::sticker_pack::StickerPack> {
+    ) -> Result<wacore::sticker_pack::StickerPack, FetchStickerPackError> {
         async {
             let url = wacore::sticker_pack::sticker_pack_data_url(pack_id, locale);
             let response = self
                 .media_http_client()?
                 .execute(crate::http::HttpRequest::get(&url))
-                .await
-                .map_err(|e| e.context("sticker pack request failed"))?;
+                .await?;
             if response.status_code != HTTP_STATUS_OK {
                 let status = response.status_code;
-                return Err(HttpStatusError { status }
-                    .into_error(format!("sticker pack endpoint returned status {status}")));
+                return Err(FetchStickerPackError::Status(HttpStatusError { status }));
             }
-            wacore::sticker_pack::parse_sticker_pack_response(&response.body)
+            Ok(wacore::sticker_pack::parse_sticker_pack_response(
+                &response.body,
+            )?)
         }
         .await
         .inspect_err(|_error| {
             #[cfg(feature = "tracing")]
             tracing::error!(
-                error = ?MediaErrorDiagnostic(_error.as_ref()),
+                error = ?MediaErrorDiagnostic(_error),
                 "sticker pack fetch failed"
             );
         })
@@ -1281,7 +1328,7 @@ impl Client {
         &self,
         downloadable: &dyn Downloadable,
         force_refresh: bool,
-    ) -> std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError> {
+    ) -> Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError> {
         DownloadUtils::validate_download_metadata(downloadable)
             .map_err(DownloadRequestError::prepare)?;
         // A static URL is fetched verbatim, so the media-conn IQ would be a round
@@ -1353,7 +1400,7 @@ impl Client {
         downloadable: &dyn Downloadable,
         writer: W,
         limits: DownloadLimits,
-    ) -> std::result::Result<W, ClientDownloadError> {
+    ) -> Result<W, ClientDownloadError> {
         if limits.is_bounded() && !self.http_client.supports_streaming() {
             return Err(discard_failed_write(
                 &self.runtime,
@@ -1372,7 +1419,7 @@ impl Client {
         &self,
         downloadable: &dyn Downloadable,
         memory: memory::MemoryBudget,
-    ) -> std::result::Result<MemoryWriter, ClientDownloadError> {
+    ) -> Result<MemoryWriter, ClientDownloadError> {
         Ok(MemoryWriter::bounded(
             downloadable.file_length().unwrap_or(0),
             memory,
@@ -1383,7 +1430,7 @@ impl Client {
         &self,
         downloadable: &dyn Downloadable,
         mut writer: MemoryWriter,
-    ) -> std::result::Result<bytes::Bytes, ClientDownloadError> {
+    ) -> Result<bytes::Bytes, ClientDownloadError> {
         if self.http_client.supports_streaming() {
             writer.preallocate_large()?;
         }
@@ -1403,7 +1450,7 @@ impl Client {
         downloadable: &dyn Downloadable,
         writer: W,
         budget: Option<DownloadBudget>,
-    ) -> std::result::Result<W, ClientDownloadError>
+    ) -> Result<W, ClientDownloadError>
     where
         W: DownloadWriter + MaybeSend + 'static,
         StoreBody: StoreBufferedBody<W>,
@@ -1414,7 +1461,7 @@ impl Client {
                 return Err(discard_failed_write(
                     &self.runtime,
                     writer,
-                    DownloadRequestError::Prepare(error),
+                    DownloadRequestError::Prepare(Box::new(error.into())),
                 )
                 .await
                 .into());
@@ -1450,7 +1497,7 @@ impl Client {
     }
 }
 
-// Crypto helpers return anyhow errors for both reader and writer I/O. Mark
+// Crypto helpers use one I/O error variant for both reader and writer failures. Mark
 // only the sink boundary so a network read error (even the same ErrorKind) is
 // never mistaken for a local destination failure. The original I/O error is
 // retained as a source; bytes are forwarded without buffering or copying.
@@ -1500,9 +1547,7 @@ fn clear_writer<W: DownloadWriter>(writer: &mut W) -> std::io::Result<()> {
 /// so the bytes it wrote are the only bytes present. That is what lets a host
 /// which streamed out plaintext before failing its MAC be replaced by a shorter
 /// one without leaving a tail behind the media.
-fn finish_verified_write<W: DownloadWriter>(
-    writer: &mut W,
-) -> std::result::Result<(), DownloadRequestError> {
+fn finish_verified_write<W: DownloadWriter>(writer: &mut W) -> Result<(), DownloadRequestError> {
     writer.rewind().map_err(DownloadRequestError::writer_io)
 }
 
@@ -1536,7 +1581,7 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
     writer: W,
-) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
+) -> Result<(W, Result<(), DownloadRequestError>), Box<DownloadCause>> {
     streaming_download_and_decrypt_mapped::<_, _, _, WriteBufferedBody>(
         http_client,
         runtime,
@@ -1556,7 +1601,7 @@ async fn streaming_download_and_decrypt_mapped<W, T, Finish, StoreBody>(
     hashes: ExpectedMediaHashes,
     writer: W,
     finish: Finish,
-) -> Result<WriterAttempt<W, T>>
+) -> Result<WriterAttempt<W, T>, Box<DownloadCause>>
 where
     W: DownloadWriter + MaybeSend + 'static,
     T: MaybeSend + 'static,
@@ -1657,7 +1702,10 @@ where
 async fn async_streamed_download<W, T>(
     runtime: &dyn Runtime,
     _admission: Option<wacore::net::StreamingRequestPermit>,
-    response: wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
+    response: wacore::runtime::BoxFuture<
+        '_,
+        Result<wacore::net::AsyncStreamingHttpResponse, wacore::net::HttpError>,
+    >,
     (media_key, media_type): (&[u8], MediaType),
     mut hashes: ExpectedMediaHashes,
     writer: W,
@@ -1689,7 +1737,7 @@ where
                 hashes.encrypted().is_some(),
                 hashes.plaintext().is_some(),
             )
-            .map_err(|e| DownloadRequestError::streamed(e.into()))?,
+            .map_err(DownloadRequestError::streamed)?,
         );
         const DECRYPT_BATCH_BYTES: usize = 128 * 1024;
         let mut ciphertext = vec![0; DECRYPT_BATCH_BYTES];
@@ -1699,7 +1747,7 @@ where
                 let read = reader
                     .read(&mut ciphertext[filled..])
                     .await
-                    .map_err(|error| DownloadRequestError::streamed(error.into()))?;
+                    .map_err(DownloadRequestError::streamed_io)?;
                 if read == 0 {
                     break;
                 }
@@ -1729,7 +1777,7 @@ where
                 })
                 .await;
             current_writer = Some(writer);
-            result.map_err(|e| DownloadRequestError::streamed(e.into()))?;
+            result.map_err(DownloadRequestError::streamed)?;
             let Some(next_decryptor) = next_decryptor else {
                 break;
             };
@@ -1771,7 +1819,7 @@ where
         let _admission = admission;
         let mut writer = writer;
 
-        let result = (|| -> std::result::Result<(), DownloadRequestError> {
+        let result = (|| -> Result<(), DownloadRequestError> {
             if let Some(budget) = &hashes.budget {
                 budget
                     .check_cancelled()
@@ -1819,7 +1867,7 @@ where
                         hashes.plaintext(),
                         &mut limited_writer,
                     )
-                    .map_err(|e| DownloadRequestError::streamed(e.into()))?;
+                    .map_err(DownloadRequestError::streamed)?;
                 }
                 MediaDecryption::Plaintext { file_sha256 } => {
                     DownloadUtils::copy_and_validate_plaintext_to_writer(
@@ -1827,7 +1875,7 @@ where
                         file_sha256,
                         &mut limited_writer,
                     )
-                    .map_err(|e| DownloadRequestError::streamed(e.into()))?;
+                    .map_err(DownloadRequestError::streamed)?;
                 }
             }
             drop(limited_writer);
@@ -1852,7 +1900,7 @@ async fn buffered_download_and_decrypt<W, T, Finish, StoreBody>(
     hashes: ExpectedMediaHashes,
     writer: W,
     finish: Finish,
-) -> Result<WriterAttempt<W, T>>
+) -> Result<WriterAttempt<W, T>, Box<DownloadCause>>
 where
     W: DownloadWriter + MaybeSend + 'static,
     T: MaybeSend + 'static,
@@ -1910,24 +1958,25 @@ where
 }
 
 // Log only typed classifications: backend error strings may contain signed URLs.
-fn log_download_retry(request: &wacore::download::DownloadRequest, error: &anyhow::Error) {
+fn log_download_retry(request: &wacore::download::DownloadRequest, error: &DownloadCause) {
+    use crate::error::ErrorChainExt;
     let io_kind = error
-        .chain()
+        .sources()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
         .map(std::io::Error::kind);
     let media_validation = error
-        .chain()
+        .sources()
         .any(|cause| cause.is::<MediaDecryptionError>());
     log::warn!(
         "Failed to download {request:?} (HTTP status {:?}, I/O kind {io_kind:?}, media validation failure {media_validation}). Trying next host.",
-        crate::error::ErrorChainExt::http_status(&**error)
+        error.http_status()
     );
 }
 
 async fn buffered_download_body(
     http_client: &Arc<dyn HttpClient>,
     request: &wacore::download::DownloadRequest,
-) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+) -> Result<Vec<u8>, DownloadRequestError> {
     let http_request = crate::http::HttpRequest::get(request.url.clone());
     let response = http_client
         .execute(http_request)
@@ -1945,7 +1994,7 @@ async fn buffered_download_to_vec(
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
     hashes: ExpectedMediaHashes,
-) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+) -> Result<Vec<u8>, DownloadRequestError> {
     let mut body = buffered_download_body(http_client, request).await?;
     let decryption = request.decryption.clone();
     let crypto_provider = runtime.crypto_provider();
@@ -1981,6 +2030,12 @@ mod tests {
     use std::sync::Arc;
     use wacore::time::Instant;
     use waproto::whatsapp as wa;
+
+    fn find_cause<E: std::error::Error + 'static>(cause: &DownloadCause) -> Option<&E> {
+        cause
+            .sources()
+            .find_map(|source| source.downcast_ref::<E>())
+    }
 
     #[tokio::test]
     async fn static_media_preparation_borrows_configured_host_storage() {
@@ -2080,16 +2135,20 @@ mod tests {
             async fn execute(
                 &self,
                 request: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
-                Err(Self::error(request.url))
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
+                Err(crate::http::HttpError::from_boxed(
+                    Self::error(request.url).into_boxed_dyn_error(),
+                ))
             }
             fn execute_upload(
                 &self,
                 request: crate::http::HttpRequest,
                 _body: Box<dyn std::io::Read + Send>,
                 _len: u64,
-            ) -> Result<crate::http::HttpResponse> {
-                Err(Self::error(request.url))
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
+                Err(crate::http::HttpError::from_boxed(
+                    Self::error(request.url).into_boxed_dyn_error(),
+                ))
             }
         }
 
@@ -2184,32 +2243,16 @@ mod tests {
                 "wa.media.download_to_writer",
             )
             .await;
-            // anyhow itself does not implement Error. A transparent typed wrapper
-            // lets this same assertion traverse the public source chain.
-            #[derive(Debug)]
-            struct Returned(anyhow::Error);
-            impl std::fmt::Display for Returned {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    std::fmt::Display::fmt(&self.0, f)
-                }
-            }
-            impl Error for Returned {
-                fn source(&self) -> Option<&(dyn Error + 'static)> {
-                    Some(self.0.as_ref())
-                }
-            }
             capture_failure(
                 async {
-                    Returned(
-                        client
-                            .upload(
-                                b"media".to_vec(),
-                                MediaType::Image,
-                                crate::upload::UploadOptions::default(),
-                            )
-                            .await
-                            .unwrap_err(),
-                    )
+                    client
+                        .upload(
+                            b"media".to_vec(),
+                            MediaType::Image,
+                            crate::upload::UploadOptions::default(),
+                        )
+                        .await
+                        .unwrap_err()
                 },
                 "wa.media.upload",
             )
@@ -2223,18 +2266,16 @@ mod tests {
             .unwrap();
             capture_failure(
                 async {
-                    Returned(
-                        client
-                            .upload_stream(bytes::Bytes::from(encrypted), info, MediaType::Image)
-                            .await
-                            .unwrap_err(),
-                    )
+                    client
+                        .upload_stream(bytes::Bytes::from(encrypted), info, MediaType::Image)
+                        .await
+                        .unwrap_err()
                 },
                 "wa.media.upload_stream",
             )
             .await;
             capture_failure(
-                async { Returned(client.fetch_sticker_pack("test", "en").await.unwrap_err()) },
+                async { client.fetch_sticker_pack("test", "en").await.unwrap_err() },
                 "wa.media.fetch_sticker_pack",
             )
             .await;
@@ -2242,7 +2283,12 @@ mod tests {
 
         #[test]
         fn download_error_debug_redacts_nested_causes_and_cleanup() {
-            let cause = || FailingHttp::error(format!("https://cdn.example.com/?auth={TOKEN}"));
+            let cause = || {
+                Box::new(DownloadCause::Http(crate::http::HttpError::from_boxed(
+                    FailingHttp::error(format!("https://cdn.example.com/?auth={TOKEN}"))
+                        .into_boxed_dyn_error(),
+                )))
+            };
             let cleanup = || std::io::Error::other(CONTEXT);
             let errors: Vec<Box<dyn Error>> = vec![
                 Box::new(MediaDownloadError::ReferenceRejected(cause())),
@@ -2260,7 +2306,10 @@ mod tests {
                 Box::new(ClientDownloadError::Preparation(cause())),
                 Box::new(ClientDownloadError::MediaSession {
                     force_refresh: true,
-                    source: crate::request::IqError::ParseError(cause()),
+                    source: crate::request::IqError::ParseError(
+                        FailingHttp::error(format!("https://cdn.example.com/?auth={TOKEN}"))
+                            .into_boxed_dyn_error(),
+                    ),
                 }),
                 Box::new(ClientDownloadError::WriterCleanup {
                     failure: Box::new(ClientDownloadError::HostsUnreachable(cause())),
@@ -2557,7 +2606,7 @@ mod tests {
                     {
                         Ok((writer, Ok(()))) => Ok(writer.into_inner()),
                         Ok((_, Err(e))) => Err(e),
-                        Err(e) => Err(DownloadRequestError::other(e)),
+                        Err(e) => Err(DownloadRequestError::Other(e)),
                     }
                 }
             },
@@ -2579,7 +2628,7 @@ mod tests {
     }
 
     /// Regression (#1193): the retry loop classified the CDN status correctly
-    /// and then dropped the classification on the way out — `into_anyhow`
+    /// and then dropped the classification on the way out — the conversion
     /// unwrapped every variant to the same bare message, so a consumer of the
     /// public path could only recover the status by parsing `Display`.
     ///
@@ -2626,7 +2675,7 @@ mod tests {
                         {
                             Ok((writer, Ok(()))) => Ok(writer.into_inner()),
                             Ok((_, Err(e))) => Err(e),
-                            Err(e) => Err(DownloadRequestError::other(e)),
+                            Err(e) => Err(DownloadRequestError::Other(e)),
                         }
                     }
                 },
@@ -2681,7 +2730,7 @@ mod tests {
                     {
                         Ok((writer, Ok(()))) => Ok(writer.into_inner()),
                         Ok((_, Err(e))) => Err(e),
-                        Err(e) => Err(DownloadRequestError::other(e)),
+                        Err(e) => Err(DownloadRequestError::Other(e)),
                     }
                 }
             },
@@ -2926,7 +2975,9 @@ mod tests {
                     async move {
                         seen_urls.lock().await.push(url.clone());
                         if url.contains("bad-host") {
-                            Err(DownloadRequestError::other(anyhow!("connection reset")))
+                            Err(DownloadRequestError::other(std::io::Error::other(
+                                "connection reset",
+                            )))
                         } else {
                             Ok(body)
                         }
@@ -2992,14 +3043,16 @@ mod tests {
                     let url = request.url.clone();
                     async move {
                         seen_urls.lock().await.push(url.clone());
-                        Err::<Vec<u8>, _>(DownloadRequestError::other(anyhow!("host {url} down")))
+                        Err::<Vec<u8>, _>(DownloadRequestError::other(std::io::Error::other(
+                            format!("host {url} down"),
+                        )))
                     }
                 }
             },
         )
         .await
         .expect_err("all hosts failing must surface an error")
-        .into_anyhow();
+        .into_cause();
 
         assert!(
             err.to_string().contains("down"),
@@ -3063,12 +3116,18 @@ mod tests {
                     let url = request.url.clone();
                     async move {
                         seen_urls.lock().await.push(url.clone());
-                        writer.seek(SeekFrom::Start(0))?;
+                        writer
+                            .seek(SeekFrom::Start(0))
+                            .map_err(|error| Box::new(DownloadCause::Io(error)))?;
                         if url.contains("cdn1.example.com") {
                             Ok((writer, Err(DownloadRequestError::auth(401))))
                         } else {
-                            writer.write_all(&body)?;
-                            writer.seek(SeekFrom::Start(0))?;
+                            writer
+                                .write_all(&body)
+                                .map_err(|error| Box::new(DownloadCause::Io(error)))?;
+                            writer
+                                .seek(SeekFrom::Start(0))
+                                .map_err(|error| Box::new(DownloadCause::Io(error)))?;
                             Ok((writer, Ok(())))
                         }
                     }
@@ -3153,7 +3212,7 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(crate::http::HttpResponse::new(status_code, body))
@@ -3168,7 +3227,7 @@ mod tests {
         fn execute_streaming(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<wacore::net::StreamingHttpResponse> {
+        ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(wacore::net::StreamingHttpResponse::new(
@@ -3187,7 +3246,7 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             self.0.execute(request).await
         }
     }
@@ -3353,7 +3412,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HttpClient for AsyncBodyHttp {
-        async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+        async fn execute(
+            &self,
+            _: crate::http::HttpRequest,
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             panic!("unexpected buffered fallback")
         }
 
@@ -3364,8 +3426,12 @@ mod tests {
         fn execute_async_streaming(
             &self,
             _: crate::http::HttpRequest,
-        ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>>
-        {
+        ) -> Option<
+            wacore::runtime::BoxFuture<
+                '_,
+                Result<wacore::net::AsyncStreamingHttpResponse, crate::http::HttpError>,
+            >,
+        > {
             let body = self.body.lock().unwrap().take().unwrap();
             Some(Box::pin(async move {
                 Ok(wacore::net::AsyncStreamingHttpResponse::new(200, body))
@@ -3373,8 +3439,12 @@ mod tests {
         }
         fn streaming_admission(
             &self,
-        ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::StreamingRequestPermit>>>
-        {
+        ) -> Option<
+            wacore::runtime::BoxFuture<
+                '_,
+                Result<wacore::net::StreamingRequestPermit, crate::http::HttpError>,
+            >,
+        > {
             self.admission.as_ref().map(|gate| {
                 Box::pin(async move {
                     Ok(Box::new(gate.clone().lock_owned().await)
@@ -3608,7 +3678,7 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 panic!("unexpected buffered fallback")
             }
 
@@ -3620,7 +3690,10 @@ mod tests {
                 &self,
                 _: crate::http::HttpRequest,
             ) -> Option<
-                wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>,
+                wacore::runtime::BoxFuture<
+                    '_,
+                    Result<wacore::net::AsyncStreamingHttpResponse, crate::http::HttpError>,
+                >,
             > {
                 Some(Box::pin(async {
                     let mut stream = tokio::net::TcpStream::connect(self.0).await?;
@@ -3629,13 +3702,14 @@ mod tests {
                         .await?;
                     let mut header = Vec::new();
                     while !header.ends_with(b"\r\n\r\n") {
-                        anyhow::ensure!(header.len() < 256, "unexpected fixture response");
+                        if header.len() >= 256 {
+                            return Err(std::io::Error::other("unexpected fixture response").into());
+                        }
                         header.push(stream.read_u8().await?);
                     }
-                    anyhow::ensure!(
-                        header.starts_with(b"HTTP/1.1 200 OK\r\n"),
-                        "expected HTTP 200"
-                    );
+                    if !header.starts_with(b"HTTP/1.1 200 OK\r\n") {
+                        return Err(std::io::Error::other("expected HTTP 200").into());
+                    }
                     Ok(wacore::net::AsyncStreamingHttpResponse::new(
                         200,
                         Box::pin(LoopbackBody(stream, self.1.clone())),
@@ -3796,7 +3870,7 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 Ok(crate::http::HttpResponse::new(
                     200,
                     self.0.lock().await.take().expect("single buffered request"),
@@ -4031,7 +4105,7 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 self.0.cancel();
                 Ok(crate::http::HttpResponse::new(200, b"download me".to_vec()))
             }
@@ -4201,7 +4275,7 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 unreachable!("streaming fixture")
             }
             fn supports_streaming(&self) -> bool {
@@ -4210,7 +4284,7 @@ mod tests {
             fn execute_streaming(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<wacore::net::StreamingHttpResponse> {
+            ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
                 let mut calls = self.calls.lock().unwrap();
                 *calls += 1;
                 let reader: Box<dyn Read + Send> = if *calls > 1 && self.recover {
@@ -4286,7 +4360,7 @@ mod tests {
                 panic!("zero progress must remain a local sink failure");
             };
             assert_eq!(
-                source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                find_cause::<std::io::Error>(&source).unwrap().kind(),
                 std::io::ErrorKind::WriteZero
             );
             assert_eq!(
@@ -4311,13 +4385,12 @@ mod tests {
         let error = WriterIoOrigin(&mut PolicySink)
             .write_all(b"media")
             .unwrap_err();
-        let DownloadRequestError::WriterIo(source) = DownloadRequestError::streamed(error.into())
+        let DownloadRequestError::WriterIo(source) = DownloadRequestError::streamed_io(error)
         else {
             panic!("a sink's policy error must remain a writer failure");
         };
         assert_eq!(
-            source
-                .downcast_ref::<std::io::Error>()
+            find_cause::<std::io::Error>(&source)
                 .unwrap()
                 .get_ref()
                 .unwrap()
@@ -4385,9 +4458,9 @@ mod tests {
                     }
                     (case, WriterAttempt::Failed(_, error)) => {
                         assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
-                        let error = error.into_anyhow();
+                        let error = error.into_cause();
                         assert!(matches!(
-                            (case, error.downcast_ref::<MediaDecryptionError>()),
+                            (case, find_cause::<MediaDecryptionError>(&error)),
                             (Case::BadMac, Some(MediaDecryptionError::InvalidMac))
                                 | (
                                     Case::BadEncryptedHash,
@@ -4462,7 +4535,7 @@ mod tests {
                 panic!("final rewind failure lost its writer classification");
             };
             assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                find_cause::<std::io::Error>(&error).unwrap().kind(),
                 std::io::ErrorKind::Other
             );
         }
@@ -4620,7 +4693,7 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 unreachable!("bounded downloads must stream")
             }
             fn supports_streaming(&self) -> bool {
@@ -4629,7 +4702,7 @@ mod tests {
             fn execute_streaming(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<wacore::net::StreamingHttpResponse> {
+            ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
                 Ok(wacore::net::StreamingHttpResponse::new(
                     200,
                     Box::new(self.0.lock().unwrap().take().unwrap()),
@@ -4798,7 +4871,7 @@ mod tests {
                     assert!(matches!(
                         (
                             corrupt_encrypted_hash,
-                            cause.downcast_ref::<MediaDecryptionError>()
+                            find_cause::<MediaDecryptionError>(&cause)
                         ),
                         (true, Some(MediaDecryptionError::EncryptedSha256Mismatch))
                             | (false, Some(MediaDecryptionError::PlaintextSha256Mismatch))
@@ -5285,10 +5358,7 @@ mod tests {
                         panic!("malformed integrity metadata must fail validation");
                     };
                     assert!(matches!(
-                        (
-                            encrypted_domain,
-                            error.downcast_ref::<MediaDecryptionError>()
-                        ),
+                        (encrypted_domain, find_cause::<MediaDecryptionError>(&error)),
                         (true, Some(MediaDecryptionError::EncryptedSha256Mismatch))
                             | (false, Some(MediaDecryptionError::PlaintextSha256Mismatch))
                     ));
@@ -5324,7 +5394,7 @@ mod tests {
                     panic!("metadata validation must precede the offline IQ path: {error:?}");
                 };
                 assert_eq!(
-                    source.downcast_ref::<DownloadPreparationError>(),
+                    find_cause::<DownloadPreparationError>(&source),
                     Some(&expected)
                 );
             }
@@ -5945,13 +6015,13 @@ mod tests {
                             }
                         };
                         if matches!(fault, DestinationFault::WriteZero) {
-                            assert!(cause.chain().any(|source| {
+                            assert!(cause.as_ref().sources().any(|source| {
                                 source
                                     .downcast_ref::<std::io::Error>()
                                     .is_some_and(|io| io.kind() == std::io::ErrorKind::WriteZero)
                             }));
                         } else {
-                            let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                            let io = find_cause::<std::io::Error>(cause).unwrap();
                             assert_eq!(io.raw_os_error(), Some(28), "lost original I/O: {error:?}");
                             assert_eq!(
                                 io.to_string(),
@@ -6003,10 +6073,12 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             if self.all_hosts || request.url.contains("first.example.com") {
                 self.inner.record(&request.url);
-                return Err(std::io::Error::from_raw_os_error(28).into());
+                return Err(crate::http::HttpError::adapter(
+                    std::io::Error::from_raw_os_error(28),
+                ));
             }
             self.inner.execute(request).await
         }
@@ -6016,7 +6088,7 @@ mod tests {
         fn execute_streaming(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<wacore::net::StreamingHttpResponse> {
+        ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
             if self.all_hosts || request.url.contains("first.example.com") {
                 self.inner.record(&request.url);
                 return Ok(wacore::net::StreamingHttpResponse::new(
@@ -6070,10 +6142,7 @@ mod tests {
                             panic!("network failure mislabeled: {error:?}");
                         };
                         assert_eq!(
-                            cause
-                                .downcast_ref::<std::io::Error>()
-                                .unwrap()
-                                .raw_os_error(),
+                            find_cause::<std::io::Error>(&cause).unwrap().raw_os_error(),
                             Some(28)
                         );
                     } else {
@@ -6123,13 +6192,13 @@ mod tests {
         }
     }
 
-    fn assert_mac_cause(cause: &anyhow::Error) {
+    fn assert_mac_cause(cause: &DownloadCause) {
         assert!(matches!(
-            cause.downcast_ref::<MediaDecryptionError>(),
+            find_cause::<MediaDecryptionError>(cause),
             Some(MediaDecryptionError::InvalidMac)
         ));
-        assert_eq!(cause.chain().count(), 1);
-        let diagnostic = format!("{:?}", MediaErrorDiagnostic(cause.as_ref()));
+        assert_eq!(cause.sources().count(), 2);
+        let diagnostic = format!("{:?}", MediaErrorDiagnostic(cause));
         assert!(
             diagnostic.contains("media_validation: true"),
             "{diagnostic}"
@@ -6266,7 +6335,7 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             *self.seen_url.lock().await = Some(request.url);
             Ok(crate::http::HttpResponse::new(
                 self.status,
@@ -6320,7 +6389,7 @@ mod tests {
             .expect_err("a non-200 sticker pack response must fail");
         // Same contract as the media paths: the status is recoverable by type,
         // not only readable in the message.
-        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        let cause: &(dyn std::error::Error + 'static) = &err;
         assert_eq!(cause.http_status(), Some(404), "got: {err:?}");
     }
     struct GatedExpiredHttp {
@@ -6334,7 +6403,7 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             if !request.url.contains("/mms/") {
                 self.entered.send(()).await.unwrap();
                 self.release.recv().await.unwrap();
@@ -6349,7 +6418,7 @@ mod tests {
         fn execute_streaming(
             &self,
             request: crate::http::HttpRequest,
-        ) -> Result<wacore::net::StreamingHttpResponse> {
+        ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
             self.entered.send_blocking(()).unwrap();
             self.release.recv_blocking().unwrap();
             self.inner.execute_streaming(request)
@@ -6518,13 +6587,16 @@ mod tests {
             async fn execute(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<crate::http::HttpResponse> {
+            ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
                 unreachable!("must stream")
             }
             fn supports_streaming(&self) -> bool {
                 true
             }
-            fn streaming_admission(&self) -> Option<BoxFuture<'_, Result<StreamingRequestPermit>>> {
+            fn streaming_admission(
+                &self,
+            ) -> Option<BoxFuture<'_, Result<StreamingRequestPermit, crate::http::HttpError>>>
+            {
                 Some(Box::pin(async move {
                     let guard = self.gate.lock_arc().await;
                     self.live.store(true, Ordering::SeqCst);
@@ -6539,7 +6611,7 @@ mod tests {
             fn execute_streaming(
                 &self,
                 _: crate::http::HttpRequest,
-            ) -> Result<StreamingHttpResponse> {
+            ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
                 assert!(self.live.load(Ordering::SeqCst));
                 self.opened.store(true, Ordering::SeqCst);
                 Ok(StreamingHttpResponse::new(

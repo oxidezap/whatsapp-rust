@@ -1,7 +1,7 @@
 // Re-export transport types from wacore
 pub use wacore::net::{
-    DisconnectReason, RacingTransportFactory, Transport, TransportEvent, TransportFactory,
-    WHATSAPP_WEB_WS_URL_FALLBACK, WHATSAPP_WEB_WS_URLS, with_edge_routing_param,
+    DisconnectReason, RacingTransportFactory, Transport, TransportError, TransportEvent,
+    TransportFactory, WHATSAPP_WEB_WS_URL_FALLBACK, WHATSAPP_WEB_WS_URLS, with_edge_routing_param,
 };
 
 #[cfg(feature = "tokio-transport")]
@@ -25,7 +25,7 @@ pub mod mock {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Transport for MockTransport {
-        async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -47,7 +47,7 @@ pub mod mock {
     impl TransportFactory for MockTransportFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError>
         {
             let (_tx, rx) = async_channel::bounded(1);
             Ok((Arc::new(MockTransport), rx))
@@ -96,7 +96,7 @@ pub mod mock {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Transport for StallingMockTransport {
-        async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), TransportError> {
             self.sends_started
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             std::future::pending::<()>().await;
@@ -197,7 +197,7 @@ pub mod mock {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Transport for CapturingMockTransport {
-        async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, data: bytes::Bytes) -> Result<(), TransportError> {
             if self
                 .remaining_failures
                 .try_update(
@@ -209,7 +209,7 @@ pub mod mock {
             {
                 self.failed_sends
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(anyhow::anyhow!("injected transport failure"));
+                return Err("injected transport failure".into());
             }
             self.sent.lock().expect("capturing mutex").push(data);
             Ok(())
@@ -246,7 +246,7 @@ pub mod mock {
     impl TransportFactory for CapturingMockTransportFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError>
         {
             let (_tx, rx) = async_channel::bounded(1);
             Ok((self.transport.clone(), rx))

@@ -32,9 +32,18 @@ async fn url_destinations_and_typed_dial_errors() {
                 .with_dialer(RecordingDialer(calls.clone())),
         );
         let error = factory.create_transport().await.err().unwrap();
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::ConnectionRefused
+        let Some(TokioTransportError::Dial(dial)) = error.downcast_ref::<TokioTransportError>()
+        else {
+            panic!("expected dial error: {error}");
+        };
+        let TokioTransportError::Io(io) = dial.as_ref() else {
+            panic!("expected I/O error: {dial}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(
+            std::error::Error::source(dial.as_ref())
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some()
         );
         assert_eq!(
             *calls.lock().unwrap(),
@@ -188,7 +197,10 @@ async fn failed_upgrade_preserves_source_and_closes_the_stream() {
         };
         let client = async {
             let error = factory.create_transport().await.err().unwrap();
-            assert!(error.downcast_ref::<tokio_websockets::Error>().is_some());
+            assert!(matches!(
+                error.downcast_ref::<TokioTransportError>(),
+                Some(TokioTransportError::Connect(_))
+            ));
         };
         tokio::join!(server, client);
     })

@@ -3111,10 +3111,14 @@ mod tests {
 
     #[test]
     fn connect_chain_includes_the_source_behind_the_top_message() {
-        let e = ConnectError::Version(anyhow::anyhow!("dns failure").context("fetching sw.js"));
+        let e = ConnectError::Transport(
+            anyhow::anyhow!("dns failure")
+                .context("fetching sw.js")
+                .into_boxed_dyn_error(),
+        );
         assert_eq!(
             connect_chain(&e),
-            "failed to resolve app version: fetching sw.js: dns failure"
+            "failed to open transport: fetching sw.js: dns failure"
         );
         assert_eq!(connect_chain(&ConnectError::Paused), "client is paused");
     }
@@ -3122,24 +3126,27 @@ mod tests {
     #[test]
     fn connect_chain_keeps_a_cause_that_extends_its_wrapper() {
         // The cause adds text to the wrapper's message: it must survive.
-        let e = ConnectError::Version(
+        let e = ConnectError::Transport(
             anyhow::anyhow!("proxy connect failed: connection refused")
-                .context("proxy connect failed"),
+                .context("proxy connect failed")
+                .into_boxed_dyn_error(),
         );
         assert_eq!(
             connect_chain(&e),
-            "failed to resolve app version: proxy connect failed: connection refused"
+            "failed to open transport: proxy connect failed: connection refused"
         );
     }
 
     #[test]
     fn connect_chain_skips_a_cause_the_wrapper_already_prints() {
-        let e = ConnectError::Version(
-            anyhow::anyhow!("dns failure").context("lookup failed: dns failure"),
+        let e = ConnectError::Transport(
+            anyhow::anyhow!("dns failure")
+                .context("lookup failed: dns failure")
+                .into_boxed_dyn_error(),
         );
         assert_eq!(
             connect_chain(&e),
-            "failed to resolve app version: lookup failed: dns failure"
+            "failed to open transport: lookup failed: dns failure"
         );
     }
 
@@ -3957,16 +3964,19 @@ mod tests {
     impl crate::transport::TransportFactory for ParkedConnect {
         async fn create_transport(
             &self,
-        ) -> Result<(
-            Arc<dyn crate::transport::Transport>,
-            async_channel::Receiver<crate::transport::TransportEvent>,
-        )> {
+        ) -> std::result::Result<
+            (
+                Arc<dyn crate::transport::Transport>,
+                async_channel::Receiver<crate::transport::TransportEvent>,
+            ),
+            crate::transport::TransportError,
+        > {
             let _ = self.entered.send(()).await;
             let _ = self.release.recv().await;
             // No socket is ever opened: what these tests are about is the
             // branch the loop takes once an attempt has ended, and a failed
             // attempt reaches it by the same route a dropped connection does.
-            Err(anyhow::anyhow!("this factory never opens a transport"))
+            Err("this factory never opens a transport".into())
         }
     }
 
@@ -4058,10 +4068,13 @@ mod tests {
     impl crate::transport::TransportFactory for AbandonedDial {
         async fn create_transport(
             &self,
-        ) -> Result<(
-            Arc<dyn crate::transport::Transport>,
-            async_channel::Receiver<crate::transport::TransportEvent>,
-        )> {
+        ) -> std::result::Result<
+            (
+                Arc<dyn crate::transport::Transport>,
+                async_channel::Receiver<crate::transport::TransportEvent>,
+            ),
+            crate::transport::TransportError,
+        > {
             self.entered.send(()).await.expect("observe dial");
             self.release.recv().await.expect("release dial");
             let (events, receiver) = async_channel::bounded(1);
@@ -4179,7 +4192,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::http::HttpClient for ShutdownConnectHttp {
-        async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+        async fn execute(
+            &self,
+            _: crate::http::HttpRequest,
+        ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
             self.0.send("version").await.unwrap();
             std::future::pending().await
         }
@@ -4194,7 +4210,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for ShutdownConnectTransport {
-        async fn send(&self, _: bytes::Bytes) -> Result<()> {
+        async fn send(
+            &self,
+            _: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             self.entered.send("handshake").await.unwrap();
             if self.pending_send {
                 std::future::pending::<()>().await;
@@ -4222,10 +4241,13 @@ mod tests {
     impl crate::transport::TransportFactory for ShutdownConnectFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(
-            Arc<dyn crate::transport::Transport>,
-            async_channel::Receiver<crate::transport::TransportEvent>,
-        )> {
+        ) -> std::result::Result<
+            (
+                Arc<dyn crate::transport::Transport>,
+                async_channel::Receiver<crate::transport::TransportEvent>,
+            ),
+            crate::transport::TransportError,
+        > {
             self.transport.entered.send("transport").await.unwrap();
             if self.pending_dial {
                 std::future::pending::<()>().await;
@@ -4492,7 +4514,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for SuccessfulHandshakeTransport {
-        async fn send(&self, data: bytes::Bytes) -> Result<()> {
+        async fn send(
+            &self,
+            data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             use wacore::libsignal::protocol::KeyPair;
             use wacore_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
             use waproto::whatsapp as wa;
@@ -4579,10 +4604,13 @@ mod tests {
     impl crate::transport::TransportFactory for SuccessfulHandshakeDial {
         async fn create_transport(
             &self,
-        ) -> Result<(
-            Arc<dyn crate::transport::Transport>,
-            async_channel::Receiver<crate::transport::TransportEvent>,
-        )> {
+        ) -> std::result::Result<
+            (
+                Arc<dyn crate::transport::Transport>,
+                async_channel::Receiver<crate::transport::TransportEvent>,
+            ),
+            crate::transport::TransportError,
+        > {
             Ok((self.transport.clone(), self.events.clone()))
         }
     }
@@ -5939,7 +5967,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for ParkedDisconnect {
-        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+        async fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             Ok(())
         }
 

@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use base64::Engine;
 use serde::Deserialize;
 use wacore::download::MediaType;
@@ -8,6 +7,42 @@ use wacore::sync_marker::MaybeSend;
 use crate::client::Client;
 use crate::http::{HttpRequest, HttpResponse, HttpStatusError};
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, is_media_auth_error};
+
+/// Failure to encrypt or upload media.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum ClientUploadError {
+    #[error("{0}")]
+    Profile(#[from] MediaProfileError),
+    #[error("{0}")]
+    Encryption(#[from] wacore::upload::MediaEncryptionError),
+    #[error("{0}")]
+    Session(#[from] crate::request::IqError),
+    #[error("{0}")]
+    Http(#[from] crate::http::HttpError),
+    #[error("{0}")]
+    SourceIo(#[from] std::io::Error),
+    #[error("{0}")]
+    Response(#[from] serde_json::Error),
+    #[error("{context}")]
+    Status {
+        context: String,
+        #[source]
+        status: HttpStatusError,
+    },
+    #[error("No media hosts")]
+    NoHosts,
+    #[error("Failed to upload to all available media hosts")]
+    AllHostsFailed,
+}
+
+impl std::fmt::Debug for ClientUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ClientUploadError")
+            .field(&crate::download::MediaErrorDiagnostic(self))
+            .finish()
+    }
+}
 
 /// Files >= 5 MiB check for existing/partial upload before sending.
 /// Matches WA Web's `_checkIfAlreadyUploaded` flow.
@@ -91,7 +126,7 @@ fn build_resume_check_request(
     HttpRequest::post(url).with_header("Origin", WHATSAPP_WEB_ORIGIN)
 }
 
-fn upload_error_from_response(response: HttpResponse) -> anyhow::Error {
+fn upload_error_from_response(response: HttpResponse) -> ClientUploadError {
     let status = response.status_code;
     let context = match String::from_utf8(response.body) {
         Ok(body) => format!("Upload failed {status} body={body}"),
@@ -102,7 +137,10 @@ fn upload_error_from_response(response: HttpResponse) -> anyhow::Error {
     // The status also goes in as a typed node, not only into the message: the
     // host-rotation loop below reads it via `is_media_auth_error`, and the
     // caller that ends up with `last_error` needs the same answer.
-    HttpStatusError { status }.into_error(context)
+    ClientUploadError::Status {
+        context,
+        status: HttpStatusError { status },
+    }
 }
 
 /// Crypto metadata needed to finalize an upload, independent of how the
@@ -148,24 +186,26 @@ type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
 #[cfg(not(target_arch = "wasm32"))]
 mod dyn_callbacks {
     use super::*;
-    pub(super) type GetMediaConnDyn<'a> =
-        dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn>> + Send + 'a;
+    pub(super) type GetMediaConnDyn<'a> = dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn, ClientUploadError>>
+        + Send
+        + 'a;
     pub(super) type InvalidateMediaConnDyn<'a> = dyn FnMut() -> BoxFut<'a, ()> + Send + 'a;
     pub(super) type ExecuteRequestDyn<'a> =
-        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse>> + Send + 'a;
-    pub(super) type SendBodyDyn<'a> =
-        dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse>> + Send + 'a;
+        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse, ClientUploadError>> + Send + 'a;
+    pub(super) type SendBodyDyn<'a> = dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse, ClientUploadError>>
+        + Send
+        + 'a;
 }
 #[cfg(target_arch = "wasm32")]
 mod dyn_callbacks {
     use super::*;
     pub(super) type GetMediaConnDyn<'a> =
-        dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn>> + 'a;
+        dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn, ClientUploadError>> + 'a;
     pub(super) type InvalidateMediaConnDyn<'a> = dyn FnMut() -> BoxFut<'a, ()> + 'a;
     pub(super) type ExecuteRequestDyn<'a> =
-        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse>> + 'a;
-    pub(super) type SendBodyDyn<'a> =
-        dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse>> + 'a;
+        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse, ClientUploadError>> + 'a;
+    pub(super) type SendBodyDyn<'a> = dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse, ClientUploadError>>
+        + 'a;
 }
 use dyn_callbacks::*;
 
@@ -188,16 +228,16 @@ async fn upload_media_with_retry<GMC, GMCFut, IMC, IMCFut, EXR, EXRFut, SB, SBFu
     mut execute_request: EXR,
     mut send_body: SB,
     media_profile: Option<wacore::download::MobileMediaHttpProfile>,
-) -> Result<UploadResponse>
+) -> Result<UploadResponse, ClientUploadError>
 where
     GMC: FnMut(bool) -> GMCFut + MaybeSend,
-    GMCFut: Future<Output = Result<crate::mediaconn::MediaConn>> + MaybeSend,
+    GMCFut: Future<Output = Result<crate::mediaconn::MediaConn, ClientUploadError>> + MaybeSend,
     IMC: FnMut() -> IMCFut + MaybeSend,
     IMCFut: Future<Output = ()> + MaybeSend,
     EXR: FnMut(HttpRequest) -> EXRFut + MaybeSend,
-    EXRFut: Future<Output = Result<HttpResponse>> + MaybeSend,
+    EXRFut: Future<Output = Result<HttpResponse, ClientUploadError>> + MaybeSend,
     SB: FnMut(HttpRequest, u64, u64) -> SBFut + MaybeSend,
-    SBFut: Future<Output = Result<HttpResponse>> + MaybeSend,
+    SBFut: Future<Output = Result<HttpResponse, ClientUploadError>> + MaybeSend,
 {
     upload_media_with_retry_dyn(
         crypto,
@@ -226,19 +266,19 @@ async fn upload_media_with_retry_dyn<'a>(
     execute_request: &mut ExecuteRequestDyn<'a>,
     send_body: &mut SendBodyDyn<'a>,
     media_profile: Option<wacore::download::MobileMediaHttpProfile>,
-) -> Result<UploadResponse> {
+) -> Result<UploadResponse, ClientUploadError> {
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(crypto.file_enc_sha256);
     let upload_path = media_profile
         .as_ref()
         .map(|p| p.upload_path(media_type))
         .unwrap_or_else(|| media_type.upload_path());
     let mut force_refresh = false;
-    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_error: Option<ClientUploadError> = None;
 
     for attempt in 0..=MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS {
         let media_conn = get_media_conn(force_refresh).await?;
         if media_conn.hosts.is_empty() {
-            return Err(anyhow!("No media hosts"));
+            return Err(ClientUploadError::NoHosts);
         }
 
         let mut retry_with_fresh_auth = false;
@@ -341,7 +381,7 @@ async fn upload_media_with_retry_dyn<'a>(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("Failed to upload to all available media hosts")))
+    Err(last_error.unwrap_or(ClientUploadError::AllHostsFailed))
 }
 
 #[derive(Clone)]
@@ -443,7 +483,7 @@ impl Client {
         data: Vec<u8>,
         media_type: MediaType,
         options: UploadOptions,
-    ) -> Result<UploadResponse> {
+    ) -> Result<UploadResponse, ClientUploadError> {
         async {
             let media_profile = self.mobile_media_http_profile()?;
             let file_length = data.len() as u64;
@@ -478,10 +518,16 @@ impl Client {
                 self.runtime.wall_time_secs(),
                 |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
                 || async { self.invalidate_media_conn().await },
-                |request| async move { self.http_client.execute(request).await },
+                |request| async move {
+                    Ok::<_, ClientUploadError>(self.http_client.execute(request).await?)
+                },
                 |request, offset, _remaining| {
                     let body = ciphertext.slice(offset as usize..);
-                    async move { self.http_client.execute(request.with_body(body)).await }
+                    async move {
+                        Ok::<_, ClientUploadError>(
+                            self.http_client.execute(request.with_body(body)).await?,
+                        )
+                    }
                 },
                 media_profile,
             )
@@ -491,7 +537,7 @@ impl Client {
         .inspect_err(|_error| {
             #[cfg(feature = "tracing")]
             tracing::error!(
-                error = ?crate::download::MediaErrorDiagnostic(_error.as_ref()),
+                error = ?crate::download::MediaErrorDiagnostic(_error),
                 "media upload failed"
             );
         })
@@ -509,7 +555,7 @@ impl Client {
         source: S,
         info: wacore::upload::EncryptedMediaInfo,
         media_type: MediaType,
-    ) -> Result<UploadResponse>
+    ) -> Result<UploadResponse, ClientUploadError>
     where
         S: wacore::upload::UploadSource + 'static,
     {
@@ -533,7 +579,9 @@ impl Client {
                 self.runtime.wall_time_secs(),
                 |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
                 || async { self.invalidate_media_conn().await },
-                |request| async move { self.http_client.execute(request).await },
+                |request| async move {
+                    Ok::<_, ClientUploadError>(self.http_client.execute(request).await?)
+                },
                 |request, offset, remaining| {
                     let source = std::sync::Arc::clone(&source);
                     let http = std::sync::Arc::clone(&self.http_client);
@@ -542,7 +590,9 @@ impl Client {
                         // task with execute_upload, not on the async worker.
                         wacore::runtime::blocking(&*self.runtime, move || {
                             let reader = source.reader_from(offset)?;
-                            http.execute_upload(request, reader, remaining)
+                            Ok::<_, ClientUploadError>(
+                                http.execute_upload(request, reader, remaining)?,
+                            )
                         })
                         .await
                     }
@@ -555,7 +605,7 @@ impl Client {
         .inspect_err(|_error| {
             #[cfg(feature = "tracing")]
             tracing::error!(
-                error = ?crate::download::MediaErrorDiagnostic(_error.as_ref()),
+                error = ?crate::download::MediaErrorDiagnostic(_error),
                 "media upload failed"
             );
         })
@@ -624,7 +674,7 @@ mod tests {
 
     /// Resume check is skipped below the 5 MiB threshold, so a check call here
     /// would be a logic error.
-    async fn unreachable_check(_req: HttpRequest) -> Result<HttpResponse> {
+    async fn unreachable_check(_req: HttpRequest) -> Result<HttpResponse, ClientUploadError> {
         panic!("resume check must not run below the resumable threshold")
     }
 
@@ -789,7 +839,7 @@ mod tests {
         .await
         .expect_err("every host refusing must fail the upload");
 
-        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        let cause: &(dyn std::error::Error + 'static) = &err;
         assert_eq!(
             cause.http_status(),
             Some(507),
@@ -806,7 +856,7 @@ mod tests {
         use crate::error::ErrorChainExt;
 
         let error = upload_error_from_response(HttpResponse::new(507, vec![0xff]));
-        let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+        let cause: &(dyn std::error::Error + 'static) = &error;
         assert_eq!(cause.http_status(), Some(507));
         assert!(
             error
@@ -905,7 +955,7 @@ struct MobileMediaHttpClient {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl wacore::net::HttpClient for MobileMediaHttpClient {
-    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, wacore::net::HttpError> {
         self.inner.execute(self.profile.apply(request)).await
     }
     fn supports_streaming(&self) -> bool {
@@ -913,13 +963,18 @@ impl wacore::net::HttpClient for MobileMediaHttpClient {
     }
     fn streaming_admission(
         &self,
-    ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::StreamingRequestPermit>>> {
+    ) -> Option<
+        wacore::runtime::BoxFuture<
+            '_,
+            Result<wacore::net::StreamingRequestPermit, wacore::net::HttpError>,
+        >,
+    > {
         self.inner.streaming_admission()
     }
     fn execute_streaming(
         &self,
         request: HttpRequest,
-    ) -> Result<wacore::net::StreamingHttpResponse> {
+    ) -> Result<wacore::net::StreamingHttpResponse, wacore::net::HttpError> {
         self.inner.execute_streaming(self.profile.apply(request))
     }
     fn supports_async_streaming(&self) -> bool {
@@ -929,8 +984,12 @@ impl wacore::net::HttpClient for MobileMediaHttpClient {
     fn execute_async_streaming(
         &self,
         request: HttpRequest,
-    ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::AsyncStreamingHttpResponse>>>
-    {
+    ) -> Option<
+        wacore::runtime::BoxFuture<
+            '_,
+            Result<wacore::net::AsyncStreamingHttpResponse, wacore::net::HttpError>,
+        >,
+    > {
         self.inner
             .execute_async_streaming(self.profile.apply(request))
     }
@@ -943,7 +1002,7 @@ impl wacore::net::HttpClient for MobileMediaHttpClient {
         request: HttpRequest,
         body: wacore::net::UploadBody,
         content_length: u64,
-    ) -> Result<HttpResponse> {
+    ) -> Result<HttpResponse, wacore::net::HttpError> {
         self.inner
             .execute_upload(self.profile.apply(request), body, content_length)
     }
@@ -960,10 +1019,22 @@ pub(crate) fn profile_media_http_client(
         None => inner,
     }
 }
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MediaProfileError {
+    #[cfg(feature = "mobile-core")]
+    #[error("{0}")]
+    InvalidSession(#[from] wacore::mobile::MobileSessionError),
+    #[error("mobile media requires an explicit HTTP/routing profile")]
+    MissingProfile,
+    #[error("mobile media requires a configured mobile session")]
+    MissingSession,
+}
+
 impl Client {
     pub(crate) fn mobile_media_http_profile(
         &self,
-    ) -> Result<Option<wacore::download::MobileMediaHttpProfile>> {
+    ) -> Result<Option<wacore::download::MobileMediaHttpProfile>, MediaProfileError> {
         #[cfg(feature = "mobile-core")]
         if let Some(session) = &self.mobile_session {
             session.validate_device(&self.persistence_manager.get_device_snapshot())?;
@@ -971,7 +1042,7 @@ impl Client {
                 .media_http_profile()
                 .cloned()
                 .map(Some)
-                .ok_or_else(|| anyhow!("mobile media requires an explicit HTTP/routing profile"));
+                .ok_or(MediaProfileError::MissingProfile);
         }
         if self
             .persistence_manager
@@ -979,11 +1050,13 @@ impl Client {
             .mobile_session
             .is_some()
         {
-            return Err(anyhow!("mobile media requires a configured mobile session"));
+            return Err(MediaProfileError::MissingSession);
         }
         Ok(None)
     }
-    pub(crate) fn media_http_client(&self) -> Result<std::sync::Arc<dyn wacore::net::HttpClient>> {
+    pub(crate) fn media_http_client(
+        &self,
+    ) -> Result<std::sync::Arc<dyn wacore::net::HttpClient>, MediaProfileError> {
         Ok(profile_media_http_client(
             self.http_client.clone(),
             self.mobile_media_http_profile()?,
@@ -1020,7 +1093,10 @@ mod mobile_media_http_tests {
     }
     #[async_trait::async_trait]
     impl HttpClient for CaptureHttp {
-        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            request: HttpRequest,
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             if request.method == "GET" {
                 self.requests.lock().unwrap().push(request);
                 Ok(HttpResponse::new(200, self.download.clone()))
@@ -1031,7 +1107,10 @@ mod mobile_media_http_tests {
         fn supports_streaming(&self) -> bool {
             self.streaming
         }
-        fn execute_streaming(&self, request: HttpRequest) -> Result<StreamingHttpResponse> {
+        fn execute_streaming(
+            &self,
+            request: HttpRequest,
+        ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
             self.requests.lock().unwrap().push(request);
             Ok(StreamingHttpResponse::new(
                 200,
@@ -1046,7 +1125,7 @@ mod mobile_media_http_tests {
             request: HttpRequest,
             mut body: UploadBody,
             length: u64,
-        ) -> Result<HttpResponse> {
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             let copied = std::io::copy(&mut body, &mut std::io::sink())?;
             assert_eq!(copied, length);
             Ok(self.capture(request))
@@ -1101,7 +1180,7 @@ mod mobile_media_http_tests {
                         let http = http.clone();
                         move |request| {
                             let http = http.clone();
-                            async move { http.execute(request).await }
+                            async move { Ok::<_, ClientUploadError>(http.execute(request).await?) }
                         }
                     },
                     {
@@ -1113,13 +1192,15 @@ mod mobile_media_http_tests {
                             async move {
                                 assert_eq!(bytes.len() as u64, remaining);
                                 if streaming {
-                                    http.execute_upload(
+                                    Ok::<_, ClientUploadError>(http.execute_upload(
                                         request,
                                         Box::new(std::io::Cursor::new(bytes)),
                                         remaining,
-                                    )
+                                    )?)
                                 } else {
-                                    http.execute(request.with_body(bytes)).await
+                                    Ok::<_, ClientUploadError>(
+                                        http.execute(request.with_body(bytes)).await?,
+                                    )
                                 }
                             }
                         }

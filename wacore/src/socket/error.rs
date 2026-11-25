@@ -63,7 +63,7 @@ pub enum EncryptSendErrorKind {
 pub struct EncryptSendError {
     pub kind: EncryptSendErrorKind,
     #[source]
-    pub source: anyhow::Error,
+    pub source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl std::fmt::Debug for EncryptSendError {
@@ -78,29 +78,37 @@ impl std::fmt::Debug for EncryptSendError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SenderStateError {
+    #[error("sender task channel closed unexpectedly")]
+    ChannelClosed,
+    #[error("noise sender disabled after a transport failure; reconnect to rekey")]
+    Poisoned,
+}
+
 impl EncryptSendError {
-    pub fn crypto(source: impl Into<anyhow::Error>) -> Self {
+    pub fn crypto(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: EncryptSendErrorKind::Crypto,
             source: source.into(),
         }
     }
 
-    pub fn framing(source: impl Into<anyhow::Error>) -> Self {
+    pub fn framing(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: EncryptSendErrorKind::Framing,
             source: source.into(),
         }
     }
 
-    pub fn transport(source: impl Into<anyhow::Error>) -> Self {
+    pub fn transport(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: EncryptSendErrorKind::Transport,
             source: source.into(),
         }
     }
 
-    pub fn join(source: impl Into<anyhow::Error>) -> Self {
+    pub fn join(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: EncryptSendErrorKind::Join,
             source: source.into(),
@@ -110,7 +118,7 @@ impl EncryptSendError {
     pub fn channel_closed() -> Self {
         Self {
             kind: EncryptSendErrorKind::ChannelClosed,
-            source: anyhow::anyhow!("sender task channel closed unexpectedly"),
+            source: Box::new(SenderStateError::ChannelClosed),
         }
     }
 
@@ -124,9 +132,7 @@ impl EncryptSendError {
     pub fn poisoned() -> Self {
         Self {
             kind: EncryptSendErrorKind::Poisoned,
-            source: anyhow::anyhow!(
-                "noise sender disabled after a transport failure; reconnect to rekey"
-            ),
+            source: Box::new(SenderStateError::Poisoned),
         }
     }
 

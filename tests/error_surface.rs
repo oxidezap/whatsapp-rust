@@ -588,11 +588,11 @@ fn mex_graphql_error_is_not_reported_as_a_server_rejection() {
             .build()])
         .build();
     let parse = spec.parse_response(&node.as_node_ref()).unwrap_err();
-    assert_eq!(parse.downcast_ref::<MexFatalError>().unwrap().code, 403);
+    assert!(matches!(&parse, wacore::iq::mex::MexQueryError::Fatal(fatal) if fatal.code == 403));
     let err = GroupError::Mex(MexError::GraphQl {
         code: 403,
         message: "denied".to_string(),
-        source: Box::new(IqError::ParseError(parse)),
+        source: Box::new(IqError::ParseError(Box::new(parse))),
     });
     assert_eq!(err.server_rejection(), None);
     // It is still recoverable by type, just not under a category it does not
@@ -604,9 +604,8 @@ fn mex_graphql_error_is_not_reported_as_a_server_rejection() {
     ));
     let iq = source.source().unwrap().downcast_ref::<IqError>().unwrap();
     let fatal = iq
-        .source()
-        .unwrap()
-        .downcast_ref::<MexFatalError>()
+        .sources()
+        .find_map(|cause| cause.downcast_ref::<MexFatalError>())
         .unwrap();
     assert_eq!(fatal.query, "ConsumerQuery");
     assert_eq!(fatal.message, "denied");

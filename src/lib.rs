@@ -471,7 +471,7 @@ pub use cache_config::{
 pub mod cache_store;
 pub(crate) mod pending_device_sync;
 pub(crate) mod sender_key_device_cache;
-pub use cache_store::CacheStore;
+pub use cache_store::{CacheError, CacheResult, CacheStore};
 pub mod http;
 pub mod types;
 
@@ -554,7 +554,7 @@ pub use plugins::{
 };
 pub mod request;
 pub(crate) mod signal_flush;
-pub use request::{IqError, RejectionStanza};
+pub use request::{IqEncodeError, IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 // The module is the feature's; the type inside it is the target's (`tokio::spawn` needs threads).
@@ -591,7 +591,7 @@ pub mod upload;
 pub mod voip;
 #[cfg(feature = "voip-control")]
 pub mod voip_control;
-pub use upload::UploadOptions;
+pub use upload::{ClientUploadError, UploadOptions};
 
 pub mod pdo;
 pub mod prekeys;
@@ -642,13 +642,14 @@ pub use features::{
     PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
     ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup, QuickReplies,
     ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
-    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
-    SecurityCodeVersion, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, StarredMessages, Status,
-    StatusPrivacySetting, StatusSendOptions, SubgroupFailure, SubgroupKind, SubgroupVisibility,
-    SyncActionMessageRange, TcToken, TcTokenError, TextStatusExpiry, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError,
-    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, message_range,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretDecryptError, SecretEncKind,
+    SecretEncrypted, SecurityCodeVersion, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError,
+    StarredMessages, Status, StatusPrivacySetting, StatusSendOptions, SubgroupFailure,
+    SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError,
+    TextStatusExpiry, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo,
+    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
+    VariantProperty, VerifiedName, message_range,
 };
 pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 
@@ -697,7 +698,7 @@ pub mod prelude {
         PluginInterceptorRegistration, PluginIqInterceptor, PluginIqReply, PluginManifest,
         PluginStanzaInterception, UntypedClientPlugin,
     };
-    pub use crate::request::{IqError, RejectionStanza};
+    pub use crate::request::{IqEncodeError, IqError, RejectionStanza};
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{

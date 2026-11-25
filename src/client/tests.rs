@@ -3661,16 +3661,22 @@ async fn runtime_cache_config_propagates_nondefault_settings() {
     struct StubStore;
     #[async_trait::async_trait]
     impl crate::cache_store::CacheStore for StubStore {
-        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+        async fn get(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+        async fn set(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: Option<Duration>,
+        ) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+        async fn delete(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn clear(&self, _: &str) -> Result<()> {
+        async fn clear(&self, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
     }
@@ -3939,16 +3945,22 @@ async fn non_group_cache_stores_are_owned_by_live_caches_only() {
     struct StubStore;
     #[async_trait::async_trait]
     impl crate::cache_store::CacheStore for StubStore {
-        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+        async fn get(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+        async fn set(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: Option<Duration>,
+        ) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+        async fn delete(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn clear(&self, _: &str) -> Result<()> {
+        async fn clear(&self, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
     }
@@ -4235,7 +4247,10 @@ async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            _data: Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             self.send_done.store(true, Ordering::Release);
@@ -4843,7 +4858,10 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
 
     #[async_trait]
     impl crate::transport::Transport for CountingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            _data: Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -4971,7 +4989,10 @@ async fn flush_waits_for_queued_delivery_receipts() {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            _data: Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             Ok(())

@@ -34,11 +34,14 @@ struct OwnershipCallbackCache {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl wacore::store::CacheStore for OwnershipCallbackCache {
-    async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        anyhow::ensure!(
-            !self.read_error.load(std::sync::atomic::Ordering::Acquire),
-            "synthetic cache read failure"
-        );
+    async fn get(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
+        if self.read_error.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other("synthetic cache read failure").into());
+        }
         Ok(self
             .rows
             .lock()
@@ -53,12 +56,12 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
         key: &str,
         value: &[u8],
         _: Option<Duration>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cache_store::CacheResult<()> {
         use std::sync::atomic::Ordering;
         self.sets.fetch_add(1, Ordering::Relaxed);
         let hook = self.set_hook.lock().unwrap().take();
         if let Some(hook) = hook {
-            hook().await?;
+            hook().await.map_err(anyhow::Error::into_boxed_dyn_error)?;
         }
         if self.enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
             let manager = self.manager.lock().unwrap().upgrade().unwrap();
@@ -83,7 +86,7 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
         Ok(())
     }
 
-    async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+    async fn delete(&self, namespace: &str, key: &str) -> crate::cache_store::CacheResult<()> {
         use std::sync::atomic::Ordering;
         if self.delete_enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
             let manager = self.manager.lock().unwrap().upgrade().unwrap();
@@ -108,12 +111,12 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
         }
         let hook = self.delete_hook.lock().unwrap().take();
         if let Some(hook) = hook {
-            hook().await?;
+            hook().await.map_err(anyhow::Error::into_boxed_dyn_error)?;
         }
         Ok(())
     }
 
-    async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+    async fn clear(&self, namespace: &str) -> crate::cache_store::CacheResult<()> {
         self.rows
             .lock()
             .unwrap()
@@ -1707,7 +1710,11 @@ async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_a
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl wacore::store::CacheStore for DelayedStore {
-        async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(self
                 .rows
                 .lock()
@@ -1722,7 +1729,7 @@ async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_a
             key: &str,
             value: &[u8],
             _: Option<Duration>,
-        ) -> anyhow::Result<()> {
+        ) -> crate::cache_store::CacheResult<()> {
             let key = (namespace.to_owned(), key.to_owned());
             if self.taken.swap(true, Ordering::AcqRel) {
                 self.rows.lock().unwrap().insert(key, value.to_vec());
@@ -1749,10 +1756,11 @@ async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_a
             }));
             receive
                 .await
-                .map_err(|_| anyhow::anyhow!("synthetic cache worker stopped"))?
+                .map_err(|_| std::io::Error::other("synthetic cache worker stopped"))?
+                .map_err(anyhow::Error::into_boxed_dyn_error)
         }
 
-        async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+        async fn delete(&self, namespace: &str, key: &str) -> crate::cache_store::CacheResult<()> {
             self.rows
                 .lock()
                 .unwrap()
@@ -1760,7 +1768,7 @@ async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_a
             Ok(())
         }
 
-        async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+        async fn clear(&self, namespace: &str) -> crate::cache_store::CacheResult<()> {
             self.rows
                 .lock()
                 .unwrap()

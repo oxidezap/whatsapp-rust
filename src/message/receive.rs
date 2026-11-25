@@ -595,7 +595,7 @@ impl Client {
                 // rejected attributes or eagerly formatting identifiers.
                 log::warn!(
                     "Failed to parse message info: {}; {}",
-                    wacore::diagnostics::ErrorSummary(error.as_ref()),
+                    wacore::diagnostics::ErrorSummary(&error),
                     crate::logging::StanzaSummary::from(nr)
                 );
                 self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
@@ -3906,7 +3906,7 @@ impl Client {
     pub(crate) async fn parse_message_info(
         &self,
         node: &NodeRef<'_>,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, wacore::messages::MessageInfoError> {
         // Per-message path: borrow pn/lid from the snapshot, no lock, no clones.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let default_jid = Jid::default();

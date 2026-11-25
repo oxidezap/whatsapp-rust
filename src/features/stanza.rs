@@ -174,7 +174,7 @@ pub enum RetryRequestError {
     #[error("the local device identity is unavailable")]
     MissingLocalIdentity,
     #[error("invalid message stanza")]
-    InvalidStanza(#[source] anyhow::Error),
+    InvalidStanza(#[source] wacore::messages::MessageInfoError),
     #[error("{0}")]
     Client(#[from] ClientError),
     #[error("failed to prepare retry request")]

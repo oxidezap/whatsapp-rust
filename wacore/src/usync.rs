@@ -1,6 +1,14 @@
 use crate::iq::usync::{parse_usync_response, project_device_list_response};
-use anyhow::Result;
 use wacore_binary::{Jid, Node};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UsyncResponseError {
+    #[error("{0}")]
+    Parse(#[from] crate::iq::usync::UsyncParseError),
+    #[error("{0}")]
+    Projection(#[from] crate::iq::usync::UsyncProjectionError),
+}
 
 /// A LID mapping learned from usync response
 #[derive(Debug, Clone)]
@@ -46,14 +54,16 @@ pub struct UserDeviceList {
 
 /// Parse usync response returning devices grouped by user with phash.
 /// This is the full-featured version that includes the participant hash.
-pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Vec<UserDeviceList>> {
+pub fn parse_get_user_devices_response_with_phash(
+    resp_node: &Node,
+) -> Result<Vec<UserDeviceList>, UsyncResponseError> {
     let response = parse_usync_response(&resp_node.as_node_ref())?;
     Ok(project_device_list_response(response)?.device_lists)
 }
 
 /// Parse usync response returning a flat list of device JIDs.
 /// This is a convenience wrapper around `parse_get_user_devices_response_with_phash`.
-pub fn parse_get_user_devices_response(resp_node: &Node) -> Result<Vec<Jid>> {
+pub fn parse_get_user_devices_response(resp_node: &Node) -> Result<Vec<Jid>, UsyncResponseError> {
     Ok(parse_get_user_devices_response_with_phash(resp_node)?
         .into_iter()
         .flat_map(|u| {

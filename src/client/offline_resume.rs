@@ -725,7 +725,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+            async fn send(&self, _: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
                 self.started.send(()).await?;
                 self.release.recv().await?;
                 Ok(())

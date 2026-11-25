@@ -4190,10 +4190,13 @@ mod tests {
             }
             #[async_trait::async_trait]
             impl crate::transport::Transport for GatedFailure {
-                async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+                async fn send(
+                    &self,
+                    _: bytes::Bytes,
+                ) -> Result<(), crate::transport::TransportError> {
                     self.entered.send(()).await.unwrap();
                     self.release.recv().await.unwrap();
-                    anyhow::bail!("synthetic send failure")
+                    return Err("synthetic send failure".into());
                 }
                 async fn disconnect(&self) {}
             }

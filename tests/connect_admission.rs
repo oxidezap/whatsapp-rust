@@ -14,7 +14,10 @@ use whatsapp_rust::{Client, ConnectAdmission, ConnectError, RunCompletionReason,
 struct OfflineHttp;
 #[whatsapp_rust::async_trait]
 impl HttpClient for OfflineHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
         panic!("version override must keep these tests offline")
     }
 }
@@ -53,7 +56,10 @@ struct Factory {
 impl TransportFactory for Factory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        whatsapp_rust::transport::TransportError,
+    > {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.order.lock().unwrap().push("factory");
         self.entered.send(()).await.unwrap();

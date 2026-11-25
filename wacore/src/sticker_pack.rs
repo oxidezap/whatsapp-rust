@@ -34,7 +34,6 @@
 
 use crate::webp;
 use crate::zip::ZipWriter;
-use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 use waproto::whatsapp as wa;
 
@@ -135,6 +134,25 @@ impl MediaUploadInfo {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StickerPackError {
+    #[error(
+        "invalid pack_id: must be non-empty, <= 128 bytes, no path separators or control chars"
+    )]
+    InvalidPackId,
+    #[error("sticker pack must contain at least 1 sticker")]
+    Empty,
+    #[error("sticker pack exceeds maximum of {max} stickers (got {got})")]
+    TooMany { max: usize, got: usize },
+    #[error("thumbnail must be uploaded with the same media_key as the zip")]
+    MismatchedMediaKey,
+    #[error("failed to parse sticker pack response: {0}")]
+    InvalidResponse(#[source] serde_json::Error),
+    #[error("no sticker pack found in response")]
+    MissingPack,
+}
+
 const MAX_STICKERS: usize = 60;
 
 /// Bundles stickers into a store-only ZIP and builds proto metadata.
@@ -143,26 +161,23 @@ pub fn create_sticker_pack_zip(
     pack_id: &str,
     stickers: &[StickerInput],
     cover: &[u8],
-) -> Result<StickerPackZipResult> {
+) -> Result<StickerPackZipResult, StickerPackError> {
     if pack_id.is_empty()
         || pack_id.len() > 128
         || pack_id
             .bytes()
             .any(|b| b == b'/' || b == b'\\' || b == b'.' || b < 0x20)
     {
-        bail!(
-            "invalid pack_id: must be non-empty, <= 128 bytes, no path separators or control chars"
-        );
+        return Err(StickerPackError::InvalidPackId);
     }
     if stickers.is_empty() {
-        bail!("sticker pack must contain at least 1 sticker");
+        return Err(StickerPackError::Empty);
     }
     if stickers.len() > MAX_STICKERS {
-        bail!(
-            "sticker pack exceeds maximum of {} stickers (got {})",
-            MAX_STICKERS,
-            stickers.len()
-        );
+        return Err(StickerPackError::TooMany {
+            max: MAX_STICKERS,
+            got: stickers.len(),
+        });
     }
 
     let mut zip = ZipWriter::new();
@@ -216,9 +231,9 @@ pub fn build_sticker_pack_message(
     zip_upload: &MediaUploadInfo,
     thumb_upload: &MediaUploadInfo,
     metadata: StickerPackMetadata,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, StickerPackError> {
     if zip_upload.media_key != thumb_upload.media_key {
-        bail!("thumbnail must be uploaded with the same media_key as the zip");
+        return Err(StickerPackError::MismatchedMediaKey);
     }
 
     let pack_msg = {
@@ -372,13 +387,13 @@ pub struct StickerPack {
 /// Parse the CDN response (a JSON array) and return its first pack.
 ///
 /// WA Web treats an empty array as an error; so do we.
-pub fn parse_sticker_pack_response(body: &[u8]) -> Result<StickerPack> {
-    let packs: Vec<StickerPack> = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("failed to parse sticker pack response: {e}"))?;
+pub fn parse_sticker_pack_response(body: &[u8]) -> Result<StickerPack, StickerPackError> {
+    let packs: Vec<StickerPack> =
+        serde_json::from_slice(body).map_err(StickerPackError::InvalidResponse)?;
     packs
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("no sticker pack found in response"))
+        .ok_or(StickerPackError::MissingPack)
 }
 
 #[cfg(test)]

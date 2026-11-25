@@ -1799,7 +1799,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HttpClient for MockHttpClient {
-        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
             // Return a mock response for version fetching
             Ok(HttpResponse::new(200, br#"self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"SiteData\":{\"server_revision\":1026131876,\"client_revision\":1026131876}}}");"#.to_vec()))
         }

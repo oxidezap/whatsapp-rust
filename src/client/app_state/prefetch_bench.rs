@@ -168,8 +168,13 @@ struct StreamingBodyHttp {
 
 #[async_trait::async_trait]
 impl crate::http::HttpClient for StreamingBodyHttp {
-    async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
-        anyhow::bail!("benchmark expects streaming HTTP")
+    async fn execute(
+        &self,
+        _: crate::http::HttpRequest,
+    ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
+        Err(crate::http::HttpError::adapter(std::io::Error::other(
+            "benchmark expects streaming HTTP",
+        )))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -179,7 +184,7 @@ impl crate::http::HttpClient for StreamingBodyHttp {
     fn execute_streaming(
         &self,
         _: crate::http::HttpRequest,
-    ) -> Result<wacore::net::StreamingHttpResponse> {
+    ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
         Ok(wacore::net::StreamingHttpResponse::new(
             200,
             Box::new(CompletionBody {

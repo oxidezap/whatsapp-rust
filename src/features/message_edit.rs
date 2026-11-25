@@ -22,7 +22,6 @@
 //!
 //! Mirrors the existing flow for poll vote decryption (`Polls::decrypt_vote`).
 
-use anyhow::{Result, anyhow};
 use buffa::MessageField;
 use log::warn;
 use wacore::message_edit::{self, MessageEditContext};
@@ -53,6 +52,22 @@ pub enum MessageEditError {
     MissingTargetSender,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SecretDecryptError {
+    #[error("{0}")]
+    Edit(#[from] message_edit::MessageEditCryptoError),
+    #[error("{0}")]
+    Reaction(#[from] wacore::reaction::ReactionError),
+    #[error("{0}")]
+    Comment(#[from] wacore::secret_enc_addon::AddonError),
+    #[error("{prior}; fallback: {fallback}")]
+    Attempts {
+        prior: Box<SecretDecryptError>,
+        fallback: Box<SecretDecryptError>,
+    },
+}
+
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.
 ///
 /// JIDs may carry their device suffix — they are normalised before being
@@ -77,7 +92,7 @@ pub fn decrypt(
     original_msg_id: &str,
     original_sender_jid: &Jid,
     editor_jid: &Jid,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     let primary_orig = original_sender_jid.to_non_ad_string();
     let primary_editor = editor_jid.to_non_ad_string();
     let primary = MessageEditContext {
@@ -85,7 +100,12 @@ pub fn decrypt(
         original_sender_jid: &primary_orig,
         editor_jid: &primary_editor,
     };
-    message_edit::decrypt_message_edit(enc_payload, enc_iv, message_secret, &primary)
+    Ok(message_edit::decrypt_message_edit(
+        enc_payload,
+        enc_iv,
+        message_secret,
+        &primary,
+    )?)
 }
 
 /// Same as [`decrypt`] but tries a fallback addressing combination if
@@ -105,7 +125,7 @@ pub fn decrypt_with_fallback(
     editor_jid: &Jid,
     fallback_original_sender: Option<&Jid>,
     fallback_editor: Option<&Jid>,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     decrypt_secret_encrypted_with_fallback(
         enc_payload,
         enc_iv,
@@ -434,7 +454,7 @@ pub fn decrypt_secret_encrypted(
     original_msg_id: &str,
     original_sender_jid: &Jid,
     modification_sender_jid: &Jid,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     let orig = original_sender_jid.to_non_ad_string();
     let sender = modification_sender_jid.to_non_ad_string();
     match kind {
@@ -470,13 +490,13 @@ pub fn decrypt_secret_encrypted(
                 original_sender_jid: &orig,
                 editor_jid: &sender,
             };
-            message_edit::decrypt_secret_encrypted(
+            Ok(message_edit::decrypt_secret_encrypted(
                 enc_payload,
                 enc_iv,
                 message_secret,
                 kind.modification_type(),
                 &ctx,
-            )
+            )?)
         }
     }
 }
@@ -494,7 +514,7 @@ pub fn decrypt_secret_encrypted_with_fallback(
     modification_sender_jid: &Jid,
     fallback_original_sender: Option<&Jid>,
     fallback_modification_sender: Option<&Jid>,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     // The reaction/comment kinds decode a different inner proto, so they go
     // through the per-kind dispatch instead of the wacore Message-only helper.
     // Like the receive path, every distinct LID/PN combination is attempted:
@@ -540,7 +560,12 @@ pub fn decrypt_secret_encrypted_with_fallback(
                 sender,
             ) {
                 Ok(inner) => return Ok(inner),
-                Err(e) => last_err = anyhow!("{last_err}; fallback: {e}"),
+                Err(e) => {
+                    last_err = SecretDecryptError::Attempts {
+                        prior: Box::new(last_err),
+                        fallback: Box::new(e),
+                    }
+                }
             }
             tried.push(pair);
         }
@@ -571,14 +596,14 @@ pub fn decrypt_secret_encrypted_with_fallback(
         })
     };
 
-    message_edit::decrypt_secret_encrypted_with_fallback(
+    Ok(message_edit::decrypt_secret_encrypted_with_fallback(
         enc_payload,
         enc_iv,
         message_secret,
         kind.modification_type(),
         &primary,
         fallback_ctx.as_ref(),
-    )
+    )?)
 }
 
 #[cfg(test)]

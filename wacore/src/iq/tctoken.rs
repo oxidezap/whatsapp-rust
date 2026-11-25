@@ -261,8 +261,30 @@ pub struct IssuePrivacyTokensResponse {
     pub tokens: Vec<ReceivedTcToken>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TcTokenParseError {
+    #[error("<tokens> child not found")]
+    MissingTokens,
+    #[error("missing required attribute {0}")]
+    MissingAttribute(&'static str),
+    #[error("invalid timestamp '{value}': {source}")]
+    InvalidTimestamp {
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid timestamp '{value}' in privacy_token notification: {source}")]
+    InvalidNotificationTimestamp {
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
+
 impl IqSpec for IssuePrivacyTokensSpec {
     type Response = IssuePrivacyTokensResponse;
+    type Error = TcTokenParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let token_nodes: Vec<Node> = self
@@ -286,7 +308,7 @@ impl IqSpec for IssuePrivacyTokensSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let tokens_node = match response.get_optional_child("tokens") {
             Some(n) => n,
             None => return Ok(IssuePrivacyTokensResponse::default()),
@@ -297,14 +319,18 @@ impl IqSpec for IssuePrivacyTokensSpec {
             let jid: Jid = token_node
                 .attrs()
                 .optional_jid("jid")
-                .ok_or_else(|| anyhow::anyhow!("missing required attribute jid"))?;
+                .ok_or(TcTokenParseError::MissingAttribute("jid"))?;
             let t_str = token_node
                 .get_attr("t")
                 .map(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing required attribute t"))?;
-            let timestamp: i64 = t_str
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid timestamp '{}': {}", t_str, e))?;
+                .ok_or(TcTokenParseError::MissingAttribute("t"))?;
+            let timestamp: i64 =
+                t_str
+                    .parse()
+                    .map_err(|source| TcTokenParseError::InvalidTimestamp {
+                        value: t_str.to_string(),
+                        source,
+                    })?;
 
             let Some(token_data) = token_node.content_bytes() else {
                 log::warn!(target: "TcToken", "Token node for {} has no binary content, skipping", jid);
@@ -329,10 +355,10 @@ impl IqSpec for IssuePrivacyTokensSpec {
 /// resolving the sender JID from the notification's `sender_lid` / `from` attributes.
 pub fn parse_privacy_token_notification(
     notification: &NodeRef<'_>,
-) -> Result<Vec<ParsedTokenData>, anyhow::Error> {
+) -> Result<Vec<ParsedTokenData>, TcTokenParseError> {
     let tokens_node = notification
         .get_optional_child("tokens")
-        .ok_or_else(|| anyhow::anyhow!("<tokens> child not found"))?;
+        .ok_or(TcTokenParseError::MissingTokens)?;
 
     let mut tokens = Vec::new();
     for token_node in tokens_node.get_children_by_tag("token") {
@@ -347,14 +373,14 @@ pub fn parse_privacy_token_notification(
         let t_str = token_node
             .get_attr("t")
             .map(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required attribute t"))?;
-        let timestamp: i64 = t_str.parse().map_err(|e| {
-            anyhow::anyhow!(
-                "invalid timestamp '{}' in privacy_token notification: {}",
-                t_str,
-                e
-            )
-        })?;
+            .ok_or(TcTokenParseError::MissingAttribute("t"))?;
+        let timestamp: i64 =
+            t_str
+                .parse()
+                .map_err(|source| TcTokenParseError::InvalidNotificationTimestamp {
+                    value: t_str.to_string(),
+                    source,
+                })?;
 
         let Some(token_data) = token_node.content_bytes() else {
             log::warn!(target: "TcToken", "Notification token node has no binary content, skipping");
@@ -660,6 +686,29 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].token, vec![0xCA, 0xFE]);
         assert_eq!(tokens[0].timestamp, 1707000000);
+    }
+
+    #[test]
+    fn notification_reports_invalid_timestamp_with_source() {
+        use std::error::Error;
+        let notification = NodeBuilder::new("notification")
+            .children([NodeBuilder::new("tokens")
+                .children([NodeBuilder::new("token")
+                    .attr("type", "trusted_contact")
+                    .attr("t", "invalid")
+                    .build()])
+                .build()])
+            .build();
+        let error = parse_privacy_token_notification(&notification.as_node_ref()).unwrap_err();
+        assert!(matches!(
+            error,
+            TcTokenParseError::InvalidNotificationTimestamp { .. }
+        ));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.is::<std::num::ParseIntError>())
+        );
     }
 
     #[test]

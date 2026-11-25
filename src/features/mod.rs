@@ -101,7 +101,9 @@ pub use media_reupload::{
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadPhase, MediaReuploadRequest,
 };
 
-pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEncrypted};
+pub use message_edit::{
+    EncryptedEdit, MessageEditError, SecretDecryptError, SecretEncKind, SecretEncrypted,
+};
 
 pub use mex::{
     CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,

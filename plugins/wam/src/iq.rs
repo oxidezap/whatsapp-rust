@@ -31,6 +31,7 @@ impl IqSpec for SendBufferSpec<'_> {
     /// The server answers with a bare result. There is nothing in it to parse
     /// and nothing the client does with it beyond "the buffer is delivered".
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let add = NodeBuilder::new("add")
@@ -44,10 +45,7 @@ impl IqSpec for SendBufferSpec<'_> {
         )
     }
 
-    fn parse_response(
-        &self,
-        _response: &NodeRef<'_>,
-    ) -> Result<Self::Response, whatsapp_rust::anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }

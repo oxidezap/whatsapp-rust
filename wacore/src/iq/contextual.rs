@@ -53,7 +53,7 @@ pub enum IqResponseError {
         name: &'static str,
     },
     MissingContent {
-        tag: &'static str,
+        tag: String,
     },
     NotANumber {
         field: &'static str,
@@ -228,6 +228,7 @@ pub mod md {
 
     impl IqSpec for MakeGetCountryCodeRequestSpec {
         type Response = MakeGetCountryCodeRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             let mut link_code_companion_reg_node = NodeBuilder::new("link_code_companion_reg");
@@ -245,12 +246,11 @@ pub mod md {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxMdGetCountryCodeRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -262,8 +262,8 @@ pub mod md {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeGetCountryCodeRequestSpec {
@@ -477,6 +477,7 @@ pub mod passive {
 
     impl IqSpec for MakeActiveIQRequestSpec {
         type Response = MakeActiveIQRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             let active_node = NodeBuilder::new("active").build();
@@ -491,12 +492,11 @@ pub mod passive {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxPassiveModeActiveIQRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -505,8 +505,8 @@ pub mod passive {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeActiveIQRequestSpec {
@@ -574,8 +574,9 @@ pub mod passive {
                         );
                         let from = response
                             .get_attr("from")
-                            .and_then(|v| v.to_jid())
-                            .ok_or(IqResponseError::MissingAttribute { name: "from" })?;
+                            .ok_or(IqResponseError::MissingAttribute { name: "from" })?
+                            .to_jid()
+                            .ok_or(IqResponseError::NotAJid { field: "from" })?;
                         iq_ensure!(
                             response.get_attr("from").map(|v| v.as_str()).as_deref()
                                 == Some("s.whatsapp.net"),
@@ -621,6 +622,7 @@ pub mod passive {
 
     impl IqSpec for MakePassiveIQRequestSpec {
         type Response = MakePassiveIQRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             let passive_node = NodeBuilder::new("passive").build();
@@ -635,12 +637,11 @@ pub mod passive {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxPassiveModePassiveIQRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -649,8 +650,8 @@ pub mod passive {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakePassiveIQRequestSpec {
@@ -709,7 +710,7 @@ pub mod passive {
                         .as_str()
                         .to_string();
                     iq_ensure!(r#type.as_str() == "result", IqResponseError::ValuePinnedMismatch { field: "type", expected: "result", value: format!("{:?}", r#type) });
-                    let from = response.get_attr("from").and_then(|v| v.to_jid()).ok_or(IqResponseError::MissingAttribute { name: "from" })?;
+                    let from = response.get_attr("from").ok_or(IqResponseError::MissingAttribute { name: "from" })?.to_jid().ok_or(IqResponseError::NotAJid { field: "from" })?;
                     iq_ensure!(response.get_attr("from").map(|v| v.as_str()).as_deref() == Some("s.whatsapp.net"), IqResponseError::ValueNotAccepted { field: "from", value: format!("{:?}", response.get_attr("from").map(|v| v.as_str()).as_deref()) });
                     Ok(MakePassiveIQRequestPassiveIQResponseSuccess {
                         r#type,
@@ -936,6 +937,7 @@ pub mod w_g2 {
 
     impl IqSpec for MakeAcceptGroupAddRequestSpec {
         type Response = MakeAcceptGroupAddRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             // `target` is the group's own JID (`<group>@g.us`) — not the bare `g.us` server.
@@ -955,12 +957,11 @@ pub mod w_g2 {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxGroupsAcceptGroupAddRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -972,8 +973,8 @@ pub mod w_g2 {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeAcceptGroupAddRequestSpec {
@@ -1628,6 +1629,7 @@ pub mod w_g2 {
 
     impl IqSpec for MakeDeleteParentGroupRequestSpec {
         type Response = MakeDeleteParentGroupRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             // `target` is the group's own JID (`<group>@g.us`) — not the bare `g.us` server.
@@ -1643,12 +1645,11 @@ pub mod w_g2 {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxGroupsDeleteParentGroupRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -1660,8 +1661,8 @@ pub mod w_g2 {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeDeleteParentGroupRequestSpec {
@@ -2179,6 +2180,7 @@ pub mod w_g2 {
 
     impl IqSpec for MakeJoinLinkedGroupRequestSpec {
         type Response = MakeJoinLinkedGroupRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             // `target` is the group's own JID (`<group>@g.us`) — not the bare `g.us` server.
@@ -2199,12 +2201,11 @@ pub mod w_g2 {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxGroupsJoinLinkedGroupRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -2216,8 +2217,8 @@ pub mod w_g2 {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeJoinLinkedGroupRequestSpec {
@@ -2889,6 +2890,7 @@ pub mod w_g2 {
 
     impl IqSpec for MakeSetSubjectRequestSpec {
         type Response = MakeSetSubjectRequestResponse;
+        type Error = IqResponseError;
 
         fn build_iq(&self) -> InfoQuery<'static> {
             // `target` is the group's own JID (`<group>@g.us`) — not the bare `g.us` server.
@@ -2906,12 +2908,11 @@ pub mod w_g2 {
         fn parse_response(
             &self,
             _response: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
+        ) -> Result<Self::Response, Self::Error> {
             Err(IqResponseError::RequestContextRequired {
                 module: "WASmaxGroupsSetSubjectRPC",
                 guard: "request_context_required",
-            }
-            .into())
+            })
         }
         fn uses_contextual_response(&self) -> bool {
             true
@@ -2923,8 +2924,8 @@ pub mod w_g2 {
             &self,
             response: &wacore_binary::NodeRef<'_>,
             request: &wacore_binary::NodeRef<'_>,
-        ) -> Result<Self::Response, anyhow::Error> {
-            Ok(Self::parse_sent_response(response, request)?)
+        ) -> Result<Self::Response, Self::Error> {
+            Self::parse_sent_response(response, request)
         }
     }
     impl MakeSetSubjectRequestSpec {

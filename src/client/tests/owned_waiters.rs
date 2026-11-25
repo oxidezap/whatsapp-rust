@@ -512,7 +512,10 @@ async fn reconnect_timeouts_still_close_transport_in_both_modes() {
     struct StalledClose(Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl crate::transport::Transport for StalledClose {
-        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+        async fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             Ok(())
         }
         async fn disconnect(&self) {

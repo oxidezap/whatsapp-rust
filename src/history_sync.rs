@@ -2450,7 +2450,7 @@ mod tests {
         async fn execute(
             &self,
             request: crate::http::HttpRequest,
-        ) -> anyhow::Result<crate::http::HttpResponse> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             self.requests.lock().unwrap().push(request.url);
             self.entered.notify_one();
             self.release.acquire().await.unwrap().forget();

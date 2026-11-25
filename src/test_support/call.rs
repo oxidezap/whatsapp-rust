@@ -301,8 +301,13 @@ impl Drop for CallFixture {
 struct NoHttp;
 #[async_trait]
 impl HttpClient for NoHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
-        anyhow::bail!("call fixture forbids HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+        Err(crate::http::HttpError::adapter(std::io::Error::other(
+            "call fixture forbids HTTP",
+        )))
     }
 }
 
@@ -322,7 +327,10 @@ struct Factory(Arc<Wire>);
 impl TransportFactory for Factory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> std::result::Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        crate::transport::TransportError,
+    > {
         Ok((self.0.clone(), self.0.server_rx.clone()))
     }
 }
@@ -463,7 +471,7 @@ impl Wire {
 
 #[async_trait]
 impl Transport for Wire {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes) -> std::result::Result<(), crate::transport::TransportError> {
         let hello = matches!(
             *self.state.lock().unwrap_or_else(|e| e.into_inner()),
             State::Hello
@@ -475,11 +483,15 @@ impl Transport for Wire {
             &data
         };
         while !remaining.is_empty() {
-            ensure!(remaining.len() >= 3, "short fixture frame");
+            if remaining.len() < 3 {
+                return Err("short fixture frame".into());
+            }
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
                 | usize::from(remaining[2]);
-            ensure!(remaining.len() >= 3 + length, "truncated fixture frame");
+            if remaining.len() < 3 + length {
+                return Err("truncated fixture frame".into());
+            }
             let (response, node) = self.frame(&remaining[3..3 + length])?;
             remaining = &remaining[3 + length..];
             if let Some(response) = response {
@@ -495,10 +507,9 @@ impl Transport for Wire {
                 if outgoing.len() <= LIMIT {
                     outgoing.push(node.clone());
                 }
-                ensure!(
-                    outgoing.len() <= LIMIT,
-                    "fixture outgoing observation limit exceeded"
-                );
+                if outgoing.len() > LIMIT {
+                    return Err("fixture outgoing observation limit exceeded".into());
+                }
             }
             let nr = node.as_node_ref();
             if nr.tag == "call" && nr.get_optional_child("offer").is_some() {
@@ -601,7 +612,10 @@ mod tests {
     impl TransportFactory for FailingFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+        ) -> std::result::Result<
+            (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+            crate::transport::TransportError,
+        > {
             Err(ConnectFault.into())
         }
     }
@@ -631,7 +645,10 @@ mod tests {
     impl TransportFactory for StalledFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+        ) -> std::result::Result<
+            (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+            crate::transport::TransportError,
+        > {
             let _exited = scopeguard::guard(self.exited.clone(), |exited| {
                 let _ = exited.try_send(());
             });

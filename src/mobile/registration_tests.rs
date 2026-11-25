@@ -59,12 +59,13 @@ struct MockHttp {
 }
 #[async_trait]
 impl HttpClient for MockHttp {
-    async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let durable = self
             .backend
             .load()
-            .await?
+            .await
+            .map_err(crate::http::HttpError::adapter)?
             .expect("keys durable before network");
         let checkpoint: RegistrationCheckpoint = serde_json::from_slice(
             durable
@@ -83,7 +84,8 @@ impl HttpClient for MockHttp {
                 durable.identity_key.public_key.public_key_bytes(),
                 durable.noise_key.public_key.public_key_bytes(),
             ),
-        )?;
+        )
+        .map_err(crate::http::HttpError::adapter)?;
         assert!(matches!(
             restored.stage(),
             RegistrationStage::OutcomeUnknown { .. }
@@ -97,9 +99,19 @@ impl HttpClient for MockHttp {
         let reply = self.replies.lock().unwrap().pop_front().unwrap();
         let (status, bytes) = match reply {
             Reply::Ready(bytes) => (200, bytes),
-            Reply::Deferred(receiver) => (200, receiver.await?),
-            Reply::DeferredStatus(status, receiver) => (status, receiver.await?),
-            Reply::Failure => anyhow::bail!("synthetic transport failure"),
+            Reply::Deferred(receiver) => (
+                200,
+                receiver.await.map_err(crate::http::HttpError::adapter)?,
+            ),
+            Reply::DeferredStatus(status, receiver) => (
+                status,
+                receiver.await.map_err(crate::http::HttpError::adapter)?,
+            ),
+            Reply::Failure => {
+                return Err(crate::http::HttpError::adapter(std::io::Error::other(
+                    "synthetic transport failure",
+                )));
+            }
         };
         Ok(HttpResponse::new(status, bytes.to_vec()))
     }

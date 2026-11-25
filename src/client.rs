@@ -1502,10 +1502,10 @@ pub enum ConnectError {
     },
     /// The app version could not be resolved.
     #[error("failed to resolve app version")]
-    Version(#[source] anyhow::Error),
+    Version(#[source] crate::version::VersionError),
     /// The transport factory could not open a connection.
     #[error("failed to open transport")]
-    Transport(#[source] anyhow::Error),
+    Transport(#[source] wacore::net::TransportError),
     /// The noise handshake failed after the transport was up.
     #[error("{0}")]
     Handshake(#[from] handshake::HandshakeError),

@@ -22,7 +22,6 @@
 
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
-use anyhow::anyhow;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -88,6 +87,19 @@ pub struct MexFatalError {
     pub query: &'static str,
     pub code: i32,
     pub message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MexQueryError {
+    #[error("Missing <result> node in MEX response")]
+    MissingResult,
+    #[error("MEX result node content is not binary or string")]
+    InvalidContent,
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Fatal(#[from] MexFatalError),
 }
 
 /// MEX GraphQL response.
@@ -175,6 +187,7 @@ fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
 
 impl IqSpec for MexQuerySpec {
     type Response = MexResponse;
+    type Error = MexQueryError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let query_node = NodeBuilder::new("query")
@@ -189,16 +202,16 @@ impl IqSpec for MexQuerySpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let result_node = response
             .get_optional_child("result")
-            .ok_or_else(|| anyhow!("Missing <result> node in MEX response"))?;
+            .ok_or(MexQueryError::MissingResult)?;
 
         // Handle both binary and string content from the server
         let mex_response: MexResponse = match result_node.content.as_ref() {
             Some(NodeContentRef::Bytes(bytes)) => serde_json::from_slice(bytes)?,
             Some(NodeContentRef::String(s)) => serde_json::from_str(s)?,
-            _ => return Err(anyhow!("MEX result node content is not binary or string")),
+            _ => return Err(MexQueryError::InvalidContent),
         };
 
         if let Some(fatal) = mex_response.fatal_error() {
@@ -373,9 +386,9 @@ mod tests {
         let error = spec
             .parse_response(&response.as_node_ref())
             .expect_err("a fatal error must fail the parse");
-        let fatal = error
-            .downcast_ref::<MexFatalError>()
-            .expect("the fatal error keeps its type");
+        let MexQueryError::Fatal(fatal) = error else {
+            panic!("the fatal error keeps its type")
+        };
         assert_eq!(fatal.code, 404);
         assert_eq!(fatal.query, TEST_DOC.name);
     }

@@ -527,7 +527,10 @@ mod mobile_transport_tests {
     struct Capture(async_channel::Sender<Bytes>);
     #[async_trait::async_trait]
     impl Transport for Capture {
-        async fn send(&self, bytes: Bytes) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            bytes: Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             self.0.send(bytes).await?;
             Ok(())
         }

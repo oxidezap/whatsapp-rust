@@ -193,7 +193,10 @@ struct StreamingOnly;
 
 #[async_trait::async_trait]
 impl crate::http::HttpClient for StreamingOnly {
-    async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+    async fn execute(
+        &self,
+        _: crate::http::HttpRequest,
+    ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
         unreachable!()
     }
     fn supports_streaming(&self) -> bool {
@@ -202,7 +205,7 @@ impl crate::http::HttpClient for StreamingOnly {
     fn execute_streaming(
         &self,
         _: crate::http::HttpRequest,
-    ) -> Result<wacore::net::StreamingHttpResponse> {
+    ) -> std::result::Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
         unreachable!()
     }
 }

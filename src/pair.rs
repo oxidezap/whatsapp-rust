@@ -14,6 +14,19 @@ use wacore_binary::{Jid, SERVER_JID};
 pub use wacore::companion_reg::{CompanionWebClientType, NATIVE_CAMERA_DEEP_LINK_PREFIX};
 pub use wacore::pair::{DeviceState, PairCryptoError, PairUtils};
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PairWithQrError {
+    #[error("{0}")]
+    Qr(#[from] wacore::pair::PairQrError),
+    #[error("{0}")]
+    Crypto(#[from] wacore::pair::MasterPairingError),
+    #[error("Cannot pair: device has no phone number JID configured")]
+    MissingPhoneJid,
+    #[error("{0}")]
+    Send(#[from] crate::client::ClientError),
+}
+
 /// Auto-derives client type from `device_props`; see
 /// [`make_qr_data_with_client_type`] to override.
 pub fn make_qr_data(store: &crate::store::Device, ref_str: &str) -> String {
@@ -550,7 +563,7 @@ async fn handle_pair_success<'a>(
     feature = "tracing",
     tracing::instrument(name = "wa.pair.qr", level = "debug", skip_all, err(Debug))
 )]
-pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<(), anyhow::Error> {
+pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<(), PairWithQrError> {
     info!(target: "Client/PairTest", "Master client attempting to pair with QR code.");
 
     let (pairing_ref, dut_noise_pub, dut_identity_pub) = PairUtils::parse_qr_code(qr_code)?;
@@ -575,7 +588,7 @@ pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<()
     let master_jid = device_snapshot
         .pn
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("Cannot pair: device has no phone number JID configured"))?;
+        .ok_or(PairWithQrError::MissingPhoneJid)?;
     let req_id = client.generate_request_id();
 
     let iq = PairUtils::build_master_pair_iq(&master_jid, encrypted, req_id);

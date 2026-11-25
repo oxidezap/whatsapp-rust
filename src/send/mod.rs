@@ -80,6 +80,10 @@ pub enum SendError {
     /// immediate retry resolves them again rather than repeating the question.
     #[error("{0}")]
     PrimaryDeviceRejected(#[source] wacore::send::PrimaryDeviceRejected),
+    #[error("{0}")]
+    Reaction(#[from] wacore::reaction::ReactionError),
+    #[error("{0}")]
+    Addon(#[from] wacore::secret_enc_addon::AddonError),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
     /// resolution) that have no dedicated variant yet. `Display` forwards to
     /// the inner error while `source()` still exposes it for downcast.
@@ -153,12 +157,6 @@ impl From<GroupError> for SendError {
             | GroupError::DescriptionConflict
             | GroupError::EmptyPicture) => SendError::Internal(group.into()),
         }
-    }
-}
-
-impl From<wacore::secret_enc_addon::AddonError> for SendError {
-    fn from(err: wacore::secret_enc_addon::AddonError) -> Self {
-        SendError::Internal(err.into())
     }
 }
 
@@ -10831,7 +10829,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for PausedTransport {
-            async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 crate::transport::Transport::send(self.capture.as_ref(), data).await?;
                 self.entered.notify_one();
                 self.release.acquire().await.unwrap().forget();

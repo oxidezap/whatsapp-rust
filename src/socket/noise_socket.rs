@@ -53,7 +53,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for CapturingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 let mut data = data.to_vec();
                 data.drain(..3); // strip the 3-byte frame length prefix
                 let counter = self.counter.fetch_add(1, Ordering::SeqCst);
@@ -133,13 +136,14 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for AcceptThenFailTransport {
-        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             let mut sent = self.sent.lock().expect("send mutex");
             sent.push(data);
             if sent.len() > self.fail_from {
-                return Err(anyhow::anyhow!(
-                    "injected failure after accepting the frame"
-                ));
+                return Err("injected failure after accepting the frame".into());
             }
             Ok(())
         }
@@ -513,8 +517,11 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl Transport for TypedFailTransport {
-            async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
-                Err(anyhow::Error::new(TypedTransportError))
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
+                Err(Box::new(TypedTransportError))
             }
             async fn disconnect(&self) {}
         }
@@ -658,7 +665,10 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for GatedTransport {
-        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
             let permit = self.gate.acquire().await.expect("gate open");
             permit.forget();
@@ -1144,7 +1154,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for RecordingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 // One write can carry several frames: the sender coalesces
                 // whatever is already queued, so each write is unpacked frame by
                 // frame before decrypting.
@@ -1226,7 +1239,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for SizeRecordingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 self.last_size.store(data.len(), Ordering::SeqCst);
                 Ok(())
             }
@@ -1320,7 +1336,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for NoOpTransport {
-            async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 Ok(())
             }
             async fn disconnect(&self) {}

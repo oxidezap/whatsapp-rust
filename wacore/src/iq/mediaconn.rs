@@ -20,10 +20,27 @@ use crate::WireEnum;
 use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
-use anyhow::anyhow;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MediaConnParseError {
+    #[error("expected <{expected}>, got <{actual}>")]
+    UnexpectedTag {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("missing hostname attribute")]
+    MissingHostname,
+    #[error("missing auth attribute")]
+    MissingAuth,
+    #[error("Missing media_conn node in response")]
+    MissingResponseNode,
+    #[error("Missing 'auth' attribute in media_conn response")]
+    MissingResponseAuth,
+}
 
 /// Media host classification. Unrecognized wire values remain available in
 /// [`HostType::Other`]; future releases may recognize additional classifications.
@@ -142,6 +159,8 @@ impl MediaConnHostExtended {
 }
 
 impl ProtocolNode for MediaConnHostExtended {
+    type Error = MediaConnParseError;
+
     fn tag(&self) -> &'static str {
         "host"
     }
@@ -211,15 +230,18 @@ impl ProtocolNode for MediaConnHostExtended {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "host" {
-            return Err(anyhow!("expected <host>, got <{}>", node.tag));
+            return Err(MediaConnParseError::UnexpectedTag {
+                expected: "host",
+                actual: node.tag.to_string(),
+            });
         }
 
         let mut attrs = node.attrs();
         let hostname = attrs
             .optional_string("hostname")
-            .ok_or_else(|| anyhow!("missing hostname attribute"))?
+            .ok_or(MediaConnParseError::MissingHostname)?
             .into_owned();
         let host_type = attrs
             .optional_string("type")
@@ -320,6 +342,8 @@ impl MediaConnResponseExtended {
 }
 
 impl ProtocolNode for MediaConnResponseExtended {
+    type Error = MediaConnParseError;
+
     fn tag(&self) -> &'static str {
         "media_conn"
     }
@@ -348,15 +372,18 @@ impl ProtocolNode for MediaConnResponseExtended {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "media_conn" {
-            return Err(anyhow!("expected <media_conn>, got <{}>", node.tag));
+            return Err(MediaConnParseError::UnexpectedTag {
+                expected: "media_conn",
+                actual: node.tag.to_string(),
+            });
         }
 
         let mut attrs = node.attrs();
         let auth = attrs
             .optional_string("auth")
-            .ok_or_else(|| anyhow!("missing auth attribute"))?
+            .ok_or(MediaConnParseError::MissingAuth)?
             .into_owned();
         let ttl = attrs.optional_u64("ttl").unwrap_or(0);
         let auth_ttl = attrs.optional_u64("auth_ttl");
@@ -393,6 +420,7 @@ impl MediaConnSpec {
 
 impl IqSpec for MediaConnSpec {
     type Response = MediaConnResponse;
+    type Error = MediaConnParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let media_conn_node = NodeBuilder::new("media_conn").build();
@@ -404,15 +432,15 @@ impl IqSpec for MediaConnSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let media_conn_node = response
             .get_optional_child("media_conn")
-            .ok_or_else(|| anyhow!("Missing media_conn node in response"))?;
+            .ok_or(MediaConnParseError::MissingResponseNode)?;
 
         let mut attrs = media_conn_node.attrs();
         let auth = attrs
             .optional_string("auth")
-            .ok_or_else(|| anyhow!("Missing 'auth' attribute in media_conn response"))?
+            .ok_or(MediaConnParseError::MissingResponseAuth)?
             .to_string();
         let ttl = attrs.optional_u64("ttl").unwrap_or(0);
         let auth_ttl = attrs.optional_u64("auth_ttl");
@@ -541,7 +569,10 @@ mod tests {
         let response = NodeBuilder::new("iq").attr("type", "result").build();
 
         let result = spec.parse_response(&response.as_node_ref());
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaConnParseError::MissingResponseNode)
+        ));
     }
 
     #[test]

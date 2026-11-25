@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
 use wacore::net::{
-    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_ORIGIN,
-    WHATSAPP_WEB_WS_URL,
+    DisconnectReason, Transport, TransportError, TransportEvent, TransportFactory,
+    WHATSAPP_WEB_ORIGIN, WHATSAPP_WEB_WS_URL,
 };
 
 pub use tokio_websockets::Connector;
@@ -38,6 +38,9 @@ pub enum TokioTransportError {
 
     #[error("WebSocket connect failed: {0}")]
     Connect(#[source] tokio_websockets::Error),
+
+    #[error("Stream dial failed: {0}")]
+    Dial(#[source] Box<TokioTransportError>),
 
     #[error("Failed to parse URL")]
     UrlParse(#[source] http::uri::InvalidUri),
@@ -89,10 +92,14 @@ pub enum TokioTransportError {
     #[error("TCP write failed: {0}")]
     TcpWrite(#[source] std::io::Error),
 
-    #[error(transparent)]
-    Custom(Box<dyn std::error::Error + Send + Sync>),
+    #[cfg(feature = "tcp")]
+    #[error("TCP flush failed: {0}")]
+    TcpFlush(#[source] std::io::Error),
 
-    #[error(transparent)]
+    #[error("{0}")]
+    Custom(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -289,15 +296,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> WsTransport<S> {
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for WsTransport<S> {
-    async fn send(&self, data: Bytes) -> Result<(), wacore::anyhow::Error> {
+    async fn send(&self, data: Bytes) -> Result<(), TransportError> {
         let mut guard = self.sink.lock().await;
-        let sink = guard
-            .as_mut()
-            .ok_or_else(|| wacore::anyhow::Error::new(TokioTransportError::SocketClosed))?;
+        let sink = guard.as_mut().ok_or(TokioTransportError::SocketClosed)?;
         debug!("--> Sending {} bytes", data.len());
         sink.send(Message::binary(data))
             .await
-            .map_err(|e| wacore::anyhow::Error::new(TokioTransportError::WebSocketSend(e)))?;
+            .map_err(TokioTransportError::WebSocketSend)?;
         Ok(())
     }
 
@@ -589,14 +594,10 @@ impl Default for TokioWebSocketTransportFactory {
 impl TransportFactory for TokioWebSocketTransportFactory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), wacore::anyhow::Error>
-    {
-        let uri: http::Uri = self
-            .url
-            .parse()
-            .map_err(|e| wacore::anyhow::Error::new(e).context("Failed to parse URL"))?;
+    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError> {
+        let uri: http::Uri = self.url.parse().map_err(TokioTransportError::UrlParse)?;
         let custom_dial = if let Some(dialer) = &self.dialer {
-            let (host, port) = dial_destination(&uri).map_err(wacore::anyhow::Error::from)?;
+            let (host, port) = dial_destination(&uri)?;
             Some((dialer, host, port))
         } else {
             None
@@ -610,24 +611,23 @@ impl TransportFactory for TokioWebSocketTransportFactory {
         let use_tls = uri.scheme_str() == Some("wss");
         let mut builder = ClientBuilder::from_uri(uri).connector(connector);
         if let Some(origin) = &self.origin {
-            let value = http::HeaderValue::from_str(origin)
-                .map_err(|e| wacore::anyhow::anyhow!("Invalid Origin {origin:?}: {e}"))?;
+            let value = http::HeaderValue::from_str(origin).map_err(|source| {
+                TokioTransportError::InvalidOrigin {
+                    origin: origin.clone(),
+                    source,
+                }
+            })?;
             builder = builder
                 .add_header(http::header::ORIGIN, value)
-                .map_err(|e| wacore::anyhow::anyhow!("Failed to set Origin header: {e}"))?;
+                .map_err(TokioTransportError::SetOriginHeader)?;
         }
 
         debug!("Dialing WebSocket");
         if let Some((dialer, host, port)) = custom_dial {
-            let stream = dialer.dial(&host, port).await.map_err(|e| match e {
-                TokioTransportError::Io(io) => {
-                    wacore::anyhow::Error::new(io).context("Stream dial failed")
-                }
-                TokioTransportError::Custom(c) => {
-                    wacore::anyhow::Error::from_boxed(c).context("Stream dial failed")
-                }
-                other => wacore::anyhow::Error::new(other).context("Stream dial failed"),
-            })?;
+            let stream = dialer
+                .dial(&host, port)
+                .await
+                .map_err(|error| TokioTransportError::Dial(Box::new(error)))?;
             let connector = if use_tls {
                 connector
             } else {
@@ -684,9 +684,8 @@ fn dial_destination(uri: &http::Uri) -> Result<(String, u16), TokioTransportErro
     ))
 }
 
-fn connect_error(error: tokio_websockets::Error) -> wacore::anyhow::Error {
-    let message = format!("WebSocket connect failed: {error}");
-    wacore::anyhow::Error::new(error).context(message)
+fn connect_error(error: tokio_websockets::Error) -> TokioTransportError {
+    TokioTransportError::Connect(error)
 }
 
 #[cfg(test)]
@@ -1214,7 +1213,10 @@ mod tests {
                                 error.to_string().contains("certificate not valid for name"),
                                 "{error}"
                             );
-                            assert!(error.downcast_ref::<tokio_websockets::Error>().is_some());
+                            assert!(matches!(
+                                error.downcast_ref::<TokioTransportError>(),
+                                Some(TokioTransportError::Connect(_))
+                            ));
                         }
                     }
                 };

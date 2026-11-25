@@ -1160,7 +1160,11 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl wacore::store::CacheStore for SharedCacheStore {
-        async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(self
                 .entries
                 .lock()
@@ -1175,7 +1179,7 @@ mod tests {
             key: &str,
             value: &[u8],
             _: Option<std::time::Duration>,
-        ) -> anyhow::Result<()> {
+        ) -> crate::cache_store::CacheResult<()> {
             if self
                 .fail_namespace
                 .lock()
@@ -1183,7 +1187,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|blocked| *blocked == namespace)
             {
-                anyhow::bail!("synthetic cache write failure");
+                return Err(std::io::Error::other("synthetic cache write failure").into());
             }
             self.entries
                 .lock()
@@ -1192,7 +1196,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+        async fn delete(&self, namespace: &str, key: &str) -> crate::cache_store::CacheResult<()> {
             self.entries
                 .lock()
                 .unwrap()
@@ -1200,7 +1204,7 @@ mod tests {
             Ok(())
         }
 
-        async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+        async fn clear(&self, namespace: &str) -> crate::cache_store::CacheResult<()> {
             self.entries
                 .lock()
                 .unwrap()

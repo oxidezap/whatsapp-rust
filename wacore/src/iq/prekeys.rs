@@ -42,7 +42,34 @@ use crate::iq::spec::IqSpec;
 use crate::prekeys::PreKeyUtils;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
-use anyhow::anyhow;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PreKeyParseError {
+    #[error("{0}")]
+    Structure(#[from] crate::iq::node::IqParseError),
+    #[error("expected <{expected}>, got <{actual}>")]
+    UnexpectedTag {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("Missing <count> node in response")]
+    MissingCount,
+    #[error("missing <digest> child in response")]
+    MissingDigest,
+    #[error("missing or empty bytes in <{0}>")]
+    MissingOrEmptyBytes(&'static str),
+    #[error("missing bytes in <{0}>")]
+    MissingBytes(&'static str),
+    #[error("Expected 3 bytes for ID, got {0}")]
+    InvalidIdLength(usize),
+    #[error("{name} must be {length} bytes")]
+    InvalidLength { name: &'static str, length: usize },
+    #[error("missing required attribute jid")]
+    MissingJid,
+    #[error("device-identity must be bytes")]
+    InvalidDeviceIdentity,
+}
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 use wacore_binary::{Jid, Server};
@@ -69,6 +96,7 @@ impl PreKeyCountSpec {
 
 impl IqSpec for PreKeyCountSpec {
     type Response = PreKeyCountResponse;
+    type Error = PreKeyParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let count_node = NodeBuilder::new("count").build();
@@ -80,10 +108,10 @@ impl IqSpec for PreKeyCountSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let count_node = response
             .get_optional_child("count")
-            .ok_or_else(|| anyhow!("Missing <count> node in response"))?;
+            .ok_or(PreKeyParseError::MissingCount)?;
 
         // Server may return <count/> without value attribute when count is 0,
         // or return an unparseable value. Default to 0 in these cases.
@@ -145,6 +173,7 @@ impl PreKeyFetchSpec {
 
 impl IqSpec for PreKeyFetchSpec {
     type Response = crate::prekeys::PreKeyFetchOutcome;
+    type Error = crate::prekeys::MissingPreKeyList;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let content = PreKeyUtils::build_fetch_prekeys_request(
@@ -159,7 +188,7 @@ impl IqSpec for PreKeyFetchSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         PreKeyUtils::parse_prekeys_response(response, &self.account_identities)
     }
 }
@@ -228,6 +257,7 @@ pub struct DigestKeyBundleResponse {
 
 impl IqSpec for DigestKeyBundleSpec {
     type Response = DigestKeyBundleResponse;
+    type Error = PreKeyParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let digest_node = NodeBuilder::new("digest").build();
@@ -239,10 +269,10 @@ impl IqSpec for DigestKeyBundleSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let digest_node = response
             .get_optional_child("digest")
-            .ok_or_else(|| anyhow::anyhow!("missing <digest> child in response"))?;
+            .ok_or(PreKeyParseError::MissingDigest)?;
 
         // Required fields — error if missing node or empty content
         let reg_node = required_child(digest_node, "registration")?;
@@ -251,7 +281,7 @@ impl IqSpec for DigestKeyBundleSpec {
         let identity_node = required_child(digest_node, "identity")?;
         let identity = match identity_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => b.to_vec(),
-            _ => return Err(anyhow!("missing or empty bytes in <identity>")),
+            _ => return Err(PreKeyParseError::MissingOrEmptyBytes("identity")),
         };
 
         let skey_node = digest_node.get_optional_child("skey");
@@ -282,7 +312,7 @@ impl IqSpec for DigestKeyBundleSpec {
         let hash_node = required_child(digest_node, "hash")?;
         let hash = match hash_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => b.to_vec(),
-            _ => return Err(anyhow!("missing or empty bytes in <hash>")),
+            _ => return Err(PreKeyParseError::MissingOrEmptyBytes("hash")),
         };
 
         Ok(DigestKeyBundleResponse {
@@ -455,6 +485,7 @@ impl EncodeNode for PreKeyUploadIqNode<'_> {
 
 impl IqSpec for PreKeyUploadSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let content = PreKeyUtils::build_upload_prekeys_request(
@@ -475,7 +506,11 @@ impl IqSpec for PreKeyUploadSpec {
         )
     }
 
-    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+    fn encode_iq_direct(
+        &self,
+        request_id: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, wacore_binary::error::BinaryError> {
         // Each key uses four short list headers, three tokens, two length
         // headers, and 35 bytes of payload.
         out.reserve(self.pre_keys.len() * 50 + 256);
@@ -489,7 +524,7 @@ impl IqSpec for PreKeyUploadSpec {
         Ok(true)
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Pre-key upload just needs a successful response
         Ok(())
     }
@@ -526,6 +561,7 @@ impl RotateSignedPreKeySpec {
 
 impl IqSpec for RotateSignedPreKeySpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         // Reuse the upload path's <skey> shape (id 3-byte BE, value 32-byte,
@@ -545,7 +581,7 @@ impl IqSpec for RotateSignedPreKeySpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -566,9 +602,9 @@ fn truncate_to_3bytes(id: u32) -> Vec<u8> {
 }
 
 /// Helper function to expand 3-byte big-endian to u32.
-fn expand_from_3bytes(bytes: &[u8]) -> Result<u32, anyhow::Error> {
+fn expand_from_3bytes(bytes: &[u8]) -> Result<u32, PreKeyParseError> {
     if bytes.len() != 3 {
-        return Err(anyhow!("Expected 3 bytes for ID, got {}", bytes.len()));
+        return Err(PreKeyParseError::InvalidIdLength(bytes.len()));
     }
     Ok(u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]))
 }
@@ -601,6 +637,8 @@ impl SignedPreKeyNode {
 }
 
 impl ProtocolNode for SignedPreKeyNode {
+    type Error = PreKeyParseError;
+
     fn tag(&self) -> &'static str {
         "skey"
     }
@@ -617,34 +655,43 @@ impl ProtocolNode for SignedPreKeyNode {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "skey" {
-            return Err(anyhow!("expected <skey>, got <{}>", node.tag));
+            return Err(PreKeyParseError::UnexpectedTag {
+                expected: "skey",
+                actual: node.tag.to_string(),
+            });
         }
 
         let id_node = required_child(node, "id")?;
         let id_bytes = match id_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
-            _ => return Err(anyhow!("missing bytes in <id>")),
+            _ => return Err(PreKeyParseError::MissingBytes("id")),
         };
         let id = expand_from_3bytes(id_bytes)?;
 
         let value_node = required_child(node, "value")?;
         let public_bytes = match value_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
-            _ => return Err(anyhow!("missing bytes in <value>")),
+            _ => return Err(PreKeyParseError::MissingBytes("value")),
         };
         if public_bytes.len() != 32 {
-            return Err(anyhow!("signed prekey public key must be 32 bytes"));
+            return Err(PreKeyParseError::InvalidLength {
+                name: "signed prekey public key",
+                length: 32,
+            });
         }
 
         let sig_node = required_child(node, "signature")?;
         let signature = match sig_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
-            _ => return Err(anyhow!("missing bytes in <signature>")),
+            _ => return Err(PreKeyParseError::MissingBytes("signature")),
         };
         if signature.len() != 64 {
-            return Err(anyhow!("signed prekey signature must be 64 bytes"));
+            return Err(PreKeyParseError::InvalidLength {
+                name: "signed prekey signature",
+                length: 64,
+            });
         }
 
         Ok(Self {
@@ -677,6 +724,8 @@ impl OneTimePreKeyNode {
 }
 
 impl ProtocolNode for OneTimePreKeyNode {
+    type Error = PreKeyParseError;
+
     fn tag(&self) -> &'static str {
         "key"
     }
@@ -692,25 +741,31 @@ impl ProtocolNode for OneTimePreKeyNode {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "key" {
-            return Err(anyhow!("expected <key>, got <{}>", node.tag));
+            return Err(PreKeyParseError::UnexpectedTag {
+                expected: "key",
+                actual: node.tag.to_string(),
+            });
         }
 
         let id_node = required_child(node, "id")?;
         let id_bytes = match id_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
-            _ => return Err(anyhow!("missing bytes in <id>")),
+            _ => return Err(PreKeyParseError::MissingBytes("id")),
         };
         let id = expand_from_3bytes(id_bytes)?;
 
         let value_node = required_child(node, "value")?;
         let public_bytes = match value_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
-            _ => return Err(anyhow!("missing bytes in <value>")),
+            _ => return Err(PreKeyParseError::MissingBytes("value")),
         };
         if public_bytes.len() != 32 {
-            return Err(anyhow!("one-time prekey public key must be 32 bytes"));
+            return Err(PreKeyParseError::InvalidLength {
+                name: "one-time prekey public key",
+                length: 32,
+            });
         }
 
         Ok(Self { id, public_bytes })
@@ -754,7 +809,7 @@ impl PreKeyBundleUserNode {
         jid: Jid,
         bundle: &PreKeyBundle,
         device_identity: Option<Vec<u8>>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, crate::libsignal::protocol::SignalProtocolError> {
         let registration_id = bundle.registration_id()?;
 
         // Identity key must be 32 bytes (raw key).
@@ -797,6 +852,8 @@ impl PreKeyBundleUserNode {
 }
 
 impl ProtocolNode for PreKeyBundleUserNode {
+    type Error = PreKeyParseError;
+
     fn tag(&self) -> &'static str {
         "user"
     }
@@ -834,24 +891,30 @@ impl ProtocolNode for PreKeyBundleUserNode {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "user" {
-            return Err(anyhow!("expected <user>, got <{}>", node.tag));
+            return Err(PreKeyParseError::UnexpectedTag {
+                expected: "user",
+                actual: node.tag.to_string(),
+            });
         }
 
         let jid = node
             .attrs()
             .optional_jid("jid")
-            .ok_or_else(|| anyhow!("missing required attribute jid"))?;
+            .ok_or(PreKeyParseError::MissingJid)?;
 
         // Parse registration ID (4 bytes big-endian)
         let reg_node = required_child(node, "registration")?;
         let reg_bytes = match reg_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
-            _ => return Err(anyhow!("missing bytes in <registration>")),
+            _ => return Err(PreKeyParseError::MissingBytes("registration")),
         };
         if reg_bytes.len() != 4 {
-            return Err(anyhow!("registration ID must be 4 bytes"));
+            return Err(PreKeyParseError::InvalidLength {
+                name: "registration ID",
+                length: 4,
+            });
         }
         let registration_id =
             u32::from_be_bytes([reg_bytes[0], reg_bytes[1], reg_bytes[2], reg_bytes[3]]);
@@ -860,10 +923,13 @@ impl ProtocolNode for PreKeyBundleUserNode {
         let identity_node = required_child(node, "identity")?;
         let identity_key = match identity_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
-            _ => return Err(anyhow!("missing bytes in <identity>")),
+            _ => return Err(PreKeyParseError::MissingBytes("identity")),
         };
         if identity_key.len() != 32 {
-            return Err(anyhow!("identity key must be 32 bytes"));
+            return Err(PreKeyParseError::InvalidLength {
+                name: "identity key",
+                length: 32,
+            });
         }
 
         // Parse signed prekey
@@ -880,7 +946,7 @@ impl ProtocolNode for PreKeyBundleUserNode {
         let device_identity = match node.get_optional_child("device-identity") {
             Some(n) => match n.content.as_ref() {
                 Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
-                _ => return Err(anyhow!("device-identity must be bytes")),
+                _ => return Err(PreKeyParseError::InvalidDeviceIdentity),
             },
             None => None,
         };

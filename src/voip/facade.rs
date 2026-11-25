@@ -5510,7 +5510,7 @@ mod tests {
 
     #[async_trait]
     impl crate::transport::Transport for GatedSendTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) != self.gate_attempt {
                 return Ok(());
             }
@@ -5523,7 +5523,7 @@ mod tests {
                 .await
                 .map_err(|_| anyhow::anyhow!("send gate closed"))?;
             if self.fail_gated_send {
-                Err(anyhow::anyhow!("injected gated send failure"))
+                Err("injected gated send failure".into())
             } else {
                 Ok(())
             }
@@ -9643,10 +9643,10 @@ mod tests {
         }
         #[async_trait]
         impl crate::transport::Transport for CountingTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 let attempt = self.count.fetch_add(1, Ordering::SeqCst);
                 if self.failure_after.is_some_and(|limit| attempt >= limit) {
-                    return Err(anyhow::anyhow!("injected transport send failure"));
+                    return Err("injected transport send failure".into());
                 }
                 Ok(())
             }
@@ -11449,7 +11449,7 @@ mod tests {
 
         #[async_trait]
         impl crate::transport::Transport for CancelAwareTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     let _ = self.first_started.try_send(());
                     self.first_release
@@ -14145,7 +14145,10 @@ mod control_only_tests {
         struct OkTransport;
         #[async_trait::async_trait]
         impl crate::transport::Transport for OkTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 Ok(())
             }
             async fn disconnect(&self) {}

@@ -421,7 +421,7 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl Transport for TestTransport {
-        async fn send(&self, _data: Bytes) -> Result<()> {
+        async fn send(&self, _data: Bytes) -> Result<(), whatsapp_rust::transport::TransportError> {
             Ok(())
         }
 
@@ -432,7 +432,12 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl TransportFactory for TestTransportFactory {
-        async fn create_transport(&self) -> Result<(Arc<dyn Transport>, Receiver<TransportEvent>)> {
+        async fn create_transport(
+            &self,
+        ) -> Result<
+            (Arc<dyn Transport>, Receiver<TransportEvent>),
+            whatsapp_rust::transport::TransportError,
+        > {
             let (_sender, receiver) = whatsapp_rust::async_channel::bounded(1);
             Ok((Arc::new(TestTransport), receiver))
         }
@@ -442,7 +447,10 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl HttpClient for TestHttpClient {
-        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
             Ok(HttpResponse::new(200, Vec::new()))
         }
     }

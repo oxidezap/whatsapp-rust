@@ -395,7 +395,7 @@ pub type BlobDownloadFn<'a> =
     dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + Send + Sync + 'a;
 
 /// Reason a SyncdSnapshotRecovery payload was refused.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum SnapshotRecoveryError {
     #[error("snapshot recovery names no collection")]
@@ -450,6 +450,12 @@ pub enum SnapshotRecoveryError {
         collection: String,
         record_index: usize,
     },
+}
+
+impl std::fmt::Debug for SnapshotRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Error)]

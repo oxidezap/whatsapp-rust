@@ -333,7 +333,6 @@ mod tests {
     use crate::http::{HttpClient, HttpRequest, HttpResponse};
     use crate::store::SqliteStore;
     use crate::store::commands::DeviceCommand;
-    use anyhow::Result;
     use std::str::FromStr;
     use std::sync::Arc;
     use wacore::store::traits::Backend;
@@ -345,7 +344,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HttpClient for MockHttpClient {
-        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             Ok(HttpResponse::new(200, br#"self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"SiteData\":{\"server_revision\":1026131876,\"client_revision\":1026131876}}}");"#.to_vec()))
         }
     }
@@ -669,7 +671,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, data: Bytes) -> Result<(), crate::transport::TransportError> {
                 if self.gate_next_send.swap(false, Ordering::AcqRel) {
                     self.started
                         .send(())

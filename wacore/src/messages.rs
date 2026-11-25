@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use buffa::MessageView;
 use compact_str::CompactString;
@@ -10,6 +9,50 @@ use buffa::Message as _;
 use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PaddingError {
+    #[error("plaintext is empty, cannot unpad")]
+    Empty,
+    #[error("invalid padding length: {0}")]
+    InvalidLength(usize),
+    #[error("invalid padding bytes")]
+    InvalidBytes,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PlaintextDecodeError {
+    #[error("{0}")]
+    Padding(#[from] PaddingError),
+    #[error("{0}")]
+    Wire(#[from] buffa::DecodeError),
+    #[error("Failed to decode decrypted plaintext: {0}")]
+    Decode(#[source] buffa::DecodeError),
+    #[error("inline history-sync payload had no decoded notification")]
+    MissingHistoryNotification,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ParticipantHashError {
+    #[error("participant list is too large to hash: {0} bytes of rendered JIDs")]
+    InputTooLarge(usize),
+    #[error("failed to encode phash: {0:?}")]
+    Encoding(base64::EncodeSliceError),
+    #[error("phash is not valid utf-8: {0:?}")]
+    Utf8(#[source] std::str::Utf8Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MessageInfoError {
+    #[error("{0}")]
+    Attribute(#[from] wacore_binary::BinaryError),
+    #[error("message stanza has an empty required 'id' attribute")]
+    EmptyId,
+}
 
 /// Names a JID-valued protobuf string field without requiring it to exist as a
 /// `String`: the DSM destination, and the group id on the sender-key
@@ -511,7 +554,7 @@ impl MessageUtils {
     )]
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
-    ) -> Result<CompactString> {
+    ) -> Result<CompactString, ParticipantHashError> {
         // Format every device into one shared arena and sort range views over
         // it instead of a heap String per device (this runs over the full
         // device set of a send). Sorting the slices is the same lexicographic
@@ -540,7 +583,10 @@ impl MessageUtils {
     // Keep the sort and hash shared across the public iterator API's
     // monomorphizations; only rendering the input depends on the iterator.
     #[inline(never)]
-    fn hash_participant_ranges(arena: &str, ranges: &mut [(u32, u32)]) -> Result<CompactString> {
+    fn hash_participant_ranges(
+        arena: &str,
+        ranges: &mut [(u32, u32)],
+    ) -> Result<CompactString, ParticipantHashError> {
         // The rendered offsets only ever grow, so one check on the finished arena
         // covers every one of them: if the whole arena addresses in a `u32`,
         // then so did each `start` and `end` recorded from it. A device set
@@ -550,10 +596,7 @@ impl MessageUtils {
         // rather than trusted. Checking here instead of per JID keeps it to a
         // single comparison, and the ranges are not read before this point.
         if u32::try_from(arena.len()).is_err() {
-            return Err(anyhow!(
-                "participant list is too large to hash: {} bytes of rendered JIDs",
-                arena.len()
-            ));
+            return Err(ParticipantHashError::InputTooLarge(arena.len()));
         }
         // Compare and hash over the bytes, not the `String`: indexing a `str`
         // re-checks a UTF-8 boundary at both ends of every probe, and the sort
@@ -595,9 +638,8 @@ impl MessageUtils {
         out[..2].copy_from_slice(b"2:");
         let encoded = base64::prelude::BASE64_STANDARD_NO_PAD
             .encode_slice(&full_hash[..6], &mut out[2..])
-            .map_err(|e| anyhow!("failed to encode phash: {:?}", e))?;
-        let out = std::str::from_utf8(&out[..2 + encoded])
-            .map_err(|e| anyhow!("phash is not valid utf-8: {:?}", e))?;
+            .map_err(ParticipantHashError::Encoding)?;
+        let out = std::str::from_utf8(&out[..2 + encoded]).map_err(ParticipantHashError::Utf8)?;
         Ok(CompactString::from(out))
     }
 
@@ -612,27 +654,27 @@ impl MessageUtils {
         Self::participant_list_hash(participants).is_ok_and(|computed| computed == expected)
     }
 
-    pub fn unpadded_message_len(plaintext: &[u8], version: u8) -> Result<usize> {
+    pub fn unpadded_message_len(plaintext: &[u8], version: u8) -> Result<usize, PaddingError> {
         if version == 3 {
             return Ok(plaintext.len());
         }
         if plaintext.is_empty() {
-            return Err(anyhow::anyhow!("plaintext is empty, cannot unpad"));
+            return Err(PaddingError::Empty);
         }
         let pad_len = plaintext[plaintext.len() - 1] as usize;
         if pad_len == 0 || pad_len > plaintext.len() {
-            return Err(anyhow::anyhow!("invalid padding length: {}", pad_len));
+            return Err(PaddingError::InvalidLength(pad_len));
         }
         let (data, padding) = plaintext.split_at(plaintext.len() - pad_len);
         for &byte in padding {
             if byte != pad_len as u8 {
-                return Err(anyhow::anyhow!("invalid padding bytes"));
+                return Err(PaddingError::InvalidBytes);
             }
         }
         Ok(data.len())
     }
 
-    pub fn unpad_message_ref(plaintext: &[u8], version: u8) -> Result<&[u8]> {
+    pub fn unpad_message_ref(plaintext: &[u8], version: u8) -> Result<&[u8], PaddingError> {
         let unpadded_len = Self::unpadded_message_len(plaintext, version)?;
         Ok(&plaintext[..unpadded_len])
     }
@@ -643,13 +685,15 @@ impl MessageUtils {
 /// Unpads the plaintext (using the given padding version) and decodes the
 /// protobuf bytes into a WhatsApp Message. This is the pure,
 /// runtime-independent portion of `handle_decrypted_plaintext`.
-pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<wa::Message> {
+pub fn decode_plaintext(
+    padded_plaintext: &[u8],
+    padding_version: u8,
+) -> Result<wa::Message, PlaintextDecodeError> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     // Route through the pinned codec entry point so the Message decode tree
     // (BotMetadata/ProtocolMessage/ContextInfo merge_field, etc.) is
     // instantiated once in waproto instead of copied into every calling crate.
-    waproto::codec::message_decode(plaintext_slice)
-        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+    waproto::codec::message_decode(plaintext_slice).map_err(PlaintextDecodeError::Decode)
 }
 
 /// History-sync metadata detached from a decoded plaintext while the large
@@ -684,7 +728,7 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
 pub fn decode_plaintext_detached_history_sync(
     padded_plaintext: Vec<u8>,
     padding_version: u8,
-) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>), PlaintextDecodeError> {
     decode_unpadded_detached_history_sync(unpad_plaintext(padded_plaintext, padding_version)?)
 }
 
@@ -694,7 +738,10 @@ pub fn decode_plaintext_detached_history_sync(
 /// bytes in between are worth having on their own: a payload that unpads
 /// cleanly but does not decode is a protocol change, while one that fails here
 /// is a corrupt frame. Returns `Bytes`, so passing it on costs a refcount bump.
-pub fn unpad_plaintext(padded_plaintext: Vec<u8>, padding_version: u8) -> Result<bytes::Bytes> {
+pub fn unpad_plaintext(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<bytes::Bytes, PaddingError> {
     let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
     Ok(bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len))
 }
@@ -713,7 +760,7 @@ pub fn unpad_plaintext(padded_plaintext: Vec<u8>, padding_version: u8) -> Result
 /// [`decode_plaintext_detached_history_sync`] to do both in one call.
 pub fn decode_unpadded_detached_history_sync(
     source: bytes::Bytes,
-) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>), PlaintextDecodeError> {
     // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
     // that message is dispatched. Inspecting just this generated-tag path
     // avoids decoding/materializing the complete MessageView graph.
@@ -743,15 +790,15 @@ pub fn decode_unpadded_detached_history_sync(
     #[cfg(feature = "tracing")]
     let _materialize_guard = materialize_span.enter();
     let encoded = redaction.rewritten.as_deref().unwrap_or(&source);
-    let mut message = waproto::codec::message_decode(encoded)
-        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))?;
+    let mut message =
+        waproto::codec::message_decode(encoded).map_err(PlaintextDecodeError::Decode)?;
 
     let mut history_sync =
         take_history_sync_notification(&mut message).map(DetachedHistorySyncNotification::from);
     if let Some(payload_range) = redaction.detached_value {
         let detached = history_sync
             .as_mut()
-            .ok_or_else(|| anyhow!("inline history-sync payload had no decoded notification"))?;
+            .ok_or(PlaintextDecodeError::MissingHistoryNotification)?;
         detached.inline_payload = Some(source.slice(payload_range));
     }
 
@@ -787,7 +834,9 @@ struct WireRedaction {
 /// Original notification fragments, including unknown fields. Concatenating
 /// repeated singular submessages preserves protobuf merge semantics. Slices
 /// share the carrier so even large inline payloads are not copied here.
-pub fn history_sync_notification_wire(source: &bytes::Bytes) -> Result<Vec<bytes::Bytes>> {
+pub fn history_sync_notification_wire(
+    source: &bytes::Bytes,
+) -> Result<Vec<bytes::Bytes>, buffa::DecodeError> {
     let path = if contains_nested_message_field(source, DEVICE_SENT_INNER_MESSAGE_PATH)? {
         DEVICE_SENT_HISTORY_PAYLOAD_PATH
     } else {
@@ -946,21 +995,19 @@ fn length_delimited_value_range(
 pub fn decode_plaintext_view(
     padded_plaintext: &[u8],
     padding_version: u8,
-) -> Result<wa::MessageView<'_>> {
+) -> Result<wa::MessageView<'_>, PlaintextDecodeError> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
-    wa::MessageView::decode_view(plaintext_slice)
-        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+    wa::MessageView::decode_view(plaintext_slice).map_err(PlaintextDecodeError::Decode)
 }
 
 /// Decode a plaintext buffer into a self-contained Buffa view.
 pub fn decode_plaintext_owned_view(
     padded_plaintext: Vec<u8>,
     padding_version: u8,
-) -> Result<wa::MessageOwnedView> {
+) -> Result<wa::MessageOwnedView, PlaintextDecodeError> {
     let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
     let plaintext = bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
-    wa::MessageOwnedView::decode(plaintext)
-        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+    wa::MessageOwnedView::decode(plaintext).map_err(PlaintextDecodeError::Decode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -972,14 +1019,14 @@ pub struct SenderKeyDistributionOnlyPlaintext<'a> {
 pub fn sender_key_distribution_only_plaintext(
     padded_plaintext: &[u8],
     padding_version: u8,
-) -> Result<Option<SenderKeyDistributionOnlyPlaintext<'_>>> {
+) -> Result<Option<SenderKeyDistributionOnlyPlaintext<'_>>, PlaintextDecodeError> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     if !has_only_sender_key_distribution_top_level_fields(plaintext_slice)? {
         return Ok(None);
     }
 
-    let view = wa::MessageView::decode_view(plaintext_slice)
-        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))?;
+    let view =
+        wa::MessageView::decode_view(plaintext_slice).map_err(PlaintextDecodeError::Decode)?;
     let axolotl_sender_key_distribution_message = view
         .sender_key_distribution_message
         .as_option()
@@ -1410,7 +1457,7 @@ pub fn parse_message_info(
     node: &wacore_binary::NodeRef<'_>,
     own_jid: &wacore_binary::Jid,
     own_lid: Option<&wacore_binary::Jid>,
-) -> Result<crate::types::message::MessageInfo> {
+) -> Result<crate::types::message::MessageInfo, MessageInfoError> {
     use crate::types::message::{
         AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource, PollType,
         ReportingBytes, StanzaMessageType,
@@ -1419,10 +1466,9 @@ pub fn parse_message_info(
 
     let mut attrs = MessageAttrs::resolve(node);
     let id = attrs.required_string(MessageAttr::Id)?;
-    anyhow::ensure!(
-        !id.is_empty(),
-        "message stanza has an empty required 'id' attribute"
-    );
+    if id.is_empty() {
+        return Err(MessageInfoError::EmptyId);
+    }
     let id = CompactString::from(id.as_ref());
     let from = attrs.required_jid(MessageAttr::From)?;
     let addressing_mode = attrs
@@ -1583,7 +1629,7 @@ pub fn parse_message_info(
     // The display name only exists inside the <verified_name> child's cert protobuf.
     let verified_name = node
         .get_optional_child("verified_name")
-        .and_then(|vn| crate::stanza::business::VerifiedName::try_from_node(vn).ok())
+        .map(crate::stanza::business::VerifiedName::from_node)
         .map(Box::new);
 
     // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
@@ -1718,6 +1764,35 @@ pub fn parse_message_info(
 #[allow(clippy::disallowed_methods)]
 mod plaintext_view_tests {
     use super::*;
+
+    #[test]
+    fn padding_errors_distinguish_invalid_frames() {
+        assert_eq!(
+            MessageUtils::unpadded_message_len(&[], 2),
+            Err(PaddingError::Empty)
+        );
+        assert_eq!(
+            MessageUtils::unpadded_message_len(&[0], 2),
+            Err(PaddingError::InvalidLength(0))
+        );
+        assert_eq!(
+            MessageUtils::unpadded_message_len(&[1, 2], 2),
+            Err(PaddingError::InvalidBytes)
+        );
+        assert_eq!(MessageUtils::unpadded_message_len(&[], 3), Ok(0));
+    }
+
+    #[test]
+    fn plaintext_decode_retains_protobuf_error() {
+        use std::error::Error;
+        let error = decode_plaintext(&[0x80], 3).unwrap_err();
+        assert!(matches!(error, PlaintextDecodeError::Decode(_)));
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.is::<buffa::DecodeError>())
+        );
+    }
 
     fn padded(msg: &wa::Message) -> Vec<u8> {
         MessageUtils::pad_message_v2(msg.encode_to_vec())
@@ -2104,6 +2179,14 @@ mod parse_message_info_tests {
                 "invalid identity or routing attributes must be rejected: {node:?}"
             );
         }
+        assert!(matches!(
+            parse_message_info(&cases[0].as_node_ref(), &own_pn, None),
+            Err(MessageInfoError::EmptyId)
+        ));
+        assert!(matches!(
+            parse_message_info(&cases[1].as_node_ref(), &own_pn, None),
+            Err(MessageInfoError::Attribute(_))
+        ));
     }
 
     #[test]

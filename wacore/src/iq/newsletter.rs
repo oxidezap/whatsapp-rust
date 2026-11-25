@@ -9,12 +9,28 @@
 /// IQ namespace for newsletter operations (message history, reactions, live updates).
 pub const NEWSLETTER_XMLNS: &str = "newsletter";
 
-use crate::iq::node::{optional_child, required_attr, required_child};
+use crate::iq::node::{IqParseError, optional_child, required_attr, required_child};
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
-use anyhow::{Result, anyhow};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, NodeContent, NodeRef, Server};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NewsletterParseError {
+    #[error("{0}")]
+    Missing(#[from] IqParseError),
+    #[error("invalid attribute jid: {0}")]
+    InvalidJid(#[source] wacore_binary::jid::JidError),
+    #[error("invalid attribute {name}: {source}")]
+    InvalidInteger {
+        name: &'static str,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("<vote> is not a 32-byte option hash")]
+    InvalidVoteHash,
+}
 
 /// This account's own add-ons (its reaction and its poll vote) on one
 /// newsletter message, as [`MyAddOnsSpec`] reads them.
@@ -82,6 +98,7 @@ impl MyAddOnsSpec {
 
 impl IqSpec for MyAddOnsSpec {
     type Response = Vec<NewsletterMyAddOns>;
+    type Error = NewsletterParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -115,14 +132,14 @@ impl IqSpec for MyAddOnsSpec {
     /// since a `server_id` only identifies a message within its channel, but a
     /// group whose channel cannot be read is an error: skipping it would pass
     /// off its add-ons as absent.
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let my_addons = required_child(response, "my_addons")?;
 
         let mut result = Vec::new();
         for group in my_addons.get_children_by_tag("messages") {
             let channel: Jid = required_attr(group, "jid")?
                 .parse()
-                .map_err(|e| anyhow!("invalid attribute jid: {e}"))?;
+                .map_err(NewsletterParseError::InvalidJid)?;
             if channel != self.jid {
                 continue;
             }
@@ -136,13 +153,15 @@ impl IqSpec for MyAddOnsSpec {
 
 /// A required integer attribute, on top of [`required_attr`] so a missing
 /// one reads like every other missing attribute.
-fn required_u64(node: &NodeRef<'_>, key: &str) -> Result<u64> {
+fn required_u64(node: &NodeRef<'_>, key: &'static str) -> Result<u64, NewsletterParseError> {
     required_attr(node, key)?
         .parse()
-        .map_err(|e| anyhow!("invalid attribute {key}: {e}"))
+        .map_err(|source| NewsletterParseError::InvalidInteger { name: key, source })
 }
 
-fn parse_my_addons_message(msg_node: &NodeRef<'_>) -> Result<NewsletterMyAddOns> {
+fn parse_my_addons_message(
+    msg_node: &NodeRef<'_>,
+) -> Result<NewsletterMyAddOns, NewsletterParseError> {
     let server_id = required_u64(msg_node, "server_id")?;
 
     let reaction = match optional_child(msg_node, "reaction") {
@@ -161,9 +180,9 @@ fn parse_my_addons_message(msg_node: &NodeRef<'_>) -> Result<NewsletterMyAddOns>
                 .map(|vote| {
                     vote.content_bytes()
                         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                        .ok_or_else(|| anyhow!("<vote> is not a 32-byte option hash"))
+                        .ok_or(NewsletterParseError::InvalidVoteHash)
                 })
-                .collect::<Result<_>>()?;
+                .collect::<Result<_, _>>()?;
             Some(NewsletterMyPollVote {
                 timestamp,
                 option_hashes,
@@ -228,7 +247,9 @@ mod tests {
             .build()
     }
 
-    fn parse(response: &wacore_binary::Node) -> Result<Vec<NewsletterMyAddOns>> {
+    fn parse(
+        response: &wacore_binary::Node,
+    ) -> Result<Vec<NewsletterMyAddOns>, NewsletterParseError> {
         MyAddOnsSpec::new(&newsletter_jid(), 20).parse_response(&response.as_node_ref())
     }
 

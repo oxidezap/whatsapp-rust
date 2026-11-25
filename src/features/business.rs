@@ -1301,10 +1301,14 @@ mod tests {
 
         #[async_trait::async_trait]
         impl HttpClient for CatalogHttp {
-            async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+            async fn execute(
+                &self,
+                request: HttpRequest,
+            ) -> Result<HttpResponse, crate::http::HttpError> {
                 assert_eq!(request.method, "POST");
                 assert_eq!(request.url, "https://graph.whatsapp.com/graphql/catalog");
-                let body: Value = serde_json::from_slice(request.body.as_deref().unwrap())?;
+                let body: Value = serde_json::from_slice(request.body.as_deref().unwrap())
+                    .map_err(crate::http::HttpError::adapter)?;
                 assert_eq!(body["access_token"], "fixture-token");
                 let product = json!({"id": "fixture-product"});
                 let data = match body["doc_id"].as_str().unwrap() {
@@ -1336,7 +1340,8 @@ mod tests {
                 };
                 Ok(HttpResponse::new(
                     200,
-                    serde_json::to_vec(&json!({"data": data}))?,
+                    serde_json::to_vec(&json!({"data": data}))
+                        .map_err(crate::http::HttpError::adapter)?,
                 ))
             }
         }

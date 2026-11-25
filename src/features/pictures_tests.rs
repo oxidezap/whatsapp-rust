@@ -737,6 +737,19 @@ async fn picture_lookup_community_nested_rate_limit_retains_original_response() 
 #[error("fixture decode failed")]
 struct FixtureParseError(Arc<()>);
 
+mod fixture_spec_error {
+    use super::FixtureParseError;
+
+    #[derive(Debug, thiserror::Error)]
+    pub(super) enum FixtureSpecError {
+        #[error("ordinary parser context")]
+        Context(#[source] FixtureParseError),
+        #[error("{0}")]
+        Core(#[from] wacore::request::IqError),
+    }
+}
+use fixture_spec_error::FixtureSpecError;
+
 struct OrdinaryParseSpec {
     marker: Arc<()>,
     core_timeout: bool,
@@ -744,17 +757,19 @@ struct OrdinaryParseSpec {
 
 impl IqSpec for OrdinaryParseSpec {
     type Response = ();
+    type Error = FixtureSpecError;
 
     fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
         ProfilePictureSpec::preview(&Jid::pn("15550000001")).build_iq()
     }
 
-    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), anyhow::Error> {
+    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), Self::Error> {
         if self.core_timeout {
             Err(wacore::request::IqError::Timeout.into())
         } else {
-            Err(anyhow::Error::new(FixtureParseError(self.marker.clone()))
-                .context("ordinary parser context"))
+            Err(FixtureSpecError::Context(FixtureParseError(
+                self.marker.clone(),
+            )))
         }
     }
 }
@@ -783,12 +798,19 @@ async fn picture_lookup_execute_leaves_ordinary_and_non_rejection_core_parse_err
         };
         if core_timeout {
             assert!(matches!(
-                error.downcast_ref::<wacore::request::IqError>(),
+                error
+                    .as_ref()
+                    .sources()
+                    .find_map(|cause| cause.downcast_ref::<wacore::request::IqError>()),
                 Some(wacore::request::IqError::Timeout)
             ));
         } else {
             assert_eq!(error.to_string(), "ordinary parser context");
-            let original = error.downcast_ref::<FixtureParseError>().unwrap();
+            let original = error
+                .as_ref()
+                .sources()
+                .find_map(|cause| cause.downcast_ref::<FixtureParseError>())
+                .unwrap();
             assert!(Arc::ptr_eq(&marker, &original.0));
         }
     }

@@ -405,7 +405,7 @@ mod tests {
         assert!(output.contains("PermissionDenied"));
         assert!(!output.contains("synthetic-private-path-key"));
         let raw = anyhow::anyhow!("synthetic-server-plaintext");
-        let error = crate::request::IqError::ParseError(raw);
+        let error = crate::request::IqError::ParseError(raw.into_boxed_dyn_error());
         assert!(!format!("{error:#?}").contains("synthetic-server-plaintext"));
         assert!(
             std::error::Error::source(&error)

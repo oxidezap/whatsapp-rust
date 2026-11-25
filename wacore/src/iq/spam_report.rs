@@ -55,6 +55,7 @@ impl SpamReportSpec {
 
 impl IqSpec for SpamReportSpec {
     type Response = SpamReportResult;
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut children: Vec<Node> = vec![build_spam_list_node(&self.request)];
@@ -69,7 +70,7 @@ impl IqSpec for SpamReportSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Extract report_id from response if present
         let report_id = response
             .get_optional_child_by_tag(&["report_id"])

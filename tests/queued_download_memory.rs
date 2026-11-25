@@ -96,7 +96,10 @@ struct NoNetworkHttp {
 
 #[async_trait]
 impl HttpClient for NoNetworkHttp {
-    async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
         panic!("unexpected buffered HTTP");
     }
 
@@ -104,9 +107,14 @@ impl HttpClient for NoNetworkHttp {
         true
     }
 
-    fn execute_streaming(&self, _: HttpRequest) -> anyhow::Result<StreamingHttpResponse> {
+    fn execute_streaming(
+        &self,
+        _: HttpRequest,
+    ) -> Result<StreamingHttpResponse, whatsapp_rust::http::HttpError> {
         self.entered.fetch_add(1, Ordering::SeqCst);
-        anyhow::bail!("network must not run while the worker is parked");
+        Err(whatsapp_rust::http::HttpError::adapter(
+            std::io::Error::other("network must not run while the worker is parked"),
+        ))
     }
 }
 
@@ -195,13 +203,19 @@ fn allocation_failure_is_a_terminal_error() {
     }
     #[async_trait]
     impl HttpClient for BodyHttp {
-        async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _: HttpRequest,
+        ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
             unreachable!()
         }
         fn supports_streaming(&self) -> bool {
             true
         }
-        fn execute_streaming(&self, _: HttpRequest) -> anyhow::Result<StreamingHttpResponse> {
+        fn execute_streaming(
+            &self,
+            _: HttpRequest,
+        ) -> Result<StreamingHttpResponse, whatsapp_rust::http::HttpError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(StreamingHttpResponse::new(
                 200,

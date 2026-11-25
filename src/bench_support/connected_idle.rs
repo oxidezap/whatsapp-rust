@@ -1070,8 +1070,13 @@ impl Drop for Session {
 struct NoHttp;
 #[async_trait]
 impl HttpClient for NoHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
-        anyhow::bail!("connected idle fixture forbids HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+        Err(crate::http::HttpError::adapter(std::io::Error::other(
+            "connected idle fixture forbids HTTP",
+        )))
     }
 }
 
@@ -1080,7 +1085,10 @@ struct Factory(Arc<Wire>);
 impl TransportFactory for Factory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> std::result::Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        crate::transport::TransportError,
+    > {
         Ok((self.0.clone(), self.0.server_rx.clone()))
     }
 }
@@ -1299,7 +1307,7 @@ impl Wire {
 
 #[async_trait]
 impl Transport for Wire {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes) -> std::result::Result<(), crate::transport::TransportError> {
         let hello = matches!(
             *self.state.lock().unwrap_or_else(|e| e.into_inner()),
             State::Hello
@@ -1313,11 +1321,15 @@ impl Transport for Wire {
         let mut batch_frames = 0;
         while !remaining.is_empty() {
             batch_frames += 1;
-            ensure!(remaining.len() >= 3, "short fixture frame");
+            if remaining.len() < 3 {
+                return Err("short fixture frame".into());
+            }
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
                 | usize::from(remaining[2]);
-            ensure!(remaining.len() >= 3 + length, "truncated fixture frame");
+            if remaining.len() < 3 + length {
+                return Err("truncated fixture frame".into());
+            }
             let (response, node, logged_in) = self.frame(&remaining[3..3 + length])?;
             if let Some(node) = &node {
                 self.observe_delivery_receipt(node.get());

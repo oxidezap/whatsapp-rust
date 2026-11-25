@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::cache::Cache;
 use serde::{Serialize, de::DeserializeOwned};
 
-pub use wacore::store::cache::CacheStore;
+pub use wacore::store::cache::{CacheError, CacheResult, CacheStore};
 
 // Share JSON decoding independently of the cache's key and borrowed-key types.
 #[inline(never)]
@@ -152,7 +152,11 @@ where
             Inner::Local(cache) => Ok(cache.get(key).await.is_some()),
             Inner::Custom {
                 store, namespace, ..
-            } => Ok(store.get(namespace, &key.to_string()).await?.is_some()),
+            } => Ok(store
+                .get(namespace, &key.to_string())
+                .await
+                .map_err(anyhow::Error::from_boxed)?
+                .is_some()),
         }
     }
 
@@ -206,7 +210,7 @@ where
                 let key_str = key.to_string();
                 if let Err(error) = store.delete(namespace, &key_str).await {
                     log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {error}");
-                    return Err(error);
+                    return Err(anyhow::Error::from_boxed(error));
                 }
             }
         }

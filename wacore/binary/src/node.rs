@@ -737,6 +737,12 @@ impl serde::Serialize for NodeRef<'_> {
 }
 
 impl<'a> NodeRef<'a> {
+    /// Returns the node's tag.
+    #[inline]
+    pub fn tag(&self) -> &str {
+        self.tag.as_ref()
+    }
+
     pub fn new(tag: NodeStr<'a>, attrs: AttrsRef<'a>, content: Option<NodeContentRef<'a>>) -> Self {
         Self {
             tag,
@@ -1014,6 +1020,14 @@ impl OwnedNodeRef {
 #[cfg(test)]
 mod attrs_capacity_tests {
     use super::*;
+
+    #[test]
+    fn node_ref_tag_accessor_handles_borrowed_and_owned_tags() {
+        let borrowed = NodeRef::new(NodeStr::Borrowed("body"), AttrsRef::Empty, None);
+        let owned = NodeRef::new(NodeStr::Owned("body".into()), AttrsRef::Empty, None);
+        assert_eq!(borrowed.tag(), "body");
+        assert_eq!(owned.tag(), "body");
+    }
 
     fn node_with(n: usize) -> Node {
         const KEYS: [&str; 8] = ["to", "id", "type", "t", "edit", "phash", "count", "offline"];

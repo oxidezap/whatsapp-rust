@@ -1,7 +1,7 @@
 //! Independent downstream proof: no default features, no live WhatsApp session.
 use std::sync::Arc;
 use std::time::Duration;
-use whatsapp_rust::anyhow::Result;
+use whatsapp_rust::CacheResult as Result;
 use whatsapp_rust::cache_config::CacheStore;
 use whatsapp_rust::media::{AudioOptions, DocumentOptions, ImageOptions, VideoOptions};
 use whatsapp_rust::waproto::whatsapp as wa;

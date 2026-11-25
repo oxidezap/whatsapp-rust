@@ -3,12 +3,35 @@
 //! Thin wrapper over [`secret_enc_addon`](crate::secret_enc_addon) specialised for the
 //! `PollVoteMessage` proto and the `"Poll Vote"` use-case.
 
-use anyhow::{Result, anyhow, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::secret_enc_addon::{
     AddonContext, MESSAGE_SECRET_SIZE, ModificationType, build_aad, decrypt_addon, encrypt_addon,
 };
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PollVoteError {
+    #[error("message_secret must be 32 bytes, got {0}")]
+    InvalidSecretSize(usize),
+    #[error("Invalid IV size: expected 12, got {0}")]
+    InvalidIvSize(usize),
+    #[error("Encrypted payload too short: need at least 16 bytes for tag, got {0}")]
+    PayloadTooShort(usize),
+    #[error("Poll vote GCM tag verification failed")]
+    AuthenticationFailed,
+    #[error("{0}")]
+    Addon(#[from] crate::secret_enc_addon::AddonError),
+    #[error("{0}")]
+    Decode(#[from] buffa::DecodeError),
+    #[error("poll vote decrypt failed: primary={primary}; fallback={fallback}")]
+    Fallback {
+        primary: Box<PollVoteError>,
+        fallback: Box<PollVoteError>,
+    },
+}
+
+type Result<T> = std::result::Result<T, PollVoteError>;
 
 const GCM_IV_SIZE: usize = 12;
 const GCM_TAG_SIZE: usize = 16;
@@ -99,12 +122,9 @@ pub fn decrypt_poll_vote(
 
     let nonce: &[u8; GCM_IV_SIZE] = iv
         .try_into()
-        .map_err(|_| anyhow!("Invalid IV size: expected {GCM_IV_SIZE}, got {}", iv.len()))?;
+        .map_err(|_| PollVoteError::InvalidIvSize(iv.len()))?;
     if enc_payload.len() < GCM_TAG_SIZE {
-        return Err(anyhow!(
-            "Encrypted payload too short: need at least {GCM_TAG_SIZE} bytes for tag, got {}",
-            enc_payload.len()
-        ));
+        return Err(PollVoteError::PayloadTooShort(enc_payload.len()));
     }
 
     // poll_creator_jid is not part of the AAD; supply an empty placeholder.
@@ -112,7 +132,7 @@ pub fn decrypt_poll_vote(
 
     let mut plaintext = Vec::with_capacity(enc_payload.len().saturating_sub(GCM_TAG_SIZE));
     aes_256_gcm_decrypt(encryption_key, nonce, &aad, enc_payload, &mut plaintext)
-        .map_err(|_| anyhow!("Poll vote GCM tag verification failed"))?;
+        .map_err(|_| PollVoteError::AuthenticationFailed)?;
 
     decode_selected_options(&plaintext)
 }
@@ -161,8 +181,9 @@ pub fn decrypt_poll_vote_with_fallback(
                 fb.poll_creator_jid,
                 fb.voter_jid,
             )
-            .map_err(|fb_err| {
-                anyhow!("poll vote decrypt failed: primary={primary_err}; fallback={fb_err}")
+            .map_err(|fb_err| PollVoteError::Fallback {
+                primary: Box::new(primary_err),
+                fallback: Box::new(fb_err),
             }),
             None => Err(primary_err),
         },
@@ -205,8 +226,9 @@ where
                 fb.voter_jid,
                 &mut visit,
             )
-            .map_err(|fb_err| {
-                anyhow!("poll vote decrypt failed: primary={primary_err}; fallback={fb_err}")
+            .map_err(|fb_err| PollVoteError::Fallback {
+                primary: Box::new(primary_err),
+                fallback: Box::new(fb_err),
             }),
             None => Err(primary_err),
         },
@@ -243,11 +265,9 @@ pub fn decrypt_poll_vote_payload_with_secret(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<Vec<u8>> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(PollVoteError::InvalidSecretSize(message_secret.len()));
+    }
     decrypt_addon(
         ciphertext.enc_payload,
         ciphertext.enc_iv,

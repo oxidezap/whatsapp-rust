@@ -99,7 +99,7 @@ struct SuppliedHttp {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl HttpClient for SuppliedHttp {
-    async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let durable = self
             .backend
