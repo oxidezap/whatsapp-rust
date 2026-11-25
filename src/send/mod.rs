@@ -4477,7 +4477,7 @@ mod tests {
 
         let failed: anyhow::Error = NoRecipientDeviceError::EncryptionFailed {
             attempted: 2,
-            source: anyhow!("session with 5511900000099:1 not found"),
+            source: Box::new(wacore::send::DeviceEncryptionError::NoCiphertext),
         }
         .into();
         // Wrapped the way the send path bubbles it: through `?` under context.

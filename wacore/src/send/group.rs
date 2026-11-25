@@ -483,13 +483,15 @@ pub async fn prepare_group_stanza_resolved(
                         && (encrypted_devices.len() != distribution_list.len()
                             || first_error.is_some())
                     {
-                        let error = first_error.unwrap_or_else(|| {
-                            anyhow!(
-                                "sender-key distribution encrypted {} of {} required targets",
-                                encrypted_devices.len(),
-                                distribution_list.len()
-                            )
-                        });
+                        let error = first_error
+                            .map(|error| anyhow::Error::new(*error))
+                            .unwrap_or_else(|| {
+                                anyhow!(
+                                    "sender-key distribution encrypted {} of {} required targets",
+                                    encrypted_devices.len(),
+                                    distribution_list.len()
+                                )
+                            });
                         let stale_device_users = stale_users_for(
                             had_unregistered_device,
                             &rejected_devices,

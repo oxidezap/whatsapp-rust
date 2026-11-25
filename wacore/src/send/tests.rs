@@ -3681,6 +3681,8 @@ mod device_unregistered_tests {
             backoff: None,
         });
         assert_eq!(error.server_error().map(|server| server.code), Some(406));
+        let error = anyhow::Error::new(super::DeviceEncryptionError::Resolver(error));
+        assert!(is_device_unregistered_error(&error));
     }
 
     #[test]

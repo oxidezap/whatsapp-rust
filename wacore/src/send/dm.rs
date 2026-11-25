@@ -90,7 +90,7 @@ pub enum NoRecipientDeviceError {
     EncryptionFailed {
         attempted: usize,
         #[source]
-        source: anyhow::Error,
+        source: Box<DeviceEncryptionError>,
     },
     /// The fan-out held no device for the recipient to begin with. Distinct
     /// from the above: nothing was attempted, so there is no per-device cause.
@@ -121,13 +121,13 @@ impl PrimaryDeviceRejected {
 }
 
 impl NoRecipientDeviceError {
-    fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
+    fn encryption_failed(attempted: usize, source: Option<Box<DeviceEncryptionError>>) -> Self {
         Self::EncryptionFailed {
             attempted,
             // A device can also drop out without an error (an encrypt that
             // produced an unsupported ciphertext type), so the source is
             // synthesised rather than left absent.
-            source: source.unwrap_or_else(|| anyhow!("no recipient device produced a ciphertext")),
+            source: source.unwrap_or_else(|| Box::new(DeviceEncryptionError::NoCiphertext)),
         }
     }
 }

@@ -1087,15 +1087,26 @@ pub struct RelayLatencyReportParams<'a> {
     pub devices: &'a [Jid],
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayLatencyReportError {
+    #[error("too many relay latency entries")]
+    TooManyEntries,
+    #[error("invalid relay latency address length")]
+    InvalidAddressLength,
+}
+
 /// Serialize measurement metadata; this does not select or connect a relay.
-pub fn build_relay_latency_report(p: &RelayLatencyReportParams<'_>) -> Result<Node> {
+pub fn build_relay_latency_report(
+    p: &RelayLatencyReportParams<'_>,
+) -> Result<Node, RelayLatencyReportError> {
     if p.entries.len() > super::relay_latency::MAX_RELAY_LATENCY_ENTRIES {
-        return Err(anyhow!("too many relay latency entries"));
+        return Err(RelayLatencyReportError::TooManyEntries);
     }
     let mut children = Vec::with_capacity(p.entries.len() + 1);
     for entry in p.entries {
         if !matches!(entry.address.len(), 6 | 18) {
-            return Err(anyhow!("invalid relay latency address length"));
+            return Err(RelayLatencyReportError::InvalidAddressLength);
         }
         let mut te = NodeBuilder::new("te")
             .attr(
@@ -2312,27 +2323,27 @@ mod tests {
         );
         let mut invalid = entries[0].clone();
         invalid.address = vec![0; 7];
-        assert!(
+        assert!(matches!(
             build_relay_latency_report(&RelayLatencyReportParams {
                 call_id: "CID",
                 to: &peer,
                 call_creator: &creator,
                 entries: &[invalid],
                 devices: &[],
-            })
-            .is_err()
-        );
+            }),
+            Err(RelayLatencyReportError::InvalidAddressLength)
+        ));
         let too_many = vec![entries[0].clone(); 9];
-        assert!(
+        assert!(matches!(
             build_relay_latency_report(&RelayLatencyReportParams {
                 call_id: "CID",
                 to: &peer,
                 call_creator: &creator,
                 entries: &too_many,
                 devices: &[],
-            })
-            .is_err()
-        );
+            }),
+            Err(RelayLatencyReportError::TooManyEntries)
+        ));
         let signed = RelayLatencyEntry::builder()
             .kind(RelayLatencyKind::Xpop)
             .latency(PackedRelayLatency::new(u32::MAX))

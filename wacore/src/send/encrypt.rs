@@ -102,7 +102,7 @@ pub struct EncryptResult {
 
 pub(crate) struct EncryptAttempt {
     pub result: EncryptResult,
-    pub first_error: Option<anyhow::Error>,
+    pub first_error: Option<Box<DeviceEncryptionError>>,
     /// Devices the encrypt fan-out itself dropped, excluding the ones already
     /// accounted for during session setup. See [`unkeyed_at_encrypt`].
     pub unkeyed_at_encrypt: u64,
@@ -138,7 +138,30 @@ pub struct EncryptForDevicesRaw {
 
 struct RawEncryptAttempt {
     result: EncryptForDevicesRaw,
-    first_error: Option<anyhow::Error>,
+    first_error: Option<Box<DeviceEncryptionError>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DeviceEncryptionError {
+    #[error("failed to encrypt for {address}")]
+    Encrypt {
+        address: String,
+        #[source]
+        source: crate::libsignal::protocol::SignalProtocolError,
+    },
+    #[error("failed to process pre-key bundle for {address}")]
+    SessionSetup {
+        address: String,
+        #[source]
+        source: crate::libsignal::protocol::SignalProtocolError,
+    },
+    #[error("{0}")]
+    Resolver(#[from] crate::client::context::SendContextError),
+    #[error("spawned task did not produce a result (panic or runtime shutdown)")]
+    TaskCanceled,
+    #[error("no recipient device produced a ciphertext")]
+    NoCiphertext,
 }
 
 /// Explicit primary wire profiles from the pinned reference clients. Neither profile
@@ -244,7 +267,7 @@ enum SessionOutcome {
     Dropped {
         jid: Jid,
         reason: Option<UnkeyableDevice>,
-        error: Option<anyhow::Error>,
+        error: Option<Box<DeviceEncryptionError>>,
     },
 }
 
@@ -363,7 +386,10 @@ async fn encrypt_one_device(
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
     crypto_provider: Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>>,
-) -> (Jid, Result<Option<EncryptOneResult>>) {
+) -> (
+    Jid,
+    Result<Option<EncryptOneResult>, Box<DeviceEncryptionError>>,
+) {
     let encrypted = if let Some(provider) = crypto_provider {
         crate::libsignal::protocol::message_encrypt_serialized_with_provider(
             &*provider,
@@ -404,7 +430,10 @@ async fn encrypt_one_device(
         }
         Err(error) => (
             device_jid,
-            Err(anyhow::Error::new(error).context(format!("failed to encrypt for {addr}"))),
+            Err(Box::new(DeviceEncryptionError::Encrypt {
+                address: addr.to_string(),
+                source: error,
+            })),
         ),
     }
 }
@@ -413,10 +442,13 @@ async fn encrypt_one_device(
 /// on success, a logged skip on failure. Node-agnostic so both the message
 /// `<to>` map and the voip offer share it.
 fn push_raw_result(
-    (device_jid, res): (Jid, Result<Option<EncryptOneResult>>),
+    (device_jid, res): (
+        Jid,
+        Result<Option<EncryptOneResult>, Box<DeviceEncryptionError>>,
+    ),
     devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
-    first_error: &mut Option<anyhow::Error>,
+    first_error: &mut Option<Box<DeviceEncryptionError>>,
     already_counted: &[Jid],
     unkeyed_at_encrypt: &mut u64,
 ) {
@@ -568,7 +600,7 @@ pub struct EncryptFanoutSummary {
     /// when every device produced a node. Already collected for the group
     /// path's detailed attempt, so a caller that turns "nothing encrypted"
     /// into an error can name the cause instead of reporting a bare count.
-    pub first_error: Option<anyhow::Error>,
+    pub first_error: Option<Box<DeviceEncryptionError>>,
 }
 
 /// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
@@ -681,7 +713,7 @@ pub struct SessionPlan {
     /// device that merely lacked a bundle or failed session setup, refreshing
     /// unrelated users for no reason.
     pub rejected_devices: Vec<Jid>,
-    first_error: Option<anyhow::Error>,
+    first_error: Option<Box<DeviceEncryptionError>>,
     /// Devices this plan already gave up on, and already counted. The encrypt
     /// fan-out skips them when tallying its own drops, so one dropped device is
     /// never reported as both a session-setup drop and an encrypt drop.
@@ -1054,7 +1086,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                 // Best-effort callers still skip these devices, while a required
                 // distribution can surface the typed server failure without
                 // reconstructing it or reducing the source chain to a string.
-                first_error = Some(e.into());
+                first_error = Some(Box::new(DeviceEncryptionError::Resolver(e)));
                 std::collections::HashMap::new()
             }
             Err(e) => {
@@ -1173,9 +1205,10 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                             Err(error) => SessionOutcome::Dropped {
                                 jid: lookup_jid,
                                 reason: Some(UnkeyableDevice::SessionSetup),
-                                error: Some(anyhow::Error::new(error).context(format!(
-                                    "failed to process pre-key bundle for {addr}"
-                                ))),
+                                error: Some(Box::new(DeviceEncryptionError::SessionSetup {
+                                    address: addr.to_string(),
+                                    source: error,
+                                })),
                             },
                         },
                     );
@@ -1187,7 +1220,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
         while let Some((chunk_len, spawn_result)) = in_flight.next().await {
             let outcomes = match spawn_result {
                 Ok(outcomes) => outcomes,
-                Err(error) => {
+                Err(_) => {
                     // The task took the devices' identities with it, so these
                     // drops cannot join `unkeyed_devices` — and must not be
                     // counted here either, or the encrypt fan-out (which will
@@ -1196,7 +1229,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                         "Session-establishment task did not deliver a result; skipping {chunk_len} device(s)."
                     );
                     if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
+                        first_error = Some(Box::new(DeviceEncryptionError::TaskCanceled));
                     }
                     continue;
                 }
@@ -1506,7 +1539,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                         );
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
@@ -1514,7 +1547,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     );
                     unkeyed_at_encrypt += chunk_countable;
                     if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
+                        first_error = Some(Box::new(DeviceEncryptionError::TaskCanceled));
                     }
                 }
             }
