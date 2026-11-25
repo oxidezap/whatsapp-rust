@@ -257,6 +257,23 @@ pub(crate) enum DeviceListIdentityConflict {
     Bootstrap,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum DeviceListIdentityError {
+    #[error("{0}")]
+    Cached(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    Conflict(#[from] DeviceListIdentityConflict),
+}
+
+impl DeviceListIdentityError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Cached(error) => error.into(),
+            Self::Conflict(error) => error.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct DeviceListIdentityContext<'a> {
     prepared: &'a [(Jid, PreparedAccountIdentity)],
@@ -1608,9 +1625,9 @@ impl Client {
                         Ok(current) if current == Some(*identity) => continue,
                         Err(error)
                             if mode != DeviceListApplyMode::GroupRefresh
-                                || !error.is::<DeviceListIdentityConflict>() =>
+                                || !matches!(&error, DeviceListIdentityError::Conflict(_)) =>
                         {
-                            return Err(error);
+                            return Err(error.into_anyhow());
                         }
                         _ => {}
                     }
@@ -1742,8 +1759,11 @@ impl Client {
                     }
                     for (user, prepared) in identities.prepared {
                         if let PreparedAccountIdentity::Trusted(expected) = prepared {
-                            unchanged &=
-                                self.device_list_account_identity(user).await? == Some(*expected);
+                            unchanged &= self
+                                .device_list_account_identity(user)
+                                .await
+                                .map_err(DeviceListIdentityError::into_anyhow)?
+                                == Some(*expected);
                         }
                     }
                     if !unchanged {
@@ -2332,7 +2352,10 @@ impl Client {
     /// Callers hold the mapping mutation guard through the live reads and
     /// publication or cold CAS/ACK. That same guard excludes companion bootstrap
     /// without reacquiring session locks its caller may already own.
-    async fn device_list_account_identity(&self, user: &Jid) -> anyhow::Result<Option<[u8; 32]>> {
+    async fn device_list_account_identity(
+        &self,
+        user: &Jid,
+    ) -> Result<Option<[u8; 32]>, DeviceListIdentityError> {
         let primary = self.cached_adv_account_identity(user).await?;
         let Some(alias) = self.device_list_identity_alias(user).await else {
             return Ok(primary);
@@ -2404,7 +2427,8 @@ impl Client {
         // repeats both live Signal anchors after waiting for durable ordering.
         if self
             .device_list_account_identity(primary)
-            .await?
+            .await
+            .map_err(DeviceListIdentityError::into_anyhow)?
             .is_some_and(|current| current != *key)
         {
             return Ok(false);
@@ -2471,7 +2495,9 @@ impl Client {
             let (_sessions, _mapping) = self
                 .device_list_identity_guards(std::slice::from_ref(&user))
                 .await?;
-            self.device_list_account_identity(&user).await
+            self.device_list_account_identity(&user)
+                .await
+                .map_err(DeviceListIdentityError::into_anyhow)
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
@@ -2734,7 +2760,8 @@ impl Client {
                         recovered.identity
                     } else {
                         self.device_list_account_identity(&user_list.user)
-                            .await?
+                            .await
+                            .map_err(DeviceListIdentityError::into_anyhow)?
                             .ok_or_else(|| {
                                 anyhow::anyhow!("device list account identity unavailable")
                             })?
