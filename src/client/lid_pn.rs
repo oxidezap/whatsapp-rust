@@ -21,6 +21,22 @@ use wacore_binary::Jid;
 use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
+/// Failure while recording or persisting LID and phone-number mappings.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MappingLearningError {
+    #[error("client ownership unavailable during mapping persistence")]
+    ClientUnavailable,
+    #[error("owned mapping learning worker stopped")]
+    WorkerStopped,
+    #[error("single mapping persistence received multiple rows")]
+    InvalidSingleBatch,
+    #[error("persisting LID-PN mapping: {0}")]
+    StoreSingle(#[source] wacore::store::error::StoreError),
+    #[error("persisting LID-PN mapping batch: {0}")]
+    StoreBatch(#[source] wacore::store::error::StoreError),
+}
+
 /// Exclusive upper bound for the device-id range we iterate when migrating
 /// PN→LID. WhatsApp's protocol caps companion devices well below this, but
 /// the conservative bound covers paired devices learned via offline syncs
@@ -142,7 +158,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn warm_up_lid_pn_cache(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn warm_up_lid_pn_cache(&self) -> wacore::store::error::Result<()> {
         let _startup = self.lid_pn_cache.warm_up_guard();
         let backend = self.persistence_manager.backend();
         let entries = backend.get_all_lid_mappings().await?;
@@ -190,7 +206,7 @@ impl Client {
         lid: &str,
         phone_number: &str,
         source: LearningSource,
-    ) -> Result<()> {
+    ) -> Result<(), MappingLearningError> {
         self.learn_lid_pn_mappings_owned(
             vec![(lid.to_owned(), phone_number.to_owned())],
             source,
@@ -209,7 +225,7 @@ impl Client {
         &self,
         mappings: Vec<(String, String)>,
         source: LearningSource,
-    ) -> Result<usize> {
+    ) -> Result<usize, MappingLearningError> {
         let batch = self
             .learn_lid_pn_mappings_owned(mappings, source, false, true)
             .await?;
@@ -319,7 +335,7 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), MappingLearningError> {
         let outcome = self
             .record_lid_pn_batch_in_memory_guarded(mappings, source, guard)
             .await;
@@ -561,16 +577,14 @@ impl Client {
         source: LearningSource,
         single: bool,
         migrate_in_worker: bool,
-    ) -> Result<PersistedMappingBatch> {
+    ) -> Result<PersistedMappingBatch, MappingLearningError> {
         // Durable callers must evaluate the skip under the same mutation scope
         // as record + ACK. Separate cache reads can straddle an ownership change.
         let client = self
             .self_weak
             .get()
             .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| {
-                anyhow::anyhow!("client ownership unavailable during mapping persistence")
-            })?;
+            .ok_or(MappingLearningError::ClientUnavailable)?;
         client
             .spawn_owned_lid_pn_learning(
                 mappings,
@@ -583,7 +597,7 @@ impl Client {
                 None,
             )
             .await
-            .map_err(|_| anyhow::anyhow!("owned mapping learning worker stopped"))?
+            .map_err(|_| MappingLearningError::WorkerStopped)?
     }
 
     /// Receive raw observations, not entries that were registered before the
@@ -594,7 +608,8 @@ impl Client {
         source: LearningSource,
         mode: MappingLearningMode,
         recorded: Option<futures::channel::oneshot::Sender<()>>,
-    ) -> futures::channel::oneshot::Receiver<Result<PersistedMappingBatch>> {
+    ) -> futures::channel::oneshot::Receiver<Result<PersistedMappingBatch, MappingLearningError>>
+    {
         let client = Arc::clone(self);
         let (finished, completion) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
@@ -614,7 +629,7 @@ impl Client {
         source: LearningSource,
         mode: MappingLearningMode,
         recorded: Option<futures::channel::oneshot::Sender<()>>,
-    ) -> Result<PersistedMappingBatch> {
+    ) -> Result<PersistedMappingBatch, MappingLearningError> {
         let guard = self.lid_pn_cache.lock_mutation().await;
         let mut token_repairs = Vec::new();
         // Explicit durable re-learns repair legacy token rows. Background
@@ -667,9 +682,7 @@ impl Client {
         entries: Vec<LidPnEntry>,
         single: bool,
         _guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> Result<Vec<LidPnMappingEntry>> {
-        use anyhow::anyhow;
-
+    ) -> Result<Vec<LidPnMappingEntry>, MappingLearningError> {
         // The storage row copies `lid`/`phone_number` into `String`s because
         // `LidPnMappingEntry` is a `String` type; the cache's persisted marker
         // keeps sharing the entry's `Arc<str>` pair instead.
@@ -689,19 +702,18 @@ impl Client {
         }
         let backend = self.persistence_manager.backend();
         if single {
-            anyhow::ensure!(
-                storage.len() == 1,
-                "single mapping persistence received multiple rows"
-            );
+            if storage.len() != 1 {
+                return Err(MappingLearningError::InvalidSingleBatch);
+            }
             backend
                 .put_lid_mapping(&storage[0])
                 .await
-                .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
+                .map_err(MappingLearningError::StoreSingle)?;
         } else {
             backend
                 .put_lid_mappings(&storage)
                 .await
-                .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
+                .map_err(MappingLearningError::StoreBatch)?;
         }
 
         for entry in &entries {
@@ -1702,6 +1714,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(result.is_err(), fail_after_ack);
+            if let Err(error) = &result {
+                assert!(matches!(error, MappingLearningError::StoreBatch(_)));
+                assert!(std::error::Error::source(error).is_some());
+            }
             assert_eq!(
                 client.lid_pn_cache.is_persisted(phone, lid).await,
                 !fail_after_ack
