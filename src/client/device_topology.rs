@@ -293,13 +293,19 @@ impl DeviceRegistryCache {
 
     /// The publication worker releases all guards before invoking host code,
     /// then revalidates cache absence and records the eviction under Registry.
-    pub(crate) async fn evict_before_identity_update(&self, key: &str) -> anyhow::Result<()> {
+    pub(crate) async fn evict_before_identity_update(
+        &self,
+        key: &str,
+    ) -> crate::cache_store::CacheResult<()> {
         self.cache.try_invalidate(key).await
     }
 
     /// Require confirmed raw absence, propagating host failures and counting
     /// malformed stored bytes as present.
-    pub(crate) async fn is_absent_after_eviction(&self, key: &str) -> anyhow::Result<bool> {
+    pub(crate) async fn is_absent_after_eviction(
+        &self,
+        key: &str,
+    ) -> crate::cache_store::CacheResult<bool> {
         Ok(!self.cache.contains_key_checked(key).await?)
     }
 

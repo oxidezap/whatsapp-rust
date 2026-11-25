@@ -143,7 +143,7 @@ where
 
     /// Publication must distinguish confirmed absence from an unavailable host
     /// cache. Any stored bytes count as present, including malformed values.
-    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> anyhow::Result<bool>
+    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> CacheResult<bool>
     where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,
@@ -152,11 +152,7 @@ where
             Inner::Local(cache) => Ok(cache.get(key).await.is_some()),
             Inner::Custom {
                 store, namespace, ..
-            } => Ok(store
-                .get(namespace, &key.to_string())
-                .await
-                .map_err(anyhow::Error::from_boxed)?
-                .is_some()),
+            } => Ok(store.get(namespace, &key.to_string()).await?.is_some()),
         }
     }
 
@@ -197,7 +193,7 @@ where
     }
 
     /// Trust replacement must observe a failed host-cache deletion.
-    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> anyhow::Result<()>
+    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> CacheResult<()>
     where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,
@@ -210,7 +206,7 @@ where
                 let key_str = key.to_string();
                 if let Err(error) = store.delete(namespace, &key_str).await {
                     log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {error}");
-                    return Err(anyhow::Error::from_boxed(error));
+                    return Err(error);
                 }
             }
         }

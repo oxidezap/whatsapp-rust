@@ -8,7 +8,26 @@
 use async_trait::async_trait;
 use std::time::Duration;
 
-pub type CacheError = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CacheError(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+impl CacheError {
+    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+
+    pub fn from_boxed(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self(error)
+    }
+}
+
+impl From<std::io::Error> for CacheError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(error)
+    }
+}
+
 pub type CacheResult<T> = Result<T, CacheError>;
 
 /// Backend trait for pluggable cache storage.

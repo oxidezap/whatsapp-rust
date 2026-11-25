@@ -61,7 +61,9 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
         self.sets.fetch_add(1, Ordering::Relaxed);
         let hook = self.set_hook.lock().unwrap().take();
         if let Some(hook) = hook {
-            hook().await.map_err(anyhow::Error::into_boxed_dyn_error)?;
+            hook()
+                .await
+                .map_err(|error| crate::CacheError::from_boxed(error.into_boxed_dyn_error()))?;
         }
         if self.enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
             let manager = self.manager.lock().unwrap().upgrade().unwrap();
@@ -111,7 +113,9 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
         }
         let hook = self.delete_hook.lock().unwrap().take();
         if let Some(hook) = hook {
-            hook().await.map_err(anyhow::Error::into_boxed_dyn_error)?;
+            hook()
+                .await
+                .map_err(|error| crate::CacheError::from_boxed(error.into_boxed_dyn_error()))?;
         }
         Ok(())
     }
@@ -804,6 +808,10 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 | EvictionCase::ReadError
         );
         assert_eq!(result.is_err(), rejected, "{case:?}: {result:?}");
+        if matches!(case, EvictionCase::ReadError) {
+            let error = result.as_ref().unwrap_err();
+            assert!(error.chain().any(|source| source.is::<std::io::Error>()));
+        }
         let expected = if matches!(case, EvictionCase::RetiredPrimary) {
             None
         } else if rejected {
@@ -1757,7 +1765,7 @@ async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_a
             receive
                 .await
                 .map_err(|_| std::io::Error::other("synthetic cache worker stopped"))?
-                .map_err(anyhow::Error::into_boxed_dyn_error)
+                .map_err(|error| crate::CacheError::from_boxed(error.into_boxed_dyn_error()))
         }
 
         async fn delete(&self, namespace: &str, key: &str) -> crate::cache_store::CacheResult<()> {
