@@ -57,13 +57,41 @@ pub enum EncryptSendErrorKind {
     Poisoned,
 }
 
-#[derive(thiserror::Error)]
-#[error("{kind}: {}", crate::diagnostics::ErrorSummary(.source.as_ref()))]
 #[non_exhaustive]
 pub struct EncryptSendError {
+    // Keep successful send futures small; details are allocated only on failure.
+    inner: Box<EncryptSendErrorDetails>,
+}
+
+#[doc(hidden)]
+pub struct EncryptSendErrorDetails {
     pub kind: EncryptSendErrorKind,
-    #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::ops::Deref for EncryptSendError {
+    type Target = EncryptSendErrorDetails;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::fmt::Display for EncryptSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {}",
+            self.kind,
+            crate::diagnostics::ErrorSummary(self.source.as_ref())
+        )
+    }
+}
+
+impl std::error::Error for EncryptSendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 impl std::fmt::Debug for EncryptSendError {
@@ -87,39 +115,33 @@ enum SenderStateError {
 }
 
 impl EncryptSendError {
-    pub fn crypto(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+    fn new(kind: EncryptSendErrorKind, source: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self {
-            kind: EncryptSendErrorKind::Crypto,
-            source: source.into(),
+            inner: Box::new(EncryptSendErrorDetails { kind, source }),
         }
+    }
+
+    pub fn crypto(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::new(EncryptSendErrorKind::Crypto, source.into())
     }
 
     pub fn framing(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Framing,
-            source: source.into(),
-        }
+        Self::new(EncryptSendErrorKind::Framing, source.into())
     }
 
     pub fn transport(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Transport,
-            source: source.into(),
-        }
+        Self::new(EncryptSendErrorKind::Transport, source.into())
     }
 
     pub fn join(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Join,
-            source: source.into(),
-        }
+        Self::new(EncryptSendErrorKind::Join, source.into())
     }
 
     pub fn channel_closed() -> Self {
-        Self {
-            kind: EncryptSendErrorKind::ChannelClosed,
-            source: Box::new(SenderStateError::ChannelClosed),
-        }
+        Self::new(
+            EncryptSendErrorKind::ChannelClosed,
+            Box::new(SenderStateError::ChannelClosed),
+        )
     }
 
     /// A transport write failed earlier on this connection, so the peer's view
@@ -130,10 +152,10 @@ impl EncryptSendError {
     /// plaintexts). The only safe recovery is a new connection with fresh
     /// handshake keys, so the sender refuses every later frame instead.
     pub fn poisoned() -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Poisoned,
-            source: Box::new(SenderStateError::Poisoned),
-        }
+        Self::new(
+            EncryptSendErrorKind::Poisoned,
+            Box::new(SenderStateError::Poisoned),
+        )
     }
 
     /// The transport is gone (broken pipe, closed connection, channel dropped)
@@ -181,6 +203,11 @@ mod tests {
             .downcast_ref::<NoiseError>()
             .expect("downcasts to NoiseError");
         assert!(matches!(ne, NoiseError::Encrypt(_)));
+    }
+
+    #[test]
+    fn send_error_is_one_pointer() {
+        assert_eq!(size_of::<EncryptSendError>(), size_of::<usize>());
     }
 
     #[test]
