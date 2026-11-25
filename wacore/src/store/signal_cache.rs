@@ -34,6 +34,19 @@ pub enum SenderKeyCacheError {
     Signal(#[from] SignalProtocolError),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum IdentityPersistenceError {
+    #[error("invalid bootstrap identity length")]
+    InvalidBootstrapIdentity,
+    #[error("invalid stored bootstrap identity length")]
+    InvalidStoredBootstrapIdentity,
+    #[error("identity persistence worker stopped")]
+    WorkerStopped,
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+}
+
 type StoreIncarnation = [u8; 16];
 
 const IDENTITY_CHANGE_CAPACITY: usize = 1024;
@@ -2151,7 +2164,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_if_absent_or_equal(address, None, data, backend)
             .await
     }
@@ -2165,7 +2178,7 @@ impl SignalStoreCache {
         alias: Option<&ProtocolAddress>,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_in_epoch(
             address,
             alias,
@@ -2184,10 +2197,10 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
         epoch: Option<u64>,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         let key: [u8; 32] = data
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
+            .map_err(|_| IdentityPersistenceError::InvalidBootstrapIdentity)?;
         // Serialize with full flushes so an older snapshot cannot overwrite
         // this write. Persist only this identity: session ratchets may belong
         // to an offline batch whose plaintext is not durable yet.
@@ -2203,10 +2216,9 @@ impl SignalStoreCache {
                     .await?
                     .map(Arc::from),
             };
-            anyhow::ensure!(
-                previous.as_deref().is_none_or(|known| known.len() == 32),
-                "invalid stored bootstrap identity length"
-            );
+            if previous.as_deref().is_some_and(|known| known.len() != 32) {
+                return Err(IdentityPersistenceError::InvalidStoredBootstrapIdentity);
+            }
             matches &= previous.as_deref().is_none_or(|known| known == data);
             // Preserve the observed absence/equality for change classification.
             // An uncached first write must not retire another request's epoch.
@@ -2272,7 +2284,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, None)
             .await
     }
@@ -2285,7 +2297,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         epoch: Option<u64>,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, Some(epoch))
             .await
     }
@@ -2297,7 +2309,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         authentication_epoch: Option<Option<u64>>,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         let cache = Arc::clone(self);
         let identities = identities.to_vec();
         let data = *data;
@@ -2315,7 +2327,7 @@ impl SignalStoreCache {
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("identity persistence worker stopped"))?
+            .map_err(|_| IdentityPersistenceError::WorkerStopped)?
     }
 
     /// Serialize the complete alias write while retaining old anchors on errors.
@@ -2325,7 +2337,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: &dyn SignalStore,
         authentication_epoch: Option<Option<u64>>,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, IdentityPersistenceError> {
         let mut reloads = 0;
         let (_flush, mut state) = loop {
             // Preloads can be evicted while waiting for an earlier writer.
@@ -9595,6 +9607,40 @@ mod durability_chaos_tests;
 #[cfg(test)]
 mod identity_continuity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_bootstrap_identity_does_not_write() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550001000", 0.into());
+        assert!(matches!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 31], &backend)
+                .await,
+            Err(IdentityPersistenceError::InvalidBootstrapIdentity)
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cache.put_identity(&address, &[2; 31]).await;
+        assert!(matches!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], &backend)
+                .await,
+            Err(IdentityPersistenceError::InvalidStoredBootstrapIdentity)
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn known_alias_transfer_requires_live_cached_anchors() {

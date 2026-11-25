@@ -2418,7 +2418,8 @@ impl Client {
         }
         let alias = alias.map(|alias| alias.to_protocol_address());
         let backend = self.persistence_manager.backend();
-        self.signal_cache
+        Ok(self
+            .signal_cache
             .persist_identity_and_alias_in_epoch(
                 &primary.to_protocol_address(),
                 alias.as_ref(),
@@ -2426,7 +2427,7 @@ impl Client {
                 backend.as_ref(),
                 epoch,
             )
-            .await
+            .await?)
     }
 
     /// Load ordinary account anchors before taking mapping/registry guards.
