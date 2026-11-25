@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use whatsapp_rust::anyhow::Result;
+use anyhow::Result;
 use whatsapp_rust::http::{HttpClient, HttpRequest, HttpResponse};
 use whatsapp_rust::store::persistence_manager::PersistenceManager;
 use whatsapp_rust::transport::{Transport, TransportEvent, TransportFactory};

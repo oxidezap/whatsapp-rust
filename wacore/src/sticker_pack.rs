@@ -134,7 +134,7 @@ impl MediaUploadInfo {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum StickerPackError {
     #[error(
@@ -151,6 +151,13 @@ pub enum StickerPackError {
     InvalidResponse(#[source] serde_json::Error),
     #[error("no sticker pack found in response")]
     MissingPack,
+}
+
+impl std::fmt::Debug for StickerPackError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 const MAX_STICKERS: usize = 60;

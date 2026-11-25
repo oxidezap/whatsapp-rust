@@ -1036,7 +1036,7 @@ impl Client {
 
 /// Errors from call-control operations. `#[non_exhaustive]` so new variants stay
 /// non-breaking after 1.0.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum CallError {
     #[error("{0}")]
@@ -1113,6 +1113,13 @@ pub enum CallError {
     #[cfg(feature = "voip-control")]
     #[error("call service request timed out")]
     ResponseTimeout,
+}
+
+impl std::fmt::Debug for CallError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl Voip<'_> {

@@ -180,7 +180,7 @@ impl ExpectedMediaHashes {
 }
 
 /// A specific cause retained across media host retries.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum DownloadCause {
     #[error("{0}")]
@@ -211,8 +211,15 @@ pub enum DownloadCause {
     Cleanup(#[source] BoxedErrorSource<ClientDownloadError>),
 }
 
+impl std::fmt::Debug for DownloadCause {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 /// Failure to retrieve or decode a sticker pack from the CDN.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchStickerPackError {
     #[error("{0}")]
@@ -223,6 +230,13 @@ pub enum FetchStickerPackError {
     Status(#[source] HttpStatusError),
     #[error("{0}")]
     Parse(#[from] wacore::sticker_pack::StickerPackError),
+}
+
+impl std::fmt::Debug for FetchStickerPackError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Why a media download failed, for callers that have no session to refresh.

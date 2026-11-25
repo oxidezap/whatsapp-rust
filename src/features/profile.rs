@@ -18,7 +18,7 @@ use wacore_binary::builder::NodeBuilder;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
 
 /// Error returned by own-profile operations (push name, status text, picture).
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ProfileError {
     /// An IQ to the server failed (status text / profile picture).
@@ -36,6 +36,13 @@ pub enum ProfileError {
     /// A provided argument is invalid (e.g. an empty push name).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+}
+
+impl std::fmt::Debug for ProfileError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Result after the push-name presence was sent and the local name was updated.

@@ -1453,6 +1453,7 @@ impl<'a> MessageAttrs<'a> {
 /// This is a pure function that extracts message metadata from a node's
 /// attributes. It requires the own JID and optional LID to determine
 /// `is_from_me`.
+#[inline(never)]
 pub fn parse_message_info(
     node: &wacore_binary::NodeRef<'_>,
     own_jid: &wacore_binary::Jid,

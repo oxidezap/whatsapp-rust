@@ -452,7 +452,7 @@ fn server_rejection_is_recovered_the_same_way_in_every_domain() {
         // Nested two domains deep.
         Box::new(CommunityError::Group(GroupError::Iq(rejected(403)))),
         // Reached through the shared cross-crate carrier instead of an IqError.
-        Box::new(GroupError::Internal(anyhow::Error::new(ServerErrorCode {
+        Box::new(GroupError::Internal(Box::new(ServerErrorCode {
             code: 403,
             text: "forbidden".to_string(),
             error_type: None,
@@ -481,7 +481,9 @@ fn http_status_is_recovered_wherever_it_comes_from() {
 
     // Nested one layer deeper, inside a domain error carrying the same anyhow.
     let nested = GroupError::Internal(
-        anyhow::Error::new(HttpStatusError { status: 429 }).context("Upload failed 429"),
+        anyhow::Error::new(HttpStatusError { status: 429 })
+            .context("Upload failed 429")
+            .into(),
     );
     assert_eq!(http_status_of(&nested), Some(429));
 
@@ -553,14 +555,19 @@ fn the_wacore_iq_error_answers_identically() {
     assert!(CoreIqError::NotConnected.is_transport_unavailable());
 }
 
-/// `Internal(anyhow)` is not a dead end: the head of the `anyhow` chain is
-/// exposed as `source()` and stays downcastable.
+/// `Internal(Box<dyn StdError + Send + Sync>)` is not a dead end: the inner
+/// error is exposed as `source()` and stays downcastable (and an `anyhow::Error`
+/// converted with `.into()` stays walkable via `sources()`).
 #[test]
 fn internal_anyhow_still_exposes_its_head() {
-    let err = GroupError::Internal(anyhow::Error::new(rejected(403)));
-    let source = StdError::source(&err).expect("anyhow head is exposed");
+    let err = GroupError::Internal(Box::new(rejected(403)));
+    let source = StdError::source(&err).expect("inner error is exposed");
     assert!(source.downcast_ref::<IqError>().is_some());
     assert_eq!(code_of(&err), Some(403));
+
+    let via_anyhow =
+        GroupError::Internal(anyhow::Error::new(rejected(403)).context("wrapped").into());
+    assert_eq!(code_of(&via_anyhow), Some(403));
 }
 
 // ── Categories are recovered, never invented ────────────────────────────────

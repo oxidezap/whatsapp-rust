@@ -16,7 +16,10 @@ struct FirstCaptureBarrier {
 
 #[async_trait::async_trait]
 impl GroupNotificationDurabilityHook for FirstCaptureBarrier {
-    async fn on_notification(&self, node: Arc<OwnedNodeRef>) -> anyhow::Result<()> {
+    async fn on_notification(
+        &self,
+        node: Arc<OwnedNodeRef>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if node.get().attrs().optional_string("id").as_deref() == Some("first") {
             self.entered.notify_one();
             self.release.notified().await;
@@ -263,12 +266,15 @@ impl RecordingHook {
 
 #[async_trait::async_trait]
 impl GroupNotificationDurabilityHook for RecordingHook {
-    async fn on_notification(&self, node: Arc<OwnedNodeRef>) -> anyhow::Result<()> {
+    async fn on_notification(
+        &self,
+        node: Arc<OwnedNodeRef>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.nodes.lock().unwrap().push(node);
         self.entered.notify_one();
         self.release.notified().await;
         if self.fail {
-            anyhow::bail!("durable commit rejected");
+            return Err("durable commit rejected".into());
         }
         Ok(())
     }

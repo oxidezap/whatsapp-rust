@@ -14,7 +14,7 @@ use wacore_binary::{Jid, SERVER_JID};
 pub use wacore::companion_reg::{CompanionWebClientType, NATIVE_CAMERA_DEEP_LINK_PREFIX};
 pub use wacore::pair::{DeviceState, PairCryptoError, PairUtils};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PairWithQrError {
     #[error("{0}")]
@@ -25,6 +25,13 @@ pub enum PairWithQrError {
     MissingPhoneJid,
     #[error("{0}")]
     Send(#[from] crate::client::ClientError),
+}
+
+impl std::fmt::Debug for PairWithQrError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Auto-derives client type from `device_props`; see

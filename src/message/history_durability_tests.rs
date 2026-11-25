@@ -32,7 +32,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
         notification: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.notifications.fetch_add(1, Ordering::SeqCst);
         if self.require_journal.load(Ordering::SeqCst) {
             assert!(
@@ -64,14 +64,15 @@ impl HistorySyncDurabilityHook for RecordingHistory {
                 .as_ref()
                 .map(Vec::len)
         );
-        anyhow::ensure!(
-            self.fail.load(Ordering::SeqCst) != 1,
-            "notification failure"
-        );
+        if self.fail.load(Ordering::SeqCst) == 1 {
+            return Err("notification failure".into());
+        }
         {
             let mut records = self.records.lock().unwrap();
             if let Some((_, previous)) = records.iter().find(|(previous, _)| previous == key) {
-                anyhow::ensure!(previous == notification, "conflicting notification");
+                if previous != notification {
+                    return Err("conflicting notification".into());
+                }
             } else {
                 records.push((key.clone(), notification.to_vec()));
             }
@@ -88,7 +89,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
         compressed: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.chunks.fetch_add(1, Ordering::SeqCst);
         {
             let records = self.records.lock().unwrap();
@@ -106,7 +107,9 @@ impl HistorySyncDurabilityHook for RecordingHistory {
             self.chunk_entered.notify_one();
             self.chunk_gate.notified().await;
         }
-        anyhow::ensure!(self.fail.load(Ordering::SeqCst) != 2, "chunk failure");
+        if self.fail.load(Ordering::SeqCst) == 2 {
+            return Err("chunk failure".into());
+        }
         Ok(())
     }
 }

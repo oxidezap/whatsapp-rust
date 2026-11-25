@@ -1,7 +1,6 @@
 //! Production app-state prefetch fixture for benchmarks.
 
 use crate::Client;
-use anyhow::{Result, ensure};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
@@ -9,6 +8,8 @@ use std::time::Duration;
 use wacore::appstate::patch_decode::{PatchList, WAPatchName};
 use wacore::time::Instant;
 use waproto::whatsapp as wa;
+
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
 
 /// Four retained, authenticated blobs using the production app-state prefetch.
 pub struct PrefetchHarness {
@@ -79,24 +80,26 @@ impl PrefetchHarness {
     }
 
     pub async fn prefetch(&self) -> Result<()> {
-        ensure!(
-            self.client.bench_startup.pending() == 0,
-            "startup entered prefetch measurement"
-        );
+        if self.client.bench_startup.pending() != 0 {
+            return Err("startup entered prefetch measurement".into());
+        }
         // Repeated samples clone only four small reference headers, never payloads.
         let (_, blobs) = self
             .client
             .pre_download_external_blobs(self.lists.clone())
             .await;
-        ensure!(blobs.len() == 4, "prefetch lost a blob");
+        if blobs.len() != 4 {
+            return Err("prefetch lost a blob".into());
+        }
         for blob in blobs.values() {
-            ensure!(
+            let blob =
                 blob.as_ref()
-                    .map_err(|error| anyhow::Error::new(Arc::clone(error)))?
-                    .as_ref()
-                    == self.plaintext,
-                "prefetch plaintext mismatch"
-            );
+                    .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("{error}").into()
+                    })?;
+            if blob.as_ref() != self.plaintext {
+                return Err("prefetch plaintext mismatch".into());
+            }
         }
         Ok(())
     }

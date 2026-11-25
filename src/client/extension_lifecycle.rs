@@ -137,16 +137,24 @@ impl fmt::Debug for ConnectionScope {
 /// `install` receives a weak client reference so retaining it cannot create a cycle.
 /// `signal_shutdown` is the non-blocking boundary for resources that must stop
 /// even when an FFI host cannot await `shutdown`.
+pub type LifecycleError = Box<dyn std::error::Error + Send + Sync>;
+
 pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
-    fn install<'a>(&'a self, _client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn install<'a>(&'a self, _client: Weak<Client>) -> BoxFuture<'a, Result<(), LifecycleError>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn on_ready<'a>(
+        &'a self,
+        _scope: ConnectionScope,
+    ) -> BoxFuture<'a, Result<(), LifecycleError>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn on_closed<'a>(
+        &'a self,
+        _scope: ConnectionScope,
+    ) -> BoxFuture<'a, Result<(), LifecycleError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -154,7 +162,7 @@ pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
     /// Implementations must return promptly and make repeated calls harmless.
     fn signal_shutdown(&self) {}
 
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -315,17 +323,17 @@ impl LifecycleRegistration {
         }
     }
 
-    pub(super) async fn install(&self, client: Weak<Client>) -> anyhow::Result<()> {
+    pub(super) async fn install(&self, client: Weak<Client>) -> Result<(), LifecycleError> {
         let rejected = self.construction_notifier.subscribe();
         if self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED {
-            return Err(anyhow::anyhow!(
-                "client shutdown began during lifecycle installation"
-            ));
+            return Err("client shutdown began during lifecycle installation".into());
         }
         let mut install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.handler.install(client)
         }))
-        .map_err(|_| anyhow::anyhow!("lifecycle install panicked before returning a future"))?;
+        .map_err(|_| -> LifecycleError {
+            "lifecycle install panicked before returning a future".into()
+        })?;
         let cancelled = Box::pin(wait_for_shutdown(&rejected));
         let result = {
             let install_poll = std::future::poll_fn(|context| install.as_mut().poll(context));
@@ -341,22 +349,17 @@ impl LifecycleRegistration {
         let drop_panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(install))).is_err();
         if drop_panicked {
-            return Err(anyhow::anyhow!(
-                "lifecycle install future panicked while being dropped"
-            ));
+            return Err("lifecycle install future panicked while being dropped".into());
         }
         let Some(result) = result else {
-            return Err(anyhow::anyhow!(
-                "client shutdown began during lifecycle installation"
-            ));
+            return Err("client shutdown began during lifecycle installation".into());
         };
-        let result = result.map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?;
+        let result =
+            result.map_err(|_| -> LifecycleError { "lifecycle install future panicked".into() })?;
         if result.is_ok()
             && self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED
         {
-            return Err(anyhow::anyhow!(
-                "client shutdown began during lifecycle installation"
-            ));
+            return Err("client shutdown began during lifecycle installation".into());
         }
         result
     }
@@ -689,7 +692,7 @@ impl LifecycleRegistration {
     async fn run_callback<'a>(
         &'a self,
         name: &'static str,
-        create: impl FnOnce(&'a dyn ClientLifecycle) -> BoxFuture<'a, anyhow::Result<()>>,
+        create: impl FnOnce(&'a dyn ClientLifecycle) -> BoxFuture<'a, Result<(), LifecycleError>>,
     ) {
         let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _callback_context = CallbackContextGuard::enter(self);
@@ -727,7 +730,12 @@ impl LifecycleRegistration {
         }
         match result {
             Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(error))) => log::warn!("Client lifecycle {name} failed: {error:#}"),
+            Some(Ok(Err(error))) => {
+                log::warn!(
+                    "Client lifecycle {name} failed: {}",
+                    wacore::diagnostics::ErrorSummary(error.as_ref())
+                );
+            }
             Some(Err(_)) => log::warn!("Client lifecycle {name} panicked"),
             None => log::warn!("Client lifecycle {name} timed out"),
         }
@@ -843,7 +851,10 @@ mod tests {
     }
 
     impl ClientLifecycle for RecordingLifecycle {
-        fn install<'a>(&'a self, client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn install<'a>(
+            &'a self,
+            client: Weak<Client>,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 assert!(client.upgrade().is_some());
                 self.events
@@ -854,7 +865,10 @@ mod tests {
             })
         }
 
-        fn on_ready<'a>(&'a self, scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -868,7 +882,10 @@ mod tests {
             })
         }
 
-        fn on_closed<'a>(&'a self, scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -878,7 +895,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.shutdowns.fetch_add(1, Ordering::SeqCst);
                 self.events
@@ -940,7 +957,10 @@ mod tests {
     }
 
     impl ClientLifecycle for ReentrantReconnectLifecycle {
-        fn install<'a>(&'a self, client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn install<'a>(
+            &'a self,
+            client: Weak<Client>,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 *self
                     .client
@@ -950,7 +970,10 @@ mod tests {
             })
         }
 
-        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -976,7 +999,10 @@ mod tests {
             })
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -986,7 +1012,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -998,7 +1024,10 @@ mod tests {
     }
 
     impl ClientLifecycle for ReentrantDisconnectLifecycle {
-        fn install<'a>(&'a self, client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn install<'a>(
+            &'a self,
+            client: Weak<Client>,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 *self
                     .client
@@ -1008,7 +1037,10 @@ mod tests {
             })
         }
 
-        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -1030,7 +1062,10 @@ mod tests {
             })
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -1040,7 +1075,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()
@@ -1066,7 +1101,10 @@ mod tests {
     }
 
     impl ClientLifecycle for QueuePressureLifecycle {
-        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 let _ = self.ready_started.try_send(());
                 let _ = self.release_ready.recv().await;
@@ -1074,14 +1112,17 @@ mod tests {
             })
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.closed_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -1090,7 +1131,7 @@ mod tests {
     }
 
     impl ClientLifecycle for BlockingShutdownLifecycle {
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let _ = self.started.try_send(());
@@ -1112,7 +1153,7 @@ mod tests {
             self.signalled.store(true, Ordering::Release);
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 assert!(self.signalled.load(Ordering::Acquire));
                 self.shutdowns.fetch_add(1, Ordering::SeqCst);
@@ -1137,7 +1178,7 @@ mod tests {
     struct DropPanickingPendingFuture;
 
     impl Future for DropPanickingPendingFuture {
-        type Output = anyhow::Result<()>;
+        type Output = Result<(), LifecycleError>;
 
         fn poll(
             self: std::pin::Pin<&mut Self>,
@@ -1154,35 +1195,47 @@ mod tests {
     }
 
     impl ClientLifecycle for SynchronousPanicLifecycle {
-        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             self.ready_calls.fetch_add(1, Ordering::SeqCst);
             panic!("synchronous on_ready panic");
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             self.closed_calls.fetch_add(1, Ordering::SeqCst);
             panic!("synchronous on_closed panic");
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
             panic!("synchronous shutdown panic");
         }
     }
 
     impl ClientLifecycle for DropPanickingFutureLifecycle {
-        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(DropPanickingPendingFuture)
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.closed_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -1211,7 +1264,10 @@ mod tests {
     }
 
     impl ClientLifecycle for BlockingReadyLifecycle {
-        fn on_ready<'a>(&'a self, scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_ready<'a>(
+            &'a self,
+            scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 *self
                     .scope
@@ -1231,7 +1287,10 @@ mod tests {
             })
         }
 
-        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn on_closed<'a>(
+            &'a self,
+            _scope: ConnectionScope,
+        ) -> BoxFuture<'a, Result<(), LifecycleError>> {
             Box::pin(async move {
                 self.events
                     .lock()

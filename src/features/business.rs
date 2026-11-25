@@ -72,7 +72,7 @@ const DEFAULT_CATALOG_LIMIT: u32 = 10;
 /// items inline, so the two limits multiply into one response.
 const DEFAULT_COLLECTION_LIMIT: u32 = 51;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum BusinessError {
     /// The linked account must be connected to read its catalog and collections.
@@ -115,6 +115,13 @@ pub enum BusinessError {
         operation: &'static str,
         detail: String,
     },
+}
+
+impl std::fmt::Debug for BusinessError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl BusinessError {

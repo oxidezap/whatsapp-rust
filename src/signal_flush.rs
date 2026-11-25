@@ -231,7 +231,7 @@ impl Client {
 
     /// One flush attempt of the worker loop; tests inject failures via a
     /// `cfg(test)` counter (same pattern as the commit batcher's `fail_flushes`).
-    async fn coalesced_flush_attempt(&self) -> Result<(), anyhow::Error> {
+    async fn coalesced_flush_attempt(&self) -> Result<(), crate::client::SignalMaintenanceError> {
         #[cfg(test)]
         {
             self.signal_flush_test_in_attempt
@@ -243,12 +243,12 @@ impl Client {
             if remaining > 0 {
                 self.signal_flush_test_failures
                     .store(remaining - 1, Ordering::Release);
-                anyhow::bail!("injected coalesced-flush failure");
+                return Err(crate::client::SignalMaintenanceError::CorruptKey(
+                    "injected coalesced-flush failure".into(),
+                ));
             }
         }
-        self.flush_signal_cache_batch_safe()
-            .await
-            .map_err(Into::into)
+        self.flush_signal_cache_batch_safe().await
     }
 
     #[cfg(test)]

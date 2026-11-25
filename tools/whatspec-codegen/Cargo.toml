@@ -22,8 +22,8 @@ serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
 toml = "1"
 # IQ emitter is independently pinned from the stable input-catalog lock.
-wa-codegen-iq = { package = "wa-codegen", git = "https://github.com/oxidezap/whatspec.git", rev = "8df95cd0cd7cce4a7625d9603409d4aaffe1e48a" }
-wa-ir-iq = { package = "wa-ir", git = "https://github.com/oxidezap/whatspec.git", rev = "8df95cd0cd7cce4a7625d9603409d4aaffe1e48a" }
+wa-codegen-iq = { package = "wa-codegen", git = "https://github.com/oxidezap/whatspec.git", rev = "3d9064051a176f75ce8e932528ced70c192cd09d" }
+wa-ir-iq = { package = "wa-ir", git = "https://github.com/oxidezap/whatspec.git", rev = "3d9064051a176f75ce8e932528ced70c192cd09d" }
 
 [lints]
 workspace = true

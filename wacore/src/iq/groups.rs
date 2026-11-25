@@ -77,20 +77,39 @@ pub enum GroupNodeError {
         value: u64,
     },
     #[error("{0}")]
-    Binary(#[from] wacore_binary::BinaryError),
+    Binary(#[source] Box<wacore_binary::BinaryError>),
     #[error("{0}")]
-    Structure(#[from] crate::iq::node::IqParseError),
+    Structure(#[source] Box<crate::iq::node::IqParseError>),
     #[error("{0}")]
     Jid(#[from] wacore_binary::jid::JidError),
     #[error("{0}")]
     Wire(#[from] crate::protocol::UnknownWireValue),
     #[error("{0}")]
-    Context(#[from] super::contextual::IqResponseError),
+    Context(#[source] Box<super::contextual::IqResponseError>),
     #[error("{0}")]
     Rejection(#[from] super::spec::ContextualRejection),
 }
 
+impl From<wacore_binary::BinaryError> for GroupNodeError {
+    fn from(error: wacore_binary::BinaryError) -> Self {
+        Self::Binary(Box::new(error))
+    }
+}
+
+impl From<crate::iq::node::IqParseError> for GroupNodeError {
+    fn from(error: crate::iq::node::IqParseError) -> Self {
+        Self::Structure(Box::new(error))
+    }
+}
+
+impl From<super::contextual::IqResponseError> for GroupNodeError {
+    fn from(error: super::contextual::IqResponseError) -> Self {
+        Self::Context(Box::new(error))
+    }
+}
+
 impl std::fmt::Debug for GroupNodeError {
+    #[inline(never)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
@@ -766,6 +785,7 @@ impl ProtocolNode for GroupParticipantResponse {
         builder.build()
     }
 
+    #[inline(never)]
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "participant" {
             return Err(GroupNodeError::UnexpectedTag {
@@ -824,6 +844,7 @@ impl ProtocolNode for GroupEphemeralSettings {
         builder.build()
     }
 
+    #[inline(never)]
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "ephemeral" {
             return Err(GroupNodeError::UnexpectedTag {
@@ -1199,6 +1220,7 @@ impl ProtocolNode for GroupMetadataResponse {
         builder.children(children).build()
     }
 
+    #[inline(never)]
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "group" && node.tag != "community" {
             return Err(GroupNodeError::UnexpectedGroupTag(node.tag.to_string()));
@@ -1597,6 +1619,7 @@ impl ProtocolNode for GroupOverviewData {
         builder.children(children).build()
     }
 
+    #[inline(never)]
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "group" && node.tag != "community" {
             return Err(GroupNodeError::UnexpectedGroupTag(node.tag.to_string()));
@@ -1768,6 +1791,7 @@ impl IqSpec for GroupQueryIq {
         )
     }
 
+    #[inline(never)]
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         match response
             .get_optional_child("group")

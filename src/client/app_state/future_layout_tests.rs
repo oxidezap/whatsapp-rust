@@ -22,7 +22,7 @@ async fn app_state_async_frames_fit_small_heap_blocks() {
         error: None,
     };
     let message = wa::Message::default();
-    let error = anyhow::anyhow!("synthetic layout probe");
+    let error = AppStateSyncFailure::new(AppStateSyncFailureKind::NoOwnJidForKeyRequest);
     let (_sender, receiver) = async_channel::bounded(1);
     let frames = [
         (
@@ -196,7 +196,7 @@ impl crate::http::HttpClient for StreamingOnly {
     async fn execute(
         &self,
         _: crate::http::HttpRequest,
-    ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
+    ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
         unreachable!()
     }
     fn supports_streaming(&self) -> bool {
@@ -205,7 +205,7 @@ impl crate::http::HttpClient for StreamingOnly {
     fn execute_streaming(
         &self,
         _: crate::http::HttpRequest,
-    ) -> std::result::Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
+    ) -> Result<wacore::net::StreamingHttpResponse, crate::http::HttpError> {
         unreachable!()
     }
 }

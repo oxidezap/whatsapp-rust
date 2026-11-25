@@ -24,10 +24,7 @@ struct BlobHttp {
 
 #[async_trait::async_trait]
 impl HttpClient for BlobHttp {
-    async fn execute(
-        &self,
-        _: HttpRequest,
-    ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         assert!(!self.streaming, "streaming adapters must not buffer HTTP");
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(HttpResponse::new(200, self.body.clone()))
@@ -40,7 +37,7 @@ impl HttpClient for BlobHttp {
     fn execute_streaming(
         &self,
         _: HttpRequest,
-    ) -> std::result::Result<StreamingHttpResponse, crate::http::HttpError> {
+    ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
         let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
         let mut body = self.body.clone();
         if first && self.corrupt_first.load(Ordering::SeqCst) {
@@ -402,10 +399,7 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
     struct GatedHttp(std::sync::Mutex<Option<GatedBody>>);
     #[async_trait::async_trait]
     impl HttpClient for GatedHttp {
-        async fn execute(
-            &self,
-            _: HttpRequest,
-        ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
             unreachable!()
         }
         fn supports_streaming(&self) -> bool {
@@ -414,7 +408,7 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
         fn execute_streaming(
             &self,
             _: HttpRequest,
-        ) -> std::result::Result<StreamingHttpResponse, crate::http::HttpError> {
+        ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
             Ok(StreamingHttpResponse::new(
                 200,
                 Box::new(self.0.lock().unwrap().take().unwrap()),

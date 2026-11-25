@@ -28,7 +28,7 @@
 //! use whatsapp_rust::test_support::CallFixture;
 //! use wacore_binary::builder::NodeBuilder;
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let fixture = Arc::new(CallFixture::new().await?);
 //! let client = fixture.client().clone();
 //! let peer = fixture.peer().clone();

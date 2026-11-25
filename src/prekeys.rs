@@ -5,7 +5,6 @@
 //! collisions when prekeys are consumed non-sequentially from the store.
 
 use crate::client::Client;
-use anyhow;
 use futures::FutureExt as _;
 use log;
 
@@ -30,7 +29,7 @@ const MIN_PRE_KEY_COUNT: usize = 5;
 
 pub(crate) const ADV_BOOTSTRAP_CONCURRENCY: usize = 8;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub(crate) enum AdvPrimaryBundleError {
     #[error("primary identity unavailable for ADV verification")]
     Missing,
@@ -38,10 +37,23 @@ pub(crate) enum AdvPrimaryBundleError {
     Invalid(#[source] PrimaryIdentityError),
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for AdvPrimaryBundleError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 pub(crate) enum AdvIdentityQueryError {
     Iq(Box<crate::request::IqError>),
     Bundle(Box<AdvPrimaryBundleError>),
+}
+
+impl std::fmt::Debug for AdvIdentityQueryError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for AdvIdentityQueryError {
@@ -74,7 +86,7 @@ impl From<AdvPrimaryBundleError> for AdvIdentityQueryError {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub(crate) enum PrimaryIdentityError {
     #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
@@ -84,7 +96,14 @@ pub(crate) enum PrimaryIdentityError {
     InvalidSignature,
 }
 
-#[derive(Debug, thiserror::Error)]
+impl std::fmt::Debug for PrimaryIdentityError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
 pub(crate) enum CachedAdvIdentityError {
     #[error("{0}")]
     Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
@@ -92,6 +111,13 @@ pub(crate) enum CachedAdvIdentityError {
     InvalidStored,
     #[error("invalid paired primary identity")]
     InvalidPaired,
+}
+
+impl std::fmt::Debug for CachedAdvIdentityError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl From<wacore::store::error::StoreError> for CachedAdvIdentityError {
@@ -124,6 +150,7 @@ impl std::fmt::Display for PreKeyUploadError {
 }
 
 impl std::fmt::Debug for PreKeyUploadError {
+    #[inline(never)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)?;
         let mut source = std::error::Error::source(&*self.0).and_then(|error| error.source());
@@ -213,7 +240,73 @@ impl Default for AdvBootstrapRegistry {
     }
 }
 
-type AdvBootstrapResult = Result<[u8; 32], Arc<anyhow::Error>>;
+#[derive(thiserror::Error)]
+pub(crate) enum AdvBootstrapError {
+    #[error("connection changed during ADV bootstrap")]
+    ScopeChanged,
+    #[error("connection closed during ADV bootstrap")]
+    ConnectionClosed,
+    #[error("ADV persistence admission closed")]
+    AdmissionClosed,
+    #[error("client ownership unavailable during bootstrap")]
+    ClientOwnershipUnavailable,
+    #[error("bootstrap identity worker stopped")]
+    WorkerStopped,
+    #[error("ADV persistence worker stopped")]
+    PersistenceWorkerStopped,
+    #[error("{0}")]
+    Cached(#[from] CachedAdvIdentityError),
+    #[error("{0}")]
+    Query(#[from] AdvIdentityQueryError),
+    #[error("{0}")]
+    Persistence(#[source] crate::usync::AdvIdentityPersistenceError),
+    #[error("{0}")]
+    Conflict(#[from] crate::usync::DeviceListIdentityConflict),
+    #[error("{0}")]
+    Shared(#[source] Arc<AdvBootstrapError>),
+}
+
+impl std::fmt::Debug for AdvBootstrapError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<crate::usync::AdvIdentityPersistenceError> for AdvBootstrapError {
+    fn from(error: crate::usync::AdvIdentityPersistenceError) -> Self {
+        match error {
+            crate::usync::AdvIdentityPersistenceError::Conflict(c) => Self::Conflict(c),
+            crate::usync::AdvIdentityPersistenceError::Account(
+                crate::usync::DeviceListIdentityError::Conflict(c),
+            ) => Self::Conflict(c),
+            e => Self::Persistence(e),
+        }
+    }
+}
+
+impl From<crate::usync::DeviceListIdentityError> for AdvBootstrapError {
+    fn from(error: crate::usync::DeviceListIdentityError) -> Self {
+        match error {
+            crate::usync::DeviceListIdentityError::Cached(e) => Self::Cached(e),
+            crate::usync::DeviceListIdentityError::Conflict(e) => Self::Conflict(e),
+        }
+    }
+}
+
+impl From<crate::usync::AdvBootstrapPersistenceError> for AdvBootstrapError {
+    fn from(error: crate::usync::AdvBootstrapPersistenceError) -> Self {
+        match error {
+            crate::usync::AdvBootstrapPersistenceError::ClientOwnershipUnavailable => {
+                Self::ClientOwnershipUnavailable
+            }
+            crate::usync::AdvBootstrapPersistenceError::WorkerStopped => Self::WorkerStopped,
+            crate::usync::AdvBootstrapPersistenceError::Persistence(e) => e.into(),
+        }
+    }
+}
+
+type AdvBootstrapResult = Result<[u8; 32], Arc<AdvBootstrapError>>;
 
 struct AdvBootstrapFlight {
     result: std::sync::Mutex<Option<AdvBootstrapResult>>,
@@ -247,7 +340,7 @@ impl Drop for AdvBootstrapLease {
 impl AdvBootstrapRegistry {
     /// Lower bound for owned heap: registry, retained map capacity, keys and
     /// registered flights. Runtime/channel waiter allocations and the opaque
-    /// allocation behind an anyhow error are deliberately not estimated.
+    /// allocation behind an error are deliberately not estimated.
     pub(crate) fn retained_bytes(&self) -> usize {
         use wacore::stats::HeapSize;
         let flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
@@ -294,29 +387,11 @@ impl AdvBootstrapRegistry {
     }
 }
 
-#[derive(Debug)]
-struct SharedAdvBootstrapError(Arc<anyhow::Error>);
-
 /// Keep trust conflicts downcastable for per-contact group rejection; share other error sources.
-fn shared_adv_bootstrap_error(error: Arc<anyhow::Error>) -> anyhow::Error {
-    use crate::usync::DeviceListIdentityConflict;
-    match error.downcast_ref::<DeviceListIdentityConflict>() {
-        Some(DeviceListIdentityConflict::Alias) => DeviceListIdentityConflict::Alias.into(),
-        Some(DeviceListIdentityConflict::Primary) => DeviceListIdentityConflict::Primary.into(),
-        Some(DeviceListIdentityConflict::Bootstrap) => DeviceListIdentityConflict::Bootstrap.into(),
-        None => anyhow::Error::new(SharedAdvBootstrapError(error)),
-    }
-}
-
-impl std::fmt::Display for SharedAdvBootstrapError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.0.as_ref(), f)
-    }
-}
-
-impl std::error::Error for SharedAdvBootstrapError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref().as_ref())
+fn shared_adv_bootstrap_error(error: Arc<AdvBootstrapError>) -> AdvBootstrapError {
+    match error.as_ref() {
+        AdvBootstrapError::Conflict(conflict) => AdvBootstrapError::Conflict(*conflict),
+        _ => AdvBootstrapError::Shared(error),
     }
 }
 
@@ -325,11 +400,10 @@ fn ensure_adv_bootstrap_scope(
     generation: &portable_atomic::AtomicU64,
     expected: u64,
     shutdown: &wacore::runtime::ShutdownSignal,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !shutdown.is_fired() && generation.load(Ordering::Acquire) == expected,
-        "connection changed during ADV bootstrap"
-    );
+) -> Result<(), AdvBootstrapError> {
+    if shutdown.is_fired() || generation.load(Ordering::Acquire) != expected {
+        return Err(AdvBootstrapError::ScopeChanged);
+    }
     Ok(())
 }
 
@@ -492,6 +566,29 @@ fn authenticate_cold_primary_bundles(
     Ok(())
 }
 
+#[derive(thiserror::Error)]
+pub(crate) enum PreKeyFetchError {
+    #[error("{0}")]
+    Cached(#[from] CachedAdvIdentityError),
+    #[error("{0}")]
+    Iq(#[from] crate::request::IqError),
+    #[error("{0}")]
+    Primary(#[from] PrimaryIdentityError),
+    #[error("{0}")]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Persistence(#[from] crate::usync::AdvBootstrapPersistenceError),
+    #[error("primary identity changed during companion bootstrap")]
+    PrimaryIdentityChanged,
+}
+
+impl std::fmt::Debug for PreKeyFetchError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Client {
     /// Allocate flight coordination only when an account needs cold ADV discovery.
     fn adv_bootstrap(&self) -> &Arc<AdvBootstrapRegistry> {
@@ -538,7 +635,7 @@ impl Client {
         &self,
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
-    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, PreKeyFetchError> {
         let bootstrap_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let account_identities = self.collect_account_identities(jids).await?;
         let mut primary_snapshots = Vec::new();
@@ -597,7 +694,7 @@ impl Client {
                     )
                     .await?
                 {
-                    anyhow::bail!("primary identity changed during companion bootstrap");
+                    return Err(PreKeyFetchError::PrimaryIdentityChanged);
                 }
             }
         }
@@ -660,7 +757,10 @@ impl Client {
     /// Establish the primary identity before trusting any companion metadata.
     /// First contact uses the primary's signed prekey, just as a direct primary
     /// session does. Device-list blobs never rotate an already stored identity.
-    pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+    pub(crate) async fn ensure_adv_account_identity(
+        &self,
+        jid: &Jid,
+    ) -> Result<[u8; 32], AdvBootstrapError> {
         use wacore::types::jid::JidExt;
         let generation = self.connection_generation.load(Ordering::Acquire);
         let shutdown = self.connection_shutdown_signal();
@@ -721,7 +821,7 @@ impl Client {
         };
         futures::select_biased! {
             _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
-                anyhow::bail!("connection closed during ADV bootstrap")
+                Err(AdvBootstrapError::ConnectionClosed)
             },
             result = Box::pin(bootstrap).fuse() => result,
         }
@@ -734,7 +834,7 @@ impl Client {
         primary: &Jid,
         generation: u64,
         shutdown: &wacore::runtime::ShutdownSignal,
-    ) -> anyhow::Result<[u8; 32]> {
+    ) -> Result<[u8; 32], AdvBootstrapError> {
         use wacore::types::jid::JidExt;
         let query = self.adv_bootstrap().queries.acquire().await;
         ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
@@ -764,12 +864,12 @@ impl Client {
             .inbound_queues()
             .work
             .try_track()
-            .ok_or_else(|| anyhow::anyhow!("ADV persistence admission closed"))?;
+            .ok_or(AdvBootstrapError::AdmissionClosed)?;
         let client = self
             .self_weak
             .get()
             .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
+            .ok_or(AdvBootstrapError::ClientOwnershipUnavailable)?;
         let current_generation = self.connection_generation.clone();
         let shutdown = shutdown.clone();
         let primary_owned = primary.clone();
@@ -784,13 +884,13 @@ impl Client {
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
                 let accepted = client
                     .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
-                    .await
-                    .map_err(crate::usync::AdvIdentityPersistenceError::into_anyhow)?;
+                    .await?;
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
-                anyhow::ensure!(
-                    accepted,
-                    crate::usync::DeviceListIdentityConflict::Bootstrap
-                );
+                if !accepted {
+                    return Err(AdvBootstrapError::Conflict(
+                        crate::usync::DeviceListIdentityConflict::Bootstrap,
+                    ));
+                }
                 Ok(key)
             }
             .await;
@@ -798,7 +898,7 @@ impl Client {
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("ADV persistence worker stopped"))?
+            .map_err(|_| AdvBootstrapError::PersistenceWorkerStopped)?
     }
 
     /// Load, for each companion JID, its account (device 0) identity key from the
@@ -807,7 +907,7 @@ impl Client {
     async fn collect_account_identities(
         &self,
         jids: &[Jid],
-    ) -> anyhow::Result<std::collections::HashMap<Jid, [u8; 32]>> {
+    ) -> Result<std::collections::HashMap<Jid, [u8; 32]>, CachedAdvIdentityError> {
         use futures::{StreamExt, TryStreamExt};
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)

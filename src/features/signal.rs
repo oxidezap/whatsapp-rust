@@ -17,7 +17,7 @@ use wacore_binary::{Jid, JidExt as _};
 use crate::client::Client;
 
 /// Error returned by the low-level Signal protocol operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum SignalError {
     /// A Signal protocol primitive (encrypt/decrypt/session) failed.
@@ -41,15 +41,34 @@ pub enum SignalError {
     InvalidInput(String),
     /// Catch-all for internal failures (device resolution, cache flush).
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Debug for SignalError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl From<crate::client::SignalMaintenanceError> for SignalError {
     fn from(err: crate::client::SignalMaintenanceError) -> Self {
         match err {
             crate::client::SignalMaintenanceError::Signal(e) => SignalError::Protocol(e),
-            other => SignalError::Internal(other.into()),
+            other => SignalError::Internal(Box::new(other)),
         }
+    }
+}
+
+impl From<crate::usync::DeviceSyncError> for SignalError {
+    fn from(err: crate::usync::DeviceSyncError) -> Self {
+        Self::Internal(Box::new(err))
+    }
+}
+
+impl From<crate::client::SessionEnsureError> for SignalError {
+    fn from(err: crate::client::SessionEnsureError) -> Self {
+        Self::Internal(Box::new(err))
     }
 }
 
@@ -608,7 +627,11 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         plaintext: &[u8],
     ) -> Result<(Option<Vec<u8>>, Vec<u8>), SignalError> {
-        let own_jid = self.client.get_own_jid_for_group(group_jid).await?;
+        let own_jid = self
+            .client
+            .get_own_jid_for_group(group_jid)
+            .await
+            .map_err(|e| SignalError::Internal(e.into()))?;
         let sender_addr = own_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_addr);
 

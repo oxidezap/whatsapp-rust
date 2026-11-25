@@ -12,7 +12,7 @@ use wacore::iq::blocklist::{GetBlocklistSpec, UpdateBlocklistSpec};
 use wacore_binary::Jid;
 
 /// Error returned by blocklist operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum BlockingError {
     /// The IQ to the server failed (transport, timeout, server rejection).
@@ -25,6 +25,13 @@ pub enum BlockingError {
     /// The LID/PN store lookup failed.
     #[error("{0}")]
     Store(#[from] wacore::store::error::StoreError),
+}
+
+impl std::fmt::Debug for BlockingError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Feature handle for blocklist operations.

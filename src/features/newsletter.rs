@@ -27,7 +27,7 @@ use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 use waproto::whatsapp as wa;
 
 /// Error returned by newsletter (channel) operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum NewsletterError {
     /// The poll definition failed validation.
@@ -58,6 +58,13 @@ pub enum NewsletterError {
     /// No newsletter exists behind this JID.
     #[error("newsletter not found: {0}")]
     NotFound(Jid),
+}
+
+impl std::fmt::Debug for NewsletterError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 // Types

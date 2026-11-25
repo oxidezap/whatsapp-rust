@@ -3,7 +3,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::oneshot;
@@ -25,6 +24,22 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::transport::{Transport, TransportEvent, TransportFactory};
 use crate::waproto::whatsapp as wa;
 
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+trait ContextExt<T> {
+    fn context(self, msg: &'static str) -> Result<T>;
+}
+impl<T> ContextExt<T> for Option<T> {
+    fn context(self, msg: &'static str) -> Result<T> {
+        self.ok_or_else(|| msg.into())
+    }
+}
+impl<T, E: std::fmt::Display> ContextExt<T> for std::result::Result<T, E> {
+    fn context(self, msg: &'static str) -> Result<T> {
+        self.map_err(|e| format!("{msg}: {e}").into())
+    }
+}
+
 const LIMIT: usize = 4096;
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -45,14 +60,14 @@ impl PendingOffer {
     pub fn complete(self) -> Result<()> {
         self.completion
             .send(Ok(()))
-            .map_err(|_| anyhow::anyhow!("offer send was cancelled"))
+            .map_err(|_| "offer send was cancelled".into())
     }
 
     /// Fail the production transport send with a synthetic error.
     pub fn fail(self) -> Result<()> {
         self.completion
             .send(Err("fixture refused offer send".into()))
-            .map_err(|_| anyhow::anyhow!("offer send was cancelled"))
+            .map_err(|_| "offer send was cancelled".into())
     }
 }
 
@@ -171,7 +186,7 @@ impl CallFixture {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 (&mut *reader).await??;
-                anyhow::bail!("fixture connect ended without reporting readiness or an error");
+                return Err("fixture connect ended without reporting readiness or an error".into());
             }
             Err(error) => {
                 reader.abort();
@@ -185,7 +200,7 @@ impl CallFixture {
                 .inject(NodeBuilder::new("success").attr("lid", own).build())
                 .await?;
             fixture.client.wait_for_session_ready(DEADLINE).await?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;
         if let Err(error) = ready {
@@ -260,20 +275,18 @@ impl CallFixture {
             .outgoing
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        ensure!(
-            nodes.len() <= LIMIT,
-            "fixture outgoing observation limit exceeded"
-        );
+        if nodes.len() > LIMIT {
+            return Err("fixture outgoing observation limit exceeded".into());
+        }
         Ok(nodes.clone())
     }
 
     /// Production event-bus events, including parsed incoming calls. No event injection API exists.
     pub fn events(&self) -> Result<Vec<Arc<Event>>> {
         let events = self.events.0.lock().unwrap_or_else(|e| e.into_inner());
-        ensure!(
-            events.len() <= LIMIT,
-            "fixture event observation limit exceeded"
-        );
+        if events.len() > LIMIT {
+            return Err("fixture event observation limit exceeded".into());
+        }
         Ok(events.clone())
     }
 
@@ -377,7 +390,9 @@ impl Wire {
                     .ephemeral
                     .context("client ephemeral")?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("ephemeral length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "ephemeral length".into()
+                    })?;
                 let identity = KeyPair::generate(&mut rand::rng());
                 let ephemeral = KeyPair::generate(&mut rand::rng());
                 let identity_pub: [u8; 32] = *identity.public_key.public_key_bytes();
@@ -422,7 +437,9 @@ impl Wire {
                 let peer: [u8; 32] = noise
                     .decrypt(&finish.r#static.context("client static")?)?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("client static length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "client static length".into()
+                    })?;
                 noise.mix_shared_secret(ephemeral.private_key.serialize(), &peer)?;
                 let _payload = noise.decrypt(&finish.payload.context("client payload")?)?;
                 let (read, write) = noise.finish()?;
@@ -454,7 +471,7 @@ impl Wire {
                 };
                 Ok((None, Some(node)))
             }
-            State::Closed => anyhow::bail!("fixture connection closed"),
+            State::Closed => return Err("fixture connection closed".into()),
         }
     }
 
@@ -462,7 +479,7 @@ impl Wire {
         let frame = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let State::Established { write, sent, .. } = &mut *state else {
-                anyhow::bail!("fixture handshake not complete");
+                return Err("fixture handshake not complete".into());
             };
             let encrypted = write.encrypt_with_counter(*sent, &marshal(&node)?)?;
             *sent = sent.checked_add(1).context("send counter exhausted")?;
@@ -523,7 +540,7 @@ impl Transport for Wire {
                 self.offers.send(PendingOffer { node, completion }).await?;
                 done.await
                     .context("fixture offer was dropped")?
-                    .map_err(anyhow::Error::msg)?;
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             } else if nr.tag == "iq" {
                 let id = nr.attrs().optional_string("id").context("IQ id")?;
                 let active = nr.get_optional_child("active").is_some();

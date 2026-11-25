@@ -1,5 +1,4 @@
 use crate::HistorySyncMetadata;
-use anyhow::Result;
 
 /// Identity of one self-sent history notification, scoped to the Client account.
 /// Stanza IDs alone are not unique: deduplicate on all three fields, and keep
@@ -66,7 +65,7 @@ pub trait HistorySyncDurabilityHook: wacore::sync_marker::MaybeSendSync {
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
         notification: &[u8],
-    ) -> Result<()>;
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Retain the decrypted, zlib-compressed chunk before its receipt. Parsing
     /// follows this callback; malformed chunks remain unacknowledged.
@@ -75,5 +74,5 @@ pub trait HistorySyncDurabilityHook: wacore::sync_marker::MaybeSendSync {
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
         compressed: &[u8],
-    ) -> Result<()>;
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

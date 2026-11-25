@@ -3,7 +3,6 @@
 //! Manages the device registry cache for tracking known devices per user.
 //! Uses LID-first storage with bidirectional lookup support.
 
-use anyhow::Result;
 use log::{debug, info, warn};
 use portable_atomic::AtomicU64;
 use std::collections::{HashMap, HashSet};
@@ -32,7 +31,8 @@ impl Client {
         keys: &[&str],
         kind: RegistryReadKind,
         publication: Option<&DeviceRegistryMutationGuard<'_>>,
-    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>> {
+    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>, wacore::store::error::StoreError>
+    {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -54,7 +54,8 @@ impl Client {
         kind: RegistryReadKind,
         guard: &DeviceRegistryMutationGuard<'_>,
         fill: bool,
-    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>> {
+    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>, wacore::store::error::StoreError>
+    {
         let backend = self.persistence_manager.backend();
         let rows = match kind {
             RegistryReadKind::Batch => backend.get_devices_batch(keys).await?,
@@ -245,7 +246,7 @@ impl Client {
         group: &Jid,
         group_info: &Arc<wacore::client::context::GroupRoutingInfo>,
         own_sending_jid: &Jid,
-    ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
+    ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, crate::usync::DeviceSyncError> {
         use crate::client::GroupDevicesMemoOutcome as Outcome;
         // Store-backed registry or mapping caches can be written by OTHER
         // processes (e.g. shared Redis across pods), which this process's
@@ -371,7 +372,7 @@ impl Client {
         group_info: &wacore::client::context::GroupRoutingInfo,
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, crate::usync::DeviceSyncError> {
         self.resolve_group_devices_checked(group_info, own_sending_jid, freshness)
             .await
             .map(|(devices, _)| devices)
@@ -386,7 +387,7 @@ impl Client {
         group_info: &wacore::client::context::GroupRoutingInfo,
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
-    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+    ) -> Result<(Vec<Jid>, bool), crate::usync::DeviceSyncError> {
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let mut jids_to_resolve: Vec<Jid> = group_info
             .participants
@@ -459,7 +460,7 @@ impl Client {
         own_jid: &Jid,
         own_lid: Option<&Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<Arc<wacore::send::ResolvedDmDevices>, anyhow::Error> {
+    ) -> Result<Arc<wacore::send::ResolvedDmDevices>, crate::usync::DeviceSyncError> {
         // Refresh asks for the server's truth, so a memo hit would serve
         // exactly what the caller asked to bypass. Store-backed registry or
         // mapping caches can be written by OTHER processes (e.g. a shared
@@ -556,7 +557,7 @@ impl Client {
         own_jid: &Jid,
         own_lid: Option<&Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+    ) -> Result<(Vec<Jid>, bool), crate::usync::DeviceSyncError> {
         #[cfg(test)]
         self.dm_devices_memo_recomputes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -630,9 +631,7 @@ impl Client {
         // for a LID recipient (whatsmeow switches ownID to LID before fanout;
         // Server::Pn becomes Server::Lid, Server::Hosted becomes Server::HostedLid).
         if recipient_bare.is_lid() {
-            let lid = own_lid.ok_or_else(|| {
-                anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
-            })?;
+            let lid = own_lid.ok_or(crate::usync::DeviceSyncErrorKind::MissingOwnLidForLidDm)?;
             for j in all_dm_jids.iter_mut() {
                 if j.server.is_pn_family() && j.is_same_user_as(own_jid) {
                     *j = lid.with_device_hosting(j.device, j.is_hosted());
@@ -786,7 +785,7 @@ impl Client {
     pub(crate) async fn recover_device_cleanup_record(
         &self,
         user: &Jid,
-    ) -> Result<wacore::store::traits::DeviceListRecord> {
+    ) -> Result<wacore::store::traits::DeviceListRecord, crate::usync::DeviceSyncError> {
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         let lookup = self.resolve_lookup_keys_for_jid(user).await;
         let backend = self.persistence_manager.backend();
@@ -805,18 +804,18 @@ impl Client {
                 let wire_address = address.strip_suffix(".0").unwrap_or(&address);
                 let wire_address = wacore::types::jid::status_session_base_name(wire_address)
                     .unwrap_or(wire_address);
-                let jid: Jid = wire_address.parse().map_err(|_| {
-                    anyhow::anyhow!("invalid stored Signal address during hosted identity recovery")
-                })?;
+                let jid: Jid = wire_address
+                    .parse()
+                    .map_err(|_| crate::usync::DeviceSyncErrorKind::InvalidStoredSignalAddress)?;
                 // Jid's fast parser deliberately treats an overflowing device
                 // as device 0. Cleanup cannot silently drop that stored suffix.
-                anyhow::ensure!(
-                    wire_address
-                        .split_once('@')
-                        .and_then(|(local, _)| local.rsplit_once(':'))
-                        .is_none_or(|(_, device)| device.parse::<u16>().ok() == Some(jid.device)),
-                    "invalid stored Signal device during hosted identity recovery"
-                );
+                if !wire_address
+                    .split_once('@')
+                    .and_then(|(local, _)| local.rsplit_once(':'))
+                    .is_none_or(|(_, device)| device.parse::<u16>().ok() == Some(jid.device))
+                {
+                    return Err(crate::usync::DeviceSyncErrorKind::InvalidStoredSignalDevice.into());
+                }
                 if jid.user == key && jid.device != 0 {
                     ids.insert(jid.device);
                 }
@@ -947,7 +946,7 @@ impl Client {
     pub(crate) async fn update_device_list(
         &self,
         record: wacore::store::traits::DeviceListRecord,
-    ) -> Result<()> {
+    ) -> Result<(), wacore::store::error::StoreError> {
         let guard = self.device_topology.lock_registry().await;
         self.update_device_list_guarded(record, &guard).await
     }
@@ -957,9 +956,7 @@ impl Client {
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
         guard: &DeviceRegistryMutationGuard<'_>,
-    ) -> Result<()> {
-        use anyhow::Context;
-
+    ) -> Result<(), wacore::store::error::StoreError> {
         let original_user = Arc::clone(&record.user);
         let lookup = self.resolve_lookup_keys(&original_user).await;
         // One allocation for the canonical name: the record carries it and
@@ -983,10 +980,7 @@ impl Client {
             .await;
 
         let backend = self.persistence_manager.backend();
-        backend
-            .update_device_list(record)
-            .await
-            .context("Failed to update device list in backend")?;
+        backend.update_device_list(record).await?;
 
         if *canonical_key != *original_user {
             // Invalidate before + after delete so a concurrent reader that
@@ -1026,7 +1020,7 @@ impl Client {
     pub(crate) async fn update_device_lists(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
-    ) -> Result<()> {
+    ) -> Result<(), wacore::store::error::StoreError> {
         let guard = self.device_topology.lock_registry().await;
         self.update_device_lists_guarded(records, &guard).await
     }
@@ -1036,9 +1030,7 @@ impl Client {
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
         guard: &DeviceRegistryMutationGuard<'_>,
-    ) -> Result<()> {
-        use anyhow::Context;
-
+    ) -> Result<(), wacore::store::error::StoreError> {
         // Test-only fault hook (see `Client::fail_next_device_list_write`):
         // fail before touching cache or backend so the caller observes a
         // write that never happened.
@@ -1047,7 +1039,9 @@ impl Client {
             .fail_next_device_list_write
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            anyhow::bail!("injected device-list write failure");
+            return Err(wacore::store::error::StoreError::Validation(
+                "injected device-list write failure".into(),
+            ));
         }
 
         if records.is_empty() {
@@ -1087,10 +1081,7 @@ impl Client {
             .await;
 
         let backend = self.persistence_manager.backend();
-        backend
-            .update_device_lists(prepared)
-            .await
-            .context("Failed to update device lists in backend")?;
+        backend.update_device_lists(prepared).await?;
 
         // Canonical-flip cleanup is rare and per-row; keep the original
         // pattern (invalidate cache + best-effort delete + re-invalidate)
@@ -1177,7 +1168,7 @@ impl Client {
         &self,
         user: &str,
         guard: &DeviceRegistryMutationGuard<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), wacore::store::error::StoreError> {
         let mut failure = None;
         let lookup = self.resolve_lookup_keys(user).await;
 
@@ -1190,7 +1181,7 @@ impl Client {
                     "Failed to delete device registry from DB for {}: {e}",
                     wacore_binary::jid::ObservedJid::from(key)
                 );
-                failure.get_or_insert_with(|| e.into());
+                failure.get_or_insert(e);
             }
             // Invalidate again after the delete: a concurrent reader that read
             // the doomed DB row can promote() it back between the first
@@ -1749,7 +1740,10 @@ impl Client {
         &self,
         keys: &[&str],
         publication: Option<&DeviceRegistryMutationGuard<'_>>,
-    ) -> Result<HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>> {
+    ) -> Result<
+        HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>,
+        wacore::store::error::StoreError,
+    > {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1796,7 +1790,10 @@ impl Client {
         users: &[&Jid],
         proposed: &HashMap<Jid, Jid>,
         publication: &DeviceRegistryMutationGuard<'_>,
-    ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
+    ) -> Result<
+        Vec<Option<wacore::store::traits::DeviceListRecord>>,
+        wacore::store::error::StoreError,
+    > {
         let (records, status) = self
             .load_device_records_projected_inner(users, proposed, Some(publication))
             .await;
@@ -1809,7 +1806,10 @@ impl Client {
         &self,
         users: &[&Jid],
         publication: &DeviceRegistryMutationGuard<'_>,
-    ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
+    ) -> Result<
+        Vec<Option<wacore::store::traits::DeviceListRecord>>,
+        wacore::store::error::StoreError,
+    > {
         self.load_device_records_batch_projected_checked(users, &HashMap::new(), publication)
             .await
     }
@@ -1822,7 +1822,7 @@ impl Client {
         publication: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> (
         Vec<Option<wacore::store::traits::DeviceListRecord>>,
-        Result<()>,
+        Result<(), wacore::store::error::StoreError>,
     ) {
         let mut out: Vec<Option<wacore::store::traits::DeviceListRecord>> =
             Vec::with_capacity(users.len());
@@ -4619,7 +4619,7 @@ mod tests {
         client: &Arc<Client>,
         recipient: &Jid,
         freshness: crate::cache::Freshness,
-    ) -> Result<Arc<wacore::send::ResolvedDmDevices>> {
+    ) -> Result<Arc<wacore::send::ResolvedDmDevices>, crate::usync::DeviceSyncError> {
         let own = dm_own_jid();
         client
             .resolve_dm_devices_memoized(recipient, recipient, &own, None, freshness)

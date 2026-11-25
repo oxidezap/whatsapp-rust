@@ -1143,8 +1143,7 @@ async fn test_primary_phone_session_probe_fails_without_pn() {
 
     let err = result.unwrap_err();
     assert!(
-        err.downcast_ref::<ClientError>()
-            .is_some_and(|e| matches!(e, ClientError::NotLoggedIn)),
+        matches!(err, ClientError::NotLoggedIn),
         "Error should be ClientError::NotLoggedIn, got: {}",
         err
     );
@@ -4247,10 +4246,7 @@ async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(
-            &self,
-            _data: Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             self.send_done.store(true, Ordering::Release);
@@ -4858,10 +4854,7 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
 
     #[async_trait]
     impl crate::transport::Transport for CountingTransport {
-        async fn send(
-            &self,
-            _data: Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -4989,10 +4982,7 @@ async fn flush_waits_for_queued_delivery_receipts() {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(
-            &self,
-            _data: Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             Ok(())
@@ -10111,7 +10101,10 @@ async fn group_notifications_queued_in_a_lane_obey_the_same_bound() {
     struct Durable;
     #[async_trait::async_trait]
     impl crate::GroupNotificationDurabilityHook for Durable {
-        async fn on_notification(&self, _: Arc<OwnedNodeRef>) -> Result<()> {
+        async fn on_notification(
+            &self,
+            _: Arc<OwnedNodeRef>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }

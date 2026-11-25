@@ -5,10 +5,8 @@ use super::*;
 const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
 const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn app_state_key_share_requires_reconnect(error: &anyhow::Error) -> bool {
-    // Annotated because `anyhow::Error` has two `AsRef<dyn Error>` impls.
-    let cause: &(dyn std::error::Error + 'static) = error.as_ref();
-    crate::ErrorChainExt::is_transport_unavailable(cause)
+fn app_state_key_share_requires_reconnect(error: &(dyn std::error::Error + 'static)) -> bool {
+    crate::ErrorChainExt::is_transport_unavailable(error)
 }
 
 impl Client {
@@ -151,7 +149,7 @@ impl Client {
     pub(super) async fn build_app_state_sync_key_share(
         &self,
         request: &wa::message::AppStateSyncKeyRequest,
-    ) -> Result<wa::message::AppStateSyncKeyShare, anyhow::Error> {
+    ) -> Result<wa::message::AppStateSyncKeyShare, crate::send::SendError> {
         #[cfg(test)]
         if self
             .app_state_key_share_prepare_test_failures
@@ -160,7 +158,7 @@ impl Client {
             })
             .is_ok()
         {
-            anyhow::bail!("injected app-state key-share preparation failure");
+            return Err(crate::send::SendInternalError::AppStateKeySharePrepareFailed.into());
         }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -346,7 +344,7 @@ impl Client {
         requester: &Jid,
         message: &wa::Message,
         message_id: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), crate::send::SendError> {
         self.ensure_e2e_sessions(std::slice::from_ref(requester))
             .await?;
         self.send_message_impl(
@@ -419,21 +417,20 @@ mod tests {
     fn key_share_reconnects_for_direct_and_iq_connection_loss() {
         use wacore_binary::builder::NodeBuilder;
 
-        let direct = anyhow::Error::new(crate::client::ClientError::NotConnected);
+        let direct = crate::client::ClientError::NotConnected;
         assert!(app_state_key_share_requires_reconnect(&direct));
 
-        let iq = anyhow::Error::new(crate::request::IqError::NotConnected);
+        let iq = crate::request::IqError::NotConnected;
         assert!(app_state_key_share_requires_reconnect(&iq));
 
-        let channel_closed = anyhow::Error::new(crate::request::IqError::InternalChannelClosed);
+        let channel_closed = crate::request::IqError::InternalChannelClosed;
         assert!(app_state_key_share_requires_reconnect(&channel_closed));
 
-        let disconnected = anyhow::Error::new(crate::request::IqError::Disconnected(Box::new(
-            NodeBuilder::new("disconnect").build(),
-        )));
+        let disconnected =
+            crate::request::IqError::Disconnected(Box::new(NodeBuilder::new("disconnect").build()));
         assert!(app_state_key_share_requires_reconnect(&disconnected));
 
-        let non_transport = anyhow::anyhow!("pre-wire failure");
+        let non_transport = std::io::Error::other("pre-wire failure");
         assert!(!app_state_key_share_requires_reconnect(&non_transport));
     }
 }

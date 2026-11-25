@@ -80,7 +80,7 @@ pub enum DeregistrationSkipReason {
     /// No phone-number identity was available for the companion request.
     MissingIdentity {
         /// The original identity lookup error.
-        source: anyhow::Error,
+        source: ClientError,
     },
 }
 
@@ -3790,7 +3790,7 @@ mod tests {
         match &report.deregistration {
             DeregistrationOutcome::NotAttempted(DeregistrationSkipReason::MissingIdentity {
                 source,
-            }) => assert!(source.downcast_ref::<ClientError>().is_some()),
+            }) => assert!(matches!(source, ClientError::NotLoggedIn)),
             other => panic!("unexpected deregistration: {other:?}"),
         }
         assert!(transport.sent().is_empty(), "no identity means no IQ");
@@ -3966,7 +3966,7 @@ mod tests {
     impl crate::transport::TransportFactory for ParkedConnect {
         async fn create_transport(
             &self,
-        ) -> std::result::Result<
+        ) -> Result<
             (
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
@@ -4070,7 +4070,7 @@ mod tests {
     impl crate::transport::TransportFactory for AbandonedDial {
         async fn create_transport(
             &self,
-        ) -> std::result::Result<
+        ) -> Result<
             (
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
@@ -4197,7 +4197,7 @@ mod tests {
         async fn execute(
             &self,
             _: crate::http::HttpRequest,
-        ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
+        ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
             self.0.send("version").await.unwrap();
             std::future::pending().await
         }
@@ -4212,10 +4212,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for ShutdownConnectTransport {
-        async fn send(
-            &self,
-            _: bytes::Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             self.entered.send("handshake").await.unwrap();
             if self.pending_send {
                 std::future::pending::<()>().await;
@@ -4243,7 +4240,7 @@ mod tests {
     impl crate::transport::TransportFactory for ShutdownConnectFactory {
         async fn create_transport(
             &self,
-        ) -> std::result::Result<
+        ) -> Result<
             (
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
@@ -4516,10 +4513,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for SuccessfulHandshakeTransport {
-        async fn send(
-            &self,
-            data: bytes::Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             use wacore::libsignal::protocol::KeyPair;
             use wacore_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
             use waproto::whatsapp as wa;
@@ -4606,7 +4600,7 @@ mod tests {
     impl crate::transport::TransportFactory for SuccessfulHandshakeDial {
         async fn create_transport(
             &self,
-        ) -> std::result::Result<
+        ) -> Result<
             (
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
@@ -5969,10 +5963,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::transport::Transport for ParkedDisconnect {
-        async fn send(
-            &self,
-            _data: bytes::Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
 

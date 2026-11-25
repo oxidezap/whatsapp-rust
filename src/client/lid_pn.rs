@@ -21,7 +21,7 @@ use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
 /// Failure while recording or persisting LID and phone-number mappings.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MappingLearningError {
     #[error("client ownership unavailable during mapping persistence")]
@@ -34,6 +34,13 @@ pub enum MappingLearningError {
     StoreSingle(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
     #[error("persisting LID-PN mapping batch: {0}")]
     StoreBatch(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
+}
+
+impl std::fmt::Debug for MappingLearningError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Exclusive upper bound for the device-id range we iterate when migrating

@@ -46,19 +46,58 @@ pub enum IdentityPersistenceError {
     Store(#[from] crate::store::error::StoreError),
 }
 
-#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SignalCacheFlushError {
-    #[error("{0}")]
-    Store(#[source] crate::error::BoxedErrorSource<crate::store::error::StoreError>),
-    #[error("Corrupted identity key for {address}: expected 32 bytes, got {length}")]
-    InvalidIdentity { address: Arc<str>, length: usize },
-    #[error("sender key serialize for {address}: {source}")]
+    Store(crate::error::BoxedErrorSource<crate::store::error::StoreError>),
+    InvalidIdentity {
+        address: Arc<str>,
+        length: usize,
+    },
     SenderKeySerialization {
         address: Arc<str>,
-        #[source]
         source: crate::error::BoxedErrorSource<SignalProtocolError>,
     },
+}
+
+impl std::fmt::Display for SignalCacheFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source: Option<&(dyn std::error::Error + 'static)> = match self {
+            Self::Store(error) => {
+                write!(f, "{error}")?;
+                Some(error.as_ref())
+            }
+            Self::InvalidIdentity { address, length } => {
+                write!(
+                    f,
+                    "Corrupted identity key for {address}: expected 32 bytes, got {length}"
+                )?;
+                None
+            }
+            Self::SenderKeySerialization { address, source } => {
+                write!(f, "sender key serialize for {address}: {source}")?;
+                Some(source.as_ref())
+            }
+        };
+        if f.alternate() {
+            let mut source = source.and_then(std::error::Error::source);
+            for _ in 0..16 {
+                let Some(error) = source else { break };
+                write!(f, ": {error}")?;
+                source = error.source();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SignalCacheFlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error.as_ref()),
+            Self::InvalidIdentity { .. } => None,
+            Self::SenderKeySerialization { source, .. } => Some(source.as_ref()),
+        }
+    }
 }
 
 debug_as_display!(

@@ -35,7 +35,7 @@ use waproto::whatsapp as wa;
 ///
 /// Both variants mean the peer sent a target message key we cannot attribute,
 /// so retrying the same envelope yields the same result.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MessageEditError {
     /// A JID carried by the target message key did not parse.
@@ -52,7 +52,14 @@ pub enum MessageEditError {
     MissingTargetSender,
 }
 
-#[derive(Debug, thiserror::Error)]
+impl std::fmt::Debug for MessageEditError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SecretDecryptError {
     #[error("{0}")]
@@ -66,6 +73,13 @@ pub enum SecretDecryptError {
         prior: Box<SecretDecryptError>,
         fallback: Box<SecretDecryptError>,
     },
+}
+
+impl std::fmt::Debug for SecretDecryptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.

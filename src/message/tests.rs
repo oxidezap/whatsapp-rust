@@ -1847,7 +1847,7 @@ async fn check_status_mixed_group_payloads_commit(
             &self,
             _: Arc<Client>,
             batch: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.content.lock().unwrap().extend(
                 batch
                     .iter()
@@ -2045,7 +2045,7 @@ async fn status_group_signal_failures_request_recovery_once_per_arrival() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("undecryptable siblings must not reach the durability hook")
         }
     }
@@ -2208,7 +2208,7 @@ async fn status_skdm_session_does_not_respond_before_group_recovery() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only session and failed group ciphertext have no consumer content")
         }
     }
@@ -2289,7 +2289,7 @@ async fn skdm_only_sender_key_status_is_acknowledged_once() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("SKDM-only content must not reach the consumer hook")
         }
     }
@@ -2335,7 +2335,7 @@ async fn ignored_expired_group_failure_preserves_skdm_only_status_response() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only and ignored ciphertext must not reach the consumer hook")
         }
     }
@@ -2450,7 +2450,7 @@ async fn skdm_only_sibling_does_not_hide_status_plaintext_failure() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only and malformed payloads must not reach the consumer hook")
         }
     }
@@ -2540,7 +2540,7 @@ async fn unusable_status_plaintext_sends_one_guarded_terminal_response() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("unusable plaintext must not reach the durability hook")
         }
     }
@@ -2834,7 +2834,7 @@ async fn direct_status_keeps_session_content_durable_before_rejecting_skmsg_cont
             &self,
             _: Arc<Client>,
             batch: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             assert_eq!(batch.len(), 1);
             assert_eq!(
                 batch[0].message.conversation.as_deref(),
@@ -11158,7 +11158,7 @@ async fn encrypted_offline_peers_and_redelivered_duplicates_get_individual_recei
             &self,
             _: Arc<Client>,
             batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             assert_eq!(
                 batch
                     .iter()
@@ -12974,13 +12974,15 @@ impl crate::types::enc_handler::EncHandler for ControlledEncHandler {
         _: Arc<Client>,
         _: &wacore_binary::Node,
         _: &MessageInfo,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _finished = scopeguard::guard((), |()| {
             let _ = self.finished.try_send(());
         });
-        self.entered.send(()).await?;
-        self.release.recv().await?;
-        anyhow::ensure!(!self.fail, "synthetic custom handler failure");
+        self.entered.send(()).await.map_err(|e| format!("{e}"))?;
+        self.release.recv().await.map_err(|e| format!("{e}"))?;
+        if self.fail {
+            return Err("synthetic custom handler failure".into());
+        }
         Ok(())
     }
 }
@@ -14693,9 +14695,9 @@ async fn raw_pending_live_equal_parts_survive_prefix_cleanup_and_later_hook_fail
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if self.calls.fetch_add(1, Ordering::Relaxed) == 1 && self.fail_second {
-                return Err(anyhow::anyhow!("injected second-part hook failure"));
+                return Err(anyhow::anyhow!("injected second-part hook failure").into());
             }
             Ok(())
         }
@@ -14799,7 +14801,7 @@ async fn claimed_secret_resend_retains_resolved_projection_after_cleanup_failure
             &self,
             _: Arc<Client>,
             batch: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0
                 .lock()
                 .unwrap()
@@ -20358,7 +20360,7 @@ mod pdo_alias_tests {
                 &self,
                 _: Arc<Client>,
                 _: &[wacore::types::events::InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -20997,7 +20999,7 @@ mod pdo_alias_tests {
                 &self,
                 _: Arc<Client>,
                 _: &[wacore::types::events::InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -21286,7 +21288,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             &self,
             _: Arc<Client>,
             messages: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             for message in messages
                 .iter()
                 .filter(|m| m.info.id == "COUNTERFACTUAL_MESSAGE")
@@ -21784,7 +21786,11 @@ async fn pdo_retry_overlaps_durability_commit() {
 
     #[async_trait::async_trait]
     impl InboundDurabilityHook for PausedHook {
-        async fn on_messages(&self, _: Arc<Client>, _: &[InboundMessage]) -> anyhow::Result<()> {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[InboundMessage],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.entered.send(()).await.unwrap();
             self.release.recv().await.unwrap();
             Ok(())
@@ -22177,11 +22183,13 @@ impl crate::types::durability_hook::InboundDurabilityHook for PdoRetryDurability
         &self,
         _: Arc<Client>,
         messages: &[wacore::types::events::InboundMessage],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].info.id, PdoRetryFixture::ID);
         self.calls.fetch_add(1, Ordering::Relaxed);
-        anyhow::ensure!(!self.fail.load(Ordering::Relaxed), "synthetic hook failure");
+        if self.fail.load(Ordering::Relaxed) {
+            return Err("synthetic hook failure".into());
+        }
         Ok(())
     }
 }
@@ -22575,7 +22583,7 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
             &self,
             _: Arc<Client>,
             batch: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0
                 .lock()
                 .unwrap()
@@ -23421,7 +23429,7 @@ async fn a_collapsed_batch_clears_every_arrived_pending_row() {
             &self,
             _client: Arc<Client>,
             _batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -23569,7 +23577,7 @@ async fn a_replay_that_fails_to_commit_counts_as_a_suppression() {
             &self,
             _client: Arc<Client>,
             _batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -24077,9 +24085,9 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
             &self,
             _client: Arc<Client>,
             _batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(anyhow::anyhow!("commit failed"));
+                return Err("commit failed".into());
             }
             Ok(())
         }
@@ -24169,7 +24177,11 @@ async fn raw_pending_legacy_alias_replay_keeps_failed_arrival_receipt_scope() {
     struct Hook;
     #[async_trait::async_trait]
     impl InboundDurabilityHook for Hook {
-        async fn on_messages(&self, _: Arc<Client>, _: &[InboundMessage]) -> anyhow::Result<()> {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[InboundMessage],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -24240,7 +24252,7 @@ async fn raw_pending_real_stanza_failure_cannot_ack_successful_predecessor() {
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(items.len(), Ordering::SeqCst);
             Ok(())
         }
@@ -24312,7 +24324,7 @@ async fn live_storage_failure_retry(reset_and_flush: bool) {
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(items.len(), Ordering::SeqCst);
             Ok(())
         }
@@ -24415,7 +24427,7 @@ async fn raw_pending_protocol_only_replay_allows_progress_without_publication() 
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only recovery must not enter the consumer hook")
         }
     }
@@ -24465,7 +24477,7 @@ async fn raw_pending_protocol_only_backend_failure_keeps_replay_owned() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("SKDM must not enter the consumer hook")
         }
     }
@@ -24551,7 +24563,7 @@ async fn raw_pending_terminal_skdm_rejection_allows_corrected_resend() {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only messages must not enter the hook")
         }
     }
@@ -24680,8 +24692,10 @@ async fn raw_pending_mixed_skdm_failure_matrix_preserves_content() {
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
-            anyhow::ensure!(!self.fail.load(Ordering::Acquire), "injected hook failure");
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("injected hook failure".into());
+            }
             self.delivered.lock().unwrap().extend(
                 items
                     .iter()
@@ -24841,7 +24855,7 @@ async fn raw_pending_multipart_replay_keeps_original_shared_metadata() {
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0
                 .lock()
                 .unwrap()
@@ -24911,7 +24925,7 @@ async fn raw_pending_capacity_refusal_preserves_ratchet_for_later_retry() {
             &self,
             _: Arc<Client>,
             messages: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(messages.len(), Ordering::SeqCst);
             Ok(())
         }
@@ -24980,11 +24994,10 @@ async fn raw_pending_cancelled_bot_replay_preserves_live_and_drain_receipts() {
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
-            anyhow::ensure!(
-                !self.fail.load(Ordering::Acquire),
-                "injected bot hook failure"
-            );
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("injected bot hook failure".into());
+            }
             self.delivered.lock().unwrap().extend(
                 items
                     .iter()
@@ -25173,11 +25186,10 @@ async fn raw_pending_packed_image_growth_survives_live_and_drain_hook_errors() {
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
-            anyhow::ensure!(
-                !self.fail.load(Ordering::Acquire),
-                "injected image hook failure"
-            );
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("injected image hook failure".into());
+            }
             self.scans.lock().unwrap().extend(items.iter().map(|item| {
                 item.message
                     .image_message
@@ -25290,7 +25302,7 @@ async fn raw_pending_fresh_drain_protocol_failure_retains_ratchet_advanced_plain
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("protocol-only replay must not publish consumer content")
         }
     }
@@ -25420,7 +25432,7 @@ async fn raw_pending_group_plaintext_failure_blocks_shared_receipt_without_forwa
             &self,
             client: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.calls.fetch_add(items.len(), Ordering::Relaxed);
             if self.arm.swap(false, Ordering::AcqRel) {
                 client
@@ -25549,7 +25561,7 @@ async fn raw_pending_drain_capacity_flush_preserves_queued_order_and_refusal_rat
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0
                 .lock()
                 .unwrap()
@@ -25696,7 +25708,7 @@ async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool, change_
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(items.len(), Ordering::SeqCst);
             Ok(())
         }
@@ -25821,7 +25833,7 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
             &self,
             client: Arc<Client>,
             _: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             client.flush_signal_cache().await?;
             self.entered.notify_one();
             self.release.notified().await;
@@ -25836,7 +25848,7 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.lock().unwrap().extend(
                 items
                     .iter()
@@ -26042,8 +26054,12 @@ async fn group_pending_recreation(change_spelling: Option<bool>, legacy_device_r
     struct Reject;
     #[async_trait::async_trait]
     impl InboundDurabilityHook for Reject {
-        async fn on_messages(&self, _: Arc<Client>, _: &[InboundMessage]) -> anyhow::Result<()> {
-            anyhow::bail!("consumer unavailable")
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[InboundMessage],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("consumer unavailable".into())
         }
     }
     struct Accept(Mutex<Vec<String>>);
@@ -26053,7 +26069,7 @@ async fn group_pending_recreation(change_spelling: Option<bool>, legacy_device_r
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.lock().unwrap().extend(
                 items
                     .iter()
@@ -26168,7 +26184,7 @@ async fn malformed_msmsg_does_not_poison_a_valid_retry() {
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.lock().unwrap().extend(
                 items
                     .iter()
@@ -26276,7 +26292,7 @@ async fn malformed_signal_plaintext_does_not_poison_a_valid_retry() {
             &self,
             _: Arc<Client>,
             items: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0.lock().unwrap().extend(
                 items
                     .iter()
@@ -26376,7 +26392,8 @@ fn live_admission_refusal_metrics_regression() {
                     &self,
                     _: Arc<Client>,
                     _: &[wacore::types::events::InboundMessage],
-                ) -> anyhow::Result<()> {
+                ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+                {
                     Ok(())
                 }
             }
@@ -27196,7 +27213,7 @@ async fn offline_receive_flushes_at_message_capacity_before_timer() {
             &self,
             _: Arc<Client>,
             items: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.0
                 .lock()
                 .unwrap()
@@ -27449,7 +27466,7 @@ async fn assert_untrusted_identity_prefix(offline: bool, journal: bool) {
             &self,
             _: Arc<Client>,
             _: &[wacore::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }

@@ -448,7 +448,6 @@ pub use waproto;
 // Third-party re-exports: these crates' types appear in the public API, so
 // consumers must name them; a direct dependency would have to version-match
 // this crate exactly.
-pub use anyhow;
 pub use async_channel;
 pub use async_trait::async_trait;
 pub use bytes;
@@ -482,6 +481,7 @@ mod inbound_queue;
 /// types embed it.
 pub use client::ClientError;
 pub use client::MappingLearningError;
+pub use client::StartupSyncError;
 pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
@@ -495,18 +495,22 @@ pub use client::{
 };
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
-pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, LifecycleError};
 pub use client::{
     ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
     DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
     SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use client::{NodeFilter, NodeWaiter};
+pub use history_sync::HistorySyncError;
+pub use pdo::PdoError;
 pub use types::connect_admission::ConnectAdmission;
 pub use types::decrypt_failure_admission::{
     DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,
 };
-pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
+pub use types::durability_hook::{
+    HistorySyncCaptureHook, HookError, HookResult, InboundDurabilityHook,
+};
 pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 #[cfg(feature = "generated-group-notifications")]
 pub use types::group_notification_facts::{
@@ -543,15 +547,16 @@ pub mod plugins;
 pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginClientInfo, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEventSubscription, PluginCoreEvents,
-    PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
-    PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
-    PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
-    PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
-    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
-    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginInterceptorRegistration,
-    PluginIq, PluginIqError, PluginIqInterceptor, PluginIqReply, PluginIqReplyError,
-    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
-    PluginStanzaInterception, PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
+    PluginError, PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope,
+    PluginEventOverflow, PluginEventPayloadEncoding, PluginEventPublishError,
+    PluginEventPublishReport, PluginEventPublisherStats, PluginEventReceiveError,
+    PluginEventRouteError, PluginEventRouter, PluginEventRouterStats, PluginEventSelector,
+    PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
+    PluginEventTryReceiveError, PluginEvents, PluginFuture, PluginHealth, PluginHostConfig,
+    PluginHostStats, PluginInterceptorRegistration, PluginIq, PluginIqError, PluginIqInterceptor,
+    PluginIqReply, PluginIqReplyError, PluginManifest, PluginMessaging, PluginMessagingError,
+    PluginPlanError, PluginResourceError, PluginResult, PluginStanzaInterception, PluginState,
+    PluginStats, PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
@@ -684,7 +689,9 @@ pub mod prelude {
     };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
-    pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+    pub use crate::client::{
+        ClientLifecycle, ConnectionScope, ConnectionScopeState, LifecycleError,
+    };
     pub use crate::client::{
         ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
         DrainOutcome, LogoutReport, ProtocolTerminalReason, RunCompletionReason, SecretFlushReport,

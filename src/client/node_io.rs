@@ -33,7 +33,7 @@ pub(crate) enum ReadLoopExit {
 
 /// Genuine failures of [`Client::read_messages_loop`] — everything here is worth
 /// reporting loudly, unlike [`ReadLoopExit`].
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 pub(crate) enum ReadLoopError {
     #[error("cannot start message loop: {0}")]
     NotStarted(&'static str),
@@ -41,6 +41,13 @@ pub(crate) enum ReadLoopError {
     Transport(DisconnectReason),
     #[error("transport event channel closed")]
     ChannelClosed,
+}
+
+impl std::fmt::Debug for ReadLoopError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl ReadLoopError {
@@ -3060,10 +3067,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl crate::transport::Transport for PrimaryStartupCloseRecorder {
-        async fn send(
-            &self,
-            _data: bytes::Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
 
@@ -3253,7 +3257,7 @@ mod tests {
             async fn send(
                 &self,
                 _data: bytes::Bytes,
-            ) -> std::result::Result<(), crate::transport::TransportError> {
+            ) -> Result<(), crate::transport::TransportError> {
                 Ok(())
             }
 

@@ -7,7 +7,7 @@ use wacore_binary::Jid;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum PresenceError {
     #[error("cannot send presence without a push name set")]
@@ -15,6 +15,13 @@ pub enum PresenceError {
     /// Connection/transport failure sending the `<presence>` stanza.
     #[error("{0}")]
     Client(#[from] ClientError),
+}
+
+impl std::fmt::Debug for PresenceError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Who announces the account's own `available` presence.

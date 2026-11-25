@@ -1790,7 +1790,6 @@ mod tests {
     use crate::TokioRuntime;
     use crate::http::{HttpClient, HttpRequest, HttpResponse};
     use crate::store::SqliteStore;
-    use anyhow::Result;
     use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 
     // Mock HTTP client for testing
@@ -1802,7 +1801,7 @@ mod tests {
         async fn execute(
             &self,
             _request: HttpRequest,
-        ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             // Return a mock response for version fetching
             Ok(HttpResponse::new(200, br#"self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"SiteData\":{\"server_revision\":1026131876,\"client_revision\":1026131876}}}");"#.to_vec()))
         }
@@ -1859,7 +1858,7 @@ mod tests {
         fn install(
             &self,
             _context: crate::plugins::PluginContext,
-        ) -> wacore::runtime::BoxFuture<'_, Result<Arc<Self::Api>>> {
+        ) -> wacore::runtime::BoxFuture<'_, crate::plugins::PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new("installed")) })
         }
     }
@@ -2508,7 +2507,7 @@ mod tests {
                 _: &str,
                 _: Option<wa::message::HistorySyncType>,
                 _: &[u8],
-            ) -> Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         }

@@ -5,16 +5,16 @@
 //! No connection flags are set by this fixture. Unsupported initialization IQs get 503;
 //! active and keepalive IQs succeed. This is not full WhatsApp service emulation.
 
+#[macro_use]
 mod util;
+pub(crate) use util::{ContextExt, Result};
 
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use anyhow::{Context, Result, ensure};
-use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
 use wacore::handshake::{NoiseCipher, NoiseHandshake};
 use wacore::libsignal::protocol::{KeyPair, SenderKeyName};
 use wacore::store::traits::Backend;
@@ -795,10 +795,10 @@ impl Session {
             .await
             .context("first DM did not reach the receiver")??;
         let Event::Messages(batch) = event.as_ref() else {
-            anyhow::bail!("expected a message event");
+            bail!("expected a message event");
         };
         let [message] = &*batch.messages else {
-            anyhow::bail!("expected one first DM");
+            bail!("expected one first DM");
         };
         ensure!(
             message.info.id == FIRST_DM_ID
@@ -853,7 +853,7 @@ impl Session {
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await??;
         self.settle().await
@@ -991,7 +991,7 @@ impl Session {
                     .monotonic_time()
                     .saturating_duration_since(last);
                 if elapsed >= quiet {
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
                 }
                 self.client.runtime.sleep(quiet - elapsed).await;
             }
@@ -1037,11 +1037,11 @@ impl Session {
         let reader_result: Result<()> = match self.reader.take() {
             Some(mut reader) => match tokio::time::timeout(DEADLINE, &mut reader).await {
                 Ok(joined) => joined
-                    .map_err(anyhow::Error::from)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
                     .and_then(|result| result),
                 Err(elapsed) => {
                     reader.abort();
-                    Err(anyhow::Error::from(elapsed).context("fixture reader did not stop"))
+                    Err(format!("fixture reader did not stop: {elapsed}").into())
                 }
             },
             None => Ok(()),
@@ -1200,7 +1200,9 @@ impl Wire {
                     .ephemeral
                     .context("client ephemeral")?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("ephemeral length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "ephemeral length".into()
+                    })?;
                 let identity = KeyPair::generate(&mut rand::rng());
                 let ephemeral = KeyPair::generate(&mut rand::rng());
                 // The same harness is compiled against the PR base and head.
@@ -1250,7 +1252,9 @@ impl Wire {
                 let peer: [u8; 32] = noise
                     .decrypt(&finish.r#static.context("client static")?)?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("client static length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "client static length".into()
+                    })?;
                 noise.mix_shared_secret(ephemeral.private_key.serialize(), &peer)?;
                 let _payload = noise.decrypt(&finish.payload.context("client payload")?)?;
                 let (read, write) = noise.finish()?;
@@ -1282,7 +1286,7 @@ impl Wire {
                 };
                 Ok((None, Some(node), false))
             }
-            State::Closed => anyhow::bail!("fixture connection closed"),
+            State::Closed => bail!("fixture connection closed"),
         }
     }
 
@@ -1290,7 +1294,7 @@ impl Wire {
         let frame = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let State::Established { write, sent, .. } = &mut *state else {
-                anyhow::bail!("fixture handshake not complete");
+                bail!("fixture handshake not complete");
             };
             let encrypted = write.encrypt_with_counter(*sent, &marshal(&node)?)?;
             *sent = sent.checked_add(1).context("send counter exhausted")?;

@@ -279,7 +279,6 @@ voip-mlow = ["voip-runtime", "wacore/voip-mlow"]
 voip-libopus = ["voip-encoded", "dep:opus"]
 
 [dependencies]
-anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-trait = { workspace = true }
@@ -349,6 +348,7 @@ parking_lot = "=0.13.0"
 parking_lot_012 = { package = "parking_lot", version = "=0.12.5" }
 
 [dev-dependencies]
+anyhow = { workspace = true, features = ["std"] }
 aes = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 # The startup-retention test ages a pending-inbound row directly, since the

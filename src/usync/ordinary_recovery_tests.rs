@@ -544,7 +544,10 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         let user = user.clone();
         tokio::spawn(async move {
             if matches!(case, EvictionCase::StrictAliasChanged) {
-                return client.refresh_user_devices(vec![user]).await;
+                return client
+                    .refresh_user_devices(vec![user])
+                    .await
+                    .map_err(anyhow::Error::from);
             }
             client
                 .signal()
@@ -1242,12 +1245,7 @@ async fn adv_review_round7_recovery_cannot_refresh_another_hosted_rows_epoch() {
     let iq = decode_sent_iq(&transport, 0).await;
     let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
     answer_iq(&client, &id, &response).await;
-    let failure = query
-        .await
-        .unwrap()
-        .unwrap_err()
-        .downcast::<DeviceListAdvError>()
-        .unwrap();
+    let failure = query.await.unwrap().unwrap_err().into_adv_error().unwrap();
     assert_eq!(failure.authentication_epoch, epoch);
     let generation = client.device_topology.current();
     client
@@ -3779,7 +3777,7 @@ async fn group_refresh_anchor_request_errors_and_strict_missing_bundles_abort_pu
         let error = refresh.await.unwrap().unwrap_err();
         if mode == DeviceListApplyMode::GroupRefresh {
             assert!(
-                error.chain().any(|source| matches!(
+                crate::error::ErrorChainExt::sources(&error).any(|source| matches!(
                     source.downcast_ref::<IqError>(),
                     Some(IqError::ServerError { code: 503, .. })
                 )),
@@ -3787,8 +3785,7 @@ async fn group_refresh_anchor_request_errors_and_strict_missing_bundles_abort_pu
             );
         } else {
             assert!(
-                error
-                    .chain()
+                crate::error::ErrorChainExt::sources(&error)
                     .any(|source| source.is::<crate::prekeys::AdvPrimaryBundleError>()),
                 "{error:#}"
             );
@@ -4055,7 +4052,10 @@ async fn group_send_skips_a_cold_contact_with_conflicting_primaries() {
             assert!(devices.contains(&good.with_device(2)));
             assert!(!devices.iter().any(|device| device.user == bad.user));
         } else {
-            assert!(result.unwrap_err().is::<DeviceListIdentityConflict>());
+            assert!(
+                crate::error::ErrorChainExt::sources(&result.unwrap_err())
+                    .any(|source| source.is::<DeviceListIdentityConflict>())
+            );
         }
         client.signal_shutdown_sync();
     }
@@ -4250,7 +4250,11 @@ async fn group_identity_storage_failure_is_not_partial_success() {
         .try_process_group_device_list_response(&response, &users, client.device_topology.current())
         .await
         .unwrap_err();
-    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    assert!(crate::ErrorChainExt::sources(&error).any(|cause| {
+        cause
+            .to_string()
+            .contains("synthetic failure before commit")
+    }));
     let error = client
         .apply_device_list_response_inner(
             &response,
@@ -4268,7 +4272,11 @@ async fn group_identity_storage_failure_is_not_partial_success() {
         )
         .await
         .unwrap_err();
-    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    assert!(crate::ErrorChainExt::sources(&error).any(|cause| {
+        cause
+            .to_string()
+            .contains("synthetic failure before commit")
+    }));
     for user in &users {
         let record = client.load_device_record_for_jid(user).await.unwrap();
         assert_eq!(
@@ -4519,7 +4527,11 @@ async fn migrated_primary_registry_failure_preserves_anchor_and_allows_retry() {
         .process_device_list_response(&response, Freshness::Refresh)
         .await
         .expect_err("the injected registry write rejection must surface");
-    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    assert!(crate::ErrorChainExt::sources(&error).any(|cause| {
+        cause
+            .to_string()
+            .contains("synthetic failure before commit")
+    }));
     // Existing registry semantics publish the already-verified cache row before
     // the durable write; distinguish that from a committed backend record.
     assert!(client.load_device_record_for_jid(&pn).await.is_some());
@@ -5028,7 +5040,13 @@ async fn bootstrap_malformed_anchor_is_a_storage_error() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid stored"));
-        assert!(!error.is::<DeviceListIdentityConflict>());
+        assert!(!matches!(
+            error,
+            AdvBootstrapPersistenceError::Persistence(
+                AdvIdentityPersistenceError::Conflict(_)
+                    | AdvIdentityPersistenceError::Account(DeviceListIdentityError::Conflict(_))
+            )
+        ));
         client.signal_shutdown_sync();
     }
 }
@@ -7837,7 +7855,11 @@ async fn adv_review_round2_registry_io_does_not_publish_unadmitted_mapping() {
     );
     assert!(raw.get_lid_mapping(&lid.user).await.unwrap().is_none());
     assert!(raw.get_pn_mapping(&phone.user).await.unwrap().is_none());
-    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    assert!(crate::ErrorChainExt::sources(&error).any(|cause| {
+        cause
+            .to_string()
+            .contains("synthetic failure before commit")
+    }));
     assert_eq!(
         raw.get_devices(&peer.user).await.unwrap().unwrap().raw_id,
         Some(1)

@@ -49,7 +49,7 @@ pub enum PairCryptoCause {
     MissingKeyIndex,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PairQrError {
     #[error("Invalid QR code format: expected at least 4 comma-separated fields, got {0}")]
@@ -66,7 +66,14 @@ pub enum PairQrError {
     IdentityLength,
 }
 
-#[derive(Debug, thiserror::Error)]
+impl std::fmt::Debug for PairQrError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MasterPairingError {
     #[error("Failed to init HMAC for master pairing: {0}")]
@@ -77,6 +84,13 @@ pub enum MasterPairingError {
     KeyDerivation,
     #[error("AES-GCM encryption failed: {0}")]
     Encryption(#[source] crate::libsignal::crypto::CryptoProviderError),
+}
+
+impl std::fmt::Debug for MasterPairingError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for PairCryptoError {

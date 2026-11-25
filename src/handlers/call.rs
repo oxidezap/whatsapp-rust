@@ -1288,45 +1288,65 @@ fn commit_decrypted_group_epoch(
 }
 
 #[cfg(feature = "voip-control")]
+#[derive(thiserror::Error)]
+enum GroupEpochDecryptError {
+    #[error("unsupported Signal envelope type")]
+    UnsupportedEnvelopeType,
+    #[error("Signal decrypt failed: {0}")]
+    Decrypt(#[from] crate::features::SignalError),
+    #[error("unsupported padding version")]
+    UnsupportedPaddingVersion,
+    #[error("message unpad failed: {0}")]
+    Unpad(#[from] wacore::messages::PaddingError),
+    #[error("message decode failed: {0}")]
+    Decode(#[from] buffa::DecodeError),
+    #[error("message has no call key")]
+    MissingCallKey,
+    #[error("call key must contain exactly 32 bytes")]
+    InvalidCallKeyLength,
+}
+
+#[cfg(feature = "voip-control")]
+impl std::fmt::Debug for GroupEpochDecryptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(feature = "voip-control")]
 async fn decrypt_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
     sender: &Jid,
-) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+) -> Result<Zeroizing<Vec<u8>>, GroupEpochDecryptError> {
     let enc_type = EncType::from_wire(&rekey.encryption_type)
-        .ok_or_else(|| anyhow::anyhow!("unsupported Signal envelope type"))?;
+        .ok_or(GroupEpochDecryptError::UnsupportedEnvelopeType)?;
     let plaintext = Zeroizing::new(
         client
             .signal()
             .decrypt_message(sender, enc_type, &rekey.ciphertext)
-            .await
-            .map_err(|error| anyhow::anyhow!("Signal decrypt failed: {error}"))?,
+            .await?,
     );
-    let decoded = MessageUtils::unpad_message_ref(
-        &plaintext,
-        u8::try_from(rekey.encryption_version)
-            .map_err(|_| anyhow::anyhow!("unsupported padding version"))?,
-    )
-    .map_err(|error| anyhow::anyhow!("message unpad failed: {error}"))
-    .and_then(|unpadded| {
-        waproto::codec::message_decode(unpadded)
-            .map_err(|error| anyhow::anyhow!("message decode failed: {error}"))
-    })?;
+    let version = u8::try_from(rekey.encryption_version)
+        .map_err(|_| GroupEpochDecryptError::UnsupportedPaddingVersion)?;
+    let unpadded = MessageUtils::unpad_message_ref(&plaintext, version)?;
+    let decoded = waproto::codec::message_decode(unpadded)?;
     let raw_epoch = Zeroizing::new(
         decoded
             .call
             .into_option()
             .and_then(|call| call.call_key)
-            .ok_or_else(|| anyhow::anyhow!("message has no call key"))?,
+            .ok_or(GroupEpochDecryptError::MissingCallKey)?,
     );
     validate_group_epoch_key(&raw_epoch)?;
     Ok(raw_epoch)
 }
 
 #[cfg(feature = "voip-control")]
-fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
+fn validate_group_epoch_key(raw_epoch: &[u8]) -> Result<(), GroupEpochDecryptError> {
     if raw_epoch.len() != 32 {
-        anyhow::bail!("call key must contain exactly 32 bytes");
+        return Err(GroupEpochDecryptError::InvalidCallKeyLength);
     }
     Ok(())
 }
@@ -1389,15 +1409,16 @@ async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid
 
 #[cfg(feature = "voip-control")]
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
-async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
-    crate::voip::direct_ingress::send_offer_receipt(client, call)
-        .await
-        .map_err(anyhow::Error::from)
+async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> Result<(), CallError> {
+    crate::voip::direct_ingress::send_offer_receipt(client, call).await
 }
 
 #[cfg(not(feature = "voip-control"))]
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
-async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
+async fn send_offer_ack_receipt(
+    client: &Client,
+    call: &IncomingCall,
+) -> Result<(), crate::client::ClientError> {
     let own_from = match call.from.server {
         Server::Lid => client.lid(),
         _ => client.pn(),

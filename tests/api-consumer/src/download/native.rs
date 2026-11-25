@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use anyhow::{self, Result};
     use std::error::Error;
     use std::io::Cursor;
     use std::sync::Arc;
-    use whatsapp_rust::anyhow::{self, Result};
     use whatsapp_rust::download::{
         ClientDownloadError, DownloadLimits, DownloadParams, DownloadPolicyError, DownloadWriter,
         MediaDownloadError, MediaDownloader, MediaRoute, MediaType,

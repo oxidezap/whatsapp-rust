@@ -69,7 +69,7 @@ pub use wacore::iq::mex::{
 pub use wacore::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
 
 /// Error types for MEX operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum MexError {
     /// Payload missing or otherwise malformed in a way that has no underlying
@@ -94,6 +94,13 @@ pub enum MexError {
 
     #[error("JSON error")]
     Json(#[from] serde_json::Error),
+}
+
+impl std::fmt::Debug for MexError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A persisted MEX operation and its associated variables type.

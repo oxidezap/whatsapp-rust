@@ -1,6 +1,5 @@
 use crate::client::Client;
 use crate::types::message::MessageInfo;
-use anyhow::Result;
 use std::sync::Arc;
 use wacore_binary::Node;
 
@@ -30,8 +29,13 @@ pub trait EncHandler: wacore::sync_marker::MaybeSendSync {
     ///
     /// # Returns
     /// * `Ok(())` if the message was handled successfully
-    /// * `Err(anyhow::Error)` if handling failed
-    async fn handle(&self, client: Arc<Client>, enc_node: &Node, info: &MessageInfo) -> Result<()>;
+    /// * `Err(...)` if handling failed
+    async fn handle(
+        &self,
+        client: Arc<Client>,
+        enc_node: &Node,
+        info: &MessageInfo,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[cfg(test)]
@@ -39,7 +43,6 @@ mod tests {
     use super::*;
     use crate::TokioRuntime;
     use crate::types::message::MessageInfo;
-    use anyhow::Result;
     use async_lock::Mutex;
     use std::sync::Arc;
     use wacore_binary::Node;
@@ -65,7 +68,7 @@ mod tests {
             _client: Arc<Client>,
             enc_node: &Node,
             _info: &MessageInfo,
-        ) -> Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let enc_type = enc_node
                 .attrs()
                 .optional_string("type")

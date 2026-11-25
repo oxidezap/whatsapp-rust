@@ -37,6 +37,7 @@ pub enum ClientUploadError {
 }
 
 impl std::fmt::Debug for ClientUploadError {
+    #[inline(never)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ClientUploadError")
             .field(&crate::download::MediaErrorDiagnostic(self))
@@ -1019,7 +1020,7 @@ pub(crate) fn profile_media_http_client(
         None => inner,
     }
 }
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MediaProfileError {
     #[cfg(feature = "mobile-core")]
@@ -1029,6 +1030,13 @@ pub enum MediaProfileError {
     MissingProfile,
     #[error("mobile media requires a configured mobile session")]
     MissingSession,
+}
+
+impl std::fmt::Debug for MediaProfileError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl Client {

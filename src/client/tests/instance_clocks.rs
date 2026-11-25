@@ -339,7 +339,7 @@ impl crate::http::HttpClient for UploadHttp {
     async fn execute(
         &self,
         _request: crate::http::HttpRequest,
-    ) -> std::result::Result<crate::http::HttpResponse, crate::http::HttpError> {
+    ) -> Result<crate::http::HttpResponse, crate::http::HttpError> {
         Ok(crate::http::HttpResponse::new(
             200,
             br#"{"url":"https://media.example.com/fixture","direct_path":"/fixture"}"#.to_vec(),

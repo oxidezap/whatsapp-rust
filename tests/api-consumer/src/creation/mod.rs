@@ -36,7 +36,7 @@ pub trait CreationOperations: whatsapp_rust::wacore::sync_marker::MaybeSendSync 
     async fn create_and_use(
         &self,
         chat: &Jid,
-    ) -> whatsapp_rust::anyhow::Result<(CreatedPoll, CreatedEvent)>;
+    ) -> anyhow::Result<(CreatedPoll, CreatedEvent)>;
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -45,7 +45,7 @@ impl CreationOperations for Client {
     async fn create_and_use(
         &self,
         chat: &Jid,
-    ) -> whatsapp_rust::anyhow::Result<(CreatedPoll, CreatedEvent)> {
+    ) -> anyhow::Result<(CreatedPoll, CreatedEvent)> {
         let poll = self
             .polls()
             .create_quiz(chat, "Quiz", &["A".into(), "B".into()], 0)

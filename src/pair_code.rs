@@ -74,7 +74,7 @@ pub use wacore::pair_code::{PairCodeError, PairCodeOptions, PairCodeRejection};
 ///
 /// Wraps `wacore::pair_code::PairCodeError` (validation, key derivation, bundle
 /// building) and adds the IQ transport layer via `RequestFailed`.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PairError {
     #[error("{0}")]
@@ -97,6 +97,13 @@ pub enum PairError {
     /// the `Debug` form.
     #[error("{0}")]
     RequestFailed(#[from] IqError),
+}
+
+impl std::fmt::Debug for PairError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 // Imported inside each body, not at module scope: `ErrorChainExt::as_dyn_error`

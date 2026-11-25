@@ -29,14 +29,14 @@ use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, E
 use whatsapp_rust::{
     ClientPlugin, PluginCapability, PluginConnectionScope, PluginCoreEventSubscription,
     PluginEventPayloadEncoding, PluginEventSelector, PluginEventTopic, PluginEvents, PluginFuture,
-    PluginManifest, PluginTasks,
+    PluginManifest, PluginResult, PluginTasks,
 };
 
 pub const METRICS_PLUGIN_ID: &str = "wa.metrics";
 pub const METRICS_TICK_TOPIC: &str = "tick";
 pub const METRICS_TICK_SCHEMA_VERSION: u32 = 1;
 
-type Result<T, E = whatsapp_rust::anyhow::Error> = std::result::Result<T, E>;
+type Result<T, E = MetricsPluginError> = std::result::Result<T, E>;
 
 /// Strongly typed errors for [`MetricsPlugin`].
 #[derive(Debug, Error)]
@@ -240,7 +240,7 @@ impl ClientPlugin for MetricsPlugin {
     fn install(
         &self,
         context: whatsapp_rust::PluginContext,
-    ) -> PluginFuture<'_, Result<Arc<Self::Api>>> {
+    ) -> PluginFuture<'_, PluginResult<Arc<Self::Api>>> {
         Box::pin(async move {
             if self.interval == Duration::ZERO {
                 return Err(MetricsPluginError::ZeroInterval.into());
@@ -283,9 +283,9 @@ impl ClientPlugin for MetricsPlugin {
         })
     }
 
-    fn on_ready(&self, scope: PluginConnectionScope) -> PluginFuture<'_, Result<()>> {
+    fn on_ready(&self, scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
-            let state = self.state().map_err(whatsapp_rust::anyhow::Error::from)?;
+            let state = self.state()?;
             let generation = scope.generation();
             let tasks = scope
                 .tasks()
@@ -308,16 +308,14 @@ impl ClientPlugin for MetricsPlugin {
         })
     }
 
-    fn on_closed(&self, scope: PluginConnectionScope) -> PluginFuture<'_, Result<()>> {
+    fn on_closed(&self, scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
-            self.state()
-                .map_err(whatsapp_rust::anyhow::Error::from)?
-                .record_closed(scope.generation());
+            self.state()?.record_closed(scope.generation());
             Ok(())
         })
     }
 
-    fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             if let Some(state) = self.state.get() {
                 state.shutdown.store(true, Ordering::Release);

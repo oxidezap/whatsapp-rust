@@ -19,7 +19,7 @@ use whatsapp_rust::wacore::store::InMemoryBackend;
 use whatsapp_rust::{Client, TokioRuntime};
 
 #[tokio::main]
-async fn main() -> whatsapp_rust::anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persistence = Arc::new(PersistenceManager::new(Arc::new(InMemoryBackend::new())).await?);
     let client = Client::builder()
         .with_runtime(TokioRuntime)

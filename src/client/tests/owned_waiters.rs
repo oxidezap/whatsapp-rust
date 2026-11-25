@@ -537,10 +537,7 @@ async fn reconnect_timeouts_still_close_transport_in_both_modes() {
     struct StalledClose(Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl crate::transport::Transport for StalledClose {
-        async fn send(
-            &self,
-            _data: bytes::Bytes,
-        ) -> std::result::Result<(), crate::transport::TransportError> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
         async fn disconnect(&self) {
@@ -855,9 +852,9 @@ fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
     let storage = MediaReuploadError::from(wacore::store::error::StoreError::Database(Box::new(
         std::io::Error::other(marker),
     )));
-    let client = MediaReuploadError::from(ClientError::Internal(anyhow::Error::new(
-        std::io::Error::other(marker),
-    )));
+    let client = MediaReuploadError::from(ClientError::Internal(Box::new(std::io::Error::other(
+        marker,
+    ))));
     for error in [storage, client] {
         assert!(!format!("{error:?}").contains(marker));
         let source = error.source().unwrap();

@@ -211,6 +211,46 @@ struct GroupBatchOutcome {
     needs_device_sync: bool,
 }
 
+#[derive(thiserror::Error)]
+enum CompanionValidationError {
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    CachedAdv(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    AdvBootstrap(#[from] crate::prekeys::AdvBootstrapError),
+    #[error("{0}")]
+    Certificate(#[from] CompanionCertificateError),
+    #[error("companion account identity unavailable after locking")]
+    AccountIdentityUnavailableAfterLock,
+}
+
+impl std::fmt::Debug for CompanionValidationError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum PlaintextHandleError {
+    #[error("{0}")]
+    Padding(#[from] wacore::messages::PaddingError),
+    #[error("{0}")]
+    Decode(#[from] wacore::messages::PlaintextDecodeError),
+    #[error("{0}")]
+    InvalidEncIndex(#[from] std::num::TryFromIntError),
+    #[error("{0}")]
+    Signal(#[from] crate::features::SignalError),
+}
+
+impl std::fmt::Debug for PlaintextHandleError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Client {
     async fn preseed_sender_retry_count(&self, info: &MessageInfo, sender_count: u8) {
         if sender_count == 0 {
@@ -253,7 +293,7 @@ impl Client {
         sender: &Jid,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         self.validate_incoming_companion_identity_at_address(
             sender,
             &sender.to_protocol_address(),
@@ -270,7 +310,7 @@ impl Client {
         address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         self.validate_incoming_companion_identity_inner(
             sender,
             address,
@@ -343,7 +383,7 @@ impl Client {
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
         account_locked: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         let backend = self
             .persistence_manager
             .get_device_snapshot()
@@ -371,9 +411,7 @@ impl Client {
         let primary = if account_locked {
             self.cached_adv_account_identity(sender)
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("companion account identity unavailable after locking")
-                })?
+                .ok_or(CompanionValidationError::AccountIdentityUnavailableAfterLock)?
         } else {
             self.ensure_adv_account_identity(sender).await?
         };
@@ -446,7 +484,7 @@ impl Client {
                     return Err(CompanionAccountRecheckError::StaleGeneration);
                 }
                 validation.map_err(|error| {
-                    if error.is::<CompanionCertificateError>() {
+                    if matches!(error, CompanionValidationError::Certificate(_)) {
                         CompanionAccountRecheckError::Rejected(payload.enc_index)
                     } else {
                         CompanionAccountRecheckError::Unavailable
@@ -3258,7 +3296,7 @@ impl Client {
         enc_index: usize,
         annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         self.handle_decrypted_plaintext_in_scope(
             enc_type,
             padded_plaintext.into(),
@@ -3281,7 +3319,7 @@ impl Client {
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         let origin = raw_pending::DeliveryOrigin {
             stanza: slot.producer,
             position: slot.index,
@@ -3310,7 +3348,7 @@ impl Client {
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         let PlaintextSlot {
             index: enc_index,
             annotations,
@@ -3903,6 +3941,7 @@ impl Client {
             .await;
     }
 
+    #[inline(never)]
     pub(crate) async fn parse_message_info(
         &self,
         node: &NodeRef<'_>,

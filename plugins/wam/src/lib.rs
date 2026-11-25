@@ -77,7 +77,7 @@ use whatsapp_rust::wacore::stanza::wire_tags::StanzaTag;
 use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 use whatsapp_rust::{
     ClientPlugin, PluginCapability, PluginContext, PluginCoreEventSubscription, PluginFuture,
-    PluginIq, PluginManifest, PluginTasks,
+    PluginIq, PluginManifest, PluginResult, PluginTasks,
 };
 use whatsapp_rust_wam_catalog::events;
 
@@ -87,7 +87,7 @@ pub use store::{InMemoryWamStore, PendingBuffer, WamStore, WamStoreError};
 
 use runtime::{BUFFERING_INTERVAL, WamRuntime, WamWriter};
 
-type Result<T, E = whatsapp_rust::anyhow::Error> = std::result::Result<T, E>;
+type Result<T, E = WamPluginError> = std::result::Result<T, E>;
 
 /// Strongly typed errors for [`WamPlugin`].
 #[derive(Debug, Error)]
@@ -274,7 +274,7 @@ impl ClientPlugin for WamPlugin {
             .with_capability(PluginCapability::ClientInfo)
     }
 
-    fn install(&self, context: PluginContext) -> PluginFuture<'_, Result<Arc<Self::Api>>> {
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, PluginResult<Arc<Self::Api>>> {
         Box::pin(async move {
             let core_events = context
                 .core_events()
@@ -325,7 +325,7 @@ impl ClientPlugin for WamPlugin {
     /// may outlive the host's drain, so the two could be alive at once: both
     /// would read the retained set and both would pick the same next key, which
     /// is the overwrite `next_key` exists to prevent.
-    fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult> {
         Box::pin(async { Ok(()) })
     }
 }

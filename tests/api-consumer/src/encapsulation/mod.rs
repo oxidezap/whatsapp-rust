@@ -13,7 +13,7 @@ impl whatsapp_rust::types::enc_handler::EncHandler for HostHandler {
         _: Arc<Client>,
         _: &whatsapp_rust::wacore_binary::Node,
         _: &whatsapp_rust::types::message::MessageInfo,
-    ) -> whatsapp_rust::anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 }
@@ -99,7 +99,7 @@ impl whatsapp_rust::ClientPlugin for HostPlugin {
     fn install(
         &self,
         context: whatsapp_rust::PluginContext,
-    ) -> whatsapp_rust::PluginFuture<'_, whatsapp_rust::anyhow::Result<Arc<Self::Api>>> {
+    ) -> whatsapp_rust::PluginFuture<'_, whatsapp_rust::PluginResult<Arc<Self::Api>>> {
         Box::pin(async move {
             let info: &whatsapp_rust::PluginClientInfo =
                 context.client_info().expect("declared client info");

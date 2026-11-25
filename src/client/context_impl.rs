@@ -7,8 +7,8 @@ use wacore::iq::prekeys::PreKeyFetchReason;
 use wacore::libsignal::protocol::PreKeyBundle;
 use wacore_binary::Jid;
 
-fn resolver_error(error: anyhow::Error) -> SendContextError {
-    SendContextError::from_boxed(error.reallocate_into_boxed_dyn_error_without_backtrace())
+fn resolver_error<E: std::error::Error + Send + Sync + 'static>(error: E) -> SendContextError {
+    SendContextError::host(error)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -57,19 +57,12 @@ impl SendContextResolver for Client {
             .map_err(|e| {
                 // Re-wrap server errors as wacore::ServerErrorCode so
                 // encrypt_for_devices can downcast across crate boundaries
-                if let Some(crate::request::IqError::ServerError {
-                    code,
-                    text,
-                    error_type,
-                    backoff,
-                    ..
-                }) = e.downcast_ref::<crate::request::IqError>()
-                {
+                if let Some(code) = crate::error::ErrorChainExt::server_rejection(&e) {
                     return SendContextError::Server(wacore::request::ServerErrorCode {
-                        code: *code,
-                        text: text.clone(),
-                        error_type: error_type.clone(),
-                        backoff: *backoff,
+                        code: code.code,
+                        text: code.text.to_string(),
+                        error_type: code.error_type.map(str::to_string),
+                        backoff: code.backoff,
                     });
                 }
                 resolver_error(e)
@@ -155,28 +148,24 @@ mod resolver_error_tests {
 
     #[test]
     fn preserves_iq_timeout_and_server_rejection() {
-        for context in [false, true] {
-            let timeout = anyhow::Error::new(crate::request::IqError::Timeout);
-            let timeout = if context {
-                timeout.context("device lookup")
-            } else {
-                timeout
-            };
-            assert!(resolver_error(timeout).is_timeout());
+        let iq_timeout = crate::request::IqError::Timeout;
+        assert!(resolver_error(iq_timeout).is_timeout());
 
-            let rejection = anyhow::Error::new(crate::test_utils::server_error_iq(
+        let wrapped_timeout = crate::usync::DeviceSyncError::from(crate::request::IqError::Timeout);
+        assert!(resolver_error(wrapped_timeout).is_timeout());
+
+        for rejection in [
+            resolver_error(crate::test_utils::server_error_iq(
                 429,
                 "rate-overlimit",
                 Some("wait"),
                 Some(7),
-            ));
-            let rejection = if context {
-                rejection.context("device lookup")
-            } else {
-                rejection
-            };
-            let error = resolver_error(rejection);
-            let server = error.server_rejection().expect("typed rejection");
+            )),
+            resolver_error(crate::usync::DeviceSyncError::from(
+                crate::test_utils::server_error_iq(429, "rate-overlimit", Some("wait"), Some(7)),
+            )),
+        ] {
+            let server = rejection.server_rejection().expect("typed rejection");
             assert_eq!(server.code, 429);
             assert_eq!(server.error_type, Some("wait"));
             assert_eq!(server.backoff, Some(7));

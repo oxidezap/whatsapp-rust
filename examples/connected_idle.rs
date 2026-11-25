@@ -10,7 +10,39 @@ mod allocator;
 #[path = "connected_idle/process_locks.rs"]
 mod process_locks;
 
-use anyhow::{Context, Result, ensure};
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+trait ContextExt<T> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T>;
+}
+impl<T> ContextExt<T> for Option<T> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T> {
+        self.ok_or_else(|| msg.to_string().into())
+    }
+}
+impl<T, E: std::fmt::Display> ContextExt<T> for std::result::Result<T, E> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T> {
+        self.map_err(|e| format!("{msg}: {e}").into())
+    }
+}
+
+macro_rules! ensure {
+    ($cond:expr $(,)?) => {
+        if !$cond {
+            return Err(concat!("condition failed: ", stringify!($cond)).into());
+        }
+    };
+    ($cond:expr, $msg:literal $(,)?) => {
+        if !$cond {
+            return Err($msg.into());
+        }
+    };
+    ($cond:expr, $fmt:expr, $($arg:tt)*) => {
+        if !$cond {
+            return Err(format!($fmt, $($arg)*).into());
+        }
+    };
+}
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use whatsapp_rust::bench_support::connected_idle::{
@@ -178,7 +210,7 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
         session.shutdown().await?;
         store.cleanup()?;
         samples.push(sample("after_shutdown", start, None).await?);
-        Ok::<_, anyhow::Error>(Run {
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Run {
             harness_sha256: harness_sha256(),
             backend: backend.into(),
             mode: mode.into(),

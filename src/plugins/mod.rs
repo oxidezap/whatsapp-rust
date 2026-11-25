@@ -41,7 +41,7 @@ use crate::client::interceptor::{
 };
 use crate::client::{
     ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease,
-    EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+    EncDecryptFailedLease, LifecycleError, RawNodeLease, SentFrameLease,
 };
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
@@ -223,6 +223,12 @@ impl PluginManifest {
 /// Target-correct future returned by native plugin entry points.
 pub type PluginFuture<'a, T> = BoxFuture<'a, T>;
 
+/// Erased error returned by client plugins during lifecycle methods.
+pub type PluginError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Convenience alias for results returned by client plugins.
+pub type PluginResult<T = ()> = Result<T, PluginError>;
+
 /// A trusted native plugin installed exactly once while the client is still inert.
 /// Capabilities shape the handles it receives; they are not an in-process sandbox.
 /// A plugin value belongs to one client installation, even when registered through an `Arc`.
@@ -231,18 +237,18 @@ pub trait ClientPlugin: MaybeSendSync + 'static {
 
     fn manifest(&self) -> PluginManifest;
 
-    fn install(&self, context: PluginContext) -> PluginFuture<'_, anyhow::Result<Arc<Self::Api>>>;
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, PluginResult<Arc<Self::Api>>>;
 
-    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Release plugin-owned state. This may run after `install` began but returned an error.
-    fn shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -255,17 +261,17 @@ pub trait ClientPlugin: MaybeSendSync + 'static {
 pub trait UntypedClientPlugin: MaybeSendSync + 'static {
     fn manifest(&self) -> PluginManifest;
 
-    fn install(&self, context: PluginContext) -> PluginFuture<'_, anyhow::Result<()>>;
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, PluginResult<()>>;
 
-    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -1408,9 +1414,9 @@ impl PluginStanzaInterception {
     /// use wacore_binary::node::OwnedNodeRef;
     ///
     /// // The plugin manifest declares StanzaInterception, IqReply and Tasks.
-    /// fn install(context: PluginContext) -> anyhow::Result<PluginInterceptorRegistration> {
+    /// fn install(context: PluginContext) -> Result<PluginInterceptorRegistration, Box<dyn std::error::Error>> {
     ///     let (sender, receiver) = async_channel::bounded::<PluginIqReply>(8);
-    ///     context.tasks().ok_or_else(|| anyhow::anyhow!("Tasks required"))?
+    ///     context.tasks().ok_or("Tasks required")?
     ///         .spawn(async move {
     ///             // One worker. Host shutdown aborts it and drops queued grants.
     ///             while let Ok(reply) = receiver.recv().await {
@@ -1420,7 +1426,7 @@ impl PluginStanzaInterception {
     ///             }
     ///         })?;
     ///     let registration = context.stanza_interception()
-    ///         .ok_or_else(|| anyhow::anyhow!("StanzaInterception required"))?
+    ///         .ok_or("StanzaInterception required")?
     ///         .register_iq(Arc::new(move |node: &OwnedNodeRef, reply: PluginIqReply| {
     ///             if node.get().get_attr("xmlns")
     ///                 .is_some_and(|namespace| namespace.as_str() == "test:extension")
@@ -2038,10 +2044,10 @@ trait ErasedClientPlugin: MaybeSendSync {
     fn marker_type_id(&self) -> Option<TypeId>;
     fn marker_type_name(&self) -> &'static str;
     fn manifest(&self) -> PluginManifest;
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>>;
-    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>>;
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Option<ErasedApi>>>;
+    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>>;
+    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>>;
+    fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>>;
 }
 
 struct PluginAdapter<P>(Arc<P>);
@@ -2059,22 +2065,22 @@ impl<P: ClientPlugin> ErasedClientPlugin for PluginAdapter<P> {
         self.0.manifest()
     }
 
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>> {
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Option<ErasedApi>>> {
         Box::pin(async move {
             let api = self.0.install(context).await?;
             Ok(Some(Arc::new(TypedApi(api)) as ErasedApi))
         })
     }
 
-    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
         self.0.on_ready(scope)
     }
 
-    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
         self.0.on_closed(scope)
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
         self.0.shutdown()
     }
 }
@@ -2094,22 +2100,22 @@ impl<P: UntypedClientPlugin + ?Sized> ErasedClientPlugin for UntypedPluginAdapte
         self.0.manifest()
     }
 
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>> {
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Option<ErasedApi>>> {
         Box::pin(async move {
             self.0.install(context).await?;
             Ok(None)
         })
     }
 
-    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
         self.0.on_ready(scope)
     }
 
-    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
         self.0.on_closed(scope)
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
         self.0.shutdown()
     }
 }
@@ -2704,16 +2710,16 @@ impl PluginHost {
         .await
     }
 
-    async fn install_all(&self, client: Weak<Client>) -> anyhow::Result<()> {
+    async fn install_all(&self, client: Weak<Client>) -> Result<(), PluginError> {
         let Some(strong_client) = client.upgrade() else {
-            anyhow::bail!("client was dropped during plugin installation");
+            return Err("client was dropped during plugin installation".into());
         };
         let runtime = strong_client.runtime.clone();
         let connection_generation = strong_client.connection_generation.clone();
         drop(strong_client);
         self.runtime
             .set(runtime.clone())
-            .map_err(|_| anyhow::anyhow!("plugin host was installed more than once"))?;
+            .map_err(|_| -> PluginError { "plugin host was installed more than once".into() })?;
 
         let installing_resources = &self.installing_resources;
         let _installing_resources = scopeguard::guard((), move |_| {
@@ -2764,7 +2770,7 @@ impl PluginHost {
             });
             if !self.track_installing_resources(&resources) {
                 rollback.rollback().await;
-                anyhow::bail!("plugin host shut down during installation");
+                return Err("plugin host shut down during installation".into());
             }
             let terminal = self.terminal_notifier.subscribe();
             let cancelled = Box::pin(wait_for_shutdown(&terminal));
@@ -2782,7 +2788,7 @@ impl PluginHost {
                         );
                     }
                     rollback.rollback().await;
-                    anyhow::bail!("plugin host shut down during installation");
+                    return Err("plugin host shut down during installation".into());
                 }
                 futures::future::Either::Right((result, _)) => result,
             };
@@ -2790,10 +2796,11 @@ impl PluginHost {
                 Ok(api) => api,
                 Err(error) => {
                     rollback.rollback().await;
-                    anyhow::bail!(
+                    return Err(format!(
                         "plugin `{}` installation failed: {error:#}",
                         planned.manifest.id
-                    );
+                    )
+                    .into());
                 }
             };
             match (planned.plugin.marker_type_id(), api) {
@@ -2801,16 +2808,17 @@ impl PluginHost {
                 (None, None) => {}
                 _ => {
                     rollback.rollback().await;
-                    anyhow::bail!(
+                    return Err(format!(
                         "plugin `{}` returned an API inconsistent with its registration",
                         planned.manifest.id
-                    );
+                    )
+                    .into());
                 }
             }
             self.abort_install_if_terminal(&mut rollback).await?;
             let Some(installed) = rollback.current.take() else {
                 rollback.rollback().await;
-                anyhow::bail!("plugin installation rollback state was lost");
+                return Err("plugin installation rollback state was lost".into());
             };
             rollback.installed.push(installed);
         }
@@ -2823,7 +2831,7 @@ impl PluginHost {
         };
         if let Err(installed) = self.installed.set(installed) {
             rollback.restore_installed(installed.plugins);
-            anyhow::bail!("plugins were installed more than once");
+            return Err("plugins were installed more than once".into());
         }
         rollback.disarm();
         Ok(())
@@ -2832,12 +2840,12 @@ impl PluginHost {
     async fn abort_install_if_terminal(
         &self,
         rollback: &mut PluginInstallRollback,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PluginError> {
         if !self.terminal.load(Ordering::Acquire) {
             return Ok(());
         }
         rollback.rollback().await;
-        anyhow::bail!("plugin host shut down during installation")
+        Err("plugin host shut down during installation".into())
     }
 
     fn track_installing_resources(&self, resources: &Arc<PluginResources>) -> bool {
@@ -2911,11 +2919,12 @@ impl PluginHost {
 
     async fn run_callback<'a>(
         &'a self,
-        make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
+        make_future: impl FnOnce() -> BoxFuture<'a, Result<(), PluginError>>,
     ) -> Result<(), PluginCallbackError> {
-        let runtime = self.runtime.get().ok_or_else(|| {
-            PluginCallbackError::Callback(anyhow::anyhow!("plugin runtime is unavailable"))
-        })?;
+        let runtime = self
+            .runtime
+            .get()
+            .ok_or_else(|| PluginCallbackError::Callback("plugin runtime is unavailable".into()))?;
         bounded_plugin_callback(&**runtime, self.config.callback_timeout(), make_future).await
     }
 
@@ -2941,11 +2950,11 @@ impl PluginHost {
 }
 
 impl ClientLifecycle for PluginHost {
-    fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn install(&self, client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async move { self.install_all(client).await })
     }
 
-    fn on_ready(&self, scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, scope: ConnectionScope) -> BoxFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async move {
             let mut failures = Vec::new();
             if let Some(upstream) = &self.upstream {
@@ -2986,7 +2995,7 @@ impl ClientLifecycle for PluginHost {
         })
     }
 
-    fn on_closed(&self, scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, scope: ConnectionScope) -> BoxFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async move {
             let mut failures = Vec::new();
             for plugin in self.installed_plugins().iter().rev() {
@@ -3046,7 +3055,7 @@ impl ClientLifecycle for PluginHost {
         }
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async move {
             let mut failures = Vec::new();
             self.signal_shutdown();
@@ -3092,7 +3101,7 @@ enum PluginCallbackError {
     )]
     TimeoutCancellationPanic { timeout_seconds: f64 },
     #[error("{0}")]
-    Callback(#[from] anyhow::Error),
+    Callback(#[from] PluginError),
 }
 
 #[derive(Debug, Error)]
@@ -3194,7 +3203,7 @@ async fn wait_for_plugin_tasks(
 async fn bounded_plugin_callback<'a>(
     runtime: &dyn Runtime,
     timeout: Duration,
-    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
+    make_future: impl FnOnce() -> BoxFuture<'a, Result<(), PluginError>>,
 ) -> Result<(), PluginCallbackError> {
     let callback = Box::pin(plugin_callback(make_future));
     match futures::future::select(callback, runtime.sleep(timeout)).await {
@@ -3215,37 +3224,37 @@ async fn bounded_plugin_callback<'a>(
 }
 
 async fn plugin_callback<'a>(
-    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
-) -> anyhow::Result<()> {
+    make_future: impl FnOnce() -> BoxFuture<'a, Result<(), PluginError>>,
+) -> Result<(), PluginError> {
     let mut future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
-        .map_err(|_| anyhow::anyhow!("callback panicked before returning a future"))?;
+        .map_err(|_| -> PluginError { "callback panicked before returning a future".into() })?;
     let result = AssertUnwindSafe(std::future::poll_fn(|context| {
         future.as_mut().poll(context)
     }))
     .catch_unwind()
     .await
-    .map_err(|_| anyhow::anyhow!("callback future panicked"));
+    .map_err(|_| -> PluginError { "callback future panicked".into() });
     let drop_result = std::panic::catch_unwind(AssertUnwindSafe(|| drop(future)));
     if drop_result.is_err() {
-        anyhow::bail!("callback future panicked while being dropped");
+        return Err("callback future panicked while being dropped".into());
     }
     result?
 }
 
 async fn plugin_install<'a, T>(
-    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<T>>,
-) -> anyhow::Result<T> {
+    make_future: impl FnOnce() -> BoxFuture<'a, Result<T, PluginError>>,
+) -> Result<T, PluginError> {
     let mut future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
-        .map_err(|_| anyhow::anyhow!("install panicked before returning a future"))?;
+        .map_err(|_| -> PluginError { "install panicked before returning a future".into() })?;
     let result = AssertUnwindSafe(std::future::poll_fn(|context| {
         future.as_mut().poll(context)
     }))
     .catch_unwind()
     .await
-    .map_err(|_| anyhow::anyhow!("install future panicked"));
+    .map_err(|_| -> PluginError { "install future panicked".into() });
     let drop_result = std::panic::catch_unwind(AssertUnwindSafe(|| drop(future)));
     if drop_result.is_err() {
-        anyhow::bail!("install future panicked while being dropped");
+        return Err("install future panicked while being dropped".into());
     }
     result?
 }
@@ -3253,31 +3262,33 @@ async fn plugin_install<'a, T>(
 async fn bounded_plugin_install<'a, T>(
     runtime: &dyn Runtime,
     timeout: Duration,
-    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<T>>,
-) -> anyhow::Result<T> {
+    make_future: impl FnOnce() -> BoxFuture<'a, Result<T, PluginError>>,
+) -> Result<T, PluginError> {
     let install = Box::pin(plugin_install(make_future));
     match futures::future::select(install, runtime.sleep(timeout)).await {
         futures::future::Either::Left((result, _)) => result,
         futures::future::Either::Right(((), install)) => {
             if std::panic::catch_unwind(AssertUnwindSafe(|| drop(install))).is_err() {
-                anyhow::bail!(
+                return Err(format!(
                     "install timed out after {:.3} seconds and panicked while being cancelled",
                     timeout.as_secs_f64()
-                );
+                )
+                .into());
             }
-            anyhow::bail!(
+            Err(format!(
                 "install timed out after {:.3} seconds",
                 timeout.as_secs_f64()
             )
+            .into())
         }
     }
 }
 
-fn finish_callbacks(stage: &str, failures: Vec<String>) -> anyhow::Result<()> {
+fn finish_callbacks(stage: &str, failures: Vec<String>) -> Result<(), LifecycleError> {
     if failures.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("plugin {stage} callbacks failed: {}", failures.join("; "))
+        Err(format!("plugin {stage} callbacks failed: {}", failures.join("; ")).into())
     }
 }
 
@@ -3366,7 +3377,7 @@ mod tests {
             }
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move { Ok(Arc::new(context.client_info().cloned())) })
         }
     }
@@ -3510,7 +3521,7 @@ mod tests {
             }
         }
 
-        fn install(&self, _context: PluginContext) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<()>> {
             let id = self.id;
             let log = Arc::clone(&self.log);
             Box::pin(async move {
@@ -3519,7 +3530,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let id = self.id;
             let log = Arc::clone(&self.log);
             Box::pin(async move {
@@ -3575,7 +3586,7 @@ mod tests {
     }
 
     impl ClientLifecycle for CaptureInstallClient {
-        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let sender = self.client.clone();
             Box::pin(async move {
                 sender.send(client).await?;
@@ -3594,10 +3605,7 @@ mod tests {
                 .with_capability(PluginCapability::PluginEvents)
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new("published-api".to_string())) })
         }
     }
@@ -3616,21 +3624,21 @@ mod tests {
                 .with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let started = self.started.clone();
             let install_dropped = self.install_dropped.clone();
             Box::pin(async move {
                 let _drop = DropFlag(install_dropped);
                 let shutdown = context
                     .tasks()
-                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))?
+                    .ok_or("tasks capability missing")?
                     .shutdown_signal();
                 started.send(shutdown).await?;
                 futures::future::pending().await
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let shutdown_called = self.shutdown_called.clone();
             Box::pin(async move {
                 shutdown_called.store(true, Ordering::Release);
@@ -3640,11 +3648,11 @@ mod tests {
     }
 
     impl ClientLifecycle for ShutdownDuringPluginInstall {
-        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
             Box::pin(async move {
                 client
                     .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("client unavailable during install"))?
+                    .ok_or("client unavailable during install")?
                     .signal_shutdown_sync();
                 Ok(())
             })
@@ -3652,15 +3660,15 @@ mod tests {
     }
 
     impl ClientLifecycle for FailingInstallLifecycle {
-        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = Arc::clone(&self.log);
             Box::pin(async move {
                 record(&log, "install:failing-upstream");
-                anyhow::bail!("injected upstream install failure")
+                Err("injected upstream install failure".into())
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = Arc::clone(&self.log);
             Box::pin(async move {
                 record(&log, "shutdown:failing-upstream");
@@ -3676,10 +3684,7 @@ mod tests {
             PluginManifest::new("foundation", "0.1.0")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "install:foundation");
@@ -3687,7 +3692,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:foundation");
@@ -3943,19 +3948,21 @@ mod tests {
             PluginManifest::new("dependent", "0.1.0").with_dependency("foundation")
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             Box::pin(async move {
                 let foundation = context
                     .plugin::<FoundationPlugin>()
-                    .ok_or_else(|| anyhow::anyhow!("foundation API is unavailable"))?;
-                anyhow::ensure!(&*foundation == "foundation-api");
+                    .ok_or("foundation API is unavailable")?;
+                if &*foundation != "foundation-api" {
+                    return Err("foundation mismatch".into());
+                }
                 record(&log, "install:dependent");
                 Ok(Arc::new("dependent-api".to_string()))
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:dependent");
@@ -4029,9 +4036,11 @@ mod tests {
             PluginManifest::new("transitive-probe", "0.1.0").with_dependency("dependent")
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
-                anyhow::ensure!(context.plugin::<DependentPlugin>().is_some());
+                if context.plugin::<DependentPlugin>().is_none() {
+                    return Err("missing dependent plugin".into());
+                }
                 Ok(Arc::new(context.plugin::<FoundationPlugin>().is_none()))
             })
         }
@@ -4064,10 +4073,7 @@ mod tests {
             }
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
     }
@@ -4127,10 +4133,7 @@ mod tests {
             self.0.clone()
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
     }
@@ -4174,10 +4177,7 @@ mod tests {
             panic!("injected manifest panic")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
     }
@@ -4279,14 +4279,11 @@ mod tests {
             PluginManifest::new("panicking-drop", "0.1.0")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(PanickingDropApi)) })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let shutdown_called = self.shutdown_called.clone();
             Box::pin(async move {
                 shutdown_called.store(true, Ordering::Release);
@@ -4340,7 +4337,7 @@ mod tests {
             PluginManifest::new("context-retaining", "0.1.0")
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let api_dropped = self.api_dropped.clone();
             Box::pin(async move {
                 Ok(Arc::new(ContextRetainingApi {
@@ -4393,7 +4390,7 @@ mod tests {
             PluginManifest::new("rollback", "0.1.0").with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             let task_dropped = self.task_dropped.clone();
             let api_dropped = self.api_dropped.clone();
@@ -4402,7 +4399,7 @@ mod tests {
                 let guard = DropFlag(task_dropped);
                 context
                     .tasks()
-                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))?
+                    .ok_or("tasks capability missing")?
                     .spawn(async move {
                         let _guard = guard;
                         futures::future::pending::<()>().await;
@@ -4413,19 +4410,17 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             let task_dropped = self.task_dropped.clone();
             let api_dropped = self.api_dropped.clone();
             Box::pin(async move {
-                anyhow::ensure!(
-                    task_dropped.load(Ordering::Acquire),
-                    "rollback task still running during shutdown"
-                );
-                anyhow::ensure!(
-                    !api_dropped.load(Ordering::Acquire),
-                    "rollback API dropped before shutdown"
-                );
+                if !task_dropped.load(Ordering::Acquire) {
+                    return Err("rollback task still running during shutdown".into());
+                }
+                if api_dropped.load(Ordering::Acquire) {
+                    return Err("rollback API dropped before shutdown".into());
+                }
                 record(&log, "shutdown:rollback");
                 Ok(())
             })
@@ -4443,18 +4438,15 @@ mod tests {
             PluginManifest::new("failing", "0.1.0").with_dependency("rollback")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "install:failing");
-                anyhow::bail!("injected failure")
+                Err("injected failure".into())
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:failing");
@@ -4515,18 +4507,15 @@ mod tests {
             PluginManifest::new("blocking-failure", "0.1.0").with_dependency("rollback")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "install:blocking-failure");
-                anyhow::bail!("injected failure")
+                Err("injected failure".into())
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             let started = self.started.clone();
             let release = self.release.clone();
@@ -4547,7 +4536,7 @@ mod tests {
     }
 
     impl ClientLifecycle for SignalAwareUpstream {
-        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "install:upstream");
@@ -4561,7 +4550,7 @@ mod tests {
             }
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = self.log.clone();
             let signalled = self.signalled.clone();
             let shutdown_saw_signal = self.shutdown_saw_signal.clone();
@@ -4658,10 +4647,7 @@ mod tests {
             PluginManifest::new("blocking-install", "0.1.0").with_dependency("rollback")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let log = self.log.clone();
             let started = self.started.clone();
             let release = self.release.clone();
@@ -4673,7 +4659,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:blocking");
@@ -4748,15 +4734,12 @@ mod tests {
             PluginManifest::new("panicking", "0.1.0").with_dependency("rollback")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             record(&self.log, "install:panicking");
             panic!("injected install panic")
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:panicking");
@@ -4817,11 +4800,8 @@ mod tests {
                 .with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
-            let tasks = context
-                .tasks()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("tasks capability missing"));
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
+            let tasks = context.tasks().cloned().ok_or("tasks capability missing");
             let started = Arc::clone(&self.install_started);
             let finished = Arc::clone(&self.install_finished);
             Box::pin(async move {
@@ -4837,11 +4817,11 @@ mod tests {
             })
         }
 
-        fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             let tasks = scope
                 .tasks()
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("connection tasks capability missing"));
+                .ok_or("connection tasks capability missing");
             let started = Arc::clone(&self.connection_started);
             let finished = Arc::clone(&self.connection_finished);
             Box::pin(async move {
@@ -4857,7 +4837,7 @@ mod tests {
             })
         }
 
-        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             let finished = self.connection_finished.load(Ordering::Acquire);
             let observed = Arc::clone(&self.closed_after_task);
             Box::pin(async move {
@@ -4866,7 +4846,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let finished = self.install_finished.load(Ordering::Acquire);
             let observed = Arc::clone(&self.shutdown_after_task);
             Box::pin(async move {
@@ -4890,11 +4870,8 @@ mod tests {
             PluginManifest::new("timed-drain", "0.1.0").with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
-            let tasks = context
-                .tasks()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("tasks capability missing"));
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
+            let tasks = context.tasks().cloned().ok_or("tasks capability missing");
             let started = Arc::clone(&self.started);
             let finished = Arc::clone(&self.finished);
             let release = self.release_rx.clone();
@@ -4908,7 +4885,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let release = self.release_tx.clone();
             Box::pin(async move {
                 let _ = release.try_send(());
@@ -4924,32 +4901,34 @@ mod tests {
             PluginManifest::new("scoped-tasks", "0.1.0").with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             let started = self.install_started.clone();
             let observed = self.install_started.clone();
             let dropped = self.install_dropped.clone();
             Box::pin(async move {
                 context
                     .tasks()
-                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))?
+                    .ok_or("tasks capability missing")?
                     .spawn(async move {
                         started.store(true, Ordering::Release);
                         let _guard = DropFlag(dropped);
                         futures::future::pending::<()>().await;
                     })?;
                 tokio::task::yield_now().await;
-                anyhow::ensure!(!observed.load(Ordering::Acquire));
+                if observed.load(Ordering::Acquire) {
+                    return Err("observed unexpected".into());
+                }
                 Ok(Arc::new(()))
             })
         }
 
-        fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             let started = self.connection_started.clone();
             let dropped = self.connection_dropped.clone();
             Box::pin(async move {
                 scope
                     .tasks()
-                    .ok_or_else(|| anyhow::anyhow!("connection tasks capability missing"))?
+                    .ok_or("connection tasks capability missing")?
                     .spawn(async move {
                         started.store(true, Ordering::Release);
                         let _guard = DropFlag(dropped);
@@ -4959,7 +4938,7 @@ mod tests {
             })
         }
 
-        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             let task_dropped = self.connection_dropped.load(Ordering::Acquire);
             let closed_after_task = self.closed_after_task.clone();
             Box::pin(async move {
@@ -4968,7 +4947,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, PluginResult<()>> {
             let task_dropped = self.install_dropped.load(Ordering::Acquire);
             let shutdown_after_task = self.shutdown_after_task.clone();
             Box::pin(async move {
@@ -5474,7 +5453,7 @@ mod tests {
     }
 
     impl ClientLifecycle for UpstreamLifecycle {
-        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "install:upstream");
@@ -5482,7 +5461,7 @@ mod tests {
             })
         }
 
-        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(&self) -> BoxFuture<'_, Result<(), LifecycleError>> {
             let log = self.log.clone();
             Box::pin(async move {
                 record(&log, "shutdown:upstream");
@@ -5494,8 +5473,8 @@ mod tests {
     struct FailingReadyLifecycle;
 
     impl ClientLifecycle for FailingReadyLifecycle {
-        fn on_ready(&self, _scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
-            Box::pin(async { anyhow::bail!("injected upstream ready failure") })
+        fn on_ready(&self, _scope: ConnectionScope) -> BoxFuture<'_, Result<(), LifecycleError>> {
+            Box::pin(async { Err("injected upstream ready failure".into()) })
         }
     }
 
@@ -5517,14 +5496,11 @@ mod tests {
             }
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
 
-        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             let id = self.id;
             let log = self.log.clone();
             let stalls = self.stalls;
@@ -5545,7 +5521,7 @@ mod tests {
     struct DropPanickingPendingFuture;
 
     impl Future for DropPanickingPendingFuture {
-        type Output = anyhow::Result<()>;
+        type Output = PluginResult<()>;
 
         fn poll(
             self: Pin<&mut Self>,
@@ -5568,14 +5544,11 @@ mod tests {
             PluginManifest::new("drop-panicking-ready", "0.1.0")
         }
 
-        fn install(
-            &self,
-            _context: PluginContext,
-        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
 
-        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, PluginResult<()>> {
             record(&self.log, "ready:drop-panicking-ready");
             Box::pin(DropPanickingPendingFuture)
         }
@@ -5785,11 +5758,11 @@ mod tests {
                 .with_capability(PluginCapability::CoreEvents)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let subscription = context
                     .core_events()
-                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
+                    .ok_or("core events capability missing")?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected]),
                         Arc::new(PanickingCoreEventHandler),
@@ -5809,11 +5782,11 @@ mod tests {
                 .with_capability(PluginCapability::CoreEvents)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let subscription = context
                     .core_events()
-                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
+                    .ok_or("core events capability missing")?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected]),
                         Arc::new(PanickingDropEventHandler),
@@ -5832,13 +5805,13 @@ mod tests {
             PluginManifest::new("shutdown-signal", "0.1.0").with_capability(PluginCapability::Tasks)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 context
                     .tasks()
                     .map(PluginTasks::shutdown_signal)
                     .map(Arc::new)
-                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))
+                    .ok_or_else(|| -> PluginError { "tasks capability missing".into() })
             })
         }
     }
@@ -5859,11 +5832,11 @@ mod tests {
                 .with_capability(PluginCapability::CoreEvents)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let subscription = context
                     .core_events()
-                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
+                    .ok_or("core events capability missing")?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected, EventKind::RawNode]),
                         Arc::new(NoopEventHandler),
@@ -5905,12 +5878,12 @@ mod tests {
                 .with_capability(PluginCapability::CoreEvents)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let events = context
                     .core_events()
                     .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?;
+                    .ok_or("core events capability missing")?;
                 let subscription = events.subscribe(
                     EventInterest::of(&[EventKind::Connected]),
                     Arc::new(ReentrantSubscriptionHandler {
@@ -5980,12 +5953,12 @@ mod tests {
                 .with_capability(PluginCapability::StanzaInterception)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let seen = Arc::new(Mutex::new(Vec::new()));
                 let interception = context
                     .stanza_interception()
-                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .ok_or("interception capability missing")?
                     .clone();
                 let registration = interception.register(Arc::new(RecordingInterceptor {
                     seen: Arc::clone(&seen),
@@ -6017,11 +5990,11 @@ mod tests {
                 .with_capability(PluginCapability::StanzaInterception)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let registration = context
                     .stanza_interception()
-                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .ok_or("interception capability missing")?
                     .register(Arc::new(PanickingInterceptor))?;
                 Ok(Arc::new(registration))
             })
@@ -6659,7 +6632,7 @@ mod tests {
                 .with_capability(PluginCapability::Messaging)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 Ok(Arc::new([
                     context.core_events().is_some(),
@@ -6699,13 +6672,13 @@ mod tests {
                 .with_capability(PluginCapability::PluginEvents)
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 context
                     .plugin_events()
                     .cloned()
                     .map(Arc::new)
-                    .ok_or_else(|| anyhow::anyhow!("plugin events capability missing"))
+                    .ok_or_else(|| -> PluginError { "plugin events capability missing".into() })
             })
         }
     }

@@ -22,6 +22,47 @@ use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetad
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 const INLINE_NOTIFICATION_ENCODING_THRESHOLD: usize = 256 * 1024;
 
+/// Error returned when replaying, validating, or acknowledging history sync payloads.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum HistorySyncError {
+    #[error("{0}")]
+    InvalidJid(#[from] wacore_binary::jid::JidError),
+    #[error("{0}")]
+    Client(#[from] crate::client::ClientError),
+    #[error("{0}")]
+    DecodeNotification(#[from] buffa::DecodeError),
+    #[error("{0}")]
+    DecodeCarrier(#[from] wacore::messages::PlaintextDecodeError),
+    #[error("{0}")]
+    MediaRetry(#[from] wacore::media_retry::MediaRetryError),
+    #[error("history sync durability hook is not registered")]
+    DurabilityHookNotRegistered,
+    #[error("history notification does not belong to this Client account")]
+    NotificationAccountMismatch,
+    #[error("history sync is shutting down")]
+    ShuttingDown,
+    #[error("history notification decoder stopped")]
+    DecoderStopped,
+    #[error("history sync capture or processing did not complete")]
+    ProcessingIncomplete,
+    #[error("history sync work queue is unavailable")]
+    WorkQueueUnavailable,
+    #[error("history sync processing capacity is full")]
+    ProcessingCapacityFull,
+    #[error("history notification encoding did not complete")]
+    EncodingIncomplete,
+    #[error("{0}")]
+    Hook(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Debug for HistorySyncError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 // Download cancellation stops I/O, but queued/running crypto cannot be
 // interrupted. Keep history accounting alive in those physical CPU jobs.
 struct HistoryDownloadRuntime {
@@ -346,24 +387,19 @@ impl Client {
         self: &Arc<Self>,
         key: &HistorySyncKey,
         notification: &[u8],
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.history_sync_durability_hook.get().is_some(),
-            "history sync durability hook is not registered"
-        );
+    ) -> Result<(), HistorySyncError> {
+        if self.history_sync_durability_hook.get().is_none() {
+            return Err(HistorySyncError::DurabilityHookNotRegistered);
+        }
         let chat: Jid = key.chat.parse()?;
         let sender: Jid = key.sender.parse()?;
         let identity = self.persistence_manager.get_device_snapshot();
-        anyhow::ensure!(
-            !key.id.is_empty()
-                && crate::send::is_own_identity(identity.pn.as_ref(), identity.lid.as_ref(), &chat)
-                && crate::send::is_own_identity(
-                    identity.pn.as_ref(),
-                    identity.lid.as_ref(),
-                    &sender
-                ),
-            "history notification does not belong to this Client account"
-        );
+        if key.id.is_empty()
+            || !crate::send::is_own_identity(identity.pn.as_ref(), identity.lid.as_ref(), &chat)
+            || !crate::send::is_own_identity(identity.pn.as_ref(), identity.lid.as_ref(), &sender)
+        {
+            return Err(HistorySyncError::NotificationAccountMismatch);
+        }
         drop(identity);
         // Reserve replay capacity before the shared pool so waiting replays
         // cannot occupy the slot needed to drain the normal sync queue. Both
@@ -371,11 +407,11 @@ impl Client {
         let replay_permit = self
             .acquire_history_sync_semaphore(&self.history_sync_activity.replay_permits)
             .await
-            .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
+            .ok_or(HistorySyncError::ShuttingDown)?;
         let permit = self
             .acquire_history_sync_permit()
             .await
-            .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
+            .ok_or(HistorySyncError::ShuttingDown)?;
         let mut tracker = self.begin_history_sync_task(0);
         tracker.set_processing_permits(permit, Some(replay_permit));
         let retained_wire;
@@ -415,8 +451,7 @@ impl Client {
                 let _ = tx.send(result);
             }));
             self.runtime.spawn(work).detach();
-            rx.await
-                .map_err(|_| anyhow::anyhow!("history notification decoder stopped"))??
+            rx.await.map_err(|_| HistorySyncError::DecoderStopped)??
         } else {
             retained_wire = Bytes::copy_from_slice(notification);
             let notification = waproto::codec::history_sync_notification_decode(notification)?;
@@ -430,16 +465,12 @@ impl Client {
         else {
             return Ok(());
         };
-        anyhow::ensure!(
-            self.process_history_sync_task_inner(
-                key.id.clone(),
-                notification,
-                &mut tracker,
-                Some(key)
-            )
-            .await,
-            "history sync capture or processing did not complete"
-        );
+        if !self
+            .process_history_sync_task_inner(key.id.clone(), notification, &mut tracker, Some(key))
+            .await
+        {
+            return Err(HistorySyncError::ProcessingIncomplete);
+        }
         Ok(())
     }
 
@@ -448,7 +479,7 @@ impl Client {
         self: &Arc<Self>,
         info: &crate::types::message::MessageInfo,
         carrier: Bytes,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), HistorySyncError> {
         if self.history_sync_durability_hook.get().is_none()
             || !info.source.is_from_me
             || info.source.sender.device != 0
@@ -481,7 +512,7 @@ impl Client {
                 // host also owns a replayable notification after its commit.
                 self.major_sync_task_sender
                     .try_send(task)
-                    .map_err(|_| anyhow::anyhow!("history sync work queue is unavailable"))?;
+                    .map_err(|_| HistorySyncError::WorkQueueUnavailable)?;
             }
         }
         Ok(())
@@ -493,16 +524,16 @@ impl Client {
         notification: DetachedHistorySyncNotification,
         wire: Vec<Bytes>,
         mut tracker: crate::sync_task::HistorySyncTaskTracker,
-    ) -> anyhow::Result<
+    ) -> Result<
         Option<(
             DetachedHistorySyncNotification,
             crate::sync_task::HistorySyncTaskTracker,
         )>,
+        HistorySyncError,
     > {
-        anyhow::ensure!(
-            !self.is_permanently_stopped(),
-            "history sync is shutting down"
-        );
+        if self.is_permanently_stopped() {
+            return Err(HistorySyncError::ShuttingDown);
+        }
         let metadata = history_sync_metadata(&notification);
         if HistoryAdmission::decide(self.skip_history_sync_enabled(), || {
             self.history_sync_admission
@@ -522,7 +553,7 @@ impl Client {
         let hook = self
             .history_sync_durability_hook
             .get()
-            .ok_or_else(|| anyhow::anyhow!("history sync durability hook is not registered"))?;
+            .ok_or(HistorySyncError::DurabilityHookNotRegistered)?;
         // Large wire copies must not stall receive's
         // executor. The tracker follows the blocking work even if its caller
         // is cancelled, then follows the hook and queued/running processing.
@@ -538,7 +569,7 @@ impl Client {
                     .history_sync_activity
                     .processing_permits
                     .try_acquire_arc()
-                    .ok_or_else(|| anyhow::anyhow!("history sync processing capacity is full"))?;
+                    .ok_or(HistorySyncError::ProcessingCapacityFull)?;
                 tracker.set_processing_permits(permit, None);
             }
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -551,9 +582,8 @@ impl Client {
                     ));
                 }))
                 .await;
-            let (notification, encoded, mut tracker) = rx
-                .await
-                .map_err(|_| anyhow::anyhow!("history notification encoding did not complete"))?;
+            let (notification, encoded, mut tracker) =
+                rx.await.map_err(|_| HistorySyncError::EncodingIncomplete)?;
             // Only intake borrows a slot for encoding. Release it before the
             // hook/queue; the worker acquires its own slot when it dequeues.
             if encoding_permit {
@@ -564,11 +594,12 @@ impl Client {
             encode_history_sync_notification(notification, wire, tracker)
         };
         let metadata = history_sync_metadata(&notification);
-        hook.on_notification(key, &metadata, &encoded).await?;
-        anyhow::ensure!(
-            !self.is_permanently_stopped(),
-            "history sync is shutting down"
-        );
+        hook.on_notification(key, &metadata, &encoded)
+            .await
+            .map_err(HistorySyncError::Hook)?;
+        if self.is_permanently_stopped() {
+            return Err(HistorySyncError::ShuttingDown);
+        }
         Ok(Some((notification, tracker)))
     }
 
@@ -1104,7 +1135,7 @@ impl Client {
         &self,
         message_id: &str,
         media_key: &[u8],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), HistorySyncError> {
         let own_jid = self
             .pn()
             .ok_or(crate::client::ClientError::NotLoggedIn)?
@@ -2081,7 +2112,7 @@ mod tests {
             message_id: &str,
             sync_type: Option<wa::message::HistorySyncType>,
             compressed: &[u8],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.captured.lock().unwrap().push(CapturedChunk {
                 message_id: message_id.to_owned(),
                 sync_type,
@@ -2091,7 +2122,7 @@ mod tests {
             self.entered.notify_one();
             self.release.acquire().await.unwrap().forget();
             if self.fail {
-                anyhow::bail!("the capture store is unavailable");
+                return Err("the capture store is unavailable".into());
             }
             Ok(())
         }
@@ -2327,7 +2358,7 @@ mod tests {
             &self,
             _: Arc<Client>,
             _: &[crate::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             panic!("history must not invoke the message commit hook");
         }
     }

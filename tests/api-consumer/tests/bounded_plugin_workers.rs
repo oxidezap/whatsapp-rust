@@ -102,7 +102,7 @@ impl ClientPlugin for WorkerPlugin {
             .with_capability(PluginCapability::Tasks)
             .with_capability(PluginCapability::PluginEvents)
     }
-    fn install(&self, context: PluginContext) -> PluginFuture<'_, anyhow::Result<Arc<Pool>>> {
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, whatsapp_rust::PluginResult<Arc<Pool>>> {
         Box::pin(async move {
             let tasks = context.tasks().unwrap();
             let (queue, jobs) = async_channel::bounded::<Job>(QUEUE);

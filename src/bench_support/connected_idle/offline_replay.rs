@@ -1,5 +1,4 @@
 use super::*;
-use anyhow::ensure;
 use wacore::time::Instant;
 use wacore::types::events::{BatchOrigin, EventInterest, EventKind};
 

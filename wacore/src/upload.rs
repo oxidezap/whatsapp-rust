@@ -7,7 +7,7 @@ use rand::rng;
 use std::io::{Read, Write};
 
 /// Errors that can occur during media encryption.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MediaEncryptionError {
     #[error("cryptographic MAC/hash error: {0}")]
@@ -16,6 +16,13 @@ pub enum MediaEncryptionError {
     KeyDerivation(#[from] crate::download::MediaDecryptionError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl std::fmt::Debug for MediaEncryptionError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 const BLOCK: usize = 16;

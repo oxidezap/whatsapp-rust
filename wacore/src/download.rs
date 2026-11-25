@@ -25,7 +25,7 @@ const WITHHELD: usize = MEDIA_MAC_SIZE + AES_BLOCK_SIZE;
 
 /// A local reason a media reference could not become a download request.
 /// Contains no URL, token or caller-provided text, so diagnostics can retain it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DownloadPreparationError {
     #[error("media_key must contain 32 bytes")]
@@ -64,7 +64,14 @@ pub enum DownloadPreparationError {
     UntrustedStaticUrl,
 }
 
-#[derive(Debug, Error)]
+impl std::fmt::Debug for DownloadPreparationError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Error)]
 #[non_exhaustive]
 pub enum MediaDecryptionError {
     #[error("downloaded file is too short to contain MAC")]
@@ -101,6 +108,13 @@ pub enum MediaDecryptionError {
     PlaintextChecksumMismatch { expected: String, got: String },
     #[error("SHA-256 mismatch for plaintext media")]
     PlaintextHashMismatch,
+}
+
+impl std::fmt::Debug for MediaDecryptionError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -982,6 +996,92 @@ impl MediaDecryptStream {
     }
 }
 
+#[inline(never)]
+fn build_host_download_request(
+    host: &MediaHost,
+    direct_path: &str,
+    token: &str,
+    decryption: &MediaDecryption,
+) -> Result<DownloadRequest, DownloadPreparationError> {
+    use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
+
+    let base = Uri::parse(format!("https://{}/", host.hostname))
+        .map_err(|_| DownloadPreparationError::InvalidRouteHost)?;
+    let base_authority = base
+        .authority()
+        .ok_or(DownloadPreparationError::InvalidRouteHost)?;
+    // CDN authorities must be DNS names or IP literals, not arbitrary
+    // RFC reg-names that an HTTP backend might interpret differently.
+    let valid_host = match base_authority.host_parsed() {
+        Host::IpvFuture { .. } => false,
+        Host::RegName(name) => {
+            !name.is_empty()
+                && name
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }
+        _ => true,
+    };
+    if !valid_host
+        || base_authority.userinfo().is_some()
+        || base.path().as_str() != "/"
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || base_authority.port().is_some_and(|port| port.is_empty())
+    {
+        return Err(DownloadPreparationError::InvalidRouteHost);
+    }
+    let base_port = base_authority
+        .port_to_u16()
+        .map_err(|_| DownloadPreparationError::InvalidRoutePort)?
+        .unwrap_or(443);
+    // Signed CDN references are already URI-encoded. Reject malformed
+    // escapes, raw whitespace and backslashes instead of repairing them.
+    let url = UriRef::parse(direct_path)
+        .map_err(|_| DownloadPreparationError::InvalidDirectPath)?
+        .resolve_against(&base)
+        .map_err(|_| DownloadPreparationError::InvalidDirectPath)?;
+    let authority = url
+        .authority()
+        .ok_or(DownloadPreparationError::OriginChanged)?;
+    if url.scheme() != base.scheme()
+        || !same_media_host(authority.host(), base_authority.host())
+        || authority
+            .port_to_u16()
+            .map_err(|_| DownloadPreparationError::InvalidDirectPathPort)?
+            .unwrap_or(443)
+            != base_port
+        || authority.userinfo().is_some()
+        || authority.port().is_some_and(|port| port.is_empty())
+    {
+        return Err(DownloadPreparationError::OriginChanged);
+    }
+    // Preserve the signed query byte-for-byte; only our URL-safe base64
+    // token is appended. The URI builder retains the fragment separately.
+    let mut query = url.query().map_or("", |q| q.as_str()).to_owned();
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("token=");
+    query.push_str(token);
+    let url = Uri::builder()
+        .scheme(url.scheme())
+        .authority(authority)
+        .path(url.path())
+        .query(EStr::new(&query).ok_or(DownloadPreparationError::InvalidQuery)?)
+        .optional(
+            |builder, fragment| builder.fragment(fragment),
+            url.fragment(),
+        )
+        .build()
+        .map_err(|_| DownloadPreparationError::InvalidUrl)?;
+    Ok(DownloadRequest {
+        url: url.into_string(),
+        decryption: decryption.clone(),
+    })
+}
+
 impl DownloadUtils {
     /// Checks transport metadata before acquiring a CDN route or sending HTTP.
     /// Optional hashes remain optional; present hashes must be SHA-256 digests.
@@ -1037,6 +1137,7 @@ impl DownloadUtils {
 
     /// Prepare requests using borrowed route hosts, without a temporary owned route.
     /// Applies the same origin and metadata validation as [`Self::prepare_download_requests`].
+    #[inline(never)]
     pub fn prepare_download_requests_with_hosts(
         downloadable: &dyn Downloadable,
         hosts: &[MediaHost],
@@ -1091,86 +1192,9 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let candidates = hosts.iter().map(
-            |host| -> Result<DownloadRequest, DownloadPreparationError> {
-                use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
-
-                let base = Uri::parse(format!("https://{}/", host.hostname))
-                    .map_err(|_| DownloadPreparationError::InvalidRouteHost)?;
-                let base_authority = base
-                    .authority()
-                    .ok_or(DownloadPreparationError::InvalidRouteHost)?;
-                // CDN authorities must be DNS names or IP literals, not arbitrary
-                // RFC reg-names that an HTTP backend might interpret differently.
-                let valid_host = match base_authority.host_parsed() {
-                    Host::IpvFuture { .. } => false,
-                    Host::RegName(name) => {
-                        !name.is_empty()
-                            && name.as_str().bytes().all(|b| {
-                                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
-                            })
-                    }
-                    _ => true,
-                };
-                if !valid_host
-                    || base_authority.userinfo().is_some()
-                    || base.path().as_str() != "/"
-                    || base.query().is_some()
-                    || base.fragment().is_some()
-                    || base_authority.port().is_some_and(|port| port.is_empty())
-                {
-                    return Err(DownloadPreparationError::InvalidRouteHost);
-                }
-                let base_port = base_authority
-                    .port_to_u16()
-                    .map_err(|_| DownloadPreparationError::InvalidRoutePort)?
-                    .unwrap_or(443);
-                // Signed CDN references are already URI-encoded. Reject malformed
-                // escapes, raw whitespace and backslashes instead of repairing them.
-                let url = UriRef::parse(direct_path)
-                    .map_err(|_| DownloadPreparationError::InvalidDirectPath)?
-                    .resolve_against(&base)
-                    .map_err(|_| DownloadPreparationError::InvalidDirectPath)?;
-                let authority = url
-                    .authority()
-                    .ok_or(DownloadPreparationError::OriginChanged)?;
-                if url.scheme() != base.scheme()
-                    || !same_media_host(authority.host(), base_authority.host())
-                    || authority
-                        .port_to_u16()
-                        .map_err(|_| DownloadPreparationError::InvalidDirectPathPort)?
-                        .unwrap_or(443)
-                        != base_port
-                    || authority.userinfo().is_some()
-                    || authority.port().is_some_and(|port| port.is_empty())
-                {
-                    return Err(DownloadPreparationError::OriginChanged);
-                }
-                // Preserve the signed query byte-for-byte; only our URL-safe base64
-                // token is appended. The URI builder retains the fragment separately.
-                let mut query = url.query().map_or("", |q| q.as_str()).to_owned();
-                if !query.is_empty() {
-                    query.push('&');
-                }
-                query.push_str("token=");
-                query.push_str(&token);
-                let url = Uri::builder()
-                    .scheme(url.scheme())
-                    .authority(authority)
-                    .path(url.path())
-                    .query(EStr::new(&query).ok_or(DownloadPreparationError::InvalidQuery)?)
-                    .optional(
-                        |builder, fragment| builder.fragment(fragment),
-                        url.fragment(),
-                    )
-                    .build()
-                    .map_err(|_| DownloadPreparationError::InvalidUrl)?;
-                Ok(DownloadRequest {
-                    url: url.into_string(),
-                    decryption: decryption.clone(),
-                })
-            },
-        );
+        let candidates = hosts
+            .iter()
+            .map(|host| build_host_download_request(host, direct_path, &token, &decryption));
         let mut requests = Vec::with_capacity(hosts.len());
         let mut last_error = None;
         for candidate in candidates {

@@ -44,7 +44,7 @@ impl EncHandler for HostHandler {
         _: Arc<Client>,
         _: &wacore_binary::Node,
         _: &whatsapp_rust::types::message::MessageInfo,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 }

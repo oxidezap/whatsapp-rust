@@ -24,7 +24,7 @@
 //!
 //! ```no_run
 //! # use whatsapp_rust::ErrorChainExt;
-//! # fn demo(err: whatsapp_rust::anyhow::Error) {
+//! # fn demo(err: anyhow::Error) {
 //! let cause: &(dyn std::error::Error + 'static) = err.as_ref();
 //! let _ = cause.server_rejection();
 //! # }

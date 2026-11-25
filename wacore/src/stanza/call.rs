@@ -29,10 +29,10 @@ pub enum CallParseError {
     Attributes {
         node: &'static str,
         #[source]
-        source: wacore_binary::BinaryError,
+        source: Box<wacore_binary::BinaryError>,
     },
     #[error("<audio> missing 'enc': {0}")]
-    MissingAudioEncoding(#[source] wacore_binary::BinaryError),
+    MissingAudioEncoding(#[source] Box<wacore_binary::BinaryError>),
     #[error("<audio enc={encoding}> missing or invalid 'rate'")]
     InvalidAudioRate { encoding: String },
     #[error("<audio enc={encoding}> 'rate'={rate} overflows u32")]
@@ -41,14 +41,20 @@ pub enum CallParseError {
     MissingCallId {
         node: String,
         #[source]
-        source: wacore_binary::BinaryError,
+        source: Box<wacore_binary::BinaryError>,
     },
     #[error("<{node}> missing 'call-creator'")]
     MissingCallCreator { node: String },
     #[error("<video> missing or non-numeric 'state'")]
     InvalidVideoState,
     #[error("{0}")]
-    Group(#[from] super::group_call::GroupCallParseError),
+    Group(#[source] Box<super::group_call::GroupCallParseError>),
+}
+
+impl From<super::group_call::GroupCallParseError> for CallParseError {
+    fn from(error: super::group_call::GroupCallParseError) -> Self {
+        Self::Group(Box::new(error))
+    }
 }
 
 debug_as_display!(CallParseError);
@@ -112,7 +118,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>, Cal
         .finish()
         .map_err(|source| CallParseError::Attributes {
             node: "call",
-            source,
+            source: Box::new(source),
         })?;
 
     let is_offer = action_tag == CallActionTag::Offer;
@@ -315,7 +321,7 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec, CallParseErro
     let mut a = node.attrs();
     let enc = a
         .required_string("enc")
-        .map_err(CallParseError::MissingAudioEncoding)?
+        .map_err(|source| CallParseError::MissingAudioEncoding(Box::new(source)))?
         .into_owned();
     let rate_raw = a
         .optional_u64("rate")
@@ -328,9 +334,20 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec, CallParseErro
     })?;
     a.finish().map_err(|source| CallParseError::Attributes {
         node: "audio",
-        source,
+        source: Box::new(source),
     })?;
     Ok(CallAudioCodec { enc, rate })
+}
+
+#[inline(never)]
+fn finish_call_attrs(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    node: &'static str,
+) -> Result<(), CallParseError> {
+    attrs.finish().map_err(|source| CallParseError::Attributes {
+        node,
+        source: Box::new(source),
+    })
 }
 
 fn parse_action(
@@ -342,7 +359,7 @@ fn parse_action(
         .required_string("call-id")
         .map_err(|source| CallParseError::MissingCallId {
             node: node.tag.to_string(),
-            source,
+            source: Box::new(source),
         })?
         .into_owned();
     let call_creator =
@@ -388,12 +405,7 @@ fn parse_action(
                 .unwrap_or(false);
             let group_jid = attrs.optional_jid("group-jid");
 
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "offer",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "offer")?;
 
             let children = node.children().unwrap_or_default();
             let is_video = children.iter().any(|c| c.tag == "video");
@@ -418,12 +430,7 @@ fn parse_action(
         CallActionTag::OfferNotice => {
             let is_video = attrs.optional_string("media").is_some_and(|s| s == "video");
             let is_group = attrs.optional_string("type").is_some_and(|s| s == "group");
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "offer_notice",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "offer_notice")?;
             CallAction::OfferNotice {
                 call_id,
                 call_creator,
@@ -432,12 +439,7 @@ fn parse_action(
             }
         }
         CallActionTag::PreAccept => {
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "preaccept",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "preaccept")?;
             let audio = node
                 .children()
                 .unwrap_or_default()
@@ -458,12 +460,7 @@ fn parse_action(
             let transport_message_type = attrs
                 .optional_string("transport-message-type")
                 .map(|s| s.into_owned());
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "transport",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "transport")?;
             CallAction::Transport {
                 call_id,
                 call_creator,
@@ -472,24 +469,14 @@ fn parse_action(
             }
         }
         CallActionTag::RelayLatency => {
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "relaylatency",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "relaylatency")?;
             CallAction::RelayLatency {
                 call_id,
                 call_creator,
             }
         }
         CallActionTag::Accept => {
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "accept",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "accept")?;
             let children = node.children().unwrap_or_default();
             let audio = children
                 .iter()
@@ -507,12 +494,7 @@ fn parse_action(
             // callee actually declining; dropping it made both look identical and ended calls the
             // peer's other devices were still answering.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "reject",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "reject")?;
             CallAction::Reject {
                 call_id,
                 call_creator,
@@ -529,12 +511,7 @@ fn parse_action(
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
             let _ = attrs.optional_string("voip_settings");
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "video",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "video")?;
             CallAction::VideoState {
                 call_id,
                 call_creator,
@@ -553,12 +530,7 @@ fn parse_action(
             let audio_duration = attrs
                 .optional_u64("audio_duration")
                 .and_then(|v| u32::try_from(v).ok());
-            attrs
-                .finish()
-                .map_err(|source| CallParseError::Attributes {
-                    node: "terminate",
-                    source,
-                })?;
+            finish_call_attrs(&mut attrs, "terminate")?;
             CallAction::Terminate {
                 call_id,
                 call_creator,

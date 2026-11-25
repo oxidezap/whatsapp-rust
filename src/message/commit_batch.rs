@@ -36,12 +36,42 @@ thread_local! {
     static INBOUND_HOOK_CLIENT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+#[derive(thiserror::Error)]
+pub(super) enum PendingInboundError {
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    Journal(#[from] raw_pending::RawPendingError),
+    #[error("{0}")]
+    LiveRetention(#[from] live_retention::LiveRetentionError),
+    #[error("pending occurrence revision conflict")]
+    RevisionConflict,
+    #[error("pending cleanup worker stopped")]
+    CleanupWorkerStopped,
+    #[error("pending occurrence cleanup revision conflict")]
+    CleanupRevisionConflict,
+    #[error("retained producer has not recovered before decrypt")]
+    RetainedProducerUnrecovered,
+    #[error("predecessor hook has not recovered before decrypt")]
+    PredecessorUnrecovered,
+    #[error("pending predecessor requires recovery before decrypt")]
+    PredecessorRequiresRecovery,
+}
+
+impl std::fmt::Debug for PendingInboundError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Client {
-    pub(crate) fn ensure_signal_maintenance_context(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            INBOUND_HOOK_CLIENT.get() != Some(std::ptr::from_ref(self) as usize),
-            "Signal maintenance cannot run inside an inbound durability hook; retry from a control task"
-        );
+    pub(crate) fn ensure_signal_maintenance_context(
+        &self,
+    ) -> Result<(), crate::client::SignalMaintenanceError> {
+        if INBOUND_HOOK_CLIENT.get() == Some(std::ptr::from_ref(self) as usize) {
+            return Err(crate::client::SignalMaintenanceError::InInboundDurabilityHook);
+        }
         Ok(())
     }
 }
@@ -500,7 +530,7 @@ impl FreshPendingWrites {
         &mut self,
         backend: &dyn wacore::store::traits::Backend,
         stored: &mut Vec<StoredPendingGroup>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PendingInboundError> {
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -518,13 +548,13 @@ impl FreshPendingWrites {
                 )
             })
             .collect();
-        anyhow::ensure!(
-            backend
-                .insert_pending_batch_if_missing(&batch, MAX_PENDING_BYTES)
-                .await?
-                == PendingInboundMutation::Applied,
-            "pending occurrence revision conflict"
-        );
+        if backend
+            .insert_pending_batch_if_missing(&batch, MAX_PENDING_BYTES)
+            .await?
+            != PendingInboundMutation::Applied
+        {
+            return Err(PendingInboundError::RevisionConflict);
+        }
         stored.extend(self.rows.drain(..).map(|(row, _)| row));
         self.bytes = 0;
         Ok(())
@@ -548,7 +578,7 @@ fn poll_pending_commit<F: Future<Output = PendingCommitOutcome>>(
     future.poll(cx)
 }
 
-type PendingRecovery = anyhow::Result<Option<Vec<PendingDelivery>>>;
+type PendingRecovery = Result<Option<Vec<PendingDelivery>>, PendingInboundError>;
 
 #[inline(never)]
 fn poll_pending_recovery<F: Future<Output = PendingRecovery>>(
@@ -558,7 +588,8 @@ fn poll_pending_recovery<F: Future<Output = PendingRecovery>>(
     future.poll(cx)
 }
 
-type PendingLookup = anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>>;
+type PendingLookup =
+    Result<Option<(String, wacore::store::traits::PendingInboundRecord)>, PendingInboundError>;
 
 #[inline(never)]
 fn poll_pending_lookup<F: Future<Output = PendingLookup>>(
@@ -604,7 +635,8 @@ impl Client {
     pub(super) async fn read_pending_for_replay(
         self: &Arc<Self>,
         info: &MessageInfo,
-    ) -> anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>> {
+    ) -> Result<Option<(String, wacore::store::traits::PendingInboundRecord)>, PendingInboundError>
+    {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner);
         let chat = info.source.chat.to_string();
@@ -622,7 +654,7 @@ impl Client {
         &self,
         items: &[PendingDelivery],
         is_drain: bool,
-    ) -> anyhow::Result<(Vec<StoredPendingGroup>, bool)> {
+    ) -> Result<(Vec<StoredPendingGroup>, bool), PendingInboundError> {
         // Workers retain this mutation owner after receive cancellation. It
         // covers only storage; never hold it while invoking consumer code.
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
@@ -838,13 +870,13 @@ impl Client {
                 sender: &row.sender,
                 id: &row.id,
             };
-            anyhow::ensure!(
-                backend
-                    .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)
-                    .await?
-                    == PendingInboundMutation::Applied,
-                "pending occurrence revision conflict"
-            );
+            if backend
+                .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)
+                .await?
+                != PendingInboundMutation::Applied
+            {
+                return Err(PendingInboundError::RevisionConflict);
+            }
             stored.push(row);
         }
         fresh.flush(backend.as_ref(), &mut stored).await?;
@@ -860,7 +892,7 @@ impl Client {
         deliveries: smallvec::SmallVec<[&PendingDelivery; 1]>,
         is_drain: bool,
         owner: &PendingStorage,
-    ) -> anyhow::Result<(bytes::Bytes, bool)> {
+    ) -> Result<(bytes::Bytes, bool), PendingInboundError> {
         // A fresh journal can only contain occurrences from this write.
         let mut covered =
             (!journal.occurrences.is_empty()).then(|| Vec::with_capacity(deliveries.len()));
@@ -913,7 +945,7 @@ impl Client {
         self: &Arc<Self>,
         rows: Vec<StoredPendingGroup>,
         retained: Arc<[PendingDelivery]>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PendingInboundError> {
         let (send, receive) = futures::channel::oneshot::channel();
         let client = Arc::clone(self);
         // The complete physical-key list has one owner even if the receipt
@@ -927,10 +959,13 @@ impl Client {
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("pending cleanup worker stopped"))?
+            .map_err(|_| PendingInboundError::CleanupWorkerStopped)?
     }
 
-    async fn cleanup_pending_group_owned(&self, rows: &[StoredPendingGroup]) -> anyhow::Result<()> {
+    async fn cleanup_pending_group_owned(
+        &self,
+        rows: &[StoredPendingGroup],
+    ) -> Result<(), PendingInboundError> {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner.clone());
         let backend = self.persistence_manager.backend();
@@ -953,7 +988,7 @@ impl Client {
                 .await
             {
                 Ok(Some(PendingInboundMutation::Applied)) => return Ok(()),
-                Ok(Some(_)) => anyhow::bail!("pending occurrence cleanup revision conflict"),
+                Ok(Some(_)) => return Err(PendingInboundError::CleanupRevisionConflict),
                 Ok(None) => {}
                 Err(error) => {
                     log::debug!("Pending cleanup batch failed, retrying individual rows: {error:?}")
@@ -972,9 +1007,7 @@ impl Client {
                 .await
             {
                 Ok(PendingInboundMutation::Applied) => Ok(()),
-                Ok(_) => Err(anyhow::anyhow!(
-                    "pending occurrence cleanup revision conflict"
-                )),
+                Ok(_) => Err(PendingInboundError::CleanupRevisionConflict),
                 Err(error) => {
                     // An error can follow an applied deletion. Verify absence
                     // under the same owner, and never delete a successor.
@@ -1046,19 +1079,20 @@ impl Client {
     pub(super) async fn persist_live_retained_before_decrypt(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PendingInboundError> {
         let retained = self.inbound_commit_batch.live_retention.for_message(info)?;
         if !retained.is_empty() {
             let retained = self
                 .live_pending_retry_batch(&retained, true)
                 .await?
                 .unwrap_or(retained);
-            anyhow::ensure!(
-                self.commit_pending_batch_result(retained.into(), BatchOrigin::Live, None, false)
-                    .await
-                    .delivered,
-                "retained producer has not recovered before decrypt"
-            );
+            if !self
+                .commit_pending_batch_result(retained.into(), BatchOrigin::Live, None, false)
+                .await
+                .delivered
+            {
+                return Err(PendingInboundError::RetainedProducerUnrecovered);
+            }
         }
         let Some((sender, record)) = self.read_pending_for_replay(info).await? else {
             return Ok(());
@@ -1077,12 +1111,13 @@ impl Client {
         // A hook can flush Signal itself. Recover the durable predecessor
         // before decrypt advances the incoming ratchet, without acknowledging
         // the incoming stanza. Refusal leaves its ciphertext untouched.
-        anyhow::ensure!(
-            self.commit_pending_batch_result(predecessor.into(), BatchOrigin::Live, None, false)
-                .await
-                .delivered,
-            "predecessor hook has not recovered before decrypt"
-        );
+        if !self
+            .commit_pending_batch_result(predecessor.into(), BatchOrigin::Live, None, false)
+            .await
+            .delivered
+        {
+            return Err(PendingInboundError::PredecessorUnrecovered);
+        }
         Ok(())
     }
 
@@ -1163,10 +1198,9 @@ impl Client {
                     .carrier
                     .as_ref()
                     .map_or(projection.len(), |(_, raw)| raw.len());
-                anyhow::ensure!(
-                    journal.fits_additional(original_len, projection.len()),
-                    "pending predecessor requires recovery before decrypt"
-                );
+                if !journal.fits_additional(original_len, projection.len()) {
+                    return Err(PendingInboundError::PredecessorRequiresRecovery);
+                }
             }
         }
         let storage_sender: Arc<str> = sender.into();
@@ -2235,7 +2269,7 @@ mod tests {
             &self,
             _client: Arc<Client>,
             batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.batches
                 .lock()
                 .expect("hook lock")
@@ -2297,7 +2331,7 @@ mod tests {
                 &self,
                 client: Arc<Client>,
                 batch: &[InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 assert!(
                     batch
                         .iter()
@@ -2314,7 +2348,10 @@ mod tests {
                     return Ok(());
                 }
                 let result: anyhow::Result<Vec<Jid>> = if self.force_refresh {
-                    client.refresh_user_devices(vec![self.user.clone()]).await
+                    client
+                        .refresh_user_devices(vec![self.user.clone()])
+                        .await
+                        .map_err(Into::into)
                 } else {
                     client
                         .signal()
@@ -2330,7 +2367,7 @@ mod tests {
                             .contains("cannot run inside an inbound durability hook"),
                         "{error:#}"
                     );
-                    return Err(error);
+                    return Err(error.into());
                 }
                 let devices = result?;
                 assert_eq!(devices, vec![self.user.clone()]);
@@ -2537,18 +2574,18 @@ mod tests {
                 &self,
                 client: Arc<Client>,
                 _: &[InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let error = client
                     .refresh_user_devices(self.0.clone())
                     .await
                     .unwrap_err();
-                anyhow::ensure!(
+                assert!(
                     error
                         .to_string()
                         .contains("cannot run inside an inbound durability hook"),
                     "{error:#}"
                 );
-                Err(error)
+                Err(error.into())
             }
         }
 
@@ -3169,7 +3206,7 @@ mod tests {
                 &self,
                 _: Arc<Client>,
                 _: &[InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if self.pause.load(Ordering::Acquire) {
                     self.entered.wait().await;
                     std::future::pending::<()>().await;
@@ -3275,7 +3312,7 @@ mod tests {
                 &self,
                 _: Arc<Client>,
                 _: &[InboundMessage],
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Another writer installs a successor after the hook commits.
                 self.backend
                     .store_pending_inbound("100@g.us", "200@s.whatsapp.net", self.id, &[9])
@@ -3629,8 +3666,8 @@ mod tests {
                 &self,
                 _: Arc<Client>,
                 _: &[InboundMessage],
-            ) -> anyhow::Result<()> {
-                Err(anyhow::anyhow!("injected hook refusal"))
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("injected hook refusal".into())
             }
         }
         let backend = Arc::new(InMemoryBackend::new());
@@ -4464,11 +4501,10 @@ mod tests {
                 &self,
                 _: Arc<Client>,
                 _: &[InboundMessage],
-            ) -> anyhow::Result<()> {
-                anyhow::ensure!(
-                    self.0.fetch_add(1, Ordering::SeqCst) != 0,
-                    "first hook fails"
-                );
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("first hook fails".into());
+                }
                 Ok(())
             }
         }

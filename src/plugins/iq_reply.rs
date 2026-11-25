@@ -320,7 +320,7 @@ mod tests {
             }
         }
 
-        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, PluginResult<Arc<Self::Api>>> {
             Box::pin(async move {
                 let grants = Arc::new(Mutex::new(Vec::new()));
                 let second_calls = Arc::new(AtomicUsize::new(0));

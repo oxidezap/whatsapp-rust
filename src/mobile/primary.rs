@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_COMPANIONS: usize = 128;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PrimaryManagementError {
     #[error("invalid primary operation: {0}")]
@@ -26,14 +26,21 @@ pub enum PrimaryManagementError {
     #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
     #[error("primary protocol operation failed")]
-    Protocol(#[source] anyhow::Error),
+    Protocol(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("invalid primary journal")]
     Journal(#[from] serde_json::Error),
 }
 
+impl std::fmt::Debug for PrimaryManagementError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl PrimaryManagementError {
-    fn protocol(error: impl Into<anyhow::Error>) -> Self {
-        Self::Protocol(error.into())
+    fn protocol<E: std::error::Error + Send + Sync + 'static>(error: E) -> Self {
+        Self::Protocol(Box::new(error))
     }
 }
 

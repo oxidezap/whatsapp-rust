@@ -13,7 +13,7 @@ use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum ReceiptError {
     #[error("{0}")]
@@ -22,6 +22,13 @@ pub enum ReceiptError {
     Read(#[source] crate::client::ClientError),
     #[error("Failed to send played receipt: {0}")]
     Played(#[source] crate::client::ClientError),
+}
+
+impl std::fmt::Debug for ReceiptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Max message ids per read/played `<receipt>` stanza. WA Web's
