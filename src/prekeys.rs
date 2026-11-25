@@ -2021,6 +2021,33 @@ mod tests {
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
 
+    #[tokio::test]
+    async fn failed_watermark_flush_stops_prekey_upload() {
+        use crate::store::release::tests::ProbeBackend;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let (mut backend, _) = ProbeBackend::new();
+        let fail_save = Arc::new(AtomicBool::new(false));
+        backend.fail_before_method = Some(("save", fail_save.clone()));
+        let (client, transport) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(backend)).await;
+        fail_save.store(true, Ordering::Release);
+        let _guard = client.prekey_upload_lock.lock().await;
+        let error = client
+            .upload_pre_keys_inner_with_count(5)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            super::PreKeyUploadErrorKind::FlushWatermarks(_)
+        ));
+        assert!(format!("{error:?}").contains("synthetic save failure"));
+        assert_eq!(transport.sent_count(), 0);
+    }
+
     fn snapshot(client: &crate::client::Client) -> (u32, u32) {
         let d = client.persistence_manager.get_device_snapshot();
         (d.next_pre_key_id, d.first_unupload_pre_key_id)
