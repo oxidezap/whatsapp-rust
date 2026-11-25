@@ -78,16 +78,6 @@ pub use peer::*;
 pub use resolved_devices::{DmSignalAddressing, ResolvedDmDevices, ResolvedGroupDevices};
 pub use status::*;
 
-macro_rules! debug_as_display {
-    ($($error:ty),+ $(,)?) => {
-        $(impl std::fmt::Debug for $error {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                std::fmt::Display::fmt(self, formatter)
-            }
-        })+
-    };
-}
-
 debug_as_display!(
     DeviceEncryptionError,
     SessionSetupError,

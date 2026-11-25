@@ -15,7 +15,7 @@ use crate::libsignal::protocol::{
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionCheckoutError {
     #[error("session is already checked out")]
@@ -24,7 +24,7 @@ pub enum SessionCheckoutError {
     Store(#[from] crate::store::error::StoreError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SenderKeyCacheError {
     #[error("{0}")]
@@ -33,7 +33,7 @@ pub enum SenderKeyCacheError {
     Signal(#[from] SignalProtocolError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum IdentityPersistenceError {
     #[error("invalid bootstrap identity length")]
@@ -46,7 +46,7 @@ pub enum IdentityPersistenceError {
     Store(#[from] crate::store::error::StoreError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SignalCacheFlushError {
     #[error("{0}")]
@@ -60,6 +60,13 @@ pub enum SignalCacheFlushError {
         source: Box<SignalProtocolError>,
     },
 }
+
+debug_as_display!(
+    SessionCheckoutError,
+    SenderKeyCacheError,
+    IdentityPersistenceError,
+    SignalCacheFlushError,
+);
 
 impl From<crate::store::error::StoreError> for SignalCacheFlushError {
     fn from(error: crate::store::error::StoreError) -> Self {
