@@ -10,6 +10,7 @@ use wacore::{
     store::{
         InMemoryBackend, SignalStoreCache,
         error::{Result, StoreError},
+        signal_cache::SignalCacheFlushError,
         traits::SignalStore,
     },
 };
@@ -108,12 +109,12 @@ fn failed_flush_preserves_source_and_can_be_retried_by_the_consumer() {
         assert!(store.get_session(address.as_str()).await.unwrap().is_none());
         store.fail_writes.store(true, Ordering::SeqCst);
         let error = cache.flush(&store).await.unwrap_err();
-        let typed = error
-            .downcast_ref::<StoreError>()
-            .expect("typed store error");
-        assert!(matches!(typed, StoreError::Database(_)));
+        let SignalCacheFlushError::Store(typed) = error else {
+            panic!("expected typed store error");
+        };
+        assert!(matches!(typed.as_ref(), StoreError::Database(_)));
         assert!(
-            std::error::Error::source(typed)
+            std::error::Error::source(typed.as_ref())
                 .unwrap()
                 .is::<BackendFailure>()
         );
