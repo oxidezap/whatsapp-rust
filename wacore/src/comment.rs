@@ -86,7 +86,7 @@ mod tests {
     fn body(text: &str) -> wa::Message {
         {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text.to_string());
                 proto

@@ -1,6 +1,5 @@
 //! Primary companion hosting through the existing IQ, Signal and persistence paths.
 use crate::Client;
-use buffa::{Enumeration as _, Message as _};
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -10,6 +9,7 @@ use wacore::mobile::primary::*;
 use wacore::store::MobileSessionBinding;
 use wacore::types::jid::JidExt as _;
 use wacore_binary::{Jid, JidExt as _};
+use waproto::protobuf::{Enumeration as _, Message as _};
 use waproto::whatsapp as wa;
 use zeroize::Zeroizing;
 
@@ -1643,18 +1643,18 @@ impl MobilePrimaryApi<'_> {
             key_id.key_id = Some(id);
             let mut key_data = wa::message::AppStateSyncKeyData::default();
             key_data.key_data = Some(stored.key_data);
-            key_data.fingerprint = buffa::MessageField::some(fingerprint);
+            key_data.fingerprint = waproto::protobuf::MessageField::some(fingerprint);
             key_data.timestamp = Some(stored.timestamp);
             let mut key = wa::message::AppStateSyncKey::default();
-            key.key_id = buffa::MessageField::some(key_id);
-            key.key_data = buffa::MessageField::some(key_data);
+            key.key_id = waproto::protobuf::MessageField::some(key_id);
+            key.key_data = waproto::protobuf::MessageField::some(key_data);
             let mut share = wa::message::AppStateSyncKeyShare::default();
             share.keys.push(key);
             let mut protocol = wa::message::ProtocolMessage::default();
             protocol.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyShare);
-            protocol.app_state_sync_key_share = buffa::MessageField::some(share);
+            protocol.app_state_sync_key_share = waproto::protobuf::MessageField::some(share);
             let mut message = wa::Message::default();
-            message.protocol_message = buffa::MessageField::some(protocol);
+            message.protocol_message = waproto::protobuf::MessageField::some(protocol);
             let message_id = self.bind_bootstrap_message(device, &message, false).await?;
             self.send_peer(device, &message, &message_id, expected_identity)
                 .await?;
@@ -2107,9 +2107,9 @@ fn build_history_bootstrap(
     notification.initial_hist_bootstrap_inline_payload = Some(compressed);
     let mut protocol = wa::message::ProtocolMessage::default();
     protocol.r#type = Some(wa::message::protocol_message::Type::HistorySyncNotification);
-    protocol.history_sync_notification = buffa::MessageField::some(notification);
+    protocol.history_sync_notification = waproto::protobuf::MessageField::some(notification);
     let mut message = wa::Message::default();
-    message.protocol_message = buffa::MessageField::some(protocol);
+    message.protocol_message = waproto::protobuf::MessageField::some(protocol);
     Ok(message)
 }
 
@@ -2158,9 +2158,9 @@ fn external_history_message(
     notification.direct_path = Some(upload.direct_path.clone());
     let mut protocol = wa::message::ProtocolMessage::default();
     protocol.r#type = Some(wa::message::protocol_message::Type::HistorySyncNotification);
-    protocol.history_sync_notification = buffa::MessageField::some(notification);
+    protocol.history_sync_notification = waproto::protobuf::MessageField::some(notification);
     let mut message = wa::Message::default();
-    message.protocol_message = buffa::MessageField::some(protocol);
+    message.protocol_message = waproto::protobuf::MessageField::some(protocol);
     message
 }
 

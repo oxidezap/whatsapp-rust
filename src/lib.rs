@@ -457,6 +457,7 @@ pub use serde;
 pub use serde_json;
 pub use wacore::time::{self, Timestamp};
 pub use waproto::buffa;
+pub use waproto::protobuf;
 
 pub mod cache;
 pub use cache::Freshness;
@@ -722,7 +723,7 @@ pub mod prelude {
     };
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
     /// Optional sub-message wrapper in `wa::Message` literals.
-    pub use waproto::buffa::MessageField;
+    pub use waproto::protobuf::MessageField;
     /// The protobuf namespace (`wa::Message`, `wa::message::*`).
     pub use waproto::whatsapp as wa;
 }

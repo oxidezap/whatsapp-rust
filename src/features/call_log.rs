@@ -219,7 +219,7 @@ mod tests {
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(1_700_000_000_000);
-                proto.call_log_action = buffa::MessageField::some({
+                proto.call_log_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::CallLogAction::default();
                     proto.call_log_record = record.into();
                     proto

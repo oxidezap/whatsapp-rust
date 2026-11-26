@@ -10,7 +10,7 @@ fn helpers_follow_classified_wrappers_and_edits() {
                 let text = stringify!($field);
                 let mut outer = wa::Message::default();
                 outer.$field.get_or_insert_default().message =
-                    buffa::MessageField::some(wa::Message::text(text));
+                    waproto::protobuf::MessageField::some(wa::Message::text(text));
                 let borrowed = outer.text_content().unwrap();
                 assert_eq!(borrowed, text);
                 let allocation = borrowed.as_ptr();
@@ -56,20 +56,20 @@ fn device_sent_and_edits_keep_their_distinct_precedence() {
     let mut image = wa::Message::default();
     image.image_message.get_or_insert_default().caption = Some("photo".into());
     let mut edit = wa::Message::default();
-    edit.edited_message.get_or_insert_default().message = buffa::MessageField::some(image.clone());
+    edit.edited_message.get_or_insert_default().message = waproto::protobuf::MessageField::some(image.clone());
     assert_eq!(stanza_type_from_message(&edit), "text");
     assert_eq!(edit.get_caption(), Some("photo"));
     assert_eq!(edit.clone().into_base_message(), image);
 
     let mut outer = wa::Message::default();
-    outer.device_sent_message.get_or_insert_default().message = buffa::MessageField::some(edit);
+    outer.device_sent_message.get_or_insert_default().message = waproto::protobuf::MessageField::some(edit);
     outer.ephemeral_message.get_or_insert_default();
     let mut poll = wa::Message::default();
     poll.poll_creation_message.get_or_insert_default();
     outer
         .group_mentioned_message
         .get_or_insert_default()
-        .message = buffa::MessageField::some(poll);
+        .message = waproto::protobuf::MessageField::some(poll);
     assert_eq!(stanza_type_from_message(&outer), "poll");
     assert_eq!(outer.get_base_message(), &image);
     assert_eq!(outer.into_base_message(), image);
@@ -82,11 +82,11 @@ fn helpers_limit_repeated_wrappers_and_preserve_empty_ones() {
         outer
             .associated_child_message
             .get_or_insert_default()
-            .message = buffa::MessageField::some(inner);
+            .message = waproto::protobuf::MessageField::some(inner);
         outer
     }
     let mut deep = wa::Message::text("leaf");
-    for _ in 0..buffa::RECURSION_LIMIT {
+    for _ in 0..waproto::protobuf::RECURSION_LIMIT {
         deep = wrap(deep);
     }
     assert_eq!(deep.text_content(), Some("leaf"));
@@ -109,15 +109,15 @@ fn empty_wrappers_do_not_hide_later_bodies_or_follow_references() {
     msg.device_sent_message.get_or_insert_default();
     msg.ephemeral_message.get_or_insert_default();
     msg.edited_message.get_or_insert_default().message =
-        buffa::MessageField::some(wa::Message::text("edit"));
+        waproto::protobuf::MessageField::some(wa::Message::text("edit"));
     msg.associated_child_message.get_or_insert_default().message =
-        buffa::MessageField::some(wa::Message::text("child"));
+        waproto::protobuf::MessageField::some(wa::Message::text("child"));
     assert_eq!(msg.text_content(), Some("child"));
     assert_eq!(msg.into_base_message(), wa::Message::text("child"));
 
     let mut opaque = wa::Message::default();
     opaque.bot_task_message.get_or_insert_default().message =
-        buffa::MessageField::some(wa::Message::text("task"));
+        waproto::protobuf::MessageField::some(wa::Message::text("task"));
     let key = opaque
         .message_context_info
         .get_or_insert_default()

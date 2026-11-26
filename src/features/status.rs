@@ -138,7 +138,7 @@ impl<'a> Status<'a> {
     ) -> Result<SendResult, SendError> {
         let message = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text.to_string());
                 proto.background_argb = Some(background_argb);
@@ -238,9 +238,9 @@ impl<'a> Status<'a> {
 
         let revoke_message = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.key = buffa::MessageField::some({
+                proto_.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.remote_jid = Some(to.to_string());
                     proto.from_me = Some(true);
@@ -392,7 +392,7 @@ mod tests {
 
         let message = {
             let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.extended_text_message = buffa::MessageField::some({
+            proto_.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::message::ExtendedTextMessage::default();
                 proto_.text = Some(text.to_string());
                 proto_.background_argb = Some(bg);
@@ -417,7 +417,7 @@ mod tests {
 
         let revoke_message = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.key = {
                     let mut proto = wa::MessageKey::default();
@@ -448,7 +448,7 @@ mod tests {
         // Non-revoke message
         let text_msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("hello".to_string());
                 proto
@@ -464,7 +464,7 @@ mod tests {
         // Revoke message
         let revoke_msg = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.r#type = Some(wa::message::protocol_message::Type::REVOKE);
                 proto_

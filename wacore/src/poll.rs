@@ -69,16 +69,16 @@ pub fn encrypt_poll_vote_with_secret(
 }
 
 fn encode_selected_options(selected_option_hashes: &[Vec<u8>]) -> Vec<u8> {
-    use buffa::encoding::{Tag, WireType};
+    use waproto::protobuf::encoding::{Tag, WireType};
 
     let encoded_len = selected_option_hashes
         .iter()
-        .map(|hash| 1 + buffa::types::bytes_encoded_len(hash))
+        .map(|hash| 1 + waproto::protobuf::types::bytes_encoded_len(hash))
         .sum();
     let mut plaintext = Vec::with_capacity(encoded_len);
     for hash in selected_option_hashes {
         Tag::new(1, WireType::LengthDelimited).encode(&mut plaintext);
-        buffa::types::encode_bytes(hash, &mut plaintext);
+        waproto::protobuf::types::encode_bytes(hash, &mut plaintext);
     }
     plaintext
 }
@@ -299,7 +299,7 @@ fn scan_selected_options<'a, F>(plaintext: &'a [u8], mut visit: F) -> Result<()>
 where
     F: FnMut(&'a [u8]),
 {
-    use buffa::encoding::{Tag, WireType, skip_field_depth};
+    use waproto::protobuf::encoding::{Tag, WireType, skip_field_depth};
 
     let mut cur = plaintext;
     while !cur.is_empty() {
@@ -307,16 +307,16 @@ where
         match tag.field_number() {
             1 => {
                 if tag.wire_type() != WireType::LengthDelimited {
-                    return Err(buffa::DecodeError::WireTypeMismatch {
+                    return Err(waproto::protobuf::DecodeError::WireTypeMismatch {
                         field_number: 1,
                         expected: WireType::LengthDelimited as u8,
                         actual: tag.wire_type() as u8,
                     }
                     .into());
                 }
-                visit(buffa::types::borrow_bytes(&mut cur)?);
+                visit(waproto::protobuf::types::borrow_bytes(&mut cur)?);
             }
-            _ => skip_field_depth(tag, &mut cur, buffa::RECURSION_LIMIT)?,
+            _ => skip_field_depth(tag, &mut cur, waproto::protobuf::RECURSION_LIMIT)?,
         }
     }
     Ok(())
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn vote_encrypt_decrypt_roundtrip() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
 
         let secret = [0xCDu8; 32];
         let stanza_id = "3EB0ABCD1234";
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn selected_option_encoding_matches_message_encoding() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
 
         let hashes = vec![
             compute_option_hash("Yes").to_vec(),

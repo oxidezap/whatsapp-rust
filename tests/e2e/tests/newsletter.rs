@@ -276,7 +276,7 @@ async fn test_newsletter_send_media_message() -> anyhow::Result<()> {
     // Build and send an image message
     let message = {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.image_message = buffa::MessageField::some({
+        proto_contract_fixture.image_message = whatsapp_rust::buffa::MessageField::some({
             let mut proto_contract_fixture = wa::message::ImageMessage::default();
             proto_contract_fixture.url = Some(upload.url.clone());
             proto_contract_fixture.direct_path = Some(upload.direct_path.clone());

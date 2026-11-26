@@ -15,11 +15,27 @@
 //! Durable input bytes and replay semantics are defined by the receiving API.
 //!
 #![allow(clippy::large_enum_variant)]
-/// Re-exported because its types permeate the generated API; depending on it
-/// directly would require version-matching this crate exactly.
-pub use buffa;
+/// Compatibility path for the protobuf traits and containers used by this crate.
+pub use protobuf as buffa;
+
+#[cfg(feature = "protobuf-experiment")]
+#[doc(hidden)]
+pub use ::buffa as reference_runtime;
+
+#[cfg(feature = "protobuf-experiment")]
+#[doc(hidden)]
+pub mod experiment;
+
+/// Protobuf messages, views, containers, and encoding APIs owned by this crate.
+pub mod protobuf;
 
 pub mod whatsapp {
+    pub use crate::protobuf::generated::whatsapp::*;
+}
+
+#[cfg(feature = "protobuf-experiment")]
+#[doc(hidden)]
+pub mod reference {
     // disallowed_methods: the generated impls call the buffa trait methods on
     // nested messages; that IS the pinned instantiation.
     // unused_qualifications: the generator emits fully-qualified paths on
@@ -35,7 +51,7 @@ pub mod whatsapp {
         clippy::disallowed_methods
     )]
     #[rustfmt::skip]
-    buffa::include_proto!("whatsapp");
+    ::buffa::include_proto!("whatsapp");
 }
 
 /// Field-level serde for open enum fields, wired in via `field_attribute` in
@@ -48,90 +64,17 @@ pub mod whatsapp {
 /// known-value case through the enum's derived impls keeps an opened field on
 /// exactly the closed-enum contract; only `Unknown` values add behavior
 /// (serialized as, and deserializable from, the raw integer).
-pub mod open_enum_serde {
-    use buffa::{EnumValue, Enumeration};
-    use serde::ser::SerializeSeq as _;
+pub use protobuf::open_enum_serde;
 
-    pub fn serialize<E, S>(value: &Option<EnumValue<E>>, s: S) -> Result<S::Ok, S::Error>
-    where
-        E: Enumeration + serde::Serialize,
-        S: serde::Serializer,
-    {
-        match value {
-            None => s.serialize_none(),
-            Some(EnumValue::Known(e)) => s.serialize_some(e),
-            Some(EnumValue::Unknown(n)) => s.serialize_some(n),
-        }
-    }
-
-    pub fn serialize_repeated<E, S>(values: &[EnumValue<E>], s: S) -> Result<S::Ok, S::Error>
-    where
-        E: Enumeration + serde::Serialize,
-        S: serde::Serializer,
-    {
-        let mut sequence = s.serialize_seq(Some(values.len()))?;
-        for value in values {
-            match value {
-                EnumValue::Known(e) => sequence.serialize_element(e)?,
-                EnumValue::Unknown(n) => sequence.serialize_element(n)?,
-            }
-        }
-        sequence.end()
-    }
-
-    #[cfg(feature = "serde-deserialize")]
-    pub fn deserialize<'de, E, D>(d: D) -> Result<Option<EnumValue<E>>, D::Error>
-    where
-        E: Enumeration + serde::Deserialize<'de>,
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Wire<E> {
-            // The enum's derived impl first, so every feature-selected input
-            // shape (lowercase names, numeric repr) keeps working; the raw
-            // integer fallback only catches values the enum doesn't know.
-            Known(E),
-            Raw(i32),
-        }
-        Ok(
-            match <Option<Wire<E>> as serde::Deserialize>::deserialize(d)? {
-                None => None,
-                Some(Wire::Known(e)) => Some(EnumValue::Known(e)),
-                Some(Wire::Raw(n)) => Some(EnumValue::from(n)),
-            },
-        )
-    }
-
-    #[cfg(feature = "serde-deserialize")]
-    pub fn deserialize_repeated<'de, E, D>(d: D) -> Result<Vec<EnumValue<E>>, D::Error>
-    where
-        E: Enumeration + serde::Deserialize<'de>,
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Wire<E> {
-            Known(E),
-            Raw(i32),
-        }
-
-        Ok(<Vec<Wire<E>> as serde::Deserialize>::deserialize(d)?
-            .into_iter()
-            .map(|value| match value {
-                Wire::Known(e) => EnumValue::Known(e),
-                Wire::Raw(n) => EnumValue::from(n),
-            })
-            .collect())
-    }
-}
+#[cfg(feature = "protobuf-experiment")]
+mod reference_enum_serde;
 
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside
 /// the buffa code. Hand-written partial decoders must reference these consts
 /// (or compile-time assert against them) instead of magic numbers, so schema
 /// changes surface as compile errors rather than silent wire-format drift.
 pub mod tags {
-    include!(concat!(env!("OUT_DIR"), "/tags.rs"));
+    include!("generated/tags.rs");
 }
 
 /// Pinned, non-generic codec entry points for the hottest protobuf roots.
@@ -151,8 +94,8 @@ pub mod tags {
 // clippy.toml disallowed-methods).
 #[allow(clippy::disallowed_methods)]
 pub mod codec {
+    use crate::protobuf::Message as _;
     use crate::whatsapp;
-    use buffa::Message as _;
 
     /// Protobuf packs the field number above the 3-bit wire type in the tag.
     const PROTOBUF_WIRE_TYPE_BITS: u32 = 3;
@@ -173,12 +116,16 @@ pub mod codec {
     }
 
     #[inline]
-    fn wire_tag_value(field: u32, wire_type: buffa::encoding::WireType) -> u64 {
+    fn wire_tag_value(field: u32, wire_type: crate::protobuf::encoding::WireType) -> u64 {
         (u64::from(field) << PROTOBUF_WIRE_TYPE_BITS) | wire_type as u64
     }
 
     #[inline]
-    fn push_wire_tag(field: u32, wire_type: buffa::encoding::WireType, out: &mut Vec<u8>) {
+    fn push_wire_tag(
+        field: u32,
+        wire_type: crate::protobuf::encoding::WireType,
+        out: &mut Vec<u8>,
+    ) {
         push_varint(wire_tag_value(field, wire_type), out);
     }
 
@@ -200,7 +147,7 @@ pub mod codec {
     fn len_delimited_len(field: u32, payload_len: usize) -> usize {
         varint_len(wire_tag_value(
             field,
-            buffa::encoding::WireType::LengthDelimited,
+            crate::protobuf::encoding::WireType::LengthDelimited,
         )) + varint_len(payload_len as u64)
             + payload_len
     }
@@ -213,9 +160,9 @@ pub mod codec {
     /// Append the encoded message to `out`. Infallible into a `Vec`.
     #[inline(never)]
     pub fn message_encode_into(msg: &whatsapp::Message, out: &mut Vec<u8>) {
-        let mut cache = buffa::SizeCache::new();
-        let size = buffa::checked_encode_size(msg.compute_size(&mut cache))
-            .unwrap_or_else(|_| buffa::encode_size_overflow());
+        let mut cache = crate::protobuf::SizeCache::new();
+        let size = crate::protobuf::checked_encode_size(msg.compute_size(&mut cache))
+            .unwrap_or_else(|_| crate::protobuf::encode_size_overflow());
         out.reserve_exact(size as usize);
         msg.write_to(&mut cache, out);
     }
@@ -231,21 +178,24 @@ pub mod codec {
     /// two passes itself instead of calling `encode`. Pinning both keeps the
     /// `Message` encode tree out of the calling crate.
     #[inline(never)]
-    pub fn message_compute_size(msg: &whatsapp::Message, cache: &mut buffa::SizeCache) -> usize {
+    pub fn message_compute_size(
+        msg: &whatsapp::Message,
+        cache: &mut crate::protobuf::SizeCache,
+    ) -> usize {
         msg.compute_size(cache) as usize
     }
 
     #[inline(never)]
     pub fn message_write_to(
         msg: &whatsapp::Message,
-        cache: &mut buffa::SizeCache,
+        cache: &mut crate::protobuf::SizeCache,
         out: &mut Vec<u8>,
     ) {
         msg.write_to(cache, out);
     }
 
     #[inline(never)]
-    pub fn message_decode(bytes: &[u8]) -> Result<whatsapp::Message, buffa::DecodeError> {
+    pub fn message_decode(bytes: &[u8]) -> Result<whatsapp::Message, crate::protobuf::DecodeError> {
         whatsapp::Message::decode_from_slice(bytes)
     }
 
@@ -261,19 +211,23 @@ pub mod codec {
     }
 
     #[inline(never)]
-    pub fn message_key_decode(bytes: &[u8]) -> Result<whatsapp::MessageKey, buffa::DecodeError> {
+    pub fn message_key_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::MessageKey, crate::protobuf::DecodeError> {
         whatsapp::MessageKey::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn web_message_info_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::WebMessageInfo, buffa::DecodeError> {
+    ) -> Result<whatsapp::WebMessageInfo, crate::protobuf::DecodeError> {
         whatsapp::WebMessageInfo::decode_from_slice(bytes)
     }
 
     #[inline(never)]
-    pub fn history_sync_decode(bytes: &[u8]) -> Result<whatsapp::HistorySync, buffa::DecodeError> {
+    pub fn history_sync_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::HistorySync, crate::protobuf::DecodeError> {
         whatsapp::HistorySync::decode_from_slice(bytes)
     }
 
@@ -281,7 +235,7 @@ pub mod codec {
     #[inline(never)]
     pub fn call_log_record_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::CallLogRecord, buffa::DecodeError> {
+    ) -> Result<whatsapp::CallLogRecord, crate::protobuf::DecodeError> {
         whatsapp::CallLogRecord::decode_from_slice(bytes)
     }
 
@@ -299,7 +253,7 @@ pub mod codec {
     #[inline(never)]
     pub fn history_sync_notification_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::message::HistorySyncNotification, buffa::DecodeError> {
+    ) -> Result<whatsapp::message::HistorySyncNotification, crate::protobuf::DecodeError> {
         whatsapp::message::HistorySyncNotification::decode_from_slice(bytes)
     }
 
@@ -320,7 +274,7 @@ pub mod codec {
     #[inline(never)]
     pub fn group_history_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::GroupHistory, buffa::DecodeError> {
+    ) -> Result<whatsapp::GroupHistory, crate::protobuf::DecodeError> {
         whatsapp::GroupHistory::decode_from_slice(bytes)
     }
 
@@ -330,12 +284,14 @@ pub mod codec {
     #[inline(never)]
     pub fn history_sync_msg_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::HistorySyncMsg, buffa::DecodeError> {
+    ) -> Result<whatsapp::HistorySyncMsg, crate::protobuf::DecodeError> {
         whatsapp::HistorySyncMsg::decode_from_slice(bytes)
     }
 
     #[inline(never)]
-    pub fn conversation_decode(bytes: &[u8]) -> Result<whatsapp::Conversation, buffa::DecodeError> {
+    pub fn conversation_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::Conversation, crate::protobuf::DecodeError> {
         whatsapp::Conversation::decode_from_slice(bytes)
     }
 
@@ -348,7 +304,7 @@ pub mod codec {
     pub fn conversation_merge_from_slice(
         conv: &mut whatsapp::Conversation,
         bytes: &[u8],
-    ) -> Result<(), buffa::DecodeError> {
+    ) -> Result<(), crate::protobuf::DecodeError> {
         conv.clear();
         conv.merge_from_slice(bytes)
     }
@@ -376,7 +332,7 @@ pub mod codec {
     #[inline(never)]
     pub fn message_context_info_compute_size(
         mci: &whatsapp::MessageContextInfo,
-        cache: &mut buffa::SizeCache,
+        cache: &mut crate::protobuf::SizeCache,
     ) -> usize {
         mci.compute_size(cache) as usize
     }
@@ -384,7 +340,7 @@ pub mod codec {
     #[inline(never)]
     pub fn message_context_info_write_to(
         mci: &whatsapp::MessageContextInfo,
-        cache: &mut buffa::SizeCache,
+        cache: &mut crate::protobuf::SizeCache,
         out: &mut Vec<u8>,
     ) {
         mci.write_to(cache, out);
@@ -396,7 +352,7 @@ pub mod codec {
     pub fn message_context_info_merge(
         mci: &mut whatsapp::MessageContextInfo,
         bytes: &[u8],
-    ) -> Result<(), buffa::DecodeError> {
+    ) -> Result<(), crate::protobuf::DecodeError> {
         mci.merge_from_slice(bytes)
     }
 
@@ -409,19 +365,21 @@ pub mod codec {
     #[inline(never)]
     pub fn syncd_snapshot_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SyncdSnapshot, buffa::DecodeError> {
+    ) -> Result<whatsapp::SyncdSnapshot, crate::protobuf::DecodeError> {
         whatsapp::SyncdSnapshot::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn syncd_mutations_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SyncdMutations, buffa::DecodeError> {
+    ) -> Result<whatsapp::SyncdMutations, crate::protobuf::DecodeError> {
         whatsapp::SyncdMutations::decode_from_slice(bytes)
     }
 
     #[inline(never)]
-    pub fn syncd_patch_decode(bytes: &[u8]) -> Result<whatsapp::SyncdPatch, buffa::DecodeError> {
+    pub fn syncd_patch_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncdPatch, crate::protobuf::DecodeError> {
         whatsapp::SyncdPatch::decode_from_slice(bytes)
     }
 
@@ -432,7 +390,7 @@ pub mod codec {
     #[inline(never)]
     pub fn syncd_snapshot_recovery_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SyncdSnapshotRecovery, buffa::DecodeError> {
+    ) -> Result<whatsapp::SyncdSnapshotRecovery, crate::protobuf::DecodeError> {
         whatsapp::SyncdSnapshotRecovery::decode_from_slice(bytes)
     }
 
@@ -444,21 +402,21 @@ pub mod codec {
     #[inline(never)]
     pub fn external_blob_reference_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ExternalBlobReference, buffa::DecodeError> {
+    ) -> Result<whatsapp::ExternalBlobReference, crate::protobuf::DecodeError> {
         whatsapp::ExternalBlobReference::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn patch_debug_data_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::PatchDebugData, buffa::DecodeError> {
+    ) -> Result<whatsapp::PatchDebugData, crate::protobuf::DecodeError> {
         whatsapp::PatchDebugData::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn sync_action_data_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SyncActionData, buffa::DecodeError> {
+    ) -> Result<whatsapp::SyncActionData, crate::protobuf::DecodeError> {
         whatsapp::SyncActionData::decode_from_slice(bytes)
     }
 
@@ -482,17 +440,17 @@ pub mod codec {
         value: &whatsapp::SyncActionValue,
         version: i32,
     ) -> Vec<u8> {
-        use buffa::encoding::WireType;
+        use crate::protobuf::encoding::WireType;
 
         // Size the value once; the same cache feeds `write_to` below.
-        let mut cache = buffa::SizeCache::new();
+        let mut cache = crate::protobuf::SizeCache::new();
         let value_len = value.compute_size(&mut cache) as usize;
 
         let total = len_delimited_len(SYNC_ACTION_DATA_INDEX, index.len())
             + len_delimited_len(SYNC_ACTION_DATA_VALUE, value_len)
             + len_delimited_len(SYNC_ACTION_DATA_PADDING, 0)
             + varint_len(wire_tag_value(SYNC_ACTION_DATA_VERSION, WireType::Varint))
-            + buffa::types::int32_encoded_len(version);
+            + crate::protobuf::types::int32_encoded_len(version);
         let mut out = Vec::with_capacity(total);
 
         push_wire_tag(SYNC_ACTION_DATA_INDEX, WireType::LengthDelimited, &mut out);
@@ -511,7 +469,7 @@ pub mod codec {
         push_varint(0, &mut out);
 
         push_wire_tag(SYNC_ACTION_DATA_VERSION, WireType::Varint, &mut out);
-        buffa::types::encode_int32(version, &mut out);
+        crate::protobuf::types::encode_int32(version, &mut out);
 
         debug_assert_eq!(out.len(), total, "two-pass size mismatch");
         out
@@ -523,7 +481,7 @@ pub mod codec {
     #[inline(never)]
     pub fn pre_key_record_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::PreKeyRecordStructure, buffa::DecodeError> {
+    ) -> Result<whatsapp::PreKeyRecordStructure, crate::protobuf::DecodeError> {
         whatsapp::PreKeyRecordStructure::decode_from_slice(bytes)
     }
 
@@ -542,7 +500,7 @@ pub mod codec {
     #[inline(never)]
     pub fn signed_pre_key_record_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SignedPreKeyRecordStructure, buffa::DecodeError> {
+    ) -> Result<whatsapp::SignedPreKeyRecordStructure, crate::protobuf::DecodeError> {
         whatsapp::SignedPreKeyRecordStructure::decode_from_slice(bytes)
     }
 
@@ -554,7 +512,7 @@ pub mod codec {
     #[inline(never)]
     pub fn sender_key_record_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SenderKeyRecordStructure, buffa::DecodeError> {
+    ) -> Result<whatsapp::SenderKeyRecordStructure, crate::protobuf::DecodeError> {
         whatsapp::SenderKeyRecordStructure::decode_from_slice(bytes)
     }
 
@@ -569,7 +527,7 @@ pub mod codec {
     #[inline(never)]
     pub fn adv_signed_device_identity_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ADVSignedDeviceIdentity, buffa::DecodeError> {
+    ) -> Result<whatsapp::ADVSignedDeviceIdentity, crate::protobuf::DecodeError> {
         whatsapp::ADVSignedDeviceIdentity::decode_from_slice(bytes)
     }
 
@@ -588,7 +546,8 @@ pub mod codec {
     #[inline(never)]
     pub fn status_privacy_action_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::sync_action_value::StatusPrivacyAction, buffa::DecodeError> {
+    ) -> Result<whatsapp::sync_action_value::StatusPrivacyAction, crate::protobuf::DecodeError>
+    {
         whatsapp::sync_action_value::StatusPrivacyAction::decode_from_slice(bytes)
     }
 
@@ -612,21 +571,21 @@ pub mod codec {
     #[inline(never)]
     pub fn adv_device_identity_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ADVDeviceIdentity, buffa::DecodeError> {
+    ) -> Result<whatsapp::ADVDeviceIdentity, crate::protobuf::DecodeError> {
         whatsapp::ADVDeviceIdentity::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn adv_signed_device_identity_hmac_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ADVSignedDeviceIdentityHMAC, buffa::DecodeError> {
+    ) -> Result<whatsapp::ADVSignedDeviceIdentityHMAC, crate::protobuf::DecodeError> {
         whatsapp::ADVSignedDeviceIdentityHMAC::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn adv_signed_key_index_list_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ADVSignedKeyIndexList, buffa::DecodeError> {
+    ) -> Result<whatsapp::ADVSignedKeyIndexList, crate::protobuf::DecodeError> {
         whatsapp::ADVSignedKeyIndexList::decode_from_slice(bytes)
     }
 
@@ -640,7 +599,7 @@ pub mod codec {
     #[inline(never)]
     pub fn adv_key_index_list_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ADVKeyIndexList, buffa::DecodeError> {
+    ) -> Result<whatsapp::ADVKeyIndexList, crate::protobuf::DecodeError> {
         whatsapp::ADVKeyIndexList::decode_from_slice(bytes)
     }
 
@@ -652,7 +611,7 @@ pub mod codec {
     #[inline(never)]
     pub fn client_pairing_props_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::ClientPairingProps, buffa::DecodeError> {
+    ) -> Result<whatsapp::ClientPairingProps, crate::protobuf::DecodeError> {
         whatsapp::ClientPairingProps::decode_from_slice(bytes)
     }
 
@@ -671,7 +630,7 @@ pub mod codec {
     #[inline(never)]
     pub fn handshake_message_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::HandshakeMessage, buffa::DecodeError> {
+    ) -> Result<whatsapp::HandshakeMessage, crate::protobuf::DecodeError> {
         whatsapp::HandshakeMessage::decode_from_slice(bytes)
     }
 
@@ -683,7 +642,7 @@ pub mod codec {
     #[inline(never)]
     pub fn lid_migration_mapping_sync_payload_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::LIDMigrationMappingSyncPayload, buffa::DecodeError> {
+    ) -> Result<whatsapp::LIDMigrationMappingSyncPayload, crate::protobuf::DecodeError> {
         whatsapp::LIDMigrationMappingSyncPayload::decode_from_slice(bytes)
     }
 
@@ -692,20 +651,23 @@ pub mod codec {
     #[inline(never)]
     pub fn sender_key_distribution_message_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::SenderKeyDistributionMessage, buffa::DecodeError> {
+    ) -> Result<whatsapp::SenderKeyDistributionMessage, crate::protobuf::DecodeError> {
         whatsapp::SenderKeyDistributionMessage::decode_from_slice(bytes)
     }
 
     /// Noise server cert chain, verified once per connection in wacore-noise.
     #[inline(never)]
-    pub fn cert_chain_decode(bytes: &[u8]) -> Result<whatsapp::CertChain, buffa::DecodeError> {
+    pub fn cert_chain_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::CertChain, crate::protobuf::DecodeError> {
         whatsapp::CertChain::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn noise_certificate_details_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::cert_chain::noise_certificate::Details, buffa::DecodeError> {
+    ) -> Result<whatsapp::cert_chain::noise_certificate::Details, crate::protobuf::DecodeError>
+    {
         whatsapp::cert_chain::noise_certificate::Details::decode_from_slice(bytes)
     }
 
@@ -713,14 +675,14 @@ pub mod codec {
     #[inline(never)]
     pub fn mobile_noise_certificate_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::NoiseCertificate, buffa::DecodeError> {
+    ) -> Result<whatsapp::NoiseCertificate, crate::protobuf::DecodeError> {
         whatsapp::NoiseCertificate::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn mobile_noise_certificate_details_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::noise_certificate::Details, buffa::DecodeError> {
+    ) -> Result<whatsapp::noise_certificate::Details, crate::protobuf::DecodeError> {
         whatsapp::noise_certificate::Details::decode_from_slice(bytes)
     }
 
@@ -728,14 +690,14 @@ pub mod codec {
     #[inline(never)]
     pub fn verified_name_certificate_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::VerifiedNameCertificate, buffa::DecodeError> {
+    ) -> Result<whatsapp::VerifiedNameCertificate, crate::protobuf::DecodeError> {
         whatsapp::VerifiedNameCertificate::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn verified_name_certificate_details_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::verified_name_certificate::Details, buffa::DecodeError> {
+    ) -> Result<whatsapp::verified_name_certificate::Details, crate::protobuf::DecodeError> {
         whatsapp::verified_name_certificate::Details::decode_from_slice(bytes)
     }
 
@@ -755,7 +717,7 @@ pub mod codec {
     #[inline(never)]
     pub fn primary_ephemeral_identity_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::PrimaryEphemeralIdentity, buffa::DecodeError> {
+    ) -> Result<whatsapp::PrimaryEphemeralIdentity, crate::protobuf::DecodeError> {
         whatsapp::PrimaryEphemeralIdentity::decode_from_slice(bytes)
     }
 
@@ -780,7 +742,7 @@ pub mod codec {
     #[inline(never)]
     pub fn reaction_message_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::message::ReactionMessage, buffa::DecodeError> {
+    ) -> Result<whatsapp::message::ReactionMessage, crate::protobuf::DecodeError> {
         whatsapp::message::ReactionMessage::decode_from_slice(bytes)
     }
 
@@ -792,14 +754,14 @@ pub mod codec {
     #[inline(never)]
     pub fn event_response_message_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::message::EventResponseMessage, buffa::DecodeError> {
+    ) -> Result<whatsapp::message::EventResponseMessage, crate::protobuf::DecodeError> {
         whatsapp::message::EventResponseMessage::decode_from_slice(bytes)
     }
 
     #[inline(never)]
     pub fn message_secret_message_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::MessageSecretMessage, buffa::DecodeError> {
+    ) -> Result<whatsapp::MessageSecretMessage, crate::protobuf::DecodeError> {
         whatsapp::MessageSecretMessage::decode_from_slice(bytes)
     }
 
@@ -819,7 +781,7 @@ pub mod codec {
     #[inline(never)]
     pub fn app_state_sync_key_fingerprint_decode(
         bytes: &[u8],
-    ) -> Result<whatsapp::message::AppStateSyncKeyFingerprint, buffa::DecodeError> {
+    ) -> Result<whatsapp::message::AppStateSyncKeyFingerprint, crate::protobuf::DecodeError> {
         whatsapp::message::AppStateSyncKeyFingerprint::decode_from_slice(bytes)
     }
 }
@@ -830,7 +792,7 @@ mod tests {
     #[test]
     fn message_append_encoding_reserves_only_the_required_capacity() {
         use super::{codec, whatsapp as wa};
-        use buffa::MessageField;
+        use crate::protobuf::MessageField;
         let quoted = wa::Message {
             conversation: Some("q".repeat(2500)),
             ..Default::default()
@@ -857,8 +819,8 @@ mod tests {
     }
 
     use super::whatsapp as wa;
-    use buffa::Message;
-    use buffa::view::MessageView;
+    use crate::protobuf::Message;
+    use crate::protobuf::view::MessageView;
 
     #[test]
     fn call_log_record_codec_preserves_optional_fields_and_rejects_truncation() {
@@ -882,7 +844,7 @@ mod tests {
     #[test]
     fn generated_views_and_oneofs_round_trip() {
         let msg = wa::Message {
-            interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+            interactive_message: crate::protobuf::MessageField::some(wa::message::InteractiveMessage {
                 interactive_message: Some(
                     wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(
                         Box::new(wa::message::interactive_message::NativeFlowMessage {

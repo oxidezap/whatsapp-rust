@@ -55,17 +55,17 @@ pub fn encode_record(
     // 5. Build the record
     let record = {
         let mut proto = wa::SyncdRecord::default();
-        proto.index = buffa::MessageField::some({
+        proto.index = waproto::protobuf::MessageField::some({
             let mut proto = wa::SyncdIndex::default();
             proto.blob = Some(index_mac);
             proto
         });
-        proto.value = buffa::MessageField::some({
+        proto.value = waproto::protobuf::MessageField::some({
             let mut proto = wa::SyncdValue::default();
             proto.blob = Some(value_blob);
             proto
         });
-        proto.key_id = buffa::MessageField::some({
+        proto.key_id = waproto::protobuf::MessageField::some({
             let mut proto = wa::KeyId::default();
             proto.id = Some(key_id.to_vec());
             proto
@@ -76,7 +76,7 @@ pub fn encode_record(
     let mutation = {
         let mut proto = wa::SyncdMutation::default();
         proto.operation = Some(operation.into());
-        proto.record = buffa::MessageField::some(record);
+        proto.record = waproto::protobuf::MessageField::some(record);
         proto
     };
 
@@ -99,7 +99,7 @@ mod tests {
         let index = b"[\"setting_pushName\"]";
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.push_name_setting = buffa::MessageField::some({
+            proto.push_name_setting = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::PushNameSetting::default();
                 proto.name = Some("Test User".to_string());
                 proto
@@ -155,7 +155,7 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     #[test]
     fn hand_written_plaintext_matches_generated_encoder() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
 
         let index = b"[\"contact\",\"5511999998888@s.whatsapp.net\"]";
         let cases = [
@@ -181,7 +181,7 @@ mod tests {
             let expected = {
                 let mut proto = wa::SyncActionData::default();
                 proto.index = Some(index.to_vec());
-                proto.value = buffa::MessageField::some(value.clone());
+                proto.value = waproto::protobuf::MessageField::some(value.clone());
                 proto.padding = Some(vec![]);
                 proto.version = Some(version);
                 proto

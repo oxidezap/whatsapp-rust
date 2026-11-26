@@ -23,12 +23,12 @@
 //! Mirrors the existing flow for poll vote decryption (`Polls::decrypt_vote`).
 
 use anyhow::{Result, anyhow};
-use buffa::MessageField;
 use log::warn;
 use wacore::message_edit::{self, MessageEditContext};
 use wacore::secret_enc_addon::ModificationType;
 use wacore_binary::Jid;
 use wacore_binary::jid::JidError;
+use waproto::protobuf::MessageField;
 use waproto::whatsapp as wa;
 
 /// Failures of the target-key sender resolvers ([`EncryptedEdit::original_sender_jid`],
@@ -1152,8 +1152,8 @@ mod tests {
 
     #[test]
     fn decrypt_secret_encrypted_roundtrip_poll_edit() {
-        use buffa::Message as _;
         use wacore::secret_enc_addon::{AddonContext, encrypt_addon};
+        use waproto::protobuf::Message as _;
 
         let secret = [0x63u8; 32];
         let parent_id = "PARENT1";

@@ -1,10 +1,6 @@
-//! Generates buffa types for the MLow runtime constant tables (the `voip`
-//! feature's `src/voip/mlow/` codec) from the committed descriptor
-//! `src/voip/mlow/tables.desc`, compiled once from `tables.proto`. Only the
-//! `voip` feature consumes these tables, so codegen is skipped otherwise.
-//! Reading the descriptor means consumers never need `protoc`; editing the
-//! proto requires regenerating the descriptor via
-//! `cargo xt tables-desc`.
+//! Checks the committed MLow schema, descriptor and static codec hashes.
+//! Only `voip` consumes these tables. Consumers need no generator or protoc;
+//! schema changes regenerate the descriptor and codec with `cargo xt tables-desc`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/voip/mlow/tables.desc");
@@ -26,14 +22,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo xt tables-desc",
     )?;
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
+    ensure_generated_fresh(
+        "src/voip/mlow/tables.desc",
+        "src/voip/mlow/tables.generated.rs",
+        "src/voip/mlow/tables.generated.rs.sha256",
+    )?;
+    Ok(())
+}
 
-    buffa_build::Config::new()
-        .descriptor_set("src/voip/mlow/tables.desc")
-        .files(&["tables.proto"])
-        .preserve_unknown_fields(false)
-        .out_dir(&out_dir)
-        .compile()
+fn ensure_generated_fresh(descriptor: &str, source: &str, manifest: &str) -> std::io::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-changed={manifest}");
+    let manifest = std::fs::read_to_string(manifest)?;
+    for (kind, path) in [("descriptor", descriptor), ("rust", source)] {
+        let expected = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{kind} ")));
+        let digest: String = Sha256::digest(std::fs::read(path)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if expected != Some(digest.as_str()) {
+            return Err(std::io::Error::other(format!(
+                "{path} has stale generated protobuf code. Run `cargo xt proto-codecs`."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Fail the build if the committed `.desc` no longer matches its `.proto` (proto

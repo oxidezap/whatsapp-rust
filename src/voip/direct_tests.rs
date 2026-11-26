@@ -228,7 +228,7 @@ impl DirectCallHost for Host {
         let mut message = waproto::whatsapp::Message::default();
         let mut call = waproto::whatsapp::message::Call::default();
         call.call_key = Some(vec![0x55; 32]);
-        message.call = buffa::MessageField::some(call);
+        message.call = waproto::protobuf::MessageField::some(call);
         Ok(MessageUtils::encode_and_pad(&message))
     }
     async fn read_token(&self, _peer: &Jid) -> Result<Option<Vec<u8>>, CallError> {

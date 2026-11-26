@@ -179,7 +179,7 @@ pub fn decrypt_message_edit_with_fallback(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::MessageField;
+    use waproto::protobuf::MessageField;
     use waproto::whatsapp as wa;
 
     fn make_inner_edit(new_text: &str) -> wa::Message {
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn general_decrypt_roundtrips_non_edit_use_case() {
         use crate::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
 
         // A POLL_EDIT envelope: same shape as MESSAGE_EDIT, different use-case.
         let secret = [0x71u8; 32];

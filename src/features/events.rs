@@ -60,7 +60,8 @@ impl<'a> Events<'a> {
 
         let mut message = {
             let mut proto = wa::Message::default();
-            proto.event_message = buffa::MessageField::some(build_event_message(params));
+            proto.event_message =
+                waproto::protobuf::MessageField::some(build_event_message(params));
             proto
         };
 
@@ -68,7 +69,7 @@ impl<'a> Events<'a> {
         // RSVP encryption key from it. WA Web rejects an event without one
         // (Events/ValidationError MISSING_MESSAGE_SECRET).
         let message_secret = super::creation::generate_message_secret();
-        message.message_context_info = buffa::MessageField::some({
+        message.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(message_secret.as_bytes().to_vec());
             proto
@@ -117,7 +118,7 @@ impl<'a> Events<'a> {
         let from_me = target.message().from_me();
         let enc = {
             let mut proto = wa::message::EncEventResponseMessage::default();
-            proto.event_creation_message_key = buffa::MessageField::some({
+            proto.event_creation_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(chat_jid.to_string());
                 proto.from_me = Some(from_me);
@@ -136,7 +137,7 @@ impl<'a> Events<'a> {
 
         let message = {
             let mut proto = wa::Message::default();
-            proto.enc_event_response_message = buffa::MessageField::some(enc);
+            proto.enc_event_response_message = waproto::protobuf::MessageField::some(enc);
             proto
         };
 

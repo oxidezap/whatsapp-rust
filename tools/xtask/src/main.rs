@@ -42,6 +42,11 @@ enum Task {
     TablesDesc,
     /// Regenerate the SQLite wire descriptor and hashes.
     WireDesc,
+    /// Regenerate or check the crate-local protobuf codecs.
+    ProtoCodecs {
+        #[arg(long)]
+        check: bool,
+    },
     /// Codec oracle regeneration and fixture packaging (release worker).
     #[command(disable_help_flag = true)]
     Mlow {
@@ -73,14 +78,21 @@ fn main() -> Result<std::process::ExitCode> {
         }
         Task::ProtoDesc => {
             descriptor(&root, "waproto/src/whatsapp", true)?;
+            proto_codecs(&root, false)?;
             0
         }
         Task::TablesDesc => {
             descriptor(&root, "wacore/src/voip/mlow/tables", false)?;
+            proto_codecs(&root, false)?;
             0
         }
         Task::WireDesc => {
             descriptor(&root, "storages/sqlite-storage/proto/wire", false)?;
+            proto_codecs(&root, false)?;
+            0
+        }
+        Task::ProtoCodecs { check } => {
+            proto_codecs(&root, check)?;
             0
         }
         Task::Mlow { args } => worker(&root, "mlow", &args)?,
@@ -105,6 +117,57 @@ fn descriptor(root: &Path, stem: &str, source_info: bool) -> Result<()> {
         &root.join(format!("{stem}.desc")),
         source_info,
     )
+}
+
+fn proto_codecs(root: &Path, check: bool) -> Result<()> {
+    for (descriptor, base, output) in [
+        (
+            "waproto/src/whatsapp.desc",
+            "crate::protobuf::generated::whatsapp",
+            "waproto/src/generated/whatsapp.rs",
+        ),
+        (
+            "wacore/src/voip/mlow/tables.desc",
+            "crate::voip::mlow::smpl_tables_blob::tables",
+            "wacore/src/voip/mlow/tables.generated.rs",
+        ),
+        (
+            "storages/sqlite-storage/proto/wire.desc",
+            "crate::wire::proto",
+            "storages/sqlite-storage/src/wire.generated.rs",
+        ),
+    ] {
+        let mut command = std::process::Command::new("cargo");
+        command.current_dir(root).args([
+            "run",
+            "--locked",
+            "-p",
+            "whatspec-codegen",
+            "--bin",
+            "protobuf-codegen",
+            "--",
+            descriptor,
+            base,
+            if descriptor == "waproto/src/whatsapp.desc" {
+                "crate::protobuf"
+            } else {
+                "::waproto::protobuf"
+            },
+            output,
+        ]);
+        if check {
+            command.arg("--check");
+        }
+        if descriptor == "waproto/src/whatsapp.desc" {
+            command.arg("--whatsapp");
+        }
+        let status = command.status().context("run protobuf codec generator")?;
+        anyhow::ensure!(
+            status.success(),
+            "protobuf codec generation failed for {descriptor}"
+        );
+    }
+    Ok(())
 }
 
 fn worker(root: &Path, task: &str, args: &[std::ffi::OsString]) -> Result<u8> {

@@ -1736,7 +1736,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
- "buffa",
  "dhat",
  "env_logger",
  "futures",
@@ -5604,8 +5603,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bon",
- "buffa",
- "buffa-build",
  "bytes",
  "cbc",
  "ciborium",
@@ -5656,7 +5653,6 @@ name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "buffa",
  "codspeed-divan-compat",
  "hex",
  "hkdf",
@@ -5712,7 +5708,6 @@ dependencies = [
  "arrayvec",
  "async-lock",
  "async-trait",
- "buffa",
  "bytes",
  "cbc",
  "ciborium",
@@ -5743,7 +5738,6 @@ name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "buffa",
  "bytes",
  "codspeed-divan-compat",
  "hkdf",
@@ -6180,7 +6174,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bon",
- "buffa",
  "bytes",
  "cbc",
  "codspeed-divan-compat",
@@ -6263,8 +6256,6 @@ name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
 dependencies = [
  "async-trait",
- "buffa",
- "buffa-build",
  "bytes",
  "codspeed-divan-compat",
  "diesel",
@@ -6369,9 +6360,13 @@ name = "whatspec-codegen"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "heck",
+ "prettyplease 0.3.0",
+ "quote",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "syn 3.0.10",
  "toml 1.2.1+spec-1.1.0",
  "wa-codegen",
  "wa-ir",

@@ -258,12 +258,12 @@ fn bench_update_hash_from_records(bencher: divan::Bencher, shape: (usize, bool))
                     blob.extend_from_slice(&[(i % 251) as u8; 32]);
                     {
                         let mut proto = wa::SyncdRecord::default();
-                        proto.index = buffa::MessageField::some({
+                        proto.index = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncdIndex::default();
                             proto.blob = Some(index_mac.to_vec());
                             proto
                         });
-                        proto.value = buffa::MessageField::some({
+                        proto.value = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncdValue::default();
                             proto.blob = Some(blob);
                             proto

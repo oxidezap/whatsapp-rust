@@ -36,7 +36,6 @@ wacore-binary.workspace = true
 # Only the opt-in legacy wire enums use the derive macro.
 wacore-derive = { workspace = true, optional = true }
 waproto.workspace = true
-buffa.workspace = true
 log.workspace = true
 
 [dev-dependencies]

@@ -710,7 +710,7 @@ mod mobile_transport_tests {
         server_hello.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
         server_hello.r#static = Some(encrypted_static);
         server_hello.payload = Some(encrypted_cert);
-        response.server_hello = buffa::MessageField::some(server_hello);
+        response.server_hello = waproto::protobuf::MessageField::some(server_hello);
         let framed = frame(&waproto::codec::handshake_message_to_vec(&response));
         // Split inside both the length prefix and encrypted handshake fields.
         for fragment in [&framed[..1], &framed[1..2], &framed[2..7], &framed[7..]] {

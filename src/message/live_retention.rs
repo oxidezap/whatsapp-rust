@@ -103,7 +103,7 @@ impl RetainedDelivery {
         item: &PendingDelivery,
         charge: &Arc<Charge>,
         message_size: usize,
-        cache: &mut buffa::SizeCache,
+        cache: &mut waproto::protobuf::SizeCache,
     ) -> Self {
         let mut encoded = Vec::with_capacity(message_size);
         waproto::codec::message_write_to(&item.message, cache, &mut encoded);
@@ -485,10 +485,10 @@ impl LiveRetention {
     }
 
     pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<usize> {
-        let mut cache = buffa::SizeCache::new();
+        let mut cache = waproto::protobuf::SizeCache::new();
         let message_size = waproto::codec::message_compute_size(&item.message, &mut cache);
-        buffa::checked_encode_size(message_size as u32)
-            .unwrap_or_else(|_| buffa::encode_size_overflow());
+        waproto::protobuf::checked_encode_size(message_size as u32)
+            .unwrap_or_else(|_| waproto::protobuf::encode_size_overflow());
         let wire_bytes = item.wire_bytes_with_message_size(message_size);
         let retained_bytes = wire_bytes
             .checked_add(
@@ -985,9 +985,9 @@ mod tests {
         let mut context = waproto::whatsapp::ContextInfo::default();
         context.mentioned_jid = vec![String::new(); 8192];
         let mut text = waproto::whatsapp::message::ExtendedTextMessage::default();
-        text.context_info = buffa::MessageField::some(context);
+        text.context_info = waproto::protobuf::MessageField::some(context);
         let mut message = waproto::whatsapp::Message::default();
-        message.extended_text_message = buffa::MessageField::some(text);
+        message.extended_text_message = waproto::protobuf::MessageField::some(text);
         let mut target = waproto::whatsapp::MessageKey::default();
         target.id = Some("RETAINED_PARENT".into());
         let mut item = PendingDelivery::from(

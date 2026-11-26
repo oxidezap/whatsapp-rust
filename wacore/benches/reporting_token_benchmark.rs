@@ -1,13 +1,13 @@
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
-use buffa::Message;
 use divan::black_box;
 use wacore::reporting_token::{
     MESSAGE_SECRET_SIZE, REPORTING_TOKEN_KEY_SIZE, calculate_reporting_token,
     derive_reporting_token_key, generate_reporting_token, generate_reporting_token_content,
 };
 use wacore_binary::jid::Jid;
+use waproto::protobuf::Message;
 use waproto::whatsapp as wa;
 
 fn main() {
@@ -25,10 +25,10 @@ fn create_simple_message() -> wa::Message {
 fn create_extended_message() -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("Test message with context info".to_string());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.is_forwarded = Some(true);
                 proto.forwarding_score = Some(5);

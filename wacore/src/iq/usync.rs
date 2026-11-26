@@ -1227,7 +1227,7 @@ mod tests {
 
     /// Build a dummy key-index-list node for device IDs (used in test fixtures)
     fn build_test_key_index_list_node(device_ids: &[u16]) -> Node {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let valid_indexes: Vec<u32> = device_ids.iter().map(|&id| id as u32).collect();
         let key_index = {
             let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();

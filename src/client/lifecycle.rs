@@ -4531,7 +4531,7 @@ mod tests {
                     hello.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
                     hello.r#static = Some(encrypted_static);
                     hello.payload = Some(payload);
-                    response.server_hello = buffa::MessageField::some(hello);
+                    response.server_hello = waproto::protobuf::MessageField::some(hello);
                     *state = Some((noise, ephemeral));
                     Some(waproto::codec::handshake_message_to_vec(&response))
                 } else {
@@ -4546,7 +4546,9 @@ mod tests {
                         noise.decrypt(&finish.payload.expect("encrypted client payload"))?;
                     #[allow(clippy::disallowed_methods)]
                     let _payload =
-                        <wa::ClientPayload as buffa::Message>::decode_from_slice(&payload)?;
+                        <wa::ClientPayload as waproto::protobuf::Message>::decode_from_slice(
+                            &payload,
+                        )?;
                     let _ciphers = noise.finish()?;
                     None
                 }

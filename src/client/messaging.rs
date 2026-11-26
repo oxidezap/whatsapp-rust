@@ -757,9 +757,9 @@ fn build_secret_message_edit_at(
 
     Ok({
         let mut proto = wa::Message::default();
-        proto.secret_encrypted_message = buffa::MessageField::some({
+        proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::SecretEncryptedMessage::default();
-            proto.target_message_key = buffa::MessageField::some({
+            proto.target_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(to.to_string());
                 proto.from_me = Some(true);
@@ -773,7 +773,7 @@ fn build_secret_message_edit_at(
             proto.remote_key_id = None;
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(message_secret.to_vec());
             proto

@@ -110,7 +110,7 @@ impl<'a> Polls<'a> {
         // (SendPollCreationMsgAction.js:158). Voters need this to derive their encryption key.
         let message_secret = super::creation::generate_message_secret();
 
-        message.message_context_info = buffa::MessageField::some({
+        message.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(message_secret.as_bytes().to_vec());
             proto
@@ -157,7 +157,7 @@ impl<'a> Polls<'a> {
 
         let poll_update = {
             let mut proto = wa::message::PollUpdateMessage::default();
-            proto.poll_creation_message_key = buffa::MessageField::some({
+            proto.poll_creation_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(chat_jid.to_string());
                 proto.from_me = Some(from_me);
@@ -177,7 +177,7 @@ impl<'a> Polls<'a> {
                 };
                 proto
             });
-            proto.vote = buffa::MessageField::some({
+            proto.vote = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::PollEncValue::default();
                 proto.enc_payload = Some(enc_payload);
                 proto.enc_iv = Some(iv.to_vec());
@@ -185,14 +185,14 @@ impl<'a> Polls<'a> {
             }); // WA Web's GeneratePollVoteMessageProto never sets metadata; a Some(empty)
             // submessage emits a stray `1A 00` (tag 3) on the wire. Omit it.
 
-            proto.metadata = buffa::MessageField::none();
+            proto.metadata = waproto::protobuf::MessageField::none();
             proto.sender_timestamp_ms = Some(self.client.runtime.wall_time_millis());
             proto
         };
 
         let message = {
             let mut proto = wa::Message::default();
-            proto.poll_update_message = buffa::MessageField::some(poll_update);
+            proto.poll_update_message = waproto::protobuf::MessageField::some(poll_update);
             proto
         };
 
@@ -504,9 +504,9 @@ fn wrap_poll_message(poll: wa::message::PollCreationMessage) -> wa::Message {
     // WA Web uses v3 for single-select text polls and v1 for multi-select.
     let mut message = wa::Message::default();
     if poll.selectable_options_count == Some(1) {
-        message.poll_creation_message_v3 = buffa::MessageField::some(poll);
+        message.poll_creation_message_v3 = waproto::protobuf::MessageField::some(poll);
     } else {
-        message.poll_creation_message = buffa::MessageField::some(poll);
+        message.poll_creation_message = waproto::protobuf::MessageField::some(poll);
     }
     message
 }
@@ -567,10 +567,10 @@ fn build_poll_creation_message(
             };
             (
                 Some(wa::message::PollType::QUIZ),
-                buffa::MessageField::some(answer),
+                waproto::protobuf::MessageField::some(answer),
             )
         }
-        None => (None, buffa::MessageField::none()),
+        None => (None, waproto::protobuf::MessageField::none()),
     };
 
     let poll_options: Vec<wa::message::poll_creation_message::Option> = options
@@ -589,7 +589,7 @@ fn build_poll_creation_message(
         proto.name = Some(name.to_string());
         proto.options = poll_options;
         proto.selectable_options_count = Some(selectable_count);
-        proto.context_info = buffa::MessageField::none(); // WA Web's GeneratePollCreationMessageProto always sets pollContentType
+        proto.context_info = waproto::protobuf::MessageField::none(); // WA Web's GeneratePollCreationMessageProto always sets pollContentType
         // (TEXT=1 for a normal poll); omitting it drops a field the real client
         // always emits.
 

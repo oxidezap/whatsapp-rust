@@ -258,9 +258,9 @@ async fn receive(
 ) -> bool {
     let mut protocol = wa::message::ProtocolMessage::default();
     protocol.r#type = Some(wa::message::protocol_message::Type::HistorySyncNotification);
-    protocol.history_sync_notification = buffa::MessageField::some(notification);
+    protocol.history_sync_notification = waproto::protobuf::MessageField::some(notification);
     let mut message = wa::Message::default();
-    message.protocol_message = buffa::MessageField::some(protocol);
+    message.protocol_message = waproto::protobuf::MessageField::some(protocol);
     client
         .handle_decrypted_plaintext(
             "msg",
@@ -306,9 +306,9 @@ async fn companion_history_cannot_reach_durability_hook() {
     source.source.sender.device = 7;
     let mut protocol = wa::message::ProtocolMessage::default();
     protocol.r#type = Some(wa::message::protocol_message::Type::HistorySyncNotification);
-    protocol.history_sync_notification = buffa::MessageField::some(notification());
+    protocol.history_sync_notification = waproto::protobuf::MessageField::some(notification());
     let mut message = wa::Message::default();
-    message.protocol_message = buffa::MessageField::some(protocol);
+    message.protocol_message = waproto::protobuf::MessageField::some(protocol);
     client
         .commit_history_sync_carrier(
             &source,
@@ -1344,8 +1344,8 @@ async fn durable_history_reconnect_keeps_parked_replay_accounted() {
 async fn durable_history_intake_retains_unknown_notification_fields() {
     fn nested(field: u32, body: &[u8]) -> Bytes {
         let mut wire = Vec::new();
-        buffa::encoding::encode_varint(u64::from(field) << 3 | 2, &mut wire);
-        buffa::encoding::encode_varint(body.len() as u64, &mut wire);
+        waproto::protobuf::encoding::encode_varint(u64::from(field) << 3 | 2, &mut wire);
+        waproto::protobuf::encoding::encode_varint(body.len() as u64, &mut wire);
         wire.extend_from_slice(body);
         Bytes::from(wire)
     }

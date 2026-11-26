@@ -88,7 +88,7 @@ mod tests {
     /// </iq>
     /// Build dummy ADV signed key index bytes for tests.
     fn build_test_key_index_bytes(device_ids: &[u16]) -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let valid_indexes: Vec<u32> = device_ids.iter().map(|&id| id as u32).collect();
         let key_index = {
             let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();

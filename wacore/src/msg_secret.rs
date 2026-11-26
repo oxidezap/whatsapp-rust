@@ -535,9 +535,10 @@ mod tests {
         // bot_metadata on a non-bot (e.g. group) chat is still a bot context.
         let prompt = {
             let mut proto = wa::Message::default();
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
-                proto.bot_metadata = buffa::MessageField::some(wa::BotMetadata::default());
+                proto.bot_metadata =
+                    waproto::protobuf::MessageField::some(wa::BotMetadata::default());
                 proto
             });
             proto

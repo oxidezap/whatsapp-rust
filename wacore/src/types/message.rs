@@ -712,7 +712,7 @@ mod status_session_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa::MessageField;
+    use waproto::protobuf::MessageField;
 
     #[test]
     fn status_expiry_uses_the_selected_clock_and_keeps_the_exact_boundary() {

@@ -285,7 +285,6 @@ async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bon = { workspace = true }
-buffa = { workspace = true }
 bytes = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }

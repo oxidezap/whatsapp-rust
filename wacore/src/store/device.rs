@@ -15,7 +15,9 @@ pub mod account_serde {
         waproto::codec::adv_signed_device_identity_to_vec(account)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<wa::ADVSignedDeviceIdentity, buffa::DecodeError> {
+    pub fn from_bytes(
+        bytes: &[u8],
+    ) -> Result<wa::ADVSignedDeviceIdentity, waproto::protobuf::DecodeError> {
         waproto::codec::adv_signed_device_identity_decode(bytes)
     }
 
@@ -53,7 +55,7 @@ pub mod status_privacy_serde {
     #[non_exhaustive]
     pub enum DecodeError {
         #[error("{0}")]
-        Protobuf(#[from] buffa::DecodeError),
+        Protobuf(#[from] waproto::protobuf::DecodeError),
         #[error("status privacy action has no mode")]
         MissingMode,
     }
@@ -136,11 +138,11 @@ fn build_base_client_payload(
     // rotating device fingerprint and silently invalidated the session.
     {
         let mut proto = wa::ClientPayload::default();
-        proto.user_agent = buffa::MessageField::some({
+        proto.user_agent = waproto::protobuf::MessageField::some({
             let mut proto = wa::client_payload::UserAgent::default();
             proto.platform = Some(profile.user_agent_platform);
             proto.release_channel = Some(wa::client_payload::user_agent::ReleaseChannel::RELEASE);
-            proto.app_version = buffa::MessageField::some(app_version);
+            proto.app_version = waproto::protobuf::MessageField::some(app_version);
             proto.mcc = Some("000".to_string());
             proto.mnc = Some("000".to_string());
             proto.os_version = Some(profile.os_version.clone());
@@ -153,13 +155,13 @@ fn build_base_client_payload(
             proto
         });
         proto.web_info = if profile.include_web_info {
-            buffa::MessageField::some({
+            waproto::protobuf::MessageField::some({
                 let mut proto = wa::client_payload::WebInfo::default();
                 proto.web_sub_platform = Some(profile.web_sub_platform);
                 proto
             })
         } else {
-            buffa::MessageField::default()
+            waproto::protobuf::MessageField::default()
         };
         proto.connect_type = Some(wa::client_payload::ConnectType::WIFI_UNKNOWN);
         proto.connect_reason = Some(wa::client_payload::ConnectReason::USER_ACTIVATED);
@@ -314,7 +316,7 @@ pub fn default_device_props() -> Arc<wa::DeviceProps> {
 fn build_default_device_props() -> wa::DeviceProps {
     let mut proto = wa::DeviceProps::default();
     proto.os = Some("rust".to_string());
-    proto.version = buffa::MessageField::some({
+    proto.version = waproto::protobuf::MessageField::some({
         let mut proto = wa::device_props::AppVersion::default();
         proto.primary = Some(0);
         proto.secondary = Some(1);
@@ -323,7 +325,8 @@ fn build_default_device_props() -> wa::DeviceProps {
     });
     proto.platform_type = Some(wa::device_props::PlatformType::UNKNOWN);
     proto.require_full_sync = Some(false);
-    proto.history_sync_config = buffa::MessageField::some(default_history_sync_config());
+    proto.history_sync_config =
+        waproto::protobuf::MessageField::some(default_history_sync_config());
     proto
 }
 
@@ -841,7 +844,7 @@ impl Device {
             props.os = Some(os);
         }
         if let Some(version) = o.version {
-            props.version = buffa::MessageField::some(version);
+            props.version = waproto::protobuf::MessageField::some(version);
         }
         if let Some(platform_type) = o.platform_type {
             props.platform_type = Some(platform_type);
@@ -850,7 +853,7 @@ impl Device {
             props.require_full_sync = Some(require_full_sync);
         }
         if let Some(history_sync_config) = o.history_sync_config {
-            props.history_sync_config = buffa::MessageField::some(history_sync_config);
+            props.history_sync_config = waproto::protobuf::MessageField::some(history_sync_config);
         }
     }
 
@@ -921,7 +924,7 @@ impl Device {
             proto
         };
 
-        payload.device_pairing_data = buffa::MessageField::some(reg_data);
+        payload.device_pairing_data = waproto::protobuf::MessageField::some(reg_data);
         payload.passive = Some(false);
         payload.pull = Some(false);
 
@@ -948,7 +951,7 @@ mod tests {
         assert_eq!(first.device_props.as_ref(), &*DEVICE_PROPS);
     }
     use super::*;
-    use buffa::Message;
+    use waproto::protobuf::Message;
 
     #[test]
     fn test_registration_id_range() {

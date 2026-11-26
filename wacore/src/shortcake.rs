@@ -31,12 +31,12 @@
 use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use crate::pair_code::PairCodeUtils;
-use buffa::Enumeration;
 #[cfg(test)]
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as _, Mac};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
+use waproto::protobuf::Enumeration;
 use waproto::whatsapp as wa;
 
 /// HKDF `info` for the pairing-handoff HMAC key (RE: "shortcake-passkey-handoff-v1").
@@ -124,7 +124,7 @@ impl ShortcakeUtils {
         waproto::codec::prologue_payload_to_vec(&{
             let mut proto = wa::ProloguePayload::default();
             proto.companion_ephemeral_identity = Some(companion_ephemeral_identity.to_vec());
-            proto.commitment = buffa::MessageField::some({
+            proto.commitment = waproto::protobuf::MessageField::some({
                 let mut proto = wa::CompanionCommitment::default();
                 proto.hash = Some(commitment_hash.to_vec());
                 proto
@@ -305,7 +305,7 @@ impl ShortcakeUtils {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message;
+    use waproto::protobuf::Message;
 
     // Deterministic vectors guard the bug-prone concat/XOR/label details the RE flagged.
 

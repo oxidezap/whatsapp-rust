@@ -174,24 +174,24 @@ impl Client {
             };
             let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
                 match waproto::codec::app_state_sync_key_fingerprint_decode(&stored.fingerprint) {
-                    Ok(fingerprint) => buffa::MessageField::some({
+                    Ok(fingerprint) => waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::AppStateSyncKeyData::default();
                         proto.key_data = Some(stored.key_data);
-                        proto.fingerprint = buffa::MessageField::some(fingerprint);
+                        proto.fingerprint = waproto::protobuf::MessageField::some(fingerprint);
                         proto.timestamp = Some(stored.timestamp);
                         proto
                     }),
                     Err(error) => {
                         warn!(target: "Client/AppState", "Stored app-state key fingerprint is invalid; returning orphan: {error}");
-                        buffa::MessageField::default()
+                        waproto::protobuf::MessageField::default()
                     }
                 }
             } else {
-                buffa::MessageField::default()
+                waproto::protobuf::MessageField::default()
             };
             keys.push({
                 let mut proto = wa::message::AppStateSyncKey::default();
-                proto.key_id = buffa::MessageField::some(requested.clone());
+                proto.key_id = waproto::protobuf::MessageField::some(requested.clone());
                 proto.key_data = key_data;
                 proto
             });
@@ -295,10 +295,10 @@ impl Client {
                         }
                         None => match client.build_app_state_sync_key_share(&request).await {
                             Ok(share) => {
-                                let prepared = { let mut proto_ = wa::Message::default(); proto_.protocol_message = buffa::MessageField::some(
+                                let prepared = { let mut proto_ = wa::Message::default(); proto_.protocol_message = waproto::protobuf::MessageField::some(
                                         { let mut proto_ = wa::message::ProtocolMessage::default(); proto_.r#type = Some(
                                                 wa::message::protocol_message::Type::AppStateSyncKeyShare,
-                                            ); proto_.app_state_sync_key_share = buffa::MessageField::some(
+                                            ); proto_.app_state_sync_key_share = waproto::protobuf::MessageField::some(
                                                 share,
                                             ); proto_ },
                                     ); proto_ };
