@@ -85,8 +85,9 @@ Review any intentional
 breaking change before regenerating that snapshot with
 `cargo run --locked -p whatspec-codegen --bin protobuf-codegen -- waproto/src/whatsapp.desc crate::protobuf::generated::whatsapp crate::protobuf - --whatsapp --update-api`.
 MLow and SQLite omit borrowed views and Serde because
-their private callers do not use them. The `protobuf-reference` feature enables
-the locked differential reference for tests. `cargo xt --help`
+their private callers do not use them. The `protobuf-reference` feature generates
+the locked Buffa reference for integration tests. Buffa is a build and test
+dependency for this feature and is not linked into the library. `cargo xt --help`
 lists tooling.
 Host tooling must not become a published runtime dependency. Task implementations
 belong in Rust, not new Bash/Python scripts.

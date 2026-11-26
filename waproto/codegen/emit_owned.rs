@@ -1789,7 +1789,7 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
     };
     let old = Emitter {
         schema,
-        base: "waproto::reference",
+        base: "crate::reference",
     };
     let mut source = String::new();
     for (index, message) in schema.messages.iter().enumerate() {
@@ -1884,7 +1884,7 @@ fn generate_view_oracle(schema: &Schema) -> String {
     };
     let old = Emitter {
         schema,
-        base: "waproto::reference",
+        base: "crate::reference",
     };
     let mut out = String::new();
     let value_assert = |value, a: &str, b: &str| {

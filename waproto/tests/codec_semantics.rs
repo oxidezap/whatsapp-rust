@@ -1,4 +1,10 @@
 use waproto::protobuf::MessageView as _;
+#[cfg(feature = "protobuf-reference")]
+#[path = "support/reference.rs"]
+mod reference;
+#[cfg(feature = "protobuf-reference")]
+#[path = "support/reference_enum_serde.rs"]
+mod reference_enum_serde;
 use waproto::protobuf::{DecodeError, DecodeOptions, Message as _};
 use waproto::whatsapp::message::interactive_message::{Header, header::Media};
 use waproto::whatsapp::{
@@ -296,13 +302,13 @@ fn required_fields_reuse_buffers() {
 fn invalid_singular_fields_match_reference_presence() {
     use buffa::Message as _;
     let mut actual = waproto::whatsapp::sync_action_value::ContactAction::default();
-    let mut expected = waproto::reference::sync_action_value::ContactAction::default();
+    let mut expected = reference::sync_action_value::ContactAction::default();
     assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 1, 0xff]).is_err());
     assert!(expected.merge_from_slice(&[0x0a, 1, 0xff]).is_err());
     assert_eq!(actual.full_name, expected.full_name);
 
     let mut actual = waproto::whatsapp::message::HistorySyncNotification::default();
-    let mut expected = waproto::reference::message::HistorySyncNotification::default();
+    let mut expected = reference::message::HistorySyncNotification::default();
     assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 2, 0x01]).is_err());
     assert!(expected.merge_from_slice(&[0x0a, 2, 0x01]).is_err());
     assert_eq!(actual.file_sha256, expected.file_sha256);

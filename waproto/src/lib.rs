@@ -102,27 +102,6 @@ pub mod prelude {
     pub use crate::whatsapp as wa;
 }
 
-#[cfg(feature = "protobuf-reference")]
-#[doc(hidden)]
-pub mod reference {
-    // disallowed_methods: the generated impls call the buffa trait methods on
-    // nested messages; that IS the pinned instantiation.
-    // unused_qualifications: the generator emits fully-qualified paths on
-    // purpose so the output cannot collide with names in the including scope.
-    #![allow(
-        non_camel_case_types,
-        non_snake_case,
-        unreachable_patterns,
-        unused_qualifications,
-        clippy::derivable_impls,
-        clippy::match_single_binding,
-        clippy::needless_else,
-        clippy::disallowed_methods
-    )]
-    #[rustfmt::skip]
-    ::buffa::include_proto!("whatsapp");
-}
-
 /// Field-level serde for open enum fields, wired in via `field_attribute` in
 /// `build.rs`.
 ///
@@ -134,9 +113,6 @@ pub mod reference {
 /// exactly the closed-enum contract; only `Unknown` values add behavior
 /// (serialized as, and deserializable from, the raw integer).
 pub use protobuf::open_enum_serde;
-
-#[cfg(feature = "protobuf-reference")]
-mod reference_enum_serde;
 
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside
 /// the buffa code. Hand-written partial decoders must reference these consts
