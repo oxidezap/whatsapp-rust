@@ -251,32 +251,18 @@ impl<'a> Reader<'a> {
 
 #[inline]
 fn varint_in_slice(input: &[u8]) -> Result<(u64, usize), DecodeError> {
-    assert!(!input.is_empty());
-    assert!(input.len() > 10 || input[input.len() - 1] < 128);
     let mut value = 0u64;
-    macro_rules! byte {
-        ($index:literal, $shift:literal) => {{
-            let byte = input[$index];
-            value |= u64::from(byte & 127) << $shift;
-            if byte < 128 {
-                return Ok((value, $index + 1));
-            }
-        }};
+    for index in 0..10 {
+        let byte = *input.get(index).ok_or(DecodeError::UnexpectedEof)?;
+        if index == 9 && byte > 1 {
+            return Err(DecodeError::VarintTooLong);
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
     }
-    byte!(0, 0);
-    byte!(1, 7);
-    byte!(2, 14);
-    byte!(3, 21);
-    byte!(4, 28);
-    byte!(5, 35);
-    byte!(6, 42);
-    byte!(7, 49);
-    byte!(8, 56);
-    let last = input[9];
-    if last > 1 {
-        return Err(DecodeError::VarintTooLong);
-    }
-    Ok((value | (u64::from(last) << 63), 10))
+    Err(DecodeError::VarintTooLong)
 }
 
 #[inline]
@@ -422,6 +408,35 @@ pub fn skip_field(tag: Tag, input: &mut impl bytes::Buf) -> Result<(), DecodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn varint_boundaries_and_cursor_match_reference() {
+        for value in [0, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            let mut input = Vec::new();
+            encode_varint(value, &mut input);
+            input.push(42);
+            let mut reader = Reader::new(&input).unwrap();
+            assert_eq!(reader.varint(), Ok(value));
+            assert_eq!(reader.remaining(), &[42]);
+            let mut buf = input.as_slice();
+            assert_eq!(decode_varint(&mut buf), Ok(value));
+            assert_eq!(buf, &[42]);
+        }
+        for input in [
+            vec![0x80; 9],
+            vec![0x80; 10],
+            vec![0xff; 10],
+            vec![0x80; 11],
+        ] {
+            let mut reference = input.as_slice();
+            let mut reader = Reader::new(&input).unwrap();
+            assert_eq!(
+                reader.varint(),
+                buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
+            );
+            assert_eq!(reader.remaining(), reference);
+        }
+    }
 
     fn reference_error(error: buffa::DecodeError) -> DecodeError {
         match error {

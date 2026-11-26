@@ -181,12 +181,17 @@ pub fn bytes_size(field: u32, length: usize) -> u64 {
 }
 
 pub fn borrow_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], DecodeError> {
-    let length = usize::try_from(encoding::decode_varint(input)?)
-        .map_err(|_| DecodeError::MessageTooLarge)?;
-    if input.len() < length {
-        return Err(DecodeError::UnexpectedEof);
-    }
-    let (value, tail) = input.split_at(length);
+    let (&first, rest) = input.split_first().ok_or(DecodeError::UnexpectedEof)?;
+    let length = if first < 128 {
+        *input = rest;
+        usize::from(first)
+    } else {
+        usize::try_from(encoding::decode_varint(input)?)
+            .map_err(|_| DecodeError::MessageTooLarge)?
+    };
+    let (value, tail) = input
+        .split_at_checked(length)
+        .ok_or(DecodeError::UnexpectedEof)?;
     *input = tail;
     Ok(value)
 }
