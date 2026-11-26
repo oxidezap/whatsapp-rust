@@ -244,22 +244,34 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[inline]
 fn varint_in_slice(input: &[u8]) -> Result<(u64, usize), DecodeError> {
+    assert!(!input.is_empty());
+    assert!(input.len() > 10 || input[input.len() - 1] < 128);
     let mut value = 0u64;
-    for (index, byte) in input.iter().copied().take(10).enumerate() {
-        if index == 9 && byte > 1 {
-            return Err(DecodeError::VarintTooLong);
-        }
-        value |= u64::from(byte & 127) << (index * 7);
-        if byte < 128 {
-            return Ok((value, index + 1));
-        }
+    macro_rules! byte {
+        ($index:literal, $shift:literal) => {{
+            let byte = input[$index];
+            value |= u64::from(byte & 127) << $shift;
+            if byte < 128 {
+                return Ok((value, $index + 1));
+            }
+        }};
     }
-    if input.len() < 10 {
-        Err(DecodeError::UnexpectedEof)
-    } else {
-        Err(DecodeError::VarintTooLong)
+    byte!(0, 0);
+    byte!(1, 7);
+    byte!(2, 14);
+    byte!(3, 21);
+    byte!(4, 28);
+    byte!(5, 35);
+    byte!(6, 42);
+    byte!(7, 49);
+    byte!(8, 56);
+    let last = input[9];
+    if last > 1 {
+        return Err(DecodeError::VarintTooLong);
     }
+    Ok((value | (u64::from(last) << 63), 10))
 }
 
 #[inline]
@@ -420,6 +432,13 @@ mod tests {
                     buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
                 );
                 assert_eq!(candidate.remaining(), reference);
+                let mut reference = input.as_slice();
+                let mut candidate = input.as_slice();
+                assert_eq!(
+                    decode_varint(&mut candidate),
+                    buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
+                );
+                assert_eq!(candidate, reference);
                 let mut reference = input.as_slice();
                 let mut candidate = Reader::new(&input).unwrap();
                 let actual = candidate
