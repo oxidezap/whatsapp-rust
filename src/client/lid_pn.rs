@@ -31,9 +31,36 @@ pub enum MappingLearningError {
     #[error("single mapping persistence received multiple rows")]
     InvalidSingleBatch,
     #[error("persisting LID-PN mapping: {0}")]
-    StoreSingle(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
+    StoreSingle(#[source] MappingStoreError),
     #[error("persisting LID-PN mapping batch: {0}")]
-    StoreBatch(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
+    StoreBatch(#[source] MappingStoreError),
+}
+
+/// Storage failure while persisting a LID-to-phone-number mapping.
+#[derive(Debug)]
+pub struct MappingStoreError(Box<wacore::store::error::StoreError>);
+
+impl MappingStoreError {
+    pub(crate) fn new(error: wacore::store::error::StoreError) -> Self {
+        Self(Box::new(error))
+    }
+
+    /// The backend error retained by the mapping operation.
+    pub fn store_error(&self) -> &wacore::store::error::StoreError {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Display for MappingStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.store_error(), f)
+    }
+}
+
+impl std::error::Error for MappingStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.store_error())
+    }
 }
 
 impl std::fmt::Debug for MappingLearningError {
@@ -715,12 +742,13 @@ impl Client {
                 .put_lid_mapping(&storage[0])
                 .await
                 .map_err(|error| {
-                    MappingLearningError::StoreSingle(wacore::error::BoxedErrorSource::new(error))
+                    MappingLearningError::StoreSingle(MappingStoreError::new(error))
                 })?;
         } else {
-            backend.put_lid_mappings(&storage).await.map_err(|error| {
-                MappingLearningError::StoreBatch(wacore::error::BoxedErrorSource::new(error))
-            })?;
+            backend
+                .put_lid_mappings(&storage)
+                .await
+                .map_err(|error| MappingLearningError::StoreBatch(MappingStoreError::new(error)))?;
         }
 
         for entry in &entries {

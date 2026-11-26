@@ -28,7 +28,7 @@ mod group_notifications;
 pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
-pub use lid_pn::MappingLearningError;
+pub use lid_pn::{MappingLearningError, MappingStoreError};
 mod lifecycle;
 pub(crate) mod member_index;
 mod messaging;

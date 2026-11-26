@@ -480,7 +480,6 @@ mod inbound_queue;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
-pub use client::MappingLearningError;
 pub use client::StartupSyncError;
 pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
@@ -501,6 +500,7 @@ pub use client::{
     DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
     SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
+pub use client::{MappingLearningError, MappingStoreError};
 pub use client::{NodeFilter, NodeWaiter};
 pub use history_sync::HistorySyncError;
 pub use pdo::PdoError;

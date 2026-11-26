@@ -283,9 +283,8 @@ mod boxed_source_tests {
 
     #[test]
     fn mapping_error_exposes_store_error() {
-        let error = crate::MappingLearningError::StoreBatch(wacore::error::BoxedErrorSource::new(
-            storage_error(),
-        ));
+        let error =
+            crate::MappingLearningError::StoreBatch(crate::MappingStoreError::new(storage_error()));
         assert!(error.sources().any(|source| source.is::<StoreError>()));
     }
 

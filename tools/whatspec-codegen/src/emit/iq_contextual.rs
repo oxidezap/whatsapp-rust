@@ -1,5 +1,6 @@
 //! Bounded, checked full-RPC consumers. Admission is separate from qualification.
 use anyhow::{Context, Result, ensure};
+use syn::spanned::Spanned as _;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -94,16 +95,31 @@ pub fn generate(wa_version: &str) -> Result<String> {
     let generated = wa_codegen_iq::generate_iq_checked(&ir).map_err(|d| {
         anyhow::anyhow!("contextual IQ generation refused incomplete contracts: {d:#?}")
     })?;
-    let declaration = "pub enum IqResponseError {";
+    let module = syn::parse_file(&generated).context("parsing generated IQ module")?;
+    let mut errors = module.items.iter().filter_map(|item| match item {
+        syn::Item::Enum(item) if item.ident == "IqResponseError" => Some(item),
+        _ => None,
+    });
+    let error = errors
+        .next()
+        .context("missing generated IQ response error")?;
     ensure!(
-        generated.matches(declaration).count() == 1,
-        "expected one generated IQ response error declaration"
+        errors.next().is_none(),
+        "duplicate generated IQ response error"
     );
-    Ok(generated.replacen(
-        declaration,
-        "#[non_exhaustive]\npub enum IqResponseError {",
-        1,
-    ))
+    ensure!(
+        matches!(error.vis, syn::Visibility::Public(_)),
+        "generated IQ response error must be public"
+    );
+    let mut generated = generated;
+    if !error
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("non_exhaustive"))
+    {
+        generated.insert_str(error.vis.span().byte_range().start, "#[non_exhaustive]\n");
+    }
+    Ok(generated)
 }
 
 pub fn verify_projection(full: &str) -> Result<()> {

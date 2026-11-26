@@ -946,10 +946,26 @@ mod context_tests;
 fn iq_parser_rejection<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a wacore::request::IqError> {
-    // A caller-provided error can contain a cyclic source chain.
-    crate::ErrorChainExt::sources(error)
-        .take(32)
-        .find_map(|cause| cause.downcast_ref::<wacore::request::IqError>())
+    // Brent's cycle detection reads each link once and does not cap valid chains.
+    let mut checkpoint = error;
+    let mut window = 1usize;
+    let mut remaining = window;
+    let mut cause = error;
+    loop {
+        if let Some(rejection) = cause.downcast_ref::<wacore::request::IqError>() {
+            return Some(rejection);
+        }
+        cause = cause.source()?;
+        if std::ptr::eq(cause, checkpoint) {
+            return None;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            checkpoint = cause;
+            window = window.saturating_mul(2);
+            remaining = window;
+        }
+    }
 }
 
 /// Run `spec` over a stream positioned inside the `<iq type="result">` root
@@ -990,16 +1006,20 @@ mod tests {
     fn iq_parser_rejection_handles_wrapped_and_cyclic_sources() {
         #[derive(Debug, thiserror::Error)]
         #[error("wrapper")]
-        struct Wrapped(#[source] wacore::request::IqError);
+        struct Wrapped(#[source] Box<dyn std::error::Error + Send + Sync>);
 
-        let rejection = Wrapped(wacore::request::IqError::ServerError {
-            code: 403,
-            text: String::new(),
-            error_type: None,
-            backoff: None,
-        });
+        let mut rejection: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(wacore::request::IqError::ServerError {
+                code: 403,
+                text: String::new(),
+                error_type: None,
+                backoff: None,
+            });
+        for _ in 0..48 {
+            rejection = Box::new(Wrapped(rejection));
+        }
         assert!(matches!(
-            super::iq_parser_rejection(&rejection),
+            super::iq_parser_rejection(rejection.as_ref()),
             Some(wacore::request::IqError::ServerError { code: 403, .. })
         ));
 
@@ -1015,7 +1035,7 @@ mod tests {
         impl std::error::Error for Cyclic {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
                 let calls = self.0.get();
-                assert!(calls < 32, "IQ parser search exceeded its source budget");
+                assert!(calls < 3, "self-cycle was not detected");
                 self.0.set(calls + 1);
                 Some(self)
             }
