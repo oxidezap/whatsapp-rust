@@ -10,12 +10,25 @@ pub trait DefaultInstance: Default + 'static {
 
 pub trait ProtoBox<T>: Deref<Target = T> + DerefMut {
     fn new(value: T) -> Self;
+    fn new_default() -> Self
+    where
+        T: Default,
+        Self: Sized,
+    {
+        Self::new(T::default())
+    }
     fn into_inner(self) -> T;
 }
 
 impl<T> ProtoBox<T> for Box<T> {
     fn new(value: T) -> Self {
         Box::new(value)
+    }
+    fn new_default() -> Self
+    where
+        T: Default,
+    {
+        Box::default()
     }
     fn into_inner(self) -> T {
         *self
@@ -84,7 +97,7 @@ impl<T: Default, P: ProtoBox<T>> MessageField<T, P> {
         self.inner.take().map(P::into_inner)
     }
     pub fn get_or_insert_default(&mut self) -> &mut T {
-        self.inner.get_or_insert_with(|| P::new(T::default()))
+        self.inner.get_or_insert_with(P::new_default)
     }
     pub fn modify<F: FnOnce(&mut T)>(&mut self, apply: F) {
         apply(self.get_or_insert_default());
