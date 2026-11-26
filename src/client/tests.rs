@@ -1143,8 +1143,7 @@ async fn test_primary_phone_session_probe_fails_without_pn() {
 
     let err = result.unwrap_err();
     assert!(
-        err.downcast_ref::<ClientError>()
-            .is_some_and(|e| matches!(e, ClientError::NotLoggedIn)),
+        matches!(err, ClientError::NotLoggedIn),
         "Error should be ClientError::NotLoggedIn, got: {}",
         err
     );
@@ -3661,16 +3660,22 @@ async fn runtime_cache_config_propagates_nondefault_settings() {
     struct StubStore;
     #[async_trait::async_trait]
     impl crate::cache_store::CacheStore for StubStore {
-        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+        async fn get(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+        async fn set(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: Option<Duration>,
+        ) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+        async fn delete(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn clear(&self, _: &str) -> Result<()> {
+        async fn clear(&self, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
     }
@@ -3939,16 +3944,22 @@ async fn non_group_cache_stores_are_owned_by_live_caches_only() {
     struct StubStore;
     #[async_trait::async_trait]
     impl crate::cache_store::CacheStore for StubStore {
-        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+        async fn get(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+        async fn set(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: Option<Duration>,
+        ) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+        async fn delete(&self, _: &str, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
-        async fn clear(&self, _: &str) -> Result<()> {
+        async fn clear(&self, _: &str) -> crate::cache_store::CacheResult<()> {
             Ok(())
         }
     }
@@ -4235,7 +4246,7 @@ async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             self.send_done.store(true, Ordering::Release);
@@ -4711,7 +4722,7 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
         .expect("one result")
         .expect_err("the transport is configured to fail");
     assert!(matches!(
-        transport_error.kind,
+        transport_error.kind(),
         EncryptSendErrorKind::Transport
     ));
     assert!(transport_error.is_transport_unavailable());
@@ -4728,7 +4739,7 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
         .expect("one result")
         .expect_err("the sender must reject work after an ambiguous write");
     assert!(matches!(
-        poisoned_error.kind,
+        poisoned_error.kind(),
         EncryptSendErrorKind::Poisoned
     ));
     assert!(poisoned_error.is_transport_unavailable());
@@ -4822,7 +4833,7 @@ async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
         .pop()
         .expect("one result")
         .expect_err("the sender receiver was dropped at construction");
-    assert!(matches!(error.kind, EncryptSendErrorKind::ChannelClosed));
+    assert!(matches!(error.kind(), EncryptSendErrorKind::ChannelClosed));
     assert!(error.is_transport_unavailable());
     assert!(frames.is_empty());
     assert_eq!(frames.capacity(), retained_capacity);
@@ -4843,7 +4854,7 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
 
     #[async_trait]
     impl crate::transport::Transport for CountingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -4971,7 +4982,7 @@ async fn flush_waits_for_queued_delivery_receipts() {
 
     #[async_trait]
     impl crate::transport::Transport for BlockingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             let _ = self.send_started.try_send(());
             let _ = self.release_send.recv().await;
             Ok(())
@@ -10090,7 +10101,10 @@ async fn group_notifications_queued_in_a_lane_obey_the_same_bound() {
     struct Durable;
     #[async_trait::async_trait]
     impl crate::GroupNotificationDurabilityHook for Durable {
-        async fn on_notification(&self, _: Arc<OwnedNodeRef>) -> Result<()> {
+        async fn on_notification(
+            &self,
+            _: Arc<OwnedNodeRef>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }

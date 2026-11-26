@@ -388,7 +388,7 @@ async fn invitation_cancellation_during_each_early_write_keeps_cleanup_ownership
     }
     #[async_trait::async_trait]
     impl crate::transport::Transport for GatedWrite {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> Result<(), crate::transport::TransportError> {
             if self.attempt.fetch_add(1, Ordering::SeqCst) == self.gate {
                 self.entered.send(()).await?;
                 self.release.recv().await?;
@@ -482,9 +482,9 @@ async fn invitation_accept_write_failure_still_owns_terminal_cleanup() {
     }
     #[async_trait::async_trait]
     impl crate::transport::Transport for FailAccept {
-        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: Bytes) -> Result<(), crate::transport::TransportError> {
             if self.attempt.fetch_add(1, Ordering::SeqCst) == 1 {
-                return Err(anyhow::anyhow!("injected accept write failure"));
+                return Err("injected accept write failure".into());
             }
             crate::transport::Transport::send(&*self.capture, data).await
         }

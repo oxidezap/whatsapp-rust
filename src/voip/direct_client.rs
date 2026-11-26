@@ -232,8 +232,7 @@ pub(crate) async fn encrypt_known_call_keys(
             plaintext,
             plan,
         )
-        .await
-        .map_err(|error| CallError::Setup(error.to_string()))?;
+        .await;
         client
             .stats
             .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);

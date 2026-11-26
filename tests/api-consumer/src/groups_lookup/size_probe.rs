@@ -4,7 +4,7 @@ use std::hint::black_box;
 use whatsapp_rust::wacore::types::call::CallAction;
 use whatsapp_rust::{
     GroupHierarchy, GroupLookupResult, GroupMetadata, GroupMetadataResult, GroupOverview,
-    GroupOverviewResult, Jid, SubgroupKind, anyhow, serde_json,
+    GroupOverviewResult, Jid, SubgroupKind, serde_json,
 };
 
 fn main() -> anyhow::Result<()> {

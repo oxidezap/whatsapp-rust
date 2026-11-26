@@ -8,7 +8,10 @@ use wacore::libsignal::protocol::{
 use wacore::types::jid::JidExt;
 use wacore_binary::Jid;
 
-pub(crate) async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) -> anyhow::Result<()> {
+pub(crate) async fn seed_peer_session(
+    client: &Arc<Client>,
+    peer: &Jid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bundle = tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let receiver = IdentityKeyPair::generate(&mut rng);

@@ -1,7 +1,6 @@
 //! 1:1 (DM) stanza preparation and DM retry stanzas.
 
 use super::*;
-use anyhow::Context as _;
 
 fn is_exact_dm_sender_device(device_jid: &Jid, own_jid: &Jid, own_lid: Option<&Jid>) -> bool {
     (device_jid.is_same_user_as(own_jid) && device_jid.device == own_jid.device)
@@ -90,12 +89,25 @@ pub enum NoRecipientDeviceError {
     EncryptionFailed {
         attempted: usize,
         #[source]
-        source: anyhow::Error,
+        source: crate::error::BoxedErrorSource<DeviceEncryptionError>,
     },
     /// The fan-out held no device for the recipient to begin with. Distinct
     /// from the above: nothing was attempted, so there is no per-device cause.
     #[error("no device resolved for the recipient")]
     Unresolved,
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum DmStanzaError {
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    SessionSetup(#[from] SessionSetupError),
+    #[error("{0}")]
+    NoRecipient(#[from] NoRecipientDeviceError),
+    #[error("encryption failed for all {0} own device(s)")]
+    NoOwnDevice(usize),
 }
 
 /// The server named a device 0 as gone while the send was establishing
@@ -121,13 +133,15 @@ impl PrimaryDeviceRejected {
 }
 
 impl NoRecipientDeviceError {
-    fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
+    fn encryption_failed(attempted: usize, source: Option<Box<DeviceEncryptionError>>) -> Self {
         Self::EncryptionFailed {
             attempted,
             // A device can also drop out without an error (an encrypt that
             // produced an unsupported ciphertext type), so the source is
             // synthesised rather than left absent.
-            source: source.unwrap_or_else(|| anyhow!("no recipient device produced a ciphertext")),
+            source: source
+                .unwrap_or_else(|| Box::new(DeviceEncryptionError::NoCiphertext))
+                .into(),
         }
     }
 }
@@ -224,7 +238,7 @@ pub async fn prepare_dm_stanza(
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     request: DmStanzaRequest<'_>,
-) -> Result<PreparedDmStanza> {
+) -> Result<PreparedDmStanza, DmStanzaError> {
     let sender_role = resolver.sender_identity_role();
     sender_role.validate()?;
     let DmStanzaRequest {
@@ -394,9 +408,7 @@ pub async fn prepare_dm_stanza(
     // the message. WA Web's encryptAndSendUserMsg rejects an empty success set
     // too, though it does not distinguish the two halves.
     if participant_nodes.is_empty() && total_devices > 0 {
-        return Err(anyhow!(
-            "encryption failed for all {total_devices} own device(s)"
-        ));
+        return Err(DmStanzaError::NoOwnDevice(total_devices));
     }
 
     // Sized for everything that can follow `<participants>`: the optional
@@ -460,6 +472,15 @@ pub async fn prepare_dm_stanza(
     })
 }
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionPreflightError {
+    #[error("{0}")]
+    Load(#[source] crate::libsignal::protocol::SignalProtocolError),
+    #[error("restoring checked-out session after pairwise retry pre-flight")]
+    Restore(#[source] crate::libsignal::protocol::SignalProtocolError),
+}
+
 /// Returns true if `message_encrypt` on `signal_address` would produce
 /// a pkmsg (no session yet, or session with un-acked pre-key still
 /// pending). Used before `message_encrypt` to fail-fast when `account`
@@ -473,12 +494,13 @@ pub async fn prepare_dm_stanza(
 pub async fn pkmsg_would_be_emitted<S>(
     session_store: &mut S,
     signal_address: &ProtocolAddress,
-) -> Result<bool>
+) -> Result<bool, SessionPreflightError>
 where
     S: crate::libsignal::protocol::SessionStore,
 {
-    let loaded =
-        crate::libsignal::protocol::SessionCheckout::load(session_store, signal_address).await?;
+    let loaded = crate::libsignal::protocol::SessionCheckout::load(session_store, signal_address)
+        .await
+        .map_err(SessionPreflightError::Load)?;
     // Conservative read: treat any failure to interrogate the session as
     // "would be pkmsg" so the caller bails. Silently treating Err as false
     // would let message_encrypt run with a corrupt session and potentially
@@ -495,7 +517,7 @@ where
         session
             .commit()
             .await
-            .context("restoring checked-out session after pairwise retry pre-flight")?;
+            .map_err(SessionPreflightError::Restore)?;
     }
     Ok(needs_pkmsg)
 }
@@ -531,6 +553,44 @@ pub struct PairwiseRetryRequest<'a> {
     pub pre_encoded: Option<&'a [u8]>,
 }
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PairwiseRetryError {
+    #[error("pairwise retry encryption target must be a user device JID")]
+    InvalidEncryptionTarget,
+    #[error("direct retry destination must be a user JID")]
+    InvalidDirectDestination,
+    #[error("direct retry recipient must be a user JID")]
+    InvalidDirectRecipient,
+    #[error("participant retry target must be a user device JID")]
+    InvalidParticipant,
+    #[error("group retry requires an addressing mode")]
+    MissingAddressingMode,
+    #[error("broadcast retry must not carry a group addressing mode")]
+    UnexpectedAddressingMode,
+    #[error("participant retry destination must be a group or broadcast list")]
+    InvalidParticipantDestination,
+    #[error("retry message ID must not be empty")]
+    MissingMessageId,
+    #[error(
+        "retry count {0} must be in 1..{max}",
+        max = crate::protocol::retry::MAX_RETRY_COUNT
+    )]
+    InvalidRetryCount(u8),
+    #[error(
+        "pairwise retry pkmsg requires <device-identity> (account is None); refusing before message_encrypt to avoid advancing the sender chain"
+    )]
+    MissingDeviceIdentity,
+    #[error("Unexpected encryption message type for pairwise retry")]
+    UnexpectedCiphertext,
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    Preflight(#[from] SessionPreflightError),
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+}
+
 #[inline]
 fn is_pairwise_user(jid: &Jid) -> bool {
     !jid.is_empty()
@@ -547,18 +607,18 @@ fn is_pairwise_user(jid: &Jid) -> bool {
 fn validate_pairwise_retry_route(
     destination: &PairwiseRetryDestination,
     encryption_jid: &Jid,
-) -> Result<()> {
+) -> Result<(), PairwiseRetryError> {
     if !is_pairwise_user(encryption_jid) {
-        bail!("pairwise retry encryption target must be a user device JID");
+        return Err(PairwiseRetryError::InvalidEncryptionTarget);
     }
 
     match destination {
         PairwiseRetryDestination::Direct { to, recipient } => {
             if !is_pairwise_user(to) {
-                bail!("direct retry destination must be a user JID");
+                return Err(PairwiseRetryError::InvalidDirectDestination);
             }
             if recipient.as_ref().is_some_and(|jid| !is_pairwise_user(jid)) {
-                bail!("direct retry recipient must be a user JID");
+                return Err(PairwiseRetryError::InvalidDirectRecipient);
             }
         }
         PairwiseRetryDestination::Participant {
@@ -567,18 +627,18 @@ fn validate_pairwise_retry_route(
             addressing_mode,
         } => {
             if !is_pairwise_user(participant) {
-                bail!("participant retry target must be a user device JID");
+                return Err(PairwiseRetryError::InvalidParticipant);
             }
             if to.is_group() {
                 if addressing_mode.is_none() {
-                    bail!("group retry requires an addressing mode");
+                    return Err(PairwiseRetryError::MissingAddressingMode);
                 }
             } else if to.is_broadcast_list() {
                 if addressing_mode.is_some() {
-                    bail!("broadcast retry must not carry a group addressing mode");
+                    return Err(PairwiseRetryError::UnexpectedAddressingMode);
                 }
             } else {
-                bail!("participant retry destination must be a group or broadcast list");
+                return Err(PairwiseRetryError::InvalidParticipantDestination);
             }
         }
     }
@@ -596,7 +656,7 @@ pub async fn prepare_pairwise_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
     request: PairwiseRetryRequest<'_>,
-) -> Result<Node>
+) -> Result<Node, PairwiseRetryError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -615,7 +675,7 @@ pub async fn prepare_pairwise_retry_stanza_for_role<S, I>(
     identity_store: &mut I,
     request: PairwiseRetryRequest<'_>,
     role: SenderIdentityRole,
-) -> Result<Node>
+) -> Result<Node, PairwiseRetryError>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
@@ -632,13 +692,10 @@ where
         pre_encoded,
     } = request;
     if message_id.is_empty() {
-        bail!("retry message ID must not be empty");
+        return Err(PairwiseRetryError::MissingMessageId);
     }
     if !(1..crate::protocol::retry::MAX_RETRY_COUNT).contains(&retry_count) {
-        bail!(
-            "retry count {retry_count} must be in 1..{}",
-            crate::protocol::retry::MAX_RETRY_COUNT
-        );
+        return Err(PairwiseRetryError::InvalidRetryCount(retry_count));
     }
     validate_pairwise_retry_route(&destination, &encryption_jid)?;
 
@@ -652,10 +709,7 @@ where
         && account.is_none()
         && pkmsg_would_be_emitted(session_store, &signal_address).await?
     {
-        bail!(
-            "pairwise retry pkmsg requires <device-identity> (account is None); \
-             refusing before message_encrypt to avoid advancing the sender chain"
-        );
+        return Err(PairwiseRetryError::MissingDeviceIdentity);
     }
 
     let encrypted = crate::libsignal::protocol::message_encrypt_serialized(
@@ -666,8 +720,8 @@ where
     )
     .await?;
 
-    let (enc_type, is_prekey, serialized) = extract_serialized_ciphertext(encrypted)
-        .ok_or_else(|| anyhow!("Unexpected encryption message type for pairwise retry"))?;
+    let (enc_type, is_prekey, serialized) =
+        extract_serialized_ciphertext(encrypted).ok_or(PairwiseRetryError::UnexpectedCiphertext)?;
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
     let mut enc_builder = NodeBuilder::new("enc")

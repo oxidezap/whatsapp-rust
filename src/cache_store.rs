@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::cache::Cache;
 use serde::{Serialize, de::DeserializeOwned};
 
-pub use wacore::store::cache::CacheStore;
+pub use wacore::store::cache::{CacheError, CacheResult, CacheStore};
 
 // Share JSON decoding independently of the cache's key and borrowed-key types.
 #[inline(never)]
@@ -143,7 +143,7 @@ where
 
     /// Publication must distinguish confirmed absence from an unavailable host
     /// cache. Any stored bytes count as present, including malformed values.
-    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> anyhow::Result<bool>
+    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> CacheResult<bool>
     where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,
@@ -193,7 +193,7 @@ where
     }
 
     /// Trust replacement must observe a failed host-cache deletion.
-    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> anyhow::Result<()>
+    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> CacheResult<()>
     where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,

@@ -21,7 +21,7 @@
 //! </iq>
 //! ```
 
-use crate::iq::node::required_child;
+use crate::iq::node::{IqParseError, required_child};
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
 use wacore_binary::builder::NodeBuilder;
@@ -30,6 +30,17 @@ use wacore_binary::{NodeContent, NodeRef};
 
 /// IQ namespace for passive mode.
 pub const PASSIVE_NAMESPACE: &str = "passive";
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PassiveModeError {
+    #[error("{0}")]
+    Parse(#[from] IqParseError),
+    #[error("{0}")]
+    Context(#[from] super::contextual::IqResponseError),
+}
+
+debug_as_display!(PassiveModeError);
 
 /// Sets the client's passive/active mode.
 #[derive(Debug, Clone)]
@@ -57,6 +68,7 @@ impl PassiveModeSpec {
 
 impl IqSpec for PassiveModeSpec {
     type Response = ();
+    type Error = PassiveModeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let tag = if self.passive { "passive" } else { "active" };
@@ -69,7 +81,7 @@ impl IqSpec for PassiveModeSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // WA Web's `ActiveIQResponseSuccess` / `PassiveIQResponseSuccess`: the
         // answer echoes the requested mode as a child (`<active/>` or
         // `<passive/>`), and the parser gates on its presence without reading
@@ -90,7 +102,7 @@ impl IqSpec for PassiveModeSpec {
         &self,
         response: &NodeRef<'_>,
         request: &NodeRef<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
+    ) -> Result<Self::Response, Self::Error> {
         use super::contextual::passive::{MakeActiveIQRequestSpec, MakePassiveIQRequestSpec};
         if self.passive {
             MakePassiveIQRequestSpec::parse_sent_response(response, request)?;

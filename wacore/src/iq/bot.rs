@@ -11,16 +11,35 @@
 //! they are.
 
 use crate::WireEnum;
-use crate::iq::node::{optional_attr, required_child};
+use crate::iq::node::{IqParseError, optional_attr, required_child};
 use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
-use anyhow::{Result, anyhow};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeContentRef, NodeRef, Server};
 
 /// IQ namespace for bot directory operations.
 pub const BOT_IQ_NAMESPACE: &str = "bot";
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BotParseError {
+    #[error("<{tag}> is missing the {attribute} attribute")]
+    MissingAttribute {
+        tag: &'static str,
+        attribute: &'static str,
+    },
+    #[error("<bot v=\"2\"> is missing its <default> child")]
+    MissingDefault,
+    #[error("<bot v=\"3\"> is missing the bhash attribute")]
+    MissingBhash,
+    #[error("{0}")]
+    Structure(#[from] IqParseError),
+    #[error("{0}")]
+    Binary(#[from] wacore_binary::error::BinaryError),
+    #[error("{0}")]
+    Node(#[from] crate::protocol::ProtocolNodeError),
+}
 
 /// Protocol version WhatsApp Web asks for. The official client pins `"2"` on
 /// every bot-list request even though its parser also accepts a `v="3"`
@@ -121,6 +140,8 @@ fn text_node(tag: &'static str, value: String) -> Node {
 }
 
 impl ProtocolNode for BotTheme {
+    type Error = BotParseError;
+
     fn tag(&self) -> &'static str {
         "theme"
     }
@@ -142,9 +163,11 @@ impl ProtocolNode for BotTheme {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        let mode = optional_attr(node, "mode")
-            .ok_or_else(|| anyhow!("<theme> is missing the mode attribute"))?;
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
+        let mode = optional_attr(node, "mode").ok_or(BotParseError::MissingAttribute {
+            tag: "theme",
+            attribute: "mode",
+        })?;
         Ok(Self {
             mode: BotThemeMode::from(mode.as_ref()),
             background: text_child(node, "background"),
@@ -183,6 +206,8 @@ impl BotListEntry {
 }
 
 impl ProtocolNode for BotListEntry {
+    type Error = BotParseError;
+
     fn tag(&self) -> &'static str {
         "bot"
     }
@@ -203,19 +228,22 @@ impl ProtocolNode for BotListEntry {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         let mut attrs = node.attrs();
         let jid = attrs.required_jid("jid")?;
         let persona_id = attrs
             .optional_string("persona_id")
-            .ok_or_else(|| anyhow!("<bot> is missing the persona_id attribute"))?
+            .ok_or(BotParseError::MissingAttribute {
+                tag: "bot",
+                attribute: "persona_id",
+            })?
             .to_string();
         let card_title = attrs.optional_string("card_title").map(|v| v.to_string());
         let count = attrs.optional_u64("count");
         let themes = node
             .get_children_by_tag("theme")
             .map(BotTheme::try_from_node_ref)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             jid,
             persona_id,
@@ -240,6 +268,8 @@ pub struct BotListSection {
 }
 
 impl ProtocolNode for BotListSection {
+    type Error = BotParseError;
+
     fn tag(&self) -> &'static str {
         "section"
     }
@@ -257,9 +287,11 @@ impl ProtocolNode for BotListSection {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        let section_type = optional_attr(node, "type")
-            .ok_or_else(|| anyhow!("<section> is missing the type attribute"))?;
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
+        let section_type = optional_attr(node, "type").ok_or(BotParseError::MissingAttribute {
+            tag: "section",
+            attribute: "type",
+        })?;
         Ok(Self {
             name: optional_attr(node, "name").map(|v| v.to_string()),
             section_type: BotSectionType::from(section_type.as_ref()),
@@ -268,7 +300,7 @@ impl ProtocolNode for BotListSection {
             bots: node
                 .get_children_by_tag("bot")
                 .map(BotListEntry::try_from_node_ref)
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -346,6 +378,8 @@ impl BotList {
 }
 
 impl ProtocolNode for BotList {
+    type Error = BotParseError;
+
     fn tag(&self) -> &'static str {
         "bot"
     }
@@ -363,9 +397,11 @@ impl ProtocolNode for BotList {
         builder.children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        let version =
-            optional_attr(node, "v").ok_or_else(|| anyhow!("<bot> is missing the v attribute"))?;
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
+        let version = optional_attr(node, "v").ok_or(BotParseError::MissingAttribute {
+            tag: "bot",
+            attribute: "v",
+        })?;
         let version = BotListVersion::from(version.as_ref());
         let default_bot = node
             .get_optional_child("default")
@@ -378,10 +414,10 @@ impl ProtocolNode for BotList {
         // neither rule.
         match version {
             BotListVersion::V2 if default_bot.is_none() => {
-                return Err(anyhow!("<bot v=\"2\"> is missing its <default> child"));
+                return Err(BotParseError::MissingDefault);
             }
             BotListVersion::V3 if bhash.is_none() => {
-                return Err(anyhow!("<bot v=\"3\"> is missing the bhash attribute"));
+                return Err(BotParseError::MissingBhash);
             }
             _ => {}
         }
@@ -392,7 +428,7 @@ impl ProtocolNode for BotList {
             sections: node
                 .get_children_by_tag("section")
                 .map(BotListSection::try_from_node_ref)
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -405,6 +441,7 @@ pub struct GetBotListSpec;
 
 impl IqSpec for GetBotListSpec {
     type Response = BotList;
+    type Error = BotParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -418,7 +455,7 @@ impl IqSpec for GetBotListSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         BotList::try_from_node_ref(required_child(response, "bot")?)
     }
 }
@@ -441,7 +478,7 @@ mod tests {
             .build()
     }
 
-    fn parse(iq: &Node) -> Result<BotList> {
+    fn parse(iq: &Node) -> Result<BotList, BotParseError> {
         GetBotListSpec.parse_response(&iq.as_node_ref())
     }
 

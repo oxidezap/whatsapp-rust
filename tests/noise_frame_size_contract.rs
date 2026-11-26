@@ -59,7 +59,10 @@ struct RecordingTransport {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl whatsapp_rust::transport::Transport for RecordingTransport {
-    async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
+    async fn send(
+        &self,
+        data: bytes::Bytes,
+    ) -> Result<(), whatsapp_rust::transport::TransportError> {
         self.writes.lock().expect("writes mutex").push(data);
         Ok(())
     }
@@ -97,7 +100,7 @@ async fn a_provider_that_breaks_the_tag_size_contract_cannot_write_a_frame() {
 
         assert!(
             matches!(
-                err.kind,
+                err.kind(),
                 whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
             ),
             "the mismatch is a crypto-layer fault, got {err:?}"
@@ -129,7 +132,7 @@ async fn offloaded_frame_rejects_bad_sealed_length_without_advancing_or_appendin
         .await
         .expect_err("malformed provider output must be refused before framing");
         assert!(matches!(
-            error.kind,
+            error.kind(),
             whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
         ));
         assert_eq!(counter, 7);

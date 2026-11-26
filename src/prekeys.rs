@@ -5,8 +5,6 @@
 //! collisions when prekeys are consumed non-sequentially from the store.
 
 use crate::client::Client;
-use anyhow;
-use anyhow::Context as _;
 use futures::FutureExt as _;
 use log;
 
@@ -31,13 +29,199 @@ const MIN_PRE_KEY_COUNT: usize = 5;
 
 pub(crate) const ADV_BOOTSTRAP_CONCURRENCY: usize = 8;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub(crate) enum AdvPrimaryBundleError {
     #[error("primary identity unavailable for ADV verification")]
     Missing,
     #[error("could not authenticate primary bundle: {0}")]
-    Invalid(#[source] anyhow::Error),
+    Invalid(#[source] PrimaryIdentityError),
 }
+
+impl std::fmt::Debug for AdvPrimaryBundleError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+pub(crate) enum AdvIdentityQueryError {
+    Iq(Box<crate::request::IqError>),
+    Bundle(Box<AdvPrimaryBundleError>),
+}
+
+impl std::fmt::Debug for AdvIdentityQueryError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::fmt::Display for AdvIdentityQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Iq(error) => std::fmt::Display::fmt(error, f),
+            Self::Bundle(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for AdvIdentityQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Iq(error) => Some(error.as_ref()),
+            Self::Bundle(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<crate::request::IqError> for AdvIdentityQueryError {
+    fn from(error: crate::request::IqError) -> Self {
+        Self::Iq(Box::new(error))
+    }
+}
+
+impl From<AdvPrimaryBundleError> for AdvIdentityQueryError {
+    fn from(error: AdvPrimaryBundleError) -> Self {
+        Self::Bundle(Box::new(error))
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum PrimaryIdentityError {
+    #[error("{0}")]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("invalid primary signed prekey signature length")]
+    InvalidSignatureLength,
+    #[error("invalid primary signed prekey signature")]
+    InvalidSignature,
+}
+
+impl std::fmt::Debug for PrimaryIdentityError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum CachedAdvIdentityError {
+    #[error("{0}")]
+    Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
+    #[error("invalid stored primary identity")]
+    InvalidStored,
+    #[error("invalid paired primary identity")]
+    InvalidPaired,
+}
+
+impl std::fmt::Debug for CachedAdvIdentityError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<wacore::store::error::StoreError> for CachedAdvIdentityError {
+    fn from(error: wacore::store::error::StoreError) -> Self {
+        Self::Store(wacore::error::BoxedErrorSource::new(error))
+    }
+}
+
+/// Failure while allocating, persisting or uploading prekeys.
+pub struct PreKeyUploadError(Box<PreKeyUploadErrorKind>);
+
+impl PreKeyUploadError {
+    pub fn new(kind: PreKeyUploadErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &PreKeyUploadErrorKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> PreKeyUploadErrorKind {
+        *self.0
+    }
+}
+
+impl std::fmt::Display for PreKeyUploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Debug for PreKeyUploadError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)?;
+        let mut source = std::error::Error::source(&*self.0).and_then(|error| error.source());
+        for _ in 0..16 {
+            let Some(error) = source else { break };
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PreKeyUploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// The operation that prevented a prekey upload.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PreKeyUploadErrorKind {
+    #[error("{0}")]
+    Store(#[source] wacore::store::error::StoreError),
+    #[error("{0}")]
+    Signal(#[source] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Curve(#[source] wacore::libsignal::core::CurveError),
+    #[error("{0}")]
+    Decode(#[source] waproto::protobuf::DecodeError),
+    #[error("{0}")]
+    Iq(#[source] crate::request::IqError),
+    #[error("failed to flush prekey watermarks: {0}")]
+    FlushWatermarks(#[source] wacore::store::error::StoreError),
+    #[error("failed to flush prekey watermark after mark: {0}")]
+    FlushMarkedWatermark(#[source] wacore::store::error::StoreError),
+    #[error("failed to flush abandon watermark: {0}")]
+    FlushAbandonWatermark(#[source] wacore::store::error::StoreError),
+    #[error("no prekey available to upload")]
+    NoPrekey,
+    #[error("no decodable prekey available to upload")]
+    NoDecodablePrekey,
+    #[error("record missing public key")]
+    MissingPublicKey,
+    #[error("Connection lost during pre-key upload retry")]
+    ConnectionLost,
+}
+
+impl std::fmt::Debug for PreKeyUploadErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+macro_rules! prekey_upload_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for PreKeyUploadError {
+            fn from(error: $source) -> Self {
+                Self::new(PreKeyUploadErrorKind::$variant(error))
+            }
+        })+
+    };
+}
+
+prekey_upload_error_from!(
+    wacore::store::error::StoreError => Store,
+    wacore::libsignal::protocol::SignalProtocolError => Signal,
+    wacore::libsignal::core::CurveError => Curve,
+    waproto::protobuf::DecodeError => Decode,
+    crate::request::IqError => Iq,
+);
 
 /// Separate from Signal locks: a slow cold lookup must not block a warm
 /// companion waiting for offline-processing admission. Only active flights
@@ -56,7 +240,73 @@ impl Default for AdvBootstrapRegistry {
     }
 }
 
-type AdvBootstrapResult = Result<[u8; 32], Arc<anyhow::Error>>;
+#[derive(thiserror::Error)]
+pub(crate) enum AdvBootstrapError {
+    #[error("connection changed during ADV bootstrap")]
+    ScopeChanged,
+    #[error("connection closed during ADV bootstrap")]
+    ConnectionClosed,
+    #[error("ADV persistence admission closed")]
+    AdmissionClosed,
+    #[error("client ownership unavailable during bootstrap")]
+    ClientOwnershipUnavailable,
+    #[error("bootstrap identity worker stopped")]
+    WorkerStopped,
+    #[error("ADV persistence worker stopped")]
+    PersistenceWorkerStopped,
+    #[error("{0}")]
+    Cached(#[from] CachedAdvIdentityError),
+    #[error("{0}")]
+    Query(#[from] AdvIdentityQueryError),
+    #[error("{0}")]
+    Persistence(#[source] crate::usync::AdvIdentityPersistenceError),
+    #[error("{0}")]
+    Conflict(#[from] crate::usync::DeviceListIdentityConflict),
+    #[error("{0}")]
+    Shared(#[source] Arc<AdvBootstrapError>),
+}
+
+impl std::fmt::Debug for AdvBootstrapError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<crate::usync::AdvIdentityPersistenceError> for AdvBootstrapError {
+    fn from(error: crate::usync::AdvIdentityPersistenceError) -> Self {
+        match error {
+            crate::usync::AdvIdentityPersistenceError::Conflict(c) => Self::Conflict(c),
+            crate::usync::AdvIdentityPersistenceError::Account(
+                crate::usync::DeviceListIdentityError::Conflict(c),
+            ) => Self::Conflict(c),
+            e => Self::Persistence(e),
+        }
+    }
+}
+
+impl From<crate::usync::DeviceListIdentityError> for AdvBootstrapError {
+    fn from(error: crate::usync::DeviceListIdentityError) -> Self {
+        match error {
+            crate::usync::DeviceListIdentityError::Cached(e) => Self::Cached(e),
+            crate::usync::DeviceListIdentityError::Conflict(e) => Self::Conflict(e),
+        }
+    }
+}
+
+impl From<crate::usync::AdvBootstrapPersistenceError> for AdvBootstrapError {
+    fn from(error: crate::usync::AdvBootstrapPersistenceError) -> Self {
+        match error {
+            crate::usync::AdvBootstrapPersistenceError::ClientOwnershipUnavailable => {
+                Self::ClientOwnershipUnavailable
+            }
+            crate::usync::AdvBootstrapPersistenceError::WorkerStopped => Self::WorkerStopped,
+            crate::usync::AdvBootstrapPersistenceError::Persistence(e) => e.into(),
+        }
+    }
+}
+
+type AdvBootstrapResult = Result<[u8; 32], Arc<AdvBootstrapError>>;
 
 struct AdvBootstrapFlight {
     result: std::sync::Mutex<Option<AdvBootstrapResult>>,
@@ -90,7 +340,7 @@ impl Drop for AdvBootstrapLease {
 impl AdvBootstrapRegistry {
     /// Lower bound for owned heap: registry, retained map capacity, keys and
     /// registered flights. Runtime/channel waiter allocations and the opaque
-    /// allocation behind an anyhow error are deliberately not estimated.
+    /// allocation behind an error are deliberately not estimated.
     pub(crate) fn retained_bytes(&self) -> usize {
         use wacore::stats::HeapSize;
         let flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
@@ -137,29 +387,11 @@ impl AdvBootstrapRegistry {
     }
 }
 
-#[derive(Debug)]
-struct SharedAdvBootstrapError(Arc<anyhow::Error>);
-
 /// Keep trust conflicts downcastable for per-contact group rejection; share other error sources.
-fn shared_adv_bootstrap_error(error: Arc<anyhow::Error>) -> anyhow::Error {
-    use crate::usync::DeviceListIdentityConflict;
-    match error.downcast_ref::<DeviceListIdentityConflict>() {
-        Some(DeviceListIdentityConflict::Alias) => DeviceListIdentityConflict::Alias.into(),
-        Some(DeviceListIdentityConflict::Primary) => DeviceListIdentityConflict::Primary.into(),
-        Some(DeviceListIdentityConflict::Bootstrap) => DeviceListIdentityConflict::Bootstrap.into(),
-        None => anyhow::Error::new(SharedAdvBootstrapError(error)),
-    }
-}
-
-impl std::fmt::Display for SharedAdvBootstrapError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.0.as_ref(), f)
-    }
-}
-
-impl std::error::Error for SharedAdvBootstrapError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref().as_ref())
+fn shared_adv_bootstrap_error(error: Arc<AdvBootstrapError>) -> AdvBootstrapError {
+    match error.as_ref() {
+        AdvBootstrapError::Conflict(conflict) => AdvBootstrapError::Conflict(*conflict),
+        _ => AdvBootstrapError::Shared(error),
     }
 }
 
@@ -168,11 +400,10 @@ fn ensure_adv_bootstrap_scope(
     generation: &portable_atomic::AtomicU64,
     expected: u64,
     shutdown: &wacore::runtime::ShutdownSignal,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !shutdown.is_fired() && generation.load(Ordering::Acquire) == expected,
-        "connection changed during ADV bootstrap"
-    );
+) -> Result<(), AdvBootstrapError> {
+    if shutdown.is_fired() || generation.load(Ordering::Acquire) != expected {
+        return Err(AdvBootstrapError::ScopeChanged);
+    }
     Ok(())
 }
 
@@ -295,17 +526,19 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
     n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
 }
 
-pub(crate) fn authenticated_primary_identity(bundle: &PreKeyBundle) -> anyhow::Result<IdentityKey> {
+pub(crate) fn authenticated_primary_identity(
+    bundle: &PreKeyBundle,
+) -> Result<IdentityKey, PrimaryIdentityError> {
     let identity = *bundle.identity_key()?;
     let signature: &[u8; 64] = bundle
         .signed_pre_key_signature()?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid primary signed prekey signature length"))?;
+        .map_err(|_| PrimaryIdentityError::InvalidSignatureLength)?;
     if !identity
         .public_key()
         .verify_signature(&bundle.signed_pre_key_public()?.serialize(), signature)
     {
-        anyhow::bail!("invalid primary signed prekey signature");
+        return Err(PrimaryIdentityError::InvalidSignature);
     }
     Ok(identity)
 }
@@ -314,8 +547,8 @@ fn authenticate_cold_primary_bundles(
     outcome: &mut wacore::prekeys::PreKeyFetchOutcome,
     companions: &[Jid],
     primaries: &[Jid],
-    mut authenticate: impl FnMut(&PreKeyBundle) -> anyhow::Result<IdentityKey>,
-) -> anyhow::Result<()> {
+    mut authenticate: impl FnMut(&PreKeyBundle) -> Result<IdentityKey, PrimaryIdentityError>,
+) -> Result<(), PrimaryIdentityError> {
     // Validate every primary before publication. The fetch owns its immutable
     // bundles, so publishing can read their keys without repeating crypto.
     for primary in primaries {
@@ -333,6 +566,29 @@ fn authenticate_cold_primary_bundles(
     Ok(())
 }
 
+#[derive(thiserror::Error)]
+pub(crate) enum PreKeyFetchError {
+    #[error("{0}")]
+    Cached(#[from] CachedAdvIdentityError),
+    #[error("{0}")]
+    Iq(#[from] crate::request::IqError),
+    #[error("{0}")]
+    Primary(#[from] PrimaryIdentityError),
+    #[error("{0}")]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Persistence(#[from] crate::usync::AdvBootstrapPersistenceError),
+    #[error("primary identity changed during companion bootstrap")]
+    PrimaryIdentityChanged,
+}
+
+impl std::fmt::Debug for PreKeyFetchError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Client {
     /// Allocate flight coordination only when an account needs cold ADV discovery.
     fn adv_bootstrap(&self) -> &Arc<AdvBootstrapRegistry> {
@@ -340,7 +596,10 @@ impl Client {
     }
 
     /// Read a fresh, signed primary key without publishing a trust change.
-    pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+    pub(crate) async fn fetch_adv_account_identity(
+        &self,
+        jid: &Jid,
+    ) -> Result<[u8; 32], AdvIdentityQueryError> {
         let primary = wacore::types::jid::adv_account_jid(jid);
         self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
             .await
@@ -353,7 +612,7 @@ impl Client {
         &'a self,
         primary: &'a Jid,
         reason: Option<PreKeyFetchReason>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<[u8; 32]>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<[u8; 32], AdvIdentityQueryError>> {
         Box::pin(async move {
             let spec = match reason {
                 Some(reason) => PreKeyFetchSpec::with_reason(vec![primary.clone()], reason),
@@ -376,7 +635,7 @@ impl Client {
         &self,
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
-    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, PreKeyFetchError> {
         let bootstrap_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let account_identities = self.collect_account_identities(jids).await?;
         let mut primary_snapshots = Vec::new();
@@ -435,7 +694,7 @@ impl Client {
                     )
                     .await?
                 {
-                    anyhow::bail!("primary identity changed during companion bootstrap");
+                    return Err(PreKeyFetchError::PrimaryIdentityChanged);
                 }
             }
         }
@@ -460,7 +719,7 @@ impl Client {
     pub(crate) async fn cached_adv_account_identity(
         &self,
         jid: &Jid,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    ) -> Result<Option<[u8; 32]>, CachedAdvIdentityError> {
         use wacore::types::jid::JidExt;
         let primary = wacore::types::jid::adv_account_jid(jid);
         let backend = self.persistence_manager.backend();
@@ -469,9 +728,12 @@ impl Client {
             .get_identity(&primary.to_protocol_address(), &*backend)
             .await?
         {
-            return Ok(Some(identity.as_ref().try_into().map_err(|_| {
-                anyhow::anyhow!("invalid stored primary identity")
-            })?));
+            return Ok(Some(
+                identity
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| CachedAdvIdentityError::InvalidStored)?,
+            ));
         }
         let snapshot = self.persistence_manager.get_device_snapshot();
         let is_self = [snapshot.pn.as_ref(), snapshot.lid.as_ref()]
@@ -484,9 +746,10 @@ impl Client {
                 .as_ref()
                 .and_then(|account| account.account_signature_key.as_deref())
         {
-            return Ok(Some(key.try_into().map_err(|_| {
-                anyhow::anyhow!("invalid paired primary identity")
-            })?));
+            return Ok(Some(
+                key.try_into()
+                    .map_err(|_| CachedAdvIdentityError::InvalidPaired)?,
+            ));
         }
         Ok(None)
     }
@@ -494,7 +757,10 @@ impl Client {
     /// Establish the primary identity before trusting any companion metadata.
     /// First contact uses the primary's signed prekey, just as a direct primary
     /// session does. Device-list blobs never rotate an already stored identity.
-    pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+    pub(crate) async fn ensure_adv_account_identity(
+        &self,
+        jid: &Jid,
+    ) -> Result<[u8; 32], AdvBootstrapError> {
         use wacore::types::jid::JidExt;
         let generation = self.connection_generation.load(Ordering::Acquire);
         let shutdown = self.connection_shutdown_signal();
@@ -555,7 +821,7 @@ impl Client {
         };
         futures::select_biased! {
             _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
-                anyhow::bail!("connection closed during ADV bootstrap")
+                Err(AdvBootstrapError::ConnectionClosed)
             },
             result = Box::pin(bootstrap).fuse() => result,
         }
@@ -568,7 +834,7 @@ impl Client {
         primary: &Jid,
         generation: u64,
         shutdown: &wacore::runtime::ShutdownSignal,
-    ) -> anyhow::Result<[u8; 32]> {
+    ) -> Result<[u8; 32], AdvBootstrapError> {
         use wacore::types::jid::JidExt;
         let query = self.adv_bootstrap().queries.acquire().await;
         ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
@@ -598,12 +864,12 @@ impl Client {
             .inbound_queues()
             .work
             .try_track()
-            .ok_or_else(|| anyhow::anyhow!("ADV persistence admission closed"))?;
+            .ok_or(AdvBootstrapError::AdmissionClosed)?;
         let client = self
             .self_weak
             .get()
             .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
+            .ok_or(AdvBootstrapError::ClientOwnershipUnavailable)?;
         let current_generation = self.connection_generation.clone();
         let shutdown = shutdown.clone();
         let primary_owned = primary.clone();
@@ -620,10 +886,11 @@ impl Client {
                     .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
                     .await?;
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
-                anyhow::ensure!(
-                    accepted,
-                    crate::usync::DeviceListIdentityConflict::Bootstrap
-                );
+                if !accepted {
+                    return Err(AdvBootstrapError::Conflict(
+                        crate::usync::DeviceListIdentityConflict::Bootstrap,
+                    ));
+                }
                 Ok(key)
             }
             .await;
@@ -631,7 +898,7 @@ impl Client {
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("ADV persistence worker stopped"))?
+            .map_err(|_| AdvBootstrapError::PersistenceWorkerStopped)?
     }
 
     /// Load, for each companion JID, its account (device 0) identity key from the
@@ -640,7 +907,7 @@ impl Client {
     async fn collect_account_identities(
         &self,
         jids: &[Jid],
-    ) -> anyhow::Result<std::collections::HashMap<Jid, [u8; 32]>> {
+    ) -> Result<std::collections::HashMap<Jid, [u8; 32]>, CachedAdvIdentityError> {
         use futures::{StreamExt, TryStreamExt};
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)
@@ -682,7 +949,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), PreKeyUploadError> {
         let has_prekeys = self
             .persistence_manager
             .get_device_snapshot()
@@ -726,16 +993,13 @@ impl Client {
         &self,
         force: bool,
         wanted: Option<usize>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         // Decision is should_upload_pre_keys(force, count), but a forced upload short-circuits
         // and skips the server-count IQ entirely: WA Web's handlePreKeyLow uploads
         // unconditionally, so a stale or transiently-failing count must never block or delay
         // the replenish. Only a non-forced caller queries the count and applies the guard.
         if !force {
-            let server_count = self
-                .get_server_pre_key_count()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let server_count = self.get_server_pre_key_count().await?;
 
             if !should_upload_pre_keys(force, server_count) {
                 log::debug!("Server has {server_count} pre-keys, no upload needed.");
@@ -769,7 +1033,7 @@ impl Client {
     )]
     pub(crate) async fn get_or_gen_single_pre_key(
         &self,
-    ) -> Result<(u32, PublicKey), anyhow::Error> {
+    ) -> Result<(u32, PublicKey), PreKeyUploadError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let backend = device_snapshot.backend.clone();
         let max_id = if prekey_watermarks_need_recovery(
@@ -852,10 +1116,9 @@ impl Client {
         // Same durability pairing as the batch path: the stored key is
         // durable, so its watermarks must not ride the lazy saver. A failed
         // flush fails the allocation; the retry dance recovers later.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermarks")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushWatermarks(error))
+        })?;
         Ok((id, key_pair.public_key))
     }
 
@@ -869,7 +1132,7 @@ impl Client {
         &self,
         _guard: &async_lock::MutexGuard<'_, ()>,
         id: u32,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         if device_snapshot.first_unupload_pre_key_id != id {
             return Ok(());
@@ -892,10 +1155,9 @@ impl Client {
                 first_unupload_pre_key_id: next_first,
             })
             .await;
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermark after mark")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushMarkedWatermark(error))
+        })?;
         Ok(())
     }
 
@@ -911,12 +1173,15 @@ impl Client {
             err(Debug)
         )
     )]
-    async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
+    async fn upload_pre_keys_inner(&self) -> Result<(), PreKeyUploadError> {
         let wanted = self.wanted_pre_key_count.load(Ordering::Relaxed);
         self.upload_pre_keys_inner_with_count(wanted).await
     }
 
-    async fn upload_pre_keys_inner_with_count(&self, wanted: usize) -> Result<(), anyhow::Error> {
+    async fn upload_pre_keys_inner_with_count(
+        &self,
+        wanted: usize,
+    ) -> Result<(), PreKeyUploadError> {
         self.upload_pre_keys_pass(true, wanted).await
     }
 
@@ -929,7 +1194,7 @@ impl Client {
         &self,
         allow_collapse_retry: bool,
         configured: usize,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         // INVARIANT: every caller holds `prekey_upload_lock` (login, prekey-low
         // notification, refresh, digest repair), serializing the watermark math
         // with the retry-receipt single-key path.
@@ -1049,10 +1314,9 @@ impl Client {
         // pre-generation watermarks and orphan the stored window. A failed
         // flush aborts the pass: proceeding would upload keys whose
         // accounting is not durable, the exact state this barrier prevents.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush prekey watermarks")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushWatermarks(error))
+        })?;
 
         // Only the leftover (already-stored) window keys are read back and decoded;
         // the fresh ones are already in `fresh_pre_keys`. On the common connect path
@@ -1084,7 +1348,7 @@ impl Client {
                 );
                 return Box::pin(self.upload_pre_keys_pass(false, configured)).await;
             }
-            anyhow::bail!("no prekey available to upload");
+            return Err(PreKeyUploadError::new(PreKeyUploadErrorKind::NoPrekey));
         }
 
         let pre_key_pairs = if leftover_rows.is_empty() {
@@ -1098,12 +1362,12 @@ impl Client {
             // decode entirely; their public keys never left memory.
             for (id, record) in &leftover_rows {
                 let public_key = waproto::codec::pre_key_record_decode(&record[..])
-                    .map_err(anyhow::Error::from)
+                    .map_err(PreKeyUploadError::from)
                     .and_then(|s| {
-                        let raw = s
-                            .public_key
-                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                        let raw = s.public_key.ok_or_else(|| {
+                            PreKeyUploadError::new(PreKeyUploadErrorKind::MissingPublicKey)
+                        })?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(PreKeyUploadError::from)
                     });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
@@ -1116,7 +1380,9 @@ impl Client {
             pairs
         };
         if pre_key_pairs.is_empty() {
-            anyhow::bail!("no decodable prekey available to upload");
+            return Err(PreKeyUploadError::new(
+                PreKeyUploadErrorKind::NoDecodablePrekey,
+            ));
         }
         let last_id = pre_key_pairs
             .last()
@@ -1150,10 +1416,9 @@ impl Client {
         // crash after a failed IQ would otherwise reload FIRST=window_start
         // and re-offer ids that may already be in the server pool. A failed
         // flush aborts instead of sending with non-durable abandonment.
-        self.persistence_manager
-            .flush()
-            .await
-            .context("failed to flush abandon watermark")?;
+        self.persistence_manager.flush().await.map_err(|error| {
+            PreKeyUploadError::new(PreKeyUploadErrorKind::FlushAbandonWatermark(error))
+        })?;
 
         self.execute(spec).await?;
 
@@ -1198,7 +1463,7 @@ impl Client {
     pub(crate) async fn upload_pre_keys_with_retry(
         &self,
         force: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         self.upload_pre_keys_with_retry_count(force, None).await
     }
 
@@ -1216,7 +1481,7 @@ impl Client {
         &self,
         force: bool,
         wanted: Option<usize>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PreKeyUploadError> {
         let mut delay_a: u64 = 1;
         let mut delay_b: u64 = 2;
         const MAX_DELAY_SECS: u64 = 610;
@@ -1241,8 +1506,8 @@ impl Client {
                     // Bail if disconnected during retry wait
                     if !self.is_logged_in() {
                         wacore::telemetry::prekey_upload("fail");
-                        return Err(anyhow::anyhow!(
-                            "Connection lost during pre-key upload retry"
+                        return Err(PreKeyUploadError::new(
+                            PreKeyUploadErrorKind::ConnectionLost,
                         ));
                     }
 
@@ -1278,7 +1543,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn refresh_pre_keys(&self) -> Result<(), anyhow::Error> {
+    pub async fn refresh_pre_keys(&self) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry(true).await
     }
@@ -1296,7 +1561,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn refresh_pre_keys_with_count(&self, count: usize) -> Result<(), anyhow::Error> {
+    pub async fn refresh_pre_keys_with_count(&self, count: usize) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry_count(true, Some(count))
             .await
@@ -1312,7 +1577,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn ensure_pre_keys(&self) -> Result<(), anyhow::Error> {
+    pub async fn ensure_pre_keys(&self) -> Result<(), PreKeyUploadError> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry(false).await
     }
@@ -1336,7 +1601,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
+    pub async fn validate_digest_key(&self) -> Result<(), PreKeyUploadError> {
         // Hold the lock across the whole pass so the 404 re-upload can't race with
         // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on
         // `next_pre_key_id` allocation.
@@ -1539,6 +1804,44 @@ mod tests {
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
         clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[test]
+    fn primary_query_exposes_the_concrete_iq_error() {
+        use std::error::Error as _;
+        let error = super::AdvIdentityQueryError::from(crate::request::IqError::NotConnected);
+        assert!(error.source().unwrap().is::<crate::request::IqError>());
+    }
+
+    #[tokio::test]
+    async fn cached_primary_identity_rejects_malformed_bytes() {
+        use wacore::types::jid::JidExt;
+        let client = crate::test_utils::create_test_client().await;
+        let user = wacore_binary::Jid::pn("15550000123");
+        client
+            .signal_cache
+            .put_identity(&user.to_protocol_address(), &[1, 2, 3])
+            .await;
+        assert!(matches!(
+            client.cached_adv_account_identity(&user).await,
+            Err(super::CachedAdvIdentityError::InvalidStored)
+        ));
+    }
+
+    #[test]
+    fn watermark_failure_preserves_backend_source() {
+        use std::error::Error as _;
+        let backend = wacore::store::error::StoreError::Database(Box::new(std::io::Error::other(
+            "prekey backend failure",
+        )));
+        let error =
+            super::PreKeyUploadError::new(super::PreKeyUploadErrorKind::FlushWatermarks(backend));
+        assert!(matches!(
+            error.kind(),
+            super::PreKeyUploadErrorKind::FlushWatermarks(_)
+        ));
+        assert!(format!("{error:?}").contains("prekey backend failure"));
+        assert!(error.source().and_then(|source| source.source()).is_some());
+    }
 
     #[tokio::test]
     async fn adv_bootstrap_authenticates_primary_prekeys_before_persisting_trust() {
@@ -1899,6 +2202,33 @@ mod tests {
 #[allow(clippy::disallowed_methods)]
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
+
+    #[tokio::test]
+    async fn failed_watermark_flush_stops_prekey_upload() {
+        use crate::store::release::tests::ProbeBackend;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let (mut backend, _) = ProbeBackend::new();
+        let fail_save = Arc::new(AtomicBool::new(false));
+        backend.fail_before_method = Some(("save", fail_save.clone()));
+        let (client, transport) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(backend)).await;
+        fail_save.store(true, Ordering::Release);
+        let _guard = client.prekey_upload_lock.lock().await;
+        let error = client
+            .upload_pre_keys_inner_with_count(5)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            super::PreKeyUploadErrorKind::FlushWatermarks(_)
+        ));
+        assert!(format!("{error:?}").contains("synthetic save failure"));
+        assert_eq!(transport.sent_count(), 0);
+    }
 
     fn snapshot(client: &crate::client::Client) -> (u32, u32) {
         let d = client.persistence_manager.get_device_snapshot();

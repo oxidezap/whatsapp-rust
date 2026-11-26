@@ -133,17 +133,19 @@ fn shared_reupload_errors_keep_the_original_typed_cause() {
         .unwrap();
     assert!(std::ptr::eq(source, shared_source));
 
-    let error = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other("fixture")));
+    let error = MediaReuploadError::from(wacore::store::error::StoreError::Database(Box::new(
+        std::io::Error::other("fixture"),
+    )));
     let cloned = error.clone();
     let source = error
         .source()
         .unwrap()
-        .downcast_ref::<std::io::Error>()
+        .downcast_ref::<wacore::store::error::StoreError>()
         .unwrap();
     let shared_source = cloned
         .source()
         .unwrap()
-        .downcast_ref::<std::io::Error>()
+        .downcast_ref::<wacore::store::error::StoreError>()
         .unwrap();
     assert!(std::ptr::eq(source, shared_source));
 }
@@ -169,6 +171,29 @@ async fn reupload_fixture() -> (Arc<Client>, Arc<CapturingMockTransport>) {
     )
     .await;
     (client, transport)
+}
+
+#[tokio::test]
+async fn reupload_mapping_failure_preserves_store_error_and_sends_nothing() {
+    use crate::store::release::tests::ProbeBackend;
+    let (mut probe, _) = ProbeBackend::new();
+    probe.fail_before_method = Some(("get_pn_mapping", Arc::new(AtomicBool::new(true))));
+    let (client, transport) =
+        crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(Jid::lid("10000000001"))))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLidMigrated(true))
+        .await;
+    let error = request(client, Jid::pn("15550000002"), "STORE-ERROR", [1; 32])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MediaReuploadError::Store(_)));
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(transport.sent_count(), 0);
 }
 
 async fn request(
@@ -512,7 +537,7 @@ async fn reconnect_timeouts_still_close_transport_in_both_modes() {
     struct StalledClose(Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl crate::transport::Transport for StalledClose {
-        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             Ok(())
         }
         async fn disconnect(&self) {
@@ -824,11 +849,13 @@ async fn reupload_rejections_preserve_the_full_shared_response_and_raw_code() {
 fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
     use std::error::Error;
     let marker = "signed-url-secret-marker";
-    let internal = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other(marker)));
-    let client = MediaReuploadError::from(ClientError::Internal(anyhow::Error::new(
+    let storage = MediaReuploadError::from(wacore::store::error::StoreError::Database(Box::new(
         std::io::Error::other(marker),
     )));
-    for error in [internal, client] {
+    let client = MediaReuploadError::from(ClientError::Internal(Box::new(std::io::Error::other(
+        marker,
+    ))));
+    for error in [storage, client] {
         assert!(!format!("{error:?}").contains(marker));
         let source = error.source().unwrap();
         let io = if let Some(client) = source.downcast_ref::<ClientError>() {
@@ -838,7 +865,11 @@ fn reupload_error_debug_hides_opaque_causes_without_losing_downcasts() {
                 .downcast_ref::<std::io::Error>()
                 .unwrap()
         } else {
-            source.downcast_ref::<std::io::Error>().unwrap()
+            source
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
         };
         assert_eq!(io.to_string(), marker);
     }

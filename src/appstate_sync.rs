@@ -974,9 +974,10 @@ mod tests {
             if fail {
                 let error = result.expect_err("injected commit failure");
                 assert!(
-                    error
-                        .downcast_ref::<wacore::appstate_sync::CommittedMutationsError>()
-                        .is_none(),
+                    !matches!(
+                        error.kind(),
+                        wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(_)
+                    ),
                     "an uncommitted patch must not publish mutations"
                 );
                 assert!(format!("{error:#}").contains("injected patch commit failure"));
@@ -1013,9 +1014,11 @@ mod tests {
             .process_patch_list(list, false)
             .await
             .expect_err("status persistence should fail");
-        let committed = error
-            .downcast::<wacore::appstate_sync::CommittedMutationsError>()
-            .expect("committed mutations should travel with the error");
+        let wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(committed) =
+            error.into_kind()
+        else {
+            panic!("committed mutations should travel with the error");
+        };
         let (mutations, state, collection, source) = committed.into_parts();
         assert_eq!(collection, WAPatchName::RegularHigh);
         assert_eq!(state.version, 1);
@@ -1059,17 +1062,19 @@ mod tests {
             patches: vec![status_patch],
             ..list
         };
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
-            Err(anyhow::anyhow!("unexpected external blob"))
+        let download = |_ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError> {
+            Err(wacore::appstate_sync::ExternalBlobError::download(std::io::Error::other("unexpected external blob")))
         };
 
         let error = processor
             .process_patch_lists(vec![first, second], &download, false)
             .await
             .expect_err("second collection should fail status persistence");
-        let committed = error
-            .downcast::<wacore::appstate_sync::CommittedPatchListsError>()
-            .expect("prior collection results should travel with the error");
+        let wacore::appstate_sync::AppStateProcessingErrorKind::CommittedPatchLists(committed) =
+            error.into_kind()
+        else {
+            panic!("prior collection results should travel with the error");
+        };
         let (results, source) = committed.into_parts();
         assert_eq!(results.len(), 1);
         let (mutations, state, applied) = &results[0];
@@ -2726,7 +2731,7 @@ mod tests {
         };
 
         let snapshot_bytes = bytes::Bytes::from(snapshot_bytes);
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
+        let download = |_ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError> {
             Ok(snapshot_bytes.clone())
         };
 

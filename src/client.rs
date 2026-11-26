@@ -8,8 +8,8 @@ pub mod bench_retry;
 #[cfg(feature = "bench-harness")]
 pub use app_state::prefetch_bench::{PrefetchCompletionGate, PrefetchHarness};
 pub(crate) use app_state::{
-    AppStateDispatchOutcome, AppStateDownloads, BatchedSyncOutcome, BatchedSyncRequest,
-    CriticalSyncPlan, SyncScope, SyncSettles, fingerprint_id, redact_jid,
+    AppStateDispatchOutcome, AppStateDownloads, AppStateSyncFailure, BatchedSyncOutcome,
+    BatchedSyncRequest, CriticalSyncPlan, SyncScope, SyncSettles, fingerprint_id, redact_jid,
 };
 #[cfg(test)]
 pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};
@@ -28,6 +28,7 @@ mod group_notifications;
 pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
+pub use lid_pn::{MappingLearningError, MappingStoreError};
 mod lifecycle;
 pub(crate) mod member_index;
 mod messaging;
@@ -37,8 +38,11 @@ mod notification_scope;
 pub(crate) use notification_scope::NotificationScope;
 pub(crate) mod offline_resume;
 mod sender_keys;
+pub(crate) use sender_keys::SenderKeyResetError;
 mod session_state;
 mod sessions;
+pub(crate) use sessions::SessionEnsureError;
+pub use sessions::StartupSyncError;
 pub(crate) mod subsystem;
 pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
@@ -51,7 +55,9 @@ pub use device_memo_stats::{DeviceMemoStats, GroupDevicesMemoStats, SkdmTargetsM
 use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
-pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use extension_lifecycle::{
+    ClientLifecycle, ConnectionScope, ConnectionScopeState, LifecycleError,
+};
 pub use lifecycle::{
     ConflictKind, Connection, DeregistrationOutcome, DeregistrationSkipReason, DrainOutcome,
     LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason, SecretFlushReport,
@@ -64,7 +70,6 @@ use crate::cache_store::TypedCache;
 use crate::handshake;
 use crate::lid_pn_cache::LidPnCache;
 use crate::pair;
-use anyhow::Result;
 use futures::FutureExt;
 #[cfg(test)]
 use std::borrow::Cow;
@@ -1423,7 +1428,7 @@ pub enum ClientError {
     /// not (yet) have a dedicated variant. Formatting retains known typed
     /// diagnostics; `source()` preserves the complete error for downcast.
     #[error("internal client error: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl std::fmt::Debug for ClientError {
@@ -1502,10 +1507,10 @@ pub enum ConnectError {
     },
     /// The app version could not be resolved.
     #[error("failed to resolve app version")]
-    Version(#[source] anyhow::Error),
+    Version(#[source] wacore::error::BoxedErrorSource<crate::version::VersionError>),
     /// The transport factory could not open a connection.
     #[error("failed to open transport")]
-    Transport(#[source] anyhow::Error),
+    Transport(#[source] wacore::net::TransportError),
     /// The noise handshake failed after the transport was up.
     #[error("{0}")]
     Handshake(#[from] handshake::HandshakeError),
@@ -1527,7 +1532,7 @@ pub enum SignalMaintenanceError {
     CorruptKey(String),
     /// The storage backend failed a read, write or flush.
     #[error("signal storage failure: {0}")]
-    Storage(#[source] anyhow::Error),
+    Storage(#[source] wacore::store::signal_cache::SignalCacheFlushError),
     /// The rotation IQ was rejected by the server or never reached it.
     #[error("IQ request failed: {0}")]
     Iq(#[from] crate::request::IqError),
@@ -1544,6 +1549,26 @@ pub enum SignalMaintenanceError {
     /// there would persist ratchet advances whose messages have no durable row.
     #[error("client dropping while inbound drain is active; skipping Signal flush")]
     DrainShuttingDown,
+    /// Signal maintenance cannot run inside an inbound durability hook.
+    #[error(
+        "Signal maintenance cannot run inside an inbound durability hook; retry from a control task"
+    )]
+    InInboundDurabilityHook,
+    /// The connection or processing permit generation changed during maintenance.
+    #[error("connection or processing permit changed during Signal maintenance")]
+    ConnectionChanged,
+}
+
+impl From<wacore::store::signal_cache::SignalCacheFlushError> for SignalMaintenanceError {
+    fn from(error: wacore::store::signal_cache::SignalCacheFlushError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<wacore::store::error::StoreError> for SignalMaintenanceError {
+    fn from(error: wacore::store::error::StoreError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 impl ConnectError {

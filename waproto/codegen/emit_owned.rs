@@ -501,7 +501,13 @@ impl Emitter<'_> {
         let name = ident(&message.name);
         let pinned_clone = matches!(
             message.full_name.as_str(),
-            ".whatsapp.Message" | ".whatsapp.ContextInfo"
+            ".whatsapp.Message"
+                | ".whatsapp.ContextInfo"
+                | ".whatsapp.BotMetadata"
+                | ".whatsapp.Message.VideoMessage"
+                | ".whatsapp.Message.ImageMessage"
+                | ".whatsapp.Message.InteractiveMessage"
+                | ".whatsapp.Message.ExtendedTextMessage"
         );
         let clone = if pinned_clone { "" } else { "Clone," };
         let mut out = format!(

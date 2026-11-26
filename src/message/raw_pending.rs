@@ -4,6 +4,53 @@ use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 use wacore::types::events::InboundMessage;
 
+#[derive(thiserror::Error)]
+pub(super) enum RawPendingError {
+    #[error("pending journal exceeds bound")]
+    ExceedsBound,
+    #[error("unsupported pending journal version")]
+    UnsupportedVersion,
+    #[error("invalid pending occurrence count")]
+    InvalidOccurrenceCount,
+    #[error("pending journal backing and metadata exceed admission")]
+    ExceedsAdmission,
+    #[error("invalid pending producer identity")]
+    InvalidProducerIdentity,
+    #[error("invalid pending index")]
+    InvalidIndex,
+    #[error("trailing pending journal bytes")]
+    TrailingBytes,
+    #[error("empty pending journal")]
+    EmptyJournal,
+    #[error("unordered pending producer occurrences")]
+    UnorderedOccurrences,
+    #[error("mixed indexed and legacy producer occurrences")]
+    MixedProducerOccurrences,
+    #[error("pending occurrence identity conflict")]
+    IdentityConflict,
+    #[error("legacy producer requires replay")]
+    LegacyProducerRequiresReplay,
+    #[error("mixed pending producer indices")]
+    MixedProducerIndices,
+    #[error("pending journal size overflow")]
+    SizeOverflow,
+    #[error("truncated pending journal")]
+    Truncated,
+    #[error("invalid pending journal integer")]
+    InvalidInt(#[from] std::num::TryFromIntError),
+    #[error("invalid pending journal slice")]
+    InvalidSlice(#[from] std::array::TryFromSliceError),
+    #[error("invalid pending message payload: {0}")]
+    Decode(#[from] waproto::protobuf::DecodeError),
+}
+
+impl std::fmt::Debug for RawPendingError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 const MAGIC: &[u8; 6] = b"\0WRPD\x04";
 const GROUPED_MAGIC: &[u8; 6] = b"\0WRPD\x03";
 const LEGACY_MAGIC: &[u8; 6] = b"\0WRPD\x01";
@@ -78,7 +125,7 @@ impl PendingDelivery {
         info: &std::sync::Arc<wacore::types::message::MessageInfo>,
         shared_message: Option<std::sync::Arc<waproto::whatsapp::Message>>,
         receipt: Option<std::sync::Arc<super::live_retention::ReceiptScope>>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, RawPendingError> {
         let message = match shared_message {
             Some(message) => message,
             None => std::sync::Arc::new(waproto::codec::message_decode(&entry.projection)?),
@@ -130,11 +177,10 @@ impl Default for PendingJournal {
     }
 }
 impl PendingJournal {
-    pub fn decode(bytes: Bytes) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            bytes.len() <= MAX_PENDING_BYTES,
-            "pending journal exceeds bound"
-        );
+    pub fn decode(bytes: Bytes) -> Result<Self, RawPendingError> {
+        if bytes.len() > MAX_PENDING_BYTES {
+            return Err(RawPendingError::ExceedsBound);
+        }
         if bytes.first() != Some(&0) {
             // Preserve a legacy row verbatim. It has no authenticated slot
             // index and must not be merged into an indexed occurrence group.
@@ -153,27 +199,25 @@ impl PendingJournal {
         }
         let compact = bytes.starts_with(MAGIC);
         let grouped = compact || bytes.starts_with(GROUPED_MAGIC);
-        anyhow::ensure!(
-            grouped || bytes.starts_with(LEGACY_MAGIC),
-            "unsupported pending journal version"
-        );
+        if !grouped && !bytes.starts_with(LEGACY_MAGIC) {
+            return Err(RawPendingError::UnsupportedVersion);
+        }
         let mut cursor = Cursor {
             bytes,
             offset: MAGIC.len(),
         };
         let generation: [u8; 16] = cursor.take(16)?.as_ref().try_into()?;
         let count = cursor.number()?;
-        anyhow::ensure!(
-            count != 0 && count <= cursor.remaining() / if grouped { 30 } else { 13 },
-            "invalid pending occurrence count"
-        );
-        anyhow::ensure!(
-            count
-                .checked_mul(size_of::<Occurrence>())
-                .and_then(|metadata| metadata.checked_add(cursor.bytes.len()))
-                .is_some_and(|retained| retained <= MAX_PENDING_BYTES),
-            "pending journal backing and metadata exceed admission"
-        );
+        if count == 0 || count > cursor.remaining() / if grouped { 30 } else { 13 } {
+            return Err(RawPendingError::InvalidOccurrenceCount);
+        }
+        if !count
+            .checked_mul(size_of::<Occurrence>())
+            .and_then(|metadata| metadata.checked_add(cursor.bytes.len()))
+            .is_some_and(|retained| retained <= MAX_PENDING_BYTES)
+        {
+            return Err(RawPendingError::ExceedsAdmission);
+        }
         let mut occurrences = SmallVec::with_capacity(count);
         for _ in 0..count {
             let producer = if grouped {
@@ -182,7 +226,7 @@ impl PendingJournal {
                 match present {
                     0 if id == [0; 16] => None,
                     1 => Some(StanzaOrigin(id)),
-                    _ => anyhow::bail!("invalid pending producer identity"),
+                    _ => return Err(RawPendingError::InvalidProducerIdentity),
                 }
             } else {
                 None
@@ -192,7 +236,7 @@ impl PendingJournal {
             let index = match indexed {
                 0 if index == 0 => None,
                 1 => Some(u32::try_from(index)?),
-                _ => anyhow::bail!("invalid pending index"),
+                _ => return Err(RawPendingError::InvalidIndex),
             };
             let original = cursor.blob()?;
             let projection = cursor.projection(&original, compact)?;
@@ -204,50 +248,52 @@ impl PendingJournal {
                 projection,
             });
         }
-        anyhow::ensure!(cursor.remaining() == 0, "trailing pending journal bytes");
+        if cursor.remaining() != 0 {
+            return Err(RawPendingError::TrailingBytes);
+        }
         let journal = Self {
             generation,
             occurrences,
             backing: grouped.then(|| cursor.bytes.clone()),
         };
         journal.validate()?;
-        if compact {
-            anyhow::ensure!(
-                journal
-                    .retained_size()
-                    .is_some_and(|size| size <= MAX_PENDING_BYTES),
-                "pending journal backing and metadata exceed admission"
-            );
+        if compact
+            && !journal
+                .retained_size()
+                .is_some_and(|size| size <= MAX_PENDING_BYTES)
+        {
+            return Err(RawPendingError::ExceedsAdmission);
         }
         Ok(journal)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.occurrences.is_empty(), "empty pending journal");
+    fn validate(&self) -> Result<(), RawPendingError> {
+        if self.occurrences.is_empty() {
+            return Err(RawPendingError::EmptyJournal);
+        }
         for (position, entry) in self.occurrences.iter().enumerate() {
             if let Some(index) = entry.index {
-                anyhow::ensure!(
-                    self.occurrences[..position]
-                        .iter()
-                        .filter(|old| old.producer == entry.producer)
-                        .all(|old| old.index.is_some_and(|prior| prior < index)),
-                    "unordered pending producer occurrences"
-                );
-            } else {
-                anyhow::ensure!(
-                    self.occurrences
-                        .iter()
-                        .filter(|old| old.producer == entry.producer)
-                        .all(|old| old.index.is_none()),
-                    "mixed indexed and legacy producer occurrences"
-                );
+                if !self.occurrences[..position]
+                    .iter()
+                    .filter(|old| old.producer == entry.producer)
+                    .all(|old| old.index.is_some_and(|prior| prior < index))
+                {
+                    return Err(RawPendingError::UnorderedOccurrences);
+                }
+            } else if !self
+                .occurrences
+                .iter()
+                .filter(|old| old.producer == entry.producer)
+                .all(|old| old.index.is_none())
+            {
+                return Err(RawPendingError::MixedProducerOccurrences);
             }
         }
         Ok(())
     }
 
     #[inline(never)]
-    pub fn merge(&mut self, occurrence: Occurrence) -> anyhow::Result<()> {
+    pub fn merge(&mut self, occurrence: Occurrence) -> Result<(), RawPendingError> {
         // Slot identity is local to a producer group. An independent retry can
         // reuse its index while retaining a different SKDM carrier verbatim.
         let same_group = |old: &&Occurrence| old.producer == occurrence.producer;
@@ -258,28 +304,30 @@ impl PendingJournal {
                 .filter(|old| old.producer == occurrence.producer)
                 .find(|old| old.index == Some(index))
             {
-                anyhow::ensure!(
-                    existing.original == occurrence.original
-                        && existing.projection == occurrence.projection,
-                    "pending occurrence identity conflict"
-                );
+                if existing.original != occurrence.original
+                    || existing.projection != occurrence.projection
+                {
+                    return Err(RawPendingError::IdentityConflict);
+                }
                 return Ok(());
             }
-            anyhow::ensure!(
-                self.occurrences
-                    .iter()
-                    .filter(same_group)
-                    .all(|old| old.index.is_some()),
-                "legacy producer requires replay"
-            );
+            if !self
+                .occurrences
+                .iter()
+                .filter(same_group)
+                .all(|old| old.index.is_some())
+            {
+                return Err(RawPendingError::LegacyProducerRequiresReplay);
+            }
         } else {
-            anyhow::ensure!(
-                self.occurrences
-                    .iter()
-                    .filter(same_group)
-                    .all(|old| old.index.is_none()),
-                "mixed pending producer indices"
-            );
+            if !self
+                .occurrences
+                .iter()
+                .filter(same_group)
+                .all(|old| old.index.is_none())
+            {
+                return Err(RawPendingError::MixedProducerIndices);
+            }
             if self.occurrences.iter().filter(same_group).any(|old| {
                 old.original == occurrence.original && old.projection == occurrence.projection
             }) {
@@ -322,7 +370,7 @@ impl PendingJournal {
     }
 
     #[inline(never)]
-    fn matches_backing(&self, bytes: &Bytes) -> anyhow::Result<bool> {
+    fn matches_backing(&self, bytes: &Bytes) -> Result<bool, RawPendingError> {
         let mut cursor = Cursor {
             bytes: bytes.clone(),
             offset: MAGIC.len(),
@@ -357,7 +405,7 @@ impl PendingJournal {
     }
 
     #[inline(never)]
-    pub fn encode(&self) -> anyhow::Result<Bytes> {
+    pub fn encode(&self) -> Result<Bytes, RawPendingError> {
         self.validate()?;
         // A retry of the same physical occurrences needs the existing bytes,
         // not another row-sized allocation. Compare metadata and every slice
@@ -376,13 +424,14 @@ impl PendingJournal {
                 .checked_add(30)
                 .and_then(|n| n.checked_add(occurrence.original.len()))
                 .and_then(|n| n.checked_add(occurrence.projection.len()))
-                .ok_or_else(|| anyhow::anyhow!("pending journal size overflow"))?;
+                .ok_or(RawPendingError::SizeOverflow)?;
         }
-        anyhow::ensure!(
-            self.retained_size()
-                .is_some_and(|retained| retained <= MAX_PENDING_BYTES),
-            "pending journal backing and metadata exceed admission"
-        );
+        if !self
+            .retained_size()
+            .is_some_and(|retained| retained <= MAX_PENDING_BYTES)
+        {
+            return Err(RawPendingError::ExceedsAdmission);
+        }
         // Equal carrier/projection bytes share one stored slice. Admission
         // still uses the conservative unshared size, preserving its limit.
         let saved: usize = self
@@ -421,32 +470,32 @@ impl Cursor {
         self.bytes.len() - self.offset
     }
     #[inline(never)]
-    fn end(&self, count: usize) -> anyhow::Result<usize> {
+    fn end(&self, count: usize) -> Result<usize, RawPendingError> {
         self.offset
             .checked_add(count)
             .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| anyhow::anyhow!("truncated pending journal"))
+            .ok_or(RawPendingError::Truncated)
     }
     #[inline(never)]
-    fn take(&mut self, count: usize) -> anyhow::Result<Bytes> {
+    fn take(&mut self, count: usize) -> Result<Bytes, RawPendingError> {
         let end = self.end(count)?;
         let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(bytes)
     }
     #[inline(never)]
-    fn number(&mut self) -> anyhow::Result<usize> {
+    fn number(&mut self) -> Result<usize, RawPendingError> {
         let end = self.end(4)?;
         // Fixed-width metadata needs no owned Bytes slice or refcount bump.
         let number = u32::from_le_bytes(self.bytes[self.offset..end].try_into()?);
         self.offset = end;
         Ok(usize::try_from(number)?)
     }
-    fn blob(&mut self) -> anyhow::Result<Bytes> {
+    fn blob(&mut self) -> Result<Bytes, RawPendingError> {
         let length = self.number()?;
         self.take(length)
     }
-    fn projection(&mut self, original: &Bytes, compact: bool) -> anyhow::Result<Bytes> {
+    fn projection(&mut self, original: &Bytes, compact: bool) -> Result<Bytes, RawPendingError> {
         let length = self.number()?;
         if compact && length == u32::MAX as usize {
             Ok(original.clone())

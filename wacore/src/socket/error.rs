@@ -57,61 +57,91 @@ pub enum EncryptSendErrorKind {
     Poisoned,
 }
 
-#[derive(thiserror::Error)]
-#[error("{kind}: {}", crate::diagnostics::ErrorSummary(.source.as_ref()))]
 #[non_exhaustive]
 pub struct EncryptSendError {
-    pub kind: EncryptSendErrorKind,
-    #[source]
-    pub source: anyhow::Error,
+    // Keep successful send futures small; details are allocated only on failure.
+    inner: Box<EncryptSendErrorDetails>,
+}
+
+struct EncryptSendErrorDetails {
+    kind: EncryptSendErrorKind,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl EncryptSendError {
+    /// The layer or sender state that prevented sending.
+    pub fn kind(&self) -> &EncryptSendErrorKind {
+        &self.inner.kind
+    }
+
+    /// The original cause, including any transport adapter error.
+    pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.source.as_ref()
+    }
+}
+
+impl std::fmt::Display for EncryptSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {}",
+            self.kind(),
+            crate::diagnostics::ErrorSummary(self.cause())
+        )
+    }
+}
+
+impl std::error::Error for EncryptSendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause())
+    }
 }
 
 impl std::fmt::Debug for EncryptSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncryptSendError")
-            .field("kind", &self.kind)
-            .field(
-                "source",
-                &crate::diagnostics::ErrorSummary(self.source.as_ref()),
-            )
+            .field("kind", self.kind())
+            .field("source", &crate::diagnostics::ErrorSummary(self.cause()))
             .finish()
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SenderStateError {
+    #[error("sender task channel closed unexpectedly")]
+    ChannelClosed,
+    #[error("noise sender disabled after a transport failure; reconnect to rekey")]
+    Poisoned,
+}
+
 impl EncryptSendError {
-    pub fn crypto(source: impl Into<anyhow::Error>) -> Self {
+    fn new(kind: EncryptSendErrorKind, source: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self {
-            kind: EncryptSendErrorKind::Crypto,
-            source: source.into(),
+            inner: Box::new(EncryptSendErrorDetails { kind, source }),
         }
     }
 
-    pub fn framing(source: impl Into<anyhow::Error>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Framing,
-            source: source.into(),
-        }
+    pub fn crypto(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::new(EncryptSendErrorKind::Crypto, source.into())
     }
 
-    pub fn transport(source: impl Into<anyhow::Error>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Transport,
-            source: source.into(),
-        }
+    pub fn framing(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::new(EncryptSendErrorKind::Framing, source.into())
     }
 
-    pub fn join(source: impl Into<anyhow::Error>) -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Join,
-            source: source.into(),
-        }
+    pub fn transport(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::new(EncryptSendErrorKind::Transport, source.into())
+    }
+
+    pub fn join(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::new(EncryptSendErrorKind::Join, source.into())
     }
 
     pub fn channel_closed() -> Self {
-        Self {
-            kind: EncryptSendErrorKind::ChannelClosed,
-            source: anyhow::anyhow!("sender task channel closed unexpectedly"),
-        }
+        Self::new(
+            EncryptSendErrorKind::ChannelClosed,
+            Box::new(SenderStateError::ChannelClosed),
+        )
     }
 
     /// A transport write failed earlier on this connection, so the peer's view
@@ -122,12 +152,10 @@ impl EncryptSendError {
     /// plaintexts). The only safe recovery is a new connection with fresh
     /// handshake keys, so the sender refuses every later frame instead.
     pub fn poisoned() -> Self {
-        Self {
-            kind: EncryptSendErrorKind::Poisoned,
-            source: anyhow::anyhow!(
-                "noise sender disabled after a transport failure; reconnect to rekey"
-            ),
-        }
+        Self::new(
+            EncryptSendErrorKind::Poisoned,
+            Box::new(SenderStateError::Poisoned),
+        )
     }
 
     /// The transport is gone (broken pipe, closed connection, channel dropped)
@@ -135,7 +163,7 @@ impl EncryptSendError {
     /// the same way: stop retrying on this connection and reconnect.
     pub fn is_transport_unavailable(&self) -> bool {
         matches!(
-            self.kind,
+            self.kind(),
             EncryptSendErrorKind::Transport
                 | EncryptSendErrorKind::ChannelClosed
                 | EncryptSendErrorKind::Poisoned
@@ -169,12 +197,17 @@ mod tests {
     #[test]
     fn crypto_preserves_the_noise_error_type() {
         let err = EncryptSendError::crypto(NoiseError::Encrypt(CryptoProviderError::BackendFailed));
-        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Crypto));
         let src = std::error::Error::source(&err).expect("source preserved");
         let ne = src
             .downcast_ref::<NoiseError>()
             .expect("downcasts to NoiseError");
         assert!(matches!(ne, NoiseError::Encrypt(_)));
+    }
+
+    #[test]
+    fn send_error_is_one_pointer() {
+        assert_eq!(size_of::<EncryptSendError>(), size_of::<usize>());
     }
 
     #[test]

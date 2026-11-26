@@ -11,6 +11,10 @@ use std::time::Duration;
 use wacore::iq::mediaconn::MediaConnSpec;
 use wacore::time::Instant;
 
+#[derive(Debug, thiserror::Error)]
+#[error("media_conn refresh failed on a shared attempt: {0}")]
+struct SharedMediaConnError(String);
+
 /// Re-export protocol types from wacore.
 pub use wacore::iq::mediaconn::{HostType, MediaConnHost};
 
@@ -337,9 +341,7 @@ impl FailureClass {
             },
             // The predicates all answer false for these, leader or waiter
             // alike; the message keeps the cause readable.
-            Self::Other(message) => IqError::ParseError(anyhow::anyhow!(
-                "media_conn refresh failed on a shared attempt: {message}"
-            )),
+            Self::Other(message) => IqError::ParseError(Box::new(SharedMediaConnError(message))),
         }
     }
 }

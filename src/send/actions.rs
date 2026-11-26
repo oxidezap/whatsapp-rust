@@ -121,7 +121,7 @@ impl Client {
         message_id: String,
         revoke_type: RevokeType,
     ) -> Result<SendResult, SendError> {
-        self.require_pn().map_err(SendError::from_anyhow)?;
+        self.require_pn()?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
             RevokeType::Sender => {

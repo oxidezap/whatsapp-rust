@@ -146,6 +146,7 @@ impl BusinessProfileSpec {
 
 impl IqSpec for BusinessProfileSpec {
     type Response = Option<BusinessProfile>;
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -160,7 +161,7 @@ impl IqSpec for BusinessProfileSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let biz_node = match response.get_optional_child("business_profile") {
             Some(n) => n,
             None => return Ok(None),
@@ -563,12 +564,13 @@ impl BusinessProfileUpdateSpec {
 
 impl IqSpec for BusinessProfileUpdateSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         business_profile_mutation(self.nodes.clone())
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // The server acknowledges with a bare <iq type="result"/>; a non-result
         // type is already turned into an error before parsing.
         Ok(())
@@ -610,6 +612,7 @@ impl SetCoverPhotoSpec {
 
 impl IqSpec for SetCoverPhotoSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         business_profile_mutation(vec![
@@ -622,7 +625,7 @@ impl IqSpec for SetCoverPhotoSpec {
         ])
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -642,6 +645,7 @@ impl RemoveCoverPhotoSpec {
 
 impl IqSpec for RemoveCoverPhotoSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         business_profile_mutation(vec![
@@ -652,7 +656,7 @@ impl IqSpec for RemoveCoverPhotoSpec {
         ])
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -669,6 +673,7 @@ pub struct CatalogNonceRequestSpec;
 
 impl IqSpec for CatalogNonceRequestSpec {
     type Response = Option<CatalogNonceStatus>;
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get("fb:thrift_iq", Jid::new("", Server::Pn), None)
@@ -678,7 +683,7 @@ impl IqSpec for CatalogNonceRequestSpec {
         &[("smax_id", "118")]
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> anyhow::Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(response
             .get_optional_child("result")
             .and_then(|node| node.attrs().optional_string("status"))
@@ -690,6 +695,7 @@ pub struct CatalogTokenExchangeSpec<'a>(pub &'a str);
 
 impl IqSpec for CatalogTokenExchangeSpec<'_> {
     type Response = Option<std::sync::Arc<str>>;
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let parameters = NodeBuilder::new("parameters")
@@ -706,7 +712,7 @@ impl IqSpec for CatalogTokenExchangeSpec<'_> {
         &[("smax_id", "104")]
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> anyhow::Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(catalog_auth_content(response, "access_token").map(std::sync::Arc::from))
     }
 }

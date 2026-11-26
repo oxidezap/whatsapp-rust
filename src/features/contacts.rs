@@ -22,7 +22,7 @@ pub use wacore::stanza::business::VerifiedName;
 
 /// Error returned by contact-information operations (existence checks,
 /// profile pictures, user info).
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ContactError {
     /// The usync/profile IQ to the server failed.
@@ -34,6 +34,13 @@ pub enum ContactError {
     /// The username lookup could not be built from the given handle.
     #[error("{0}")]
     Username(#[from] UsernameLookupError),
+}
+
+impl std::fmt::Debug for ContactError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<(), ContactError> {

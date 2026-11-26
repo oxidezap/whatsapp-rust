@@ -1,10 +1,12 @@
 //! Public consumer checks for decoded IQ structure errors.
 
-use whatsapp_rust::anyhow::Context;
 use whatsapp_rust::features::GroupError;
 use whatsapp_rust::request::IqError;
 use whatsapp_rust::wacore::iq::{
-    newsletter::MyAddOnsSpec, node::IqParseError, passive::PassiveModeSpec, spec::IqSpec,
+    newsletter::{MyAddOnsSpec, NewsletterParseError},
+    node::IqParseError,
+    passive::{PassiveModeError, PassiveModeSpec},
+    spec::IqSpec,
 };
 use whatsapp_rust::{ErrorChainExt, NodeBuilder};
 
@@ -26,11 +28,15 @@ fn passive_response_requires_the_requested_child_and_keeps_its_name() {
         let error = PassiveModeSpec::new(passive)
             .parse_response(&response.as_node_ref())
             .unwrap_err();
-        assert!(matches!(error.downcast_ref::<IqParseError>(),
-            Some(IqParseError::MissingChild { tag }) if tag == expected));
+        assert!(matches!(&error,
+            PassiveModeError::Parse(IqParseError::MissingChild { tag }) if tag == expected));
         assert_eq!(error.to_string(), format!("<{expected}> child not found"));
 
-        let error = GroupError::Iq(IqError::ParseError(error.context("consumer operation")));
+        let error = GroupError::Iq(IqError::ParseError(
+            anyhow::Error::new(error)
+                .context("consumer operation")
+                .into_boxed_dyn_error(),
+        ));
         let recovered = error
             .sources()
             .find_map(|source| source.downcast_ref::<IqParseError>())
@@ -48,8 +54,8 @@ fn newsletter_missing_child_and_attribute_remain_distinct() {
     let error = spec
         .parse_response(&missing_child.as_node_ref())
         .unwrap_err();
-    assert!(matches!(error.downcast_ref::<IqParseError>(),
-        Some(IqParseError::MissingChild { tag }) if tag == "my_addons"));
+    assert!(matches!(error,
+        NewsletterParseError::Missing(IqParseError::MissingChild { tag }) if tag == "my_addons"));
 
     let missing_attribute = NodeBuilder::new("iq")
         .children([NodeBuilder::new("my_addons")
@@ -60,16 +66,16 @@ fn newsletter_missing_child_and_attribute_remain_distinct() {
         .build();
     let error = spec
         .parse_response(&missing_attribute.as_node_ref())
-        .context("reading newsletter add-ons")
         .unwrap_err();
-    assert!(matches!(error.downcast_ref::<IqParseError>(),
-        Some(IqParseError::MissingAttribute { name }) if name == "jid"));
+    assert!(matches!(&error,
+        NewsletterParseError::Missing(IqParseError::MissingAttribute { name }) if name == "jid"));
+    let error = anyhow::Error::new(error).context("reading newsletter add-ons");
     assert_eq!(
         error.root_cause().to_string(),
         "missing required attribute jid"
     );
     assert!(!format!("{error:?}").contains("fixture-secret-must-not-appear"));
-    let error = IqError::ParseError(error);
+    let error = IqError::ParseError(error.into_boxed_dyn_error());
     assert!(
         error
             .sources()

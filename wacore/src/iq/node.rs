@@ -5,22 +5,20 @@ use wacore_binary::{NodeContentRef, NodeRef};
 
 /// Missing structure in a decoded IQ response.
 ///
-/// The IQ parsers keep their `anyhow::Error` return type; callers can recover
-/// this error by downcasting, including through additional context. It records
-/// only the expected field name, never attribute values or response contents.
+/// This records only the expected field name, never attribute values or response contents.
 /// This is not a server rejection or a failure to decode the binary stanza.
 /// It covers the required-node helpers, not every IQ parser failure.
 ///
 /// ```
-/// use wacore::iq::{node::IqParseError, passive::PassiveModeSpec, spec::IqSpec};
+/// use wacore::iq::{node::IqParseError, passive::{PassiveModeError, PassiveModeSpec}, spec::IqSpec};
 /// use wacore_binary::builder::NodeBuilder;
 ///
 /// let response = NodeBuilder::new("iq").attr("type", "result").build();
 /// let error = PassiveModeSpec::new(true)
 ///     .parse_response(&response.as_node_ref())
 ///     .unwrap_err();
-/// assert!(matches!(error.downcast_ref::<IqParseError>(),
-///     Some(IqParseError::MissingChild { tag }) if tag == "passive"));
+/// assert!(matches!(error,
+///     PassiveModeError::Parse(IqParseError::MissingChild { tag }) if tag == "passive"));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -37,13 +35,11 @@ pub enum IqParseError {
 pub(crate) fn required_child<'a>(
     node: &'a NodeRef<'_>,
     tag: &str,
-) -> Result<&'a NodeRef<'a>, anyhow::Error> {
-    node.get_optional_child(tag).ok_or_else(|| {
-        IqParseError::MissingChild {
+) -> Result<&'a NodeRef<'a>, IqParseError> {
+    node.get_optional_child(tag)
+        .ok_or_else(|| IqParseError::MissingChild {
             tag: tag.to_owned(),
-        }
-        .into()
-    })
+        })
 }
 
 /// Get an optional child node by tag from a `NodeRef`.
@@ -52,13 +48,12 @@ pub(crate) fn optional_child<'a>(node: &'a NodeRef<'_>, tag: &str) -> Option<&'a
 }
 
 /// Get a required string attribute from a `NodeRef`.
-pub(crate) fn required_attr(node: &NodeRef<'_>, key: &str) -> Result<String, anyhow::Error> {
-    node.get_attr(key).map(|v| v.to_string()).ok_or_else(|| {
-        IqParseError::MissingAttribute {
+pub(crate) fn required_attr(node: &NodeRef<'_>, key: &str) -> Result<String, IqParseError> {
+    node.get_attr(key)
+        .map(|v| v.to_string())
+        .ok_or_else(|| IqParseError::MissingAttribute {
             name: key.to_owned(),
-        }
-        .into()
-    })
+        })
 }
 
 /// Get an optional string attribute from a `NodeRef`.
@@ -70,9 +65,9 @@ pub(crate) fn optional_attr<'a>(node: &'a NodeRef<'_>, key: &str) -> Option<Cow<
 pub(crate) fn collect_children<T: ProtocolNode>(
     node: &NodeRef<'_>,
     tag: &str,
-) -> Result<Vec<T>, anyhow::Error> {
+) -> Result<Vec<T>, T::Error> {
     node.get_children_by_tag(tag)
-        .map(|child| T::try_from_node_ref(child))
+        .map(T::try_from_node_ref)
         .collect()
 }
 

@@ -111,7 +111,7 @@ impl Assertion {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PasskeyError {
     #[error("no passkey registered for this account on the authenticator")]
@@ -124,6 +124,13 @@ pub enum PasskeyError {
     Backend(String),
     #[error("passkey linking flow error: {0}")]
     Flow(String),
+}
+
+impl std::fmt::Debug for PasskeyError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Produces a WebAuthn assertion for a SHORTCAKE_PASSKEY link. Implemented by a

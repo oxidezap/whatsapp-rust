@@ -20,9 +20,11 @@ fn serialization_attribute(text: &str) -> bool {
 }
 
 pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
+    let actual_entries: BTreeSet<_> = actual.iter().map(|line| line.trim_end()).collect();
     let missing: Vec<_> = expected
         .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !actual.contains(*l))
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !actual_entries.contains(l))
         .collect();
     // Attribute entries are separate so existing snapshots stay readable.
     // A new attribute on a retained field can change serialization, even
@@ -44,7 +46,7 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
                 .map(|(owner, _)| owner)
         })
         .collect();
-    let expected_entries: BTreeSet<_> = expected.lines().collect();
+    let expected_entries: BTreeSet<_> = expected.lines().map(str::trim_end).collect();
     let added_attributes: Vec<_> = actual
         .iter()
         .filter(|line| {

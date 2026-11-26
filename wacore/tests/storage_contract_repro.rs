@@ -376,7 +376,7 @@ use wacore::appstate::{
     encode_record, expand_app_state_keys,
     patch_decode::{PatchList, WAPatchName},
 };
-use wacore::appstate_sync::{AppStateProcessor, CommittedMutationsError};
+use wacore::appstate_sync::{AppStateProcessingErrorKind, AppStateProcessor};
 use waproto::whatsapp as wa;
 
 fn processor(p: Arc<Probe>) -> AppStateProcessor {
@@ -477,7 +477,10 @@ async fn legacy_commit_failure_leaves_cursor_ahead_and_restart_cannot_replay() {
                 .contains(&format!("injected write {fail_at}")),
             "{err:#}"
         );
-        assert!(err.downcast_ref::<CommittedMutationsError>().is_none());
+        assert!(!matches!(
+            err.kind(),
+            AppStateProcessingErrorKind::CommittedMutations(_)
+        ));
         let held = p.get_version("regular").await.unwrap().unwrap();
         assert_eq!(held.version, if fail_at == 1 { 1 } else { 2 });
         assert_eq!(
@@ -555,14 +558,16 @@ async fn legacy_commit_failure_preserves_earlier_result_but_persisted_cursor_can
         .process_patch_list(list(vec![second, third]), true)
         .await
         .unwrap_err();
-    let committed = err.downcast::<CommittedMutationsError>().unwrap();
+    let AppStateProcessingErrorKind::CommittedMutations(committed) = err.into_kind() else {
+        panic!("expected committed mutations");
+    };
     let (mutations, state, collection, cause) = committed.into_parts();
     assert_eq!(mutations.len(), 2);
     assert_eq!(state.version, 2);
     assert_eq!(collection, WAPatchName::Regular);
     assert!(matches!(
-        cause.downcast_ref::<StoreError>(),
-        Some(StoreError::Validation(_))
+        cause.kind(),
+        AppStateProcessingErrorKind::Store(StoreError::Validation(_))
     ));
     assert!(cause.to_string().contains("injected write 5"));
     assert_eq!(
@@ -632,8 +637,8 @@ async fn atomic_commit_failure_keeps_cursor_and_macs_replayable_after_restart() 
             .await
             .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<StoreError>(),
-            Some(StoreError::Validation(_))
+            error.kind(),
+            AppStateProcessingErrorKind::Store(StoreError::Validation(_))
         ));
         let held = p.get_version("regular").await.unwrap().unwrap();
         assert_eq!(held.version, before.version);
@@ -698,16 +703,16 @@ async fn atomic_commit_error_reports_exactly_the_persisted_partial_result() {
         .process_patch_list(list(vec![second, third.clone()]), true)
         .await
         .unwrap_err();
-    let (mutations, committed, collection, cause) = error
-        .downcast::<CommittedMutationsError>()
-        .unwrap()
-        .into_parts();
+    let AppStateProcessingErrorKind::CommittedMutations(committed) = error.into_kind() else {
+        panic!("expected committed mutations");
+    };
+    let (mutations, committed, collection, cause) = committed.into_parts();
     assert_eq!(mutations.len(), 2);
     assert_eq!(committed.version, 2);
     assert_eq!(collection, WAPatchName::Regular);
     assert!(matches!(
-        cause.downcast_ref::<StoreError>(),
-        Some(StoreError::Validation(_))
+        cause.kind(),
+        AppStateProcessingErrorKind::Store(StoreError::Validation(_))
     ));
     let held = p.get_version("regular").await.unwrap().unwrap();
     assert_eq!(held.version, committed.version);
@@ -735,10 +740,13 @@ async fn atomic_post_commit_error_still_requires_delivery_recovery() {
         .process_patch_list(list(vec![second.clone()]), true)
         .await
         .unwrap_err();
-    assert!(error.downcast_ref::<CommittedMutationsError>().is_none());
+    assert!(!matches!(
+        error.kind(),
+        AppStateProcessingErrorKind::CommittedMutations(_)
+    ));
     assert!(matches!(
-        error.downcast_ref::<StoreError>(),
-        Some(StoreError::Validation(_))
+        error.kind(),
+        AppStateProcessingErrorKind::Store(StoreError::Validation(_))
     ));
     assert_eq!(p.get_version("regular").await.unwrap().unwrap().version, 2);
     assert!(

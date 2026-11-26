@@ -1018,10 +1018,10 @@ mod tests {
             async fn on_notification(
                 &self,
                 _: Arc<wacore_binary::OwnedNodeRef>,
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 self.0
                     .fetch_add((MAX_MESSAGE_DELAY_MS + 1) * 1_000_000, Ordering::AcqRel);
-                anyhow::bail!("synthetic capture failure after a long wait");
+                Err("synthetic capture failure after a long wait".into())
             }
         }
         let clock = Arc::new(AtomicU64::new(0));

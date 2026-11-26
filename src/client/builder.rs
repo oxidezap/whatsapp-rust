@@ -79,7 +79,7 @@ impl ClientBuild {
 }
 
 /// A validated client-construction failure.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ClientBuilderError {
     #[error("invalid mobile session configuration: {0}")]
@@ -129,15 +129,22 @@ pub enum ClientBuilderError {
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     #[error("client lifecycle installation failed: {0}")]
-    LifecycleInstall(#[source] anyhow::Error),
+    LifecycleInstall(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("plugin host installation failed: {0}")]
-    PluginInstall(#[source] anyhow::Error),
+    PluginInstall(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("invalid plugin plan: {0}")]
     PluginPlan(#[from] PluginPlanError),
+}
+
+impl std::fmt::Debug for ClientBuilderError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Shared runtime, cache and sync configuration for both construction facades.
@@ -963,13 +970,13 @@ impl ClientBuilder {
                 client.shutdown_lifecycle().await;
                 #[cfg(feature = "plugins")]
                 if client.plugin_host.is_some() {
-                    return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
-                        "client shutdown raced plugin publication"
-                    )));
+                    return Err(ClientBuilderError::PluginInstall(
+                        "client shutdown raced plugin publication".into(),
+                    ));
                 }
-                return Err(ClientBuilderError::LifecycleInstall(anyhow::anyhow!(
-                    "client shutdown raced lifecycle activation"
-                )));
+                return Err(ClientBuilderError::LifecycleInstall(
+                    "client shutdown raced lifecycle activation".into(),
+                ));
             }
         }
         #[cfg(feature = "client-lifecycle")]
@@ -1254,7 +1261,7 @@ mod tests {
                 Arc<dyn crate::transport::Transport>,
                 async_channel::Receiver<crate::transport::TransportEvent>,
             ),
-            anyhow::Error,
+            crate::transport::TransportError,
         > {
             self.started
                 .send(())
@@ -1264,7 +1271,7 @@ mod tests {
                 .recv()
                 .await
                 .map_err(|_| anyhow::anyhow!("transport release closed"))?;
-            Err(anyhow::anyhow!("injected transport stop"))
+            Err("injected transport stop".into())
         }
     }
 
@@ -1273,7 +1280,10 @@ mod tests {
         fn install<'a>(
             &'a self,
             client: std::sync::Weak<Client>,
-        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+        ) -> wacore::runtime::BoxFuture<
+            'a,
+            Result<(), crate::client::extension_lifecycle::LifecycleError>,
+        > {
             Box::pin(async move {
                 let client = client
                     .upgrade()
@@ -1305,7 +1315,10 @@ mod tests {
         fn install<'a>(
             &'a self,
             client: std::sync::Weak<Client>,
-        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+        ) -> wacore::runtime::BoxFuture<
+            'a,
+            Result<(), crate::client::extension_lifecycle::LifecycleError>,
+        > {
             Box::pin(async move {
                 let client = client
                     .upgrade()
@@ -1339,14 +1352,17 @@ mod tests {
         fn install<'a>(
             &'a self,
             client: std::sync::Weak<Client>,
-        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+        ) -> wacore::runtime::BoxFuture<
+            'a,
+            Result<(), crate::client::extension_lifecycle::LifecycleError>,
+        > {
             Box::pin(async move {
                 assert_eq!(self.spawns.load(Ordering::SeqCst), 0);
                 *self
                     .installed_client
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client);
-                Err(anyhow::anyhow!("injected install failure"))
+                Err("injected install failure".into())
             })
         }
     }
@@ -1552,7 +1568,7 @@ mod tests {
             _: &str,
             _: Option<waproto::whatsapp::message::HistorySyncType>,
             _: &[u8],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -1566,7 +1582,7 @@ mod tests {
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
             _: &[u8],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
 
@@ -1575,7 +1591,7 @@ mod tests {
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
             _: &[u8],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -1632,7 +1648,7 @@ mod tests {
             &self,
             _: Arc<Client>,
             _: &[crate::types::events::InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -2274,7 +2290,10 @@ mod tests {
         fn install(
             &self,
             _client: std::sync::Weak<Client>,
-        ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<()>> {
+        ) -> wacore::runtime::BoxFuture<
+            '_,
+            Result<(), crate::client::extension_lifecycle::LifecycleError>,
+        > {
             if !self.when_polled {
                 panic!("injected synchronous install panic");
             }

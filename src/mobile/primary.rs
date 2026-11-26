@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_COMPANIONS: usize = 128;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum PrimaryManagementError {
     #[error("invalid primary operation: {0}")]
@@ -26,14 +26,21 @@ pub enum PrimaryManagementError {
     #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
     #[error("primary protocol operation failed")]
-    Protocol(#[source] anyhow::Error),
+    Protocol(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("invalid primary journal")]
     Journal(#[from] serde_json::Error),
 }
 
+impl std::fmt::Debug for PrimaryManagementError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl PrimaryManagementError {
-    fn protocol(error: impl Into<anyhow::Error>) -> Self {
-        Self::Protocol(error.into())
+    fn protocol<E: std::error::Error + Send + Sync + 'static>(error: E) -> Self {
+        Self::Protocol(Box::new(error))
     }
 }
 
@@ -2843,7 +2850,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl crate::transport::Transport for FailCheckpointAfterWrite {
-        async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+        async fn send(&self, data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             crate::transport::Transport::send(self.inner.as_ref(), data).await?;
             // Arm storage failure synchronously after the real Noise frame was
             // accepted, before the sender can checkpoint its completed dispatch.

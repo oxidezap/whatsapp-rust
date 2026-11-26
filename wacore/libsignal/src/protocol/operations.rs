@@ -120,13 +120,12 @@ pub async fn message_encrypt<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Si
     sessions: &mut S,
     identities: &mut I,
 ) -> Result<CiphertextMessage> {
-    message_encrypt_using(
-        engine::RustCrypto,
+    message_encrypt_with_provider(
+        &crate::crypto::RustCryptoProvider,
         plaintext,
         address,
         sessions,
         identities,
-        parse_encrypted_message,
     )
     .await
 }
@@ -143,7 +142,7 @@ pub async fn message_encrypt_with_provider<
     identities: &mut I,
 ) -> Result<CiphertextMessage> {
     message_encrypt_using(
-        crate::crypto::ProviderCrypto::new(provider),
+        provider,
         plaintext,
         address,
         sessions,
@@ -171,13 +170,12 @@ pub async fn message_encrypt_serialized<S: SessionStore + ?Sized, I: IdentityKey
     sessions: &mut S,
     identities: &mut I,
 ) -> Result<SerializedCiphertext> {
-    message_encrypt_using(
-        engine::RustCrypto,
+    message_encrypt_serialized_with_provider(
+        &crate::crypto::RustCryptoProvider,
         plaintext,
         address,
         sessions,
         identities,
-        SerializedCiphertext::from_pairwise,
     )
     .await
 }
@@ -193,7 +191,7 @@ pub async fn message_encrypt_serialized_with_provider<
     identities: &mut I,
 ) -> Result<SerializedCiphertext> {
     message_encrypt_using(
-        crate::crypto::ProviderCrypto::new(provider),
+        provider,
         plaintext,
         address,
         sessions,
@@ -203,19 +201,15 @@ pub async fn message_encrypt_serialized_with_provider<
     .await
 }
 #[allow(clippy::too_many_arguments)]
-async fn message_encrypt_using<
-    C: engine::CryptoProvider,
-    S: SessionStore + ?Sized,
-    I: IdentityKeyStore + ?Sized,
-    T,
->(
-    crypto: C,
+async fn message_encrypt_using<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Sized, T>(
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     plaintext: &[u8],
     address: &ProtocolAddress,
     sessions: &mut S,
     identities: &mut I,
     finish: impl FnOnce(Vec<u8>, bool) -> Result<T>,
 ) -> Result<T> {
+    let crypto = crate::crypto::ProviderCrypto::new(provider);
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
@@ -283,8 +277,8 @@ pub async fn message_decrypt<
     rng: &mut R,
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    message_decrypt_using(
-        engine::RustCrypto,
+    message_decrypt_with_provider(
+        &crate::crypto::RustCryptoProvider,
         message,
         address,
         sessions,
@@ -316,28 +310,19 @@ pub async fn message_decrypt_with_provider<
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
     message_decrypt_using(
-        crate::crypto::ProviderCrypto::new(provider),
-        message,
-        address,
-        sessions,
-        identities,
-        prekeys,
-        signed,
-        rng,
-        pq,
+        provider, message, address, sessions, identities, prekeys, signed, rng, pq,
     )
     .await
 }
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_using<
-    C: engine::CryptoProvider,
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
     P: PreKeyStore + ?Sized,
     K: SignedPreKeyStore + ?Sized,
     R: rand::Rng + rand::CryptoRng,
 >(
-    crypto: C,
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     message: &CiphertextMessage,
     address: &ProtocolAddress,
     sessions: &mut S,
@@ -354,11 +339,12 @@ async fn message_decrypt_using<
     }
     match message {
         CiphertextMessage::SignalMessage(message) => {
-            message_decrypt_signal_using(crypto, message, address, sessions, identities, rng).await
+            message_decrypt_signal_using(provider, message, address, sessions, identities, rng)
+                .await
         }
         CiphertextMessage::PreKeySignalMessage(message) => {
             message_decrypt_prekey_using(
-                crypto, message, address, sessions, identities, prekeys, signed, rng, pq,
+                provider, message, address, sessions, identities, prekeys, signed, rng, pq,
             )
             .await
         }
@@ -385,8 +371,8 @@ pub async fn message_decrypt_owned<
     rng: &mut R,
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    message_decrypt_owned_using(
-        engine::RustCrypto,
+    message_decrypt_owned_with_provider(
+        &crate::crypto::RustCryptoProvider,
         message,
         address,
         sessions,
@@ -418,28 +404,19 @@ pub async fn message_decrypt_owned_with_provider<
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
     message_decrypt_owned_using(
-        crate::crypto::ProviderCrypto::new(provider),
-        message,
-        address,
-        sessions,
-        identities,
-        prekeys,
-        signed,
-        rng,
-        pq,
+        provider, message, address, sessions, identities, prekeys, signed, rng, pq,
     )
     .await
 }
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_owned_using<
-    C: engine::CryptoProvider,
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
     P: PreKeyStore + ?Sized,
     K: SignedPreKeyStore + ?Sized,
     R: rand::Rng + rand::CryptoRng,
 >(
-    crypto: C,
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     message: &mut OwnedCiphertextMessage,
     address: &ProtocolAddress,
     sessions: &mut S,
@@ -453,7 +430,7 @@ async fn message_decrypt_owned_using<
         SignalProtocolError::InvalidState("decrypt", "ciphertext consumed".into())
     })?;
     let result = message_decrypt_using(
-        crypto, retained, address, sessions, identities, prekeys, signed, rng, pq,
+        provider, retained, address, sessions, identities, prekeys, signed, rng, pq,
     )
     .await;
     if result.is_ok() {
@@ -517,13 +494,12 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: rand::Rng + rand::Cryp
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<SenderKeyMessage> {
-    group_encrypt_using(
-        std::convert::identity,
+    group_encrypt_with_provider(
+        &crate::crypto::RustCryptoProvider,
         store,
         name,
         plaintext,
         rng,
-        parse_sender_key_message,
     )
     .await
 }
@@ -540,7 +516,7 @@ pub async fn group_encrypt_with_provider<
     rng: &mut R,
 ) -> Result<SenderKeyMessage> {
     group_encrypt_using(
-        |crypto| crate::crypto::ProviderCrypto::with_crypto(crypto, provider),
+        provider,
         store,
         name,
         plaintext,
@@ -564,13 +540,12 @@ pub async fn group_encrypt_serialized<
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<SerializedCiphertext> {
-    group_encrypt_using(
-        std::convert::identity,
+    group_encrypt_serialized_with_provider(
+        &crate::crypto::RustCryptoProvider,
         store,
         name,
         plaintext,
         rng,
-        SerializedCiphertext::from_sender_key,
     )
     .await
 }
@@ -587,7 +562,7 @@ pub async fn group_encrypt_serialized_with_provider<
     rng: &mut R,
 ) -> Result<SerializedCiphertext> {
     group_encrypt_using(
-        |crypto| crate::crypto::ProviderCrypto::with_crypto(crypto, provider),
+        provider,
         store,
         name,
         plaintext,
@@ -597,14 +572,8 @@ pub async fn group_encrypt_serialized_with_provider<
     .await
 }
 #[allow(clippy::too_many_arguments)]
-async fn group_encrypt_using<
-    C: engine::CryptoProvider,
-    F: FnOnce(group_crypto::PreparedGroupProvider) -> C,
-    S: SenderKeyStore + ?Sized,
-    R: rand::Rng + rand::CryptoRng,
-    T,
->(
-    prepare: F,
+async fn group_encrypt_using<S: SenderKeyStore + ?Sized, R: rand::Rng + rand::CryptoRng, T>(
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     store: &mut S,
     name: &SenderKeyName,
     plaintext: &[u8],
@@ -638,7 +607,8 @@ async fn group_encrypt_using<
     record.inner.reservation.mark_committed();
     let bytes = {
         let mut random = RandomAdapter(rng);
-        let crypto = prepare(record.prepared_signer(0)?);
+        let crypto =
+            crate::crypto::ProviderCrypto::with_crypto(record.prepared_signer(0)?, provider);
         engine::Engine::new(&crypto, &mut random)
             .encrypt_sender_key(&mut record.inner, plaintext)?
     };
@@ -653,7 +623,8 @@ pub async fn group_decrypt_shared<S: SenderKeyStore + ?Sized>(
     store: &mut S,
     name: &SenderKeyName,
 ) -> Result<Vec<u8>> {
-    group_decrypt_shared_using(std::convert::identity, ciphertext, store, name).await
+    group_decrypt_shared_with_provider(&crate::crypto::RustCryptoProvider, ciphertext, store, name)
+        .await
 }
 /// Run this operation with a caller-owned symmetric crypto backend.
 #[allow(clippy::too_many_arguments)]
@@ -663,21 +634,11 @@ pub async fn group_decrypt_shared_with_provider<S: SenderKeyStore + ?Sized>(
     store: &mut S,
     name: &SenderKeyName,
 ) -> Result<Vec<u8>> {
-    group_decrypt_shared_using(
-        |crypto| crate::crypto::ProviderCrypto::with_crypto(crypto, provider),
-        ciphertext,
-        store,
-        name,
-    )
-    .await
+    group_decrypt_shared_using(provider, ciphertext, store, name).await
 }
 #[allow(clippy::too_many_arguments)]
-async fn group_decrypt_shared_using<
-    C: engine::CryptoProvider,
-    F: FnOnce(group_crypto::PreparedGroupProvider) -> C,
-    S: SenderKeyStore + ?Sized,
->(
-    prepare: F,
+async fn group_decrypt_shared_using<S: SenderKeyStore + ?Sized>(
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     ciphertext: bytes::Bytes,
     store: &mut S,
     name: &SenderKeyName,
@@ -694,7 +655,8 @@ async fn group_decrypt_shared_using<
         .position(|state| state.id == message.chain_id())
         .ok_or_else(|| SignalProtocolError::NoSenderKeyState(name.to_string()))?;
     let plaintext = {
-        let crypto = prepare(record.prepared_verifier(index)?);
+        let crypto =
+            crate::crypto::ProviderCrypto::with_crypto(record.prepared_verifier(index)?, provider);
         engine::Engine::new(&crypto, &mut NoRandomSource)
             .decrypt_sender_key(&mut record.inner, &message.bytes)
             .map_err(|error| match error {
@@ -734,8 +696,8 @@ pub async fn message_decrypt_signal<
     identities: &mut I,
     rng: &mut R,
 ) -> Result<DecryptionResult> {
-    message_decrypt_signal_using(
-        engine::RustCrypto,
+    message_decrypt_signal_with_provider(
+        &crate::crypto::RustCryptoProvider,
         message,
         address,
         sessions,
@@ -758,30 +720,22 @@ pub async fn message_decrypt_signal_with_provider<
     identities: &mut I,
     rng: &mut R,
 ) -> Result<DecryptionResult> {
-    message_decrypt_signal_using(
-        crate::crypto::ProviderCrypto::new(provider),
-        message,
-        address,
-        sessions,
-        identities,
-        rng,
-    )
-    .await
+    message_decrypt_signal_using(provider, message, address, sessions, identities, rng).await
 }
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_signal_using<
-    C: engine::CryptoProvider,
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
     R: rand::Rng + rand::CryptoRng,
 >(
-    crypto: C,
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     message: &SignalMessage,
     address: &ProtocolAddress,
     sessions: &mut S,
     identities: &mut I,
     rng: &mut R,
 ) -> Result<DecryptionResult> {
+    let crypto = crate::crypto::ProviderCrypto::new(provider);
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
@@ -820,8 +774,8 @@ pub async fn message_decrypt_prekey<
     rng: &mut R,
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    message_decrypt_prekey_using(
-        engine::RustCrypto,
+    message_decrypt_prekey_with_provider(
+        &crate::crypto::RustCryptoProvider,
         message,
         address,
         sessions,
@@ -853,15 +807,7 @@ pub async fn message_decrypt_prekey_with_provider<
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
     message_decrypt_prekey_using(
-        crate::crypto::ProviderCrypto::new(provider),
-        message,
-        address,
-        sessions,
-        identities,
-        prekeys,
-        signed,
-        rng,
-        pq,
+        provider, message, address, sessions, identities, prekeys, signed, rng, pq,
     )
     .await
 }
@@ -904,14 +850,13 @@ fn decrypt_existing_prekey<C: engine::CryptoProvider, R: RandomSource>(
 
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_prekey_using<
-    C: engine::CryptoProvider,
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
     P: PreKeyStore + ?Sized,
     K: SignedPreKeyStore + ?Sized,
     R: rand::Rng + rand::CryptoRng,
 >(
-    crypto: C,
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
     message: &PreKeySignalMessage,
     address: &ProtocolAddress,
     sessions: &mut S,
@@ -921,6 +866,7 @@ async fn message_decrypt_prekey_using<
     rng: &mut R,
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
+    let crypto = crate::crypto::ProviderCrypto::new(provider);
     if pq == UsePQRatchet::Yes {
         return Err(SignalProtocolError::InvalidArgument(
             "post-quantum ratchet unsupported".into(),

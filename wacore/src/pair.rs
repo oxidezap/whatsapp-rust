@@ -23,7 +23,74 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct PairCryptoError {
     pub code: u16,
     pub text: &'static str,
-    pub source: anyhow::Error,
+    pub source: PairCryptoCause,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PairCryptoCause {
+    #[error("{0}")]
+    Decode(#[from] waproto::protobuf::DecodeError),
+    #[error("{0}")]
+    Curve(#[from] crate::libsignal::core::CurveError),
+    #[error("{0}")]
+    HmacInit(hmac::digest::InvalidLength),
+    #[error("HMAC container missing details")]
+    MissingHmacDetails,
+    #[error("HMAC container missing hmac")]
+    MissingHmac,
+    #[error("ADV signed-device-identity HMAC verification failed")]
+    HmacMismatch,
+    #[error("ADVSignedDeviceIdentity missing details")]
+    MissingIdentityDetails,
+    #[error("libsignal signature verification failed")]
+    SignatureMismatch,
+    #[error("ADVDeviceIdentity missing key_index")]
+    MissingKeyIndex,
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PairQrError {
+    #[error("Invalid QR code format: expected at least 4 comma-separated fields, got {0}")]
+    TooFewFields(usize),
+    #[error("Invalid QR code format: all comma-separated fields must be non-empty")]
+    EmptyField,
+    #[error("Invalid QR noise public key base64: {0}")]
+    NoiseBase64(base64::DecodeError),
+    #[error("Invalid QR identity public key base64: {0}")]
+    IdentityBase64(base64::DecodeError),
+    #[error("Invalid noise public key length")]
+    NoiseLength,
+    #[error("Invalid identity public key length")]
+    IdentityLength,
+}
+
+impl std::fmt::Debug for PairQrError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum MasterPairingError {
+    #[error("Failed to init HMAC for master pairing: {0}")]
+    HmacInit(hmac::digest::InvalidLength),
+    #[error("{0}")]
+    Curve(#[from] crate::libsignal::core::CurveError),
+    #[error("HKDF expand failed")]
+    KeyDerivation,
+    #[error("AES-GCM encryption failed: {0}")]
+    Encryption(#[source] crate::libsignal::crypto::CryptoProviderError),
+}
+
+impl std::fmt::Debug for MasterPairingError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for PairCryptoError {
@@ -36,7 +103,11 @@ impl std::fmt::Display for PairCryptoError {
     }
 }
 
-impl std::error::Error for PairCryptoError {}
+impl std::error::Error for PairCryptoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Device state needed for pairing operations
 pub struct DeviceState {
@@ -205,25 +276,19 @@ impl PairUtils {
                 PairCryptoError {
                     code: 500,
                     text: "internal-error",
-                    source: e.into(),
+                    source: PairCryptoCause::HmacInit(e),
                 }
             })?;
-        let details_bytes = hmac_container
-            .details
-            .as_deref()
-            .ok_or_else(|| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: anyhow::anyhow!("HMAC container missing details"),
-            })?;
-        let hmac_bytes = hmac_container
-            .hmac
-            .as_deref()
-            .ok_or_else(|| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: anyhow::anyhow!("HMAC container missing hmac"),
-            })?;
+        let details_bytes = hmac_container.details.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingHmacDetails,
+        })?;
+        let hmac_bytes = hmac_container.hmac.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingHmac,
+        })?;
 
         if is_hosted_account {
             mac.update(&ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE);
@@ -236,7 +301,7 @@ impl PairUtils {
         mac.verify_slice(hmac_bytes).map_err(|_| PairCryptoError {
             code: 401,
             text: "hmac-mismatch",
-            source: anyhow::anyhow!("ADV signed-device-identity HMAC verification failed"),
+            source: PairCryptoCause::HmacMismatch,
         })?;
 
         let mut signed_identity = waproto::codec::adv_signed_device_identity_decode(details_bytes)
@@ -254,15 +319,11 @@ impl PairUtils {
             .account_signature
             .as_deref()
             .unwrap_or_default();
-        let inner_details_bytes =
-            signed_identity
-                .details
-                .as_deref()
-                .ok_or_else(|| PairCryptoError {
-                    code: 500,
-                    text: "internal-error",
-                    source: anyhow::anyhow!("ADVSignedDeviceIdentity missing details"),
-                })?;
+        let inner_details_bytes = signed_identity.details.as_deref().ok_or(PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: PairCryptoCause::MissingIdentityDetails,
+        })?;
         let identity_details = waproto::codec::adv_device_identity_decode(inner_details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
@@ -287,14 +348,14 @@ impl PairUtils {
             return Err(PairCryptoError {
                 code: 401,
                 text: "signature-mismatch",
-                source: anyhow::anyhow!("libsignal signature verification failed"),
+                source: PairCryptoCause::SignatureMismatch,
             });
         }
 
-        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+        let key_index = identity_details.key_index.ok_or(PairCryptoError {
             code: 500,
             text: "internal-error",
-            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+            source: PairCryptoCause::MissingKeyIndex,
         })?;
 
         // WAWebAdvSignatureApi.generateDeviceSignature always signs a regular companion.
@@ -342,16 +403,13 @@ impl PairUtils {
     /// `https://wa.me/settings/linked_devices#` prefix, trailing FAQ URL,
     /// or any combination (used by e2e replay; WA Web only emits one shape
     /// at a time).
-    pub fn parse_qr_code(qr_code: &str) -> Result<(String, [u8; 32], [u8; 32]), anyhow::Error> {
+    pub fn parse_qr_code(qr_code: &str) -> Result<(String, [u8; 32], [u8; 32]), PairQrError> {
         let body = qr_code
             .strip_prefix(crate::companion_reg::NATIVE_CAMERA_DEEP_LINK_PREFIX)
             .unwrap_or(qr_code);
         let parts: Vec<&str> = body.split(',').collect();
         if parts.len() < 4 {
-            return Err(anyhow::anyhow!(
-                "Invalid QR code format: expected at least 4 comma-separated fields, got {}",
-                parts.len()
-            ));
+            return Err(PairQrError::TooFewFields(parts.len()));
         }
         let pairing_ref = parts[0].to_string();
         let dut_noise_pub_b64 = parts[1];
@@ -362,23 +420,21 @@ impl PairUtils {
             || parts[3].is_empty()
             || parts.iter().skip(4).any(|p| p.is_empty())
         {
-            return Err(anyhow::anyhow!(
-                "Invalid QR code format: all comma-separated fields must be non-empty"
-            ));
+            return Err(PairQrError::EmptyField);
         }
         let dut_noise_pub_bytes = BASE64_STANDARD
             .decode(dut_noise_pub_b64)
-            .map_err(|e| anyhow::anyhow!("Invalid QR noise public key base64: {e}"))?;
+            .map_err(PairQrError::NoiseBase64)?;
         let dut_identity_pub_bytes = BASE64_STANDARD
             .decode(dut_identity_pub_b64)
-            .map_err(|e| anyhow::anyhow!("Invalid QR identity public key base64: {e}"))?;
+            .map_err(PairQrError::IdentityBase64)?;
 
         let dut_noise_pub: [u8; 32] = dut_noise_pub_bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid noise public key length"))?;
+            .map_err(|_| PairQrError::NoiseLength)?;
         let dut_identity_pub: [u8; 32] = dut_identity_pub_bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid identity public key length"))?;
+            .map_err(|_| PairQrError::IdentityLength)?;
 
         Ok((pairing_ref, dut_noise_pub, dut_identity_pub))
     }
@@ -390,13 +446,13 @@ impl PairUtils {
         dut_noise_pub: &[u8; 32],
         dut_identity_pub: &[u8; 32],
         master_ephemeral: KeyPair,
-    ) -> Result<Vec<u8>, anyhow::Error> {
+    ) -> Result<Vec<u8>, MasterPairingError> {
         // Perform the cryptographic exchange to create the shared secrets
         let adv_key = &device_state.adv_secret_key;
         let identity_key = &device_state.identity_key;
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(adv_key)
-            .map_err(|e| anyhow::anyhow!("Failed to init HMAC for master pairing: {e}"))?;
+            .map_err(MasterPairingError::HmacInit)?;
         mac.update(&ADV_PREFIX_ACCOUNT_SIGNATURE);
         mac.update(dut_identity_pub);
         mac.update(master_ephemeral.public_key.public_key_bytes());
@@ -415,7 +471,7 @@ impl PairUtils {
         // Encrypt the final message
         let mut encryption_key = [0u8; 32];
         crate::crypto::hkdf_sha256_into(&shared_secret, None, b"WA-Ads-Key", &mut encryption_key)
-            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+            .map_err(|_| MasterPairingError::KeyDerivation)?;
         let nonce = [0u8; 12];
         let mut encrypted = Vec::with_capacity(final_message.len() + 16);
         aes_256_gcm_encrypt(
@@ -425,7 +481,7 @@ impl PairUtils {
             &final_message,
             &mut encrypted,
         )
-        .map_err(|e| anyhow::anyhow!("AES-GCM encryption failed: {e}"))?;
+        .map_err(MasterPairingError::Encryption)?;
 
         Ok(encrypted)
     }
@@ -1077,6 +1133,7 @@ mod tests {
 
     #[test]
     fn do_pair_crypto_rejects_mismatched_hmac() {
+        use std::error::Error;
         let state = dummy_device_state();
         // Different secret than the companion holds: tampered/forged pair-success.
         let wrong_secret = [0xCDu8; 32];
@@ -1085,6 +1142,11 @@ mod tests {
             .expect_err("mismatched HMAC must abort pairing");
         assert_eq!(err.code, 401, "expected 401 unauthorized, got {}", err.code);
         assert_eq!(err.text, "hmac-mismatch");
+        assert!(matches!(&err.source, PairCryptoCause::HmacMismatch));
+        assert!(
+            err.source()
+                .is_some_and(|source| source.is::<PairCryptoCause>())
+        );
     }
 
     // A SHORTCAKE_PASSKEY (QR-less) login converges to the SAME pair-success as the

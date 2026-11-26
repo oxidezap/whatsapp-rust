@@ -22,19 +22,45 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 use whatsapp_rust::{
     ClientPlugin, PluginCapability, PluginConnectionScope, PluginCoreEventSubscription,
     PluginEventPayloadEncoding, PluginEventSelector, PluginEventTopic, PluginEvents, PluginFuture,
-    PluginManifest, PluginTasks,
+    PluginManifest, PluginResult, PluginTasks,
 };
 
 pub const METRICS_PLUGIN_ID: &str = "wa.metrics";
 pub const METRICS_TICK_TOPIC: &str = "tick";
 pub const METRICS_TICK_SCHEMA_VERSION: u32 = 1;
+
+type Result<T, E = MetricsPluginError> = std::result::Result<T, E>;
+
+/// Strongly typed errors for [`MetricsPlugin`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MetricsPluginError {
+    #[error("metrics plugin is not installed")]
+    NotInstalled,
+    #[error("metrics interval is zero")]
+    ZeroInterval,
+    #[error("core-events capability is missing")]
+    MissingCoreEvents,
+    #[error("tasks capability is missing")]
+    MissingTasks,
+    #[error("plugin-events capability is missing")]
+    MissingPluginEvents,
+    #[error("connection tasks capability is missing")]
+    MissingConnectionTasks,
+    #[error("metrics plugin was installed more than once")]
+    AlreadyInstalled,
+    #[error(transparent)]
+    Resource(#[from] whatsapp_rust::PluginResourceError),
+    #[error(transparent)]
+    Route(#[from] whatsapp_rust::PluginEventRouteError),
+}
 
 /// Stable snapshot exposed by [`MetricsApi`] and encoded in every tick event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -187,11 +213,11 @@ impl MetricsPlugin {
         }
     }
 
-    fn state(&self) -> Result<Arc<MetricsState>> {
+    fn state(&self) -> Result<Arc<MetricsState>, MetricsPluginError> {
         self.state
             .get()
             .cloned()
-            .context("metrics plugin is not installed")
+            .ok_or(MetricsPluginError::NotInstalled)
     }
 }
 
@@ -214,26 +240,28 @@ impl ClientPlugin for MetricsPlugin {
     fn install(
         &self,
         context: whatsapp_rust::PluginContext,
-    ) -> PluginFuture<'_, Result<Arc<Self::Api>>> {
+    ) -> PluginFuture<'_, PluginResult<Arc<Self::Api>>> {
         Box::pin(async move {
-            ensure!(self.interval != Duration::ZERO, "metrics interval is zero");
+            if self.interval == Duration::ZERO {
+                return Err(MetricsPluginError::ZeroInterval.into());
+            }
             let core_events = context
                 .core_events()
                 .cloned()
-                .context("core-events capability is missing")?;
+                .ok_or(MetricsPluginError::MissingCoreEvents)?;
             let tasks = context
                 .tasks()
                 .cloned()
-                .context("tasks capability is missing")?;
+                .ok_or(MetricsPluginError::MissingTasks)?;
             let plugin_events = context
                 .plugin_events()
                 .cloned()
-                .context("plugin-events capability is missing")?;
+                .ok_or(MetricsPluginError::MissingPluginEvents)?;
             let tick = PluginEventTopic::new(METRICS_TICK_TOPIC)?;
             let state = Arc::new(MetricsState::default());
             self.state
                 .set(state.clone())
-                .map_err(|_| anyhow::anyhow!("metrics plugin was installed more than once"))?;
+                .map_err(|_| MetricsPluginError::AlreadyInstalled)?;
 
             let core_events = core_events.subscribe(
                 EventInterest::of(&[
@@ -255,14 +283,14 @@ impl ClientPlugin for MetricsPlugin {
         })
     }
 
-    fn on_ready(&self, scope: PluginConnectionScope) -> PluginFuture<'_, Result<()>> {
+    fn on_ready(&self, scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             let state = self.state()?;
             let generation = scope.generation();
             let tasks = scope
                 .tasks()
                 .cloned()
-                .context("connection tasks capability is missing")?;
+                .ok_or(MetricsPluginError::MissingConnectionTasks)?;
             state.open_scope(generation);
             let worker_tasks = tasks.clone();
             let worker_state = state.clone();
@@ -280,14 +308,14 @@ impl ClientPlugin for MetricsPlugin {
         })
     }
 
-    fn on_closed(&self, scope: PluginConnectionScope) -> PluginFuture<'_, Result<()>> {
+    fn on_closed(&self, scope: PluginConnectionScope) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             self.state()?.record_closed(scope.generation());
             Ok(())
         })
     }
 
-    fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             if let Some(state) = self.state.get() {
                 state.shutdown.store(true, Ordering::Release);
@@ -303,7 +331,7 @@ fn spawn_install_ticker(
     topic: PluginEventTopic,
     state: Arc<MetricsState>,
     interval: Duration,
-) -> Result<()> {
+) -> Result<(), MetricsPluginError> {
     let worker_tasks = tasks.clone();
     tasks.spawn(async move {
         while worker_tasks.sleep(interval).await.is_ok() {
@@ -391,7 +419,7 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl Transport for TestTransport {
-        async fn send(&self, _data: Bytes) -> Result<()> {
+        async fn send(&self, _data: Bytes) -> Result<(), whatsapp_rust::transport::TransportError> {
             Ok(())
         }
 
@@ -402,7 +430,12 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl TransportFactory for TestTransportFactory {
-        async fn create_transport(&self) -> Result<(Arc<dyn Transport>, Receiver<TransportEvent>)> {
+        async fn create_transport(
+            &self,
+        ) -> Result<
+            (Arc<dyn Transport>, Receiver<TransportEvent>),
+            whatsapp_rust::transport::TransportError,
+        > {
             let (_sender, receiver) = whatsapp_rust::async_channel::bounded(1);
             Ok((Arc::new(TestTransport), receiver))
         }
@@ -412,7 +445,10 @@ mod tests {
 
     #[whatsapp_rust::async_trait]
     impl HttpClient for TestHttpClient {
-        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
             Ok(HttpResponse::new(200, Vec::new()))
         }
     }

@@ -20,7 +20,6 @@
 //! ```
 
 use crate::types::presence::ChatActivity;
-use anyhow::Result;
 use thiserror::Error;
 use wacore_binary::Jid;
 use wacore_binary::Node;
@@ -42,10 +41,6 @@ pub enum ChatstateParseError {
     /// Missing required `from` attribute
     #[error("missing required attribute 'from'")]
     MissingFrom,
-
-    /// Invalid JID in attribute
-    #[error("invalid JID: {0}")]
-    InvalidJid(#[from] anyhow::Error),
 }
 
 impl ChatActivity {

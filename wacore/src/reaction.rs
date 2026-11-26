@@ -7,10 +7,22 @@
 //! `sender_timestamp_ms` (the target key travels in the outer envelope), and
 //! the HKDF use-case is `"Enc Reaction"` with empty AAD.
 
-use anyhow::{Result, ensure};
 use waproto::whatsapp::message::ReactionMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum ReactionError {
+    #[error("message_secret must be 32 bytes, got {0}")]
+    InvalidSecretSize(usize),
+    #[error("{0}")]
+    Addon(#[from] crate::secret_enc_addon::AddonError),
+    #[error("{0}")]
+    Decode(#[from] waproto::protobuf::DecodeError),
+}
+
+debug_as_display!(ReactionError);
 
 const GCM_IV_SIZE: usize = 12;
 const MESSAGE_SECRET_SIZE: usize = 32;
@@ -39,12 +51,10 @@ pub fn encrypt_reaction_with_secret(
     parent_msg_id: &str,
     parent_sender_jid: &str,
     reactor_jid: &str,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE]), ReactionError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(ReactionError::InvalidSecretSize(message_secret.len()));
+    }
     // WA Web encodes only { text, senderTimestampMs }; the key is envelope-side.
     let inner = {
         let mut proto = ReactionMessage::default();
@@ -58,6 +68,7 @@ pub fn encrypt_reaction_with_secret(
         message_secret,
         &reaction_addon_ctx(parent_msg_id, parent_sender_jid, reactor_jid),
     )
+    .map_err(Into::into)
 }
 
 /// Decrypt an `enc_reaction_message` payload given the parent's `messageSecret`.
@@ -71,12 +82,10 @@ pub fn decrypt_reaction_with_secret(
     parent_msg_id: &str,
     parent_sender_jid: &str,
     reactor_jid: &str,
-) -> Result<ReactionMessage> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+) -> Result<ReactionMessage, ReactionError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(ReactionError::InvalidSecretSize(message_secret.len()));
+    }
     let plaintext = decrypt_addon(
         enc_payload,
         iv,
@@ -137,9 +146,10 @@ mod tests {
 
     #[test]
     fn invalid_secret_size_rejected() {
-        assert!(
-            encrypt_reaction_with_secret("x", 1, &[0u8; 16], PARENT_ID, AUTHOR, REACTOR).is_err()
-        );
+        assert!(matches!(
+            encrypt_reaction_with_secret("x", 1, &[0u8; 16], PARENT_ID, AUTHOR, REACTOR),
+            Err(ReactionError::InvalidSecretSize(16))
+        ));
         assert!(
             decrypt_reaction_with_secret(
                 &[0u8; 32], &[0u8; 12], &[0u8; 16], PARENT_ID, AUTHOR, REACTOR

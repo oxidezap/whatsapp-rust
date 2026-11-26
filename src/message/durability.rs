@@ -198,7 +198,7 @@ impl Client {
                                     self.inbound_commit_batch.live_retention.receipt_for(info);
                                 Ok(delivery)
                             })
-                            .collect::<anyhow::Result<Vec<_>>>()
+                            .collect::<Result<Vec<_>, raw_pending::RawPendingError>>()
                     }) {
                         Ok(replay) => replay,
                         Err(error) => {
@@ -258,13 +258,13 @@ mod tests {
             &self,
             _client: Arc<Client>,
             batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.messages.fetch_add(batch.len(), Ordering::SeqCst);
             if self.succeed.load(Ordering::SeqCst) {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!("commit failed"))
+                Err("commit failed".into())
             }
         }
     }
@@ -558,7 +558,7 @@ mod tests {
             &self,
             _: Arc<Client>,
             batch: &[InboundMessage],
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.attempted
                 .lock()
                 .unwrap()
@@ -570,7 +570,7 @@ mod tests {
                         .to_owned()
                 }));
             if !self.succeed.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("synthetic consumer unavailable"));
+                return Err("synthetic consumer unavailable".into());
             }
             self.observed
                 .lock()

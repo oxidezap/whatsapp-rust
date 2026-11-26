@@ -24,7 +24,7 @@ struct BlobHttp {
 
 #[async_trait::async_trait]
 impl HttpClient for BlobHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         assert!(!self.streaming, "streaming adapters must not buffer HTTP");
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(HttpResponse::new(200, self.body.clone()))
@@ -34,7 +34,10 @@ impl HttpClient for BlobHttp {
         self.streaming
     }
 
-    fn execute_streaming(&self, _: HttpRequest) -> Result<StreamingHttpResponse> {
+    fn execute_streaming(
+        &self,
+        _: HttpRequest,
+    ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
         let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
         let mut body = self.body.clone();
         if first && self.corrupt_first.load(Ordering::SeqCst) {
@@ -100,8 +103,14 @@ async fn client(
     (client, http)
 }
 
-fn is_memory_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+fn error_sources<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |cause| cause.source())
+}
+
+fn is_memory_error(error: &wacore::appstate_sync::ExternalBlobError) -> bool {
+    error_sources(error).any(|cause| {
         matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(
@@ -238,7 +247,7 @@ async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
             .prefetch_validated_for_test(&[list(reference.clone())])
             .await;
         let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
-        assert!(error.chain().any(|cause| matches!(
+        assert!(error_sources(&error).any(|cause| matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(_))
         )));
@@ -249,7 +258,7 @@ async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
             .process_parsed_patch_list(list(reference), &resolve, true)
             .await
             .expect_err("resource failure must reach the processor");
-        assert!(error.chain().any(|cause| matches!(
+        assert!(error_sources(&error).any(|cause| matches!(
             cause.downcast_ref::<ClientDownloadError>(),
             Some(ClientDownloadError::ResourcePolicy(_))
         )));
@@ -291,9 +300,7 @@ async fn cryptographic_failure_is_preserved_and_releases_capacity() {
         .await;
     let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
     assert!(
-        error
-            .chain()
-            .any(|cause| cause.is::<MediaDecryptionError>()),
+        error_sources(&error).any(|cause| cause.is::<MediaDecryptionError>()),
         "{error:?}"
     );
     let retry = client
@@ -392,13 +399,16 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
     struct GatedHttp(std::sync::Mutex<Option<GatedBody>>);
     #[async_trait::async_trait]
     impl HttpClient for GatedHttp {
-        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
             unreachable!()
         }
         fn supports_streaming(&self) -> bool {
             true
         }
-        fn execute_streaming(&self, _: HttpRequest) -> Result<StreamingHttpResponse> {
+        fn execute_streaming(
+            &self,
+            _: HttpRequest,
+        ) -> Result<StreamingHttpResponse, crate::http::HttpError> {
             Ok(StreamingHttpResponse::new(
                 200,
                 Box::new(self.0.lock().unwrap().take().unwrap()),

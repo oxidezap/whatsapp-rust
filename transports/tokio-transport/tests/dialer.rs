@@ -3,13 +3,15 @@ use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wacore::net::TransportFactory;
-use whatsapp_rust_tokio_transport::{BoxedStream, StreamDialer, TokioWebSocketTransportFactory};
+use whatsapp_rust_tokio_transport::{
+    BoxedStream, StreamDialer, TokioTransportError, TokioWebSocketTransportFactory,
+};
 
 struct RecordingDialer(Arc<Mutex<Vec<(String, u16)>>>);
 
 #[async_trait]
 impl StreamDialer for RecordingDialer {
-    async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, TokioTransportError> {
         self.0.lock().unwrap().push((host.into(), port));
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "dial sentinel").into())
     }
@@ -30,9 +32,18 @@ async fn url_destinations_and_typed_dial_errors() {
                 .with_dialer(RecordingDialer(calls.clone())),
         );
         let error = factory.create_transport().await.err().unwrap();
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::ConnectionRefused
+        let Some(TokioTransportError::Dial(dial)) = error.downcast_ref::<TokioTransportError>()
+        else {
+            panic!("expected dial error: {error}");
+        };
+        let TokioTransportError::Io(io) = dial.as_ref() else {
+            panic!("expected I/O error: {dial}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(
+            std::error::Error::source(dial.as_ref())
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some()
         );
         assert_eq!(
             *calls.lock().unwrap(),
@@ -74,7 +85,7 @@ struct LocalDialer(std::net::SocketAddr);
 
 #[async_trait]
 impl StreamDialer for LocalDialer {
-    async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, TokioTransportError> {
         assert_eq!(host, "relay.example");
         assert_eq!(port, self.0.port());
         Ok(Box::new(tokio::net::TcpStream::connect(self.0).await?))
@@ -128,7 +139,7 @@ impl Drop for DropFlag {
 
 #[async_trait]
 impl StreamDialer for WaitingDialer {
-    async fn dial(&self, _: &str, _: u16) -> anyhow::Result<BoxedStream> {
+    async fn dial(&self, _: &str, _: u16) -> Result<BoxedStream, TokioTransportError> {
         let _stream = tokio::net::TcpStream::connect(self.addr).await?;
         let _flag = DropFlag(self.dropped.clone());
         self.ready.notify_one();
@@ -186,7 +197,10 @@ async fn failed_upgrade_preserves_source_and_closes_the_stream() {
         };
         let client = async {
             let error = factory.create_transport().await.err().unwrap();
-            assert!(error.downcast_ref::<tokio_websockets::Error>().is_some());
+            assert!(matches!(
+                error.downcast_ref::<TokioTransportError>(),
+                Some(TokioTransportError::Connect(_))
+            ));
         };
         tokio::join!(server, client);
     })

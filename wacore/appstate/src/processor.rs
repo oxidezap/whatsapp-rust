@@ -575,7 +575,7 @@ where
         let prev = if !is_remove && let Some(value_mac) = in_patch.get(index_mac) {
             Some(value_mac.to_vec())
         } else {
-            get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
+            get_prev_value_mac(index_mac)?
         };
         // The operand `update_hash` just added for this SET, by the same rule it
         // used -- so the next SET on this index subtracts what the first one

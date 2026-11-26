@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use anyhow::{self, Result};
     use std::error::Error;
     use std::io::Cursor;
     use std::sync::Arc;
-    use whatsapp_rust::anyhow::{self, Result};
     use whatsapp_rust::download::{
         ClientDownloadError, DownloadLimits, DownloadParams, DownloadPolicyError, DownloadWriter,
         MediaDownloadError, MediaDownloader, MediaRoute, MediaType,
@@ -74,7 +74,10 @@ mod tests {
     impl TransportFactory for Offline {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, channels::Receiver<TransportEvent>)> {
+        ) -> Result<
+            (Arc<dyn Transport>, channels::Receiver<TransportEvent>),
+            whatsapp_rust::transport::TransportError,
+        > {
             panic!("downloads must not dial a socket");
         }
     }
@@ -82,7 +85,10 @@ mod tests {
     struct Rejected;
     #[async_trait]
     impl HttpClient for Rejected {
-        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            request: HttpRequest,
+        ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
             assert_eq!(request.url, "https://mmg.whatsapp.net/static");
             Ok(HttpResponse::new(410, Vec::new()))
         }
@@ -173,13 +179,19 @@ mod tests {
     struct AcceptedBody(bool);
     #[async_trait]
     impl HttpClient for AcceptedBody {
-        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _: HttpRequest,
+        ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
             Ok(HttpResponse::new(200, b"external destination".to_vec()))
         }
         fn supports_streaming(&self) -> bool {
             self.0
         }
-        fn execute_streaming(&self, _: HttpRequest) -> Result<wacore::net::StreamingHttpResponse> {
+        fn execute_streaming(
+            &self,
+            _: HttpRequest,
+        ) -> Result<wacore::net::StreamingHttpResponse, whatsapp_rust::http::HttpError> {
             Ok(wacore::net::StreamingHttpResponse::new(
                 200,
                 Box::new(Cursor::new(b"external destination".to_vec())),
@@ -301,7 +313,11 @@ mod tests {
                 let ClientDownloadError::WriterIo(cause) = error else {
                     panic!("wrong destination classification: {error:?}");
                 };
-                let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                let io = cause
+                    .as_ref()
+                    .sources()
+                    .find_map(|source| source.downcast_ref::<std::io::Error>())
+                    .unwrap();
                 assert_eq!(io.raw_os_error(), Some(28));
                 assert_eq!(
                     io.to_string(),
@@ -319,7 +335,11 @@ mod tests {
                 let MediaDownloadError::WriterIo(cause) = error else {
                     panic!("wrong destination classification: {error:?}");
                 };
-                let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                let io = cause
+                    .as_ref()
+                    .sources()
+                    .find_map(|source| source.downcast_ref::<std::io::Error>())
+                    .unwrap();
                 assert_eq!(io.raw_os_error(), Some(28));
                 assert_eq!(
                     io.to_string(),

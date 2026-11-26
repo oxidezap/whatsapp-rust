@@ -24,7 +24,7 @@
 //!
 //! ```no_run
 //! # use whatsapp_rust::ErrorChainExt;
-//! # fn demo(err: whatsapp_rust::anyhow::Error) {
+//! # fn demo(err: anyhow::Error) {
 //! let cause: &(dyn std::error::Error + 'static) = err.as_ref();
 //! let _ = cause.server_rejection();
 //! # }
@@ -149,9 +149,12 @@ pub trait ErrorChainExt {
     /// Whether the operation ran out of time waiting for the server.
     ///
     /// Covers a request that got no answer and a connect or handshake step
-    /// that never completed.
+    /// that never completed, and timeouts reported by HTTP adapters.
     fn is_timeout(&self) -> bool {
         self.sources().any(|cause| {
+            if let Some(http) = cause.downcast_ref::<crate::http::HttpError>() {
+                return http.is_timeout();
+            }
             if let Some(iq) = cause.downcast_ref::<ClientIqError>() {
                 return iq.is_timeout();
             }
@@ -251,5 +254,134 @@ impl ErrorChainExt for dyn StdError + 'static {
 impl ErrorChainExt for dyn StdError + Send + Sync + 'static {
     fn as_dyn_error(&self) -> &(dyn StdError + 'static) {
         self
+    }
+}
+
+#[cfg(test)]
+mod boxed_source_tests {
+    use super::ErrorChainExt;
+    use wacore::store::error::StoreError;
+
+    fn storage_error() -> StoreError {
+        StoreError::Io(std::io::Error::other("synthetic storage failure"))
+    }
+
+    #[test]
+    fn http_timeout_is_classified_through_a_media_error() {
+        use std::io::{Error, ErrorKind};
+
+        let cause = crate::download::DownloadCause::from(crate::http::HttpError::from(
+            Error::from(ErrorKind::TimedOut),
+        ));
+        assert!(cause.is_timeout());
+
+        let cause = crate::download::DownloadCause::from(crate::http::HttpError::from(
+            Error::from(ErrorKind::ConnectionRefused),
+        ));
+        assert!(!cause.is_timeout());
+    }
+
+    #[test]
+    fn mapping_error_exposes_store_error() {
+        let error =
+            crate::MappingLearningError::StoreBatch(crate::MappingStoreError::new(storage_error()));
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn send_error_exposes_store_error() {
+        let error = crate::SendError::Store(wacore::error::BoxedErrorSource::new(storage_error()));
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn cached_identity_exposes_store_error() {
+        let error = crate::prekeys::CachedAdvIdentityError::from(storage_error());
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn signal_flush_exposes_store_error() {
+        let error = wacore::store::signal_cache::SignalCacheFlushError::from(storage_error());
+        assert!(error.sources().any(|source| source.is::<StoreError>()));
+    }
+
+    #[test]
+    fn failed_recipient_exposes_device_error() {
+        let error = wacore::send::NoRecipientDeviceError::EncryptionFailed {
+            attempted: 1,
+            source: wacore::error::BoxedErrorSource::new(
+                wacore::send::DeviceEncryptionError::NoCiphertext,
+            ),
+        };
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::send::DeviceEncryptionError>())
+        );
+    }
+
+    #[test]
+    fn download_error_exposes_download_cause() {
+        let error = crate::download::ClientDownloadError::HostsUnreachable(
+            wacore::error::BoxedErrorSource::new(crate::download::DownloadCause::NoHosts),
+        );
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::download::DownloadCause>())
+        );
+    }
+
+    #[test]
+    fn connection_error_exposes_version_cause() {
+        let error = crate::ConnectError::Version(wacore::error::BoxedErrorSource::new(
+            crate::version::VersionError::Shape(crate::version::VersionShapeError::Field {
+                field: "version",
+                url: "test",
+            }),
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::version::VersionError>())
+        );
+    }
+
+    #[test]
+    fn group_error_exposes_signal_cause() {
+        let error =
+            wacore::send::GroupStanzaError::GroupEncrypt(wacore::error::BoxedErrorSource::new(
+                wacore::libsignal::protocol::SignalProtocolError::InvalidArgument("fixture".into()),
+            ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::libsignal::protocol::SignalProtocolError>())
+        );
+    }
+
+    #[test]
+    fn send_error_exposes_sender_key_cache_cause() {
+        let error = crate::SendError::SenderKeyCache(wacore::error::BoxedErrorSource::new(
+            wacore::store::signal_cache::SenderKeyCacheError::Store(storage_error()),
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<wacore::store::signal_cache::SenderKeyCacheError>())
+        );
+    }
+
+    #[test]
+    fn iq_error_exposes_client_state_cause() {
+        let error = crate::request::IqError::ClientState(wacore::error::BoxedErrorSource::new(
+            crate::ClientError::NotConnected,
+        ));
+        assert!(
+            error
+                .sources()
+                .any(|source| source.is::<crate::ClientError>())
+        );
     }
 }

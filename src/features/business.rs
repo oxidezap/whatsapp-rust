@@ -72,7 +72,7 @@ const DEFAULT_CATALOG_LIMIT: u32 = 10;
 /// items inline, so the two limits multiply into one response.
 const DEFAULT_COLLECTION_LIMIT: u32 = 51;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum BusinessError {
     /// The linked account must be connected to read its catalog and collections.
@@ -115,6 +115,13 @@ pub enum BusinessError {
         operation: &'static str,
         detail: String,
     },
+}
+
+impl std::fmt::Debug for BusinessError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl BusinessError {
@@ -1301,10 +1308,14 @@ mod tests {
 
         #[async_trait::async_trait]
         impl HttpClient for CatalogHttp {
-            async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
+            async fn execute(
+                &self,
+                request: HttpRequest,
+            ) -> Result<HttpResponse, crate::http::HttpError> {
                 assert_eq!(request.method, "POST");
                 assert_eq!(request.url, "https://graph.whatsapp.com/graphql/catalog");
-                let body: Value = serde_json::from_slice(request.body.as_deref().unwrap())?;
+                let body: Value = serde_json::from_slice(request.body.as_deref().unwrap())
+                    .map_err(crate::http::HttpError::adapter)?;
                 assert_eq!(body["access_token"], "fixture-token");
                 let product = json!({"id": "fixture-product"});
                 let data = match body["doc_id"].as_str().unwrap() {
@@ -1336,7 +1347,8 @@ mod tests {
                 };
                 Ok(HttpResponse::new(
                     200,
-                    serde_json::to_vec(&json!({"data": data}))?,
+                    serde_json::to_vec(&json!({"data": data}))
+                        .map_err(crate::http::HttpError::adapter)?,
                 ))
             }
         }

@@ -29,6 +29,7 @@ impl SetStatusTextSpec {
 
 impl IqSpec for SetStatusTextSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -42,7 +43,7 @@ impl IqSpec for SetStatusTextSpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> anyhow::Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }

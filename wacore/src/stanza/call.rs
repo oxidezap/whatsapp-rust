@@ -6,16 +6,64 @@
 //! call-terminate (SIG-14), call-ack (SIG-07). The `<offer>` child order is
 //! server-enforced; a mis-ordered offer is rejected with error 439.
 
-use anyhow::{Result, anyhow};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef};
 
 use crate::time::from_secs;
 use crate::types::call::{CallAction, CallActionTag, CallAudioCodec, IncomingCall, VideoState};
 
-pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum CallParseError {
+    #[error("expected <call>, got <{actual}>")]
+    UnexpectedTag { actual: String },
+    #[error("<call> missing 'from' attribute")]
+    MissingFrom,
+    #[error("<call> invalid 't' attribute")]
+    InvalidTimestamp,
+    #[error("<call> 't'={0} out of range")]
+    TimestampOutOfRange(i64),
+    #[error("<call> missing 't' attribute")]
+    MissingTimestamp,
+    #[error("<{node}> attrs: {source}")]
+    Attributes {
+        node: &'static str,
+        #[source]
+        source: crate::error::BoxedErrorSource<wacore_binary::BinaryError>,
+    },
+    #[error("<audio> missing 'enc': {0}")]
+    MissingAudioEncoding(#[source] crate::error::BoxedErrorSource<wacore_binary::BinaryError>),
+    #[error("<audio enc={encoding}> missing or invalid 'rate'")]
+    InvalidAudioRate { encoding: String },
+    #[error("<audio enc={encoding}> 'rate'={rate} overflows u32")]
+    AudioRateOverflow { encoding: String, rate: u64 },
+    #[error("<{node}> missing 'call-id': {source}")]
+    MissingCallId {
+        node: String,
+        #[source]
+        source: crate::error::BoxedErrorSource<wacore_binary::BinaryError>,
+    },
+    #[error("<{node}> missing 'call-creator'")]
+    MissingCallCreator { node: String },
+    #[error("<video> missing or non-numeric 'state'")]
+    InvalidVideoState,
+    #[error("{0}")]
+    Group(#[source] crate::error::BoxedErrorSource<super::group_call::GroupCallParseError>),
+}
+
+impl From<super::group_call::GroupCallParseError> for CallParseError {
+    fn from(error: super::group_call::GroupCallParseError) -> Self {
+        Self::Group(crate::error::BoxedErrorSource::new(error))
+    }
+}
+
+debug_as_display!(CallParseError);
+
+pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>, CallParseError> {
     if node.tag != "call" {
-        return Err(anyhow!("expected <call>, got <{}>", node.tag));
+        return Err(CallParseError::UnexpectedTag {
+            actual: node.tag.to_string(),
+        });
     }
 
     // Find a known action child first so unknown/future actions short-circuit
@@ -33,7 +81,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     let mut attrs = node.attrs();
     let from = attrs
         .optional_jid("from")
-        .ok_or_else(|| anyhow!("<call> missing 'from' attribute"))?;
+        .ok_or(CallParseError::MissingFrom)?;
     // whatsmeow doesn't require an id on <call>, and the signaling-only actions (transport,
     // relaylatency) can arrive without one. Only the offer-ack consumes stanza_id and real offers
     // always carry it, so default a missing id to empty rather than rejecting the whole stanza --
@@ -55,18 +103,23 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     let timestamp = if node.get_attr("t").is_some() {
         let ts = attrs
             .optional_unix_time("t")
-            .ok_or_else(|| anyhow!("<call> invalid 't' attribute"))?;
-        Some(from_secs(ts).ok_or_else(|| anyhow!("<call> 't'={ts} out of range"))?)
+            .ok_or(CallParseError::InvalidTimestamp)?;
+        Some(from_secs(ts).ok_or(CallParseError::TimestampOutOfRange(ts))?)
     } else if action_tag == CallActionTag::EncRekey {
         None
     } else {
-        return Err(anyhow!("<call> missing 't' attribute"));
+        return Err(CallParseError::MissingTimestamp);
     };
     // Server-set presence flag marking an offline-queue replay (WA Web `hasAttr("offline")`), the
     // same idiom we already use for messages/receipts. NOT the `e` attr, which is an offer timestamp.
     let offline = attrs.optional_string("offline").is_some();
 
-    attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
+    attrs
+        .finish()
+        .map_err(|source| CallParseError::Attributes {
+            node: "call",
+            source: crate::error::BoxedErrorSource::new(source),
+        })?;
 
     let is_offer = action_tag == CallActionTag::Offer;
     let caller_username = if is_offer {
@@ -264,30 +317,59 @@ fn parse_video_orientation(node: &NodeRef<'_>) -> Option<u8> {
         .filter(|orientation| *orientation <= 3)
 }
 
-fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
+fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec, CallParseError> {
     let mut a = node.attrs();
     let enc = a
         .required_string("enc")
-        .map_err(|e| anyhow!("<audio> missing 'enc': {e}"))?
+        .map_err(|source| {
+            CallParseError::MissingAudioEncoding(crate::error::BoxedErrorSource::new(source))
+        })?
         .into_owned();
     let rate_raw = a
         .optional_u64("rate")
-        .ok_or_else(|| anyhow!("<audio enc={enc}> missing or invalid 'rate'"))?;
-    let rate = u32::try_from(rate_raw)
-        .map_err(|_| anyhow!("<audio enc={enc}> 'rate'={rate_raw} overflows u32"))?;
-    a.finish().map_err(|e| anyhow!("<audio> attrs: {e}"))?;
+        .ok_or_else(|| CallParseError::InvalidAudioRate {
+            encoding: enc.clone(),
+        })?;
+    let rate = u32::try_from(rate_raw).map_err(|_| CallParseError::AudioRateOverflow {
+        encoding: enc.clone(),
+        rate: rate_raw,
+    })?;
+    a.finish().map_err(|source| CallParseError::Attributes {
+        node: "audio",
+        source: crate::error::BoxedErrorSource::new(source),
+    })?;
     Ok(CallAudioCodec { enc, rate })
 }
 
-fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAction> {
+#[inline(never)]
+fn finish_call_attrs(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    node: &'static str,
+) -> Result<(), CallParseError> {
+    attrs.finish().map_err(|source| CallParseError::Attributes {
+        node,
+        source: crate::error::BoxedErrorSource::new(source),
+    })
+}
+
+fn parse_action(
+    node: &NodeRef<'_>,
+    action_tag: CallActionTag,
+) -> Result<CallAction, CallParseError> {
     let mut attrs = node.attrs();
     let call_id = attrs
         .required_string("call-id")
-        .map_err(|e| anyhow!("<{}> missing 'call-id': {e}", node.tag))?
+        .map_err(|source| CallParseError::MissingCallId {
+            node: node.tag.to_string(),
+            source: crate::error::BoxedErrorSource::new(source),
+        })?
         .into_owned();
-    let call_creator = attrs
-        .optional_jid("call-creator")
-        .ok_or_else(|| anyhow!("<{}> missing 'call-creator'", node.tag))?;
+    let call_creator =
+        attrs
+            .optional_jid("call-creator")
+            .ok_or_else(|| CallParseError::MissingCallCreator {
+                node: node.tag.to_string(),
+            })?;
 
     // The group parsers re-read the action identity and finish their own attribute readers because
     // they also own the action-specific attributes.
@@ -325,7 +407,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 .unwrap_or(false);
             let group_jid = attrs.optional_jid("group-jid");
 
-            attrs.finish().map_err(|e| anyhow!("<offer> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "offer")?;
 
             let children = node.children().unwrap_or_default();
             let is_video = children.iter().any(|c| c.tag == "video");
@@ -333,7 +415,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 .iter()
                 .filter(|c| c.tag == "audio")
                 .map(parse_audio_codec)
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
 
             CallAction::Offer {
                 call_id,
@@ -350,9 +432,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
         CallActionTag::OfferNotice => {
             let is_video = attrs.optional_string("media").is_some_and(|s| s == "video");
             let is_group = attrs.optional_string("type").is_some_and(|s| s == "group");
-            attrs
-                .finish()
-                .map_err(|e| anyhow!("<offer_notice> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "offer_notice")?;
             CallAction::OfferNotice {
                 call_id,
                 call_creator,
@@ -361,16 +441,14 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             }
         }
         CallActionTag::PreAccept => {
-            attrs
-                .finish()
-                .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "preaccept")?;
             let audio = node
                 .children()
                 .unwrap_or_default()
                 .iter()
                 .filter(|child| child.tag == "audio")
                 .map(parse_audio_codec)
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
             CallAction::PreAccept {
                 call_id,
                 call_creator,
@@ -384,9 +462,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             let transport_message_type = attrs
                 .optional_string("transport-message-type")
                 .map(|s| s.into_owned());
-            attrs
-                .finish()
-                .map_err(|e| anyhow!("<transport> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "transport")?;
             CallAction::Transport {
                 call_id,
                 call_creator,
@@ -395,22 +471,20 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             }
         }
         CallActionTag::RelayLatency => {
-            attrs
-                .finish()
-                .map_err(|e| anyhow!("<relaylatency> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "relaylatency")?;
             CallAction::RelayLatency {
                 call_id,
                 call_creator,
             }
         }
         CallActionTag::Accept => {
-            attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "accept")?;
             let children = node.children().unwrap_or_default();
             let audio = children
                 .iter()
                 .filter(|child| child.tag == "audio")
                 .map(parse_audio_codec)
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
             CallAction::Accept {
                 call_id,
                 call_creator,
@@ -422,7 +496,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             // callee actually declining; dropping it made both look identical and ended calls the
             // peer's other devices were still answering.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
-            attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "reject")?;
             CallAction::Reject {
                 call_id,
                 call_creator,
@@ -433,13 +507,13 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             let state_raw = attrs
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
-                .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
+                .ok_or(CallParseError::InvalidVideoState)?;
             let orientation = parse_video_orientation(node);
             let dec = attrs.optional_string("dec").map(|s| s.into_owned());
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
             let _ = attrs.optional_string("voip_settings");
-            attrs.finish().map_err(|e| anyhow!("<video> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "video")?;
             CallAction::VideoState {
                 call_id,
                 call_creator,
@@ -458,9 +532,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             let audio_duration = attrs
                 .optional_u64("audio_duration")
                 .and_then(|v| u32::try_from(v).ok());
-            attrs
-                .finish()
-                .map_err(|e| anyhow!("<terminate> attrs: {e}"))?;
+            finish_call_attrs(&mut attrs, "terminate")?;
             CallAction::Terminate {
                 call_id,
                 call_creator,
@@ -1087,15 +1159,26 @@ pub struct RelayLatencyReportParams<'a> {
     pub devices: &'a [Jid],
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayLatencyReportError {
+    #[error("too many relay latency entries")]
+    TooManyEntries,
+    #[error("invalid relay latency address length")]
+    InvalidAddressLength,
+}
+
 /// Serialize measurement metadata; this does not select or connect a relay.
-pub fn build_relay_latency_report(p: &RelayLatencyReportParams<'_>) -> Result<Node> {
+pub fn build_relay_latency_report(
+    p: &RelayLatencyReportParams<'_>,
+) -> Result<Node, RelayLatencyReportError> {
     if p.entries.len() > super::relay_latency::MAX_RELAY_LATENCY_ENTRIES {
-        return Err(anyhow!("too many relay latency entries"));
+        return Err(RelayLatencyReportError::TooManyEntries);
     }
     let mut children = Vec::with_capacity(p.entries.len() + 1);
     for entry in p.entries {
         if !matches!(entry.address.len(), 6 | 18) {
-            return Err(anyhow!("invalid relay latency address length"));
+            return Err(RelayLatencyReportError::InvalidAddressLength);
         }
         let mut te = NodeBuilder::new("te")
             .attr(
@@ -1423,6 +1506,24 @@ mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
+
+    #[test]
+    fn call_parse_errors_expose_boxed_concrete_causes() {
+        let error = CallParseError::MissingAudioEncoding(crate::error::BoxedErrorSource::new(
+            wacore_binary::BinaryError::MissingAttr("enc".into()),
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<wacore_binary::BinaryError>()
+        );
+        let group = CallParseError::from(super::super::group_call::GroupCallParseError::MissingEnc);
+        assert!(
+            std::error::Error::source(&group)
+                .unwrap()
+                .is::<super::super::group_call::GroupCallParseError>()
+        );
+    }
 
     fn fake_caller_lid() -> Jid {
         Jid::new("111111111111111", Server::Lid)
@@ -1847,6 +1948,7 @@ mod tests {
                 .children([NodeBuilder::new(tag).build()])
                 .build();
             let error = parse_call_stanza(&node.as_node_ref()).unwrap_err();
+            assert!(matches!(error, CallParseError::MissingTimestamp));
             assert!(error.to_string().contains("missing 't'"), "{tag}: {error}");
         }
         let unknown = NodeBuilder::new("call")
@@ -2312,27 +2414,27 @@ mod tests {
         );
         let mut invalid = entries[0].clone();
         invalid.address = vec![0; 7];
-        assert!(
+        assert!(matches!(
             build_relay_latency_report(&RelayLatencyReportParams {
                 call_id: "CID",
                 to: &peer,
                 call_creator: &creator,
                 entries: &[invalid],
                 devices: &[],
-            })
-            .is_err()
-        );
+            }),
+            Err(RelayLatencyReportError::InvalidAddressLength)
+        ));
         let too_many = vec![entries[0].clone(); 9];
-        assert!(
+        assert!(matches!(
             build_relay_latency_report(&RelayLatencyReportParams {
                 call_id: "CID",
                 to: &peer,
                 call_creator: &creator,
                 entries: &too_many,
                 devices: &[],
-            })
-            .is_err()
-        );
+            }),
+            Err(RelayLatencyReportError::TooManyEntries)
+        ));
         let signed = RelayLatencyEntry::builder()
             .kind(RelayLatencyKind::Xpop)
             .latency(PackedRelayLatency::new(u32::MAX))

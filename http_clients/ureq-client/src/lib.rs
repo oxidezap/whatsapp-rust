@@ -2,12 +2,46 @@
 // It cannot work on wasm32 targets — users must provide their own HttpClient.
 #![cfg(not(target_arch = "wasm32"))]
 
-use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use thiserror::Error;
+use wacore::net::HttpError;
+type Result<T> = std::result::Result<T, HttpError>;
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 use wacore::stats::HttpResourceReport;
+
+/// Strongly typed HTTP error for the ureq-based client.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum UreqHttpError {
+    #[error("Unsupported HTTP method: {0}")]
+    UnsupportedMethod(String),
+    #[error("Streaming only supports GET, got: {0}")]
+    StreamingUnsupportedMethod(String),
+    #[error("Upload streaming only supports POST, got: {0}")]
+    UploadStreamingUnsupportedMethod(String),
+    #[error("{0}")]
+    Ureq(#[from] ureq::Error),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+impl From<UreqHttpError> for HttpError {
+    fn from(error: UreqHttpError) -> Self {
+        match &error {
+            UreqHttpError::Ureq(ureq::Error::Timeout(_)) => Self::timeout(error),
+            UreqHttpError::Ureq(ureq::Error::Io(cause)) | UreqHttpError::Io(cause)
+                if cause.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Self::timeout(error)
+            }
+            _ => Self::adapter(error),
+        }
+    }
+}
 
 /// Default per-response transport cap (2 GiB), independent of media policy.
 /// Overrides ureq's 10 MiB default on `read_to_vec()`.
@@ -228,7 +262,10 @@ const ERROR_BODY_CAP: u64 = 64 * 1024;
 /// save a socket hands a broken or hostile host a way to spend our time, and
 /// the host that just answered 401/403 is the one this attempt is about to
 /// rotate away from anyway.
-fn read_body(response: ureq::http::Response<ureq::Body>, max_body_bytes: u64) -> Result<Vec<u8>> {
+fn read_body(
+    response: ureq::http::Response<ureq::Body>,
+    max_body_bytes: u64,
+) -> std::result::Result<Vec<u8>, UreqHttpError> {
     if response.status().is_success() {
         // ureq's `read_to_vec()` default cap is 10 MiB.
         return Ok(response
@@ -255,39 +292,44 @@ impl HttpClient for UreqHttpClient {
         let max_body_bytes = self.max_body_bytes;
         let requested = self.requested.clone();
         // Since ureq is blocking, we must use spawn_blocking
-        tokio::task::spawn_blocking(move || {
-            let response = match request.method.as_str() {
-                "GET" => {
-                    let mut req = status_as_response(agent.get(&request.url));
-                    for (key, value) in &request.headers {
-                        req = req.header(key, value);
+        let result = tokio::task::spawn_blocking(
+            move || -> std::result::Result<HttpResponse, UreqHttpError> {
+                let response = match request.method.as_str() {
+                    "GET" => {
+                        let mut req = status_as_response(agent.get(&request.url));
+                        for (key, value) in &request.headers {
+                            req = req.header(key, value);
+                        }
+                        mark_if_dispatchable(&requested, &req, &request.url);
+                        req.call()?
                     }
-                    mark_if_dispatchable(&requested, &req, &request.url);
-                    req.call()?
-                }
-                "POST" => {
-                    let mut req = status_as_response(agent.post(&request.url));
-                    for (key, value) in &request.headers {
-                        req = req.header(key, value);
+                    "POST" => {
+                        let mut req = status_as_response(agent.post(&request.url));
+                        for (key, value) in &request.headers {
+                            req = req.header(key, value);
+                        }
+                        mark_if_dispatchable(&requested, &req, &request.url);
+                        if let Some(body) = request.body {
+                            req.send(&body[..])?
+                        } else {
+                            req.send(&[])?
+                        }
                     }
-                    mark_if_dispatchable(&requested, &req, &request.url);
-                    if let Some(body) = request.body {
-                        req.send(&body[..])?
-                    } else {
-                        req.send(&[])?
+                    method => {
+                        return Err(UreqHttpError::UnsupportedMethod(method.to_string()));
                     }
-                }
-                method => {
-                    return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method));
-                }
-            };
+                };
 
-            let status_code = response.status().as_u16();
-            let body = read_body(response, max_body_bytes)?;
+                let status_code = response.status().as_u16();
+                let body = read_body(response, max_body_bytes)?;
 
-            Ok(HttpResponse::new(status_code, body))
-        })
-        .await?
+                Ok(HttpResponse::new(status_code, body))
+            },
+        )
+        .await
+        .map_err(UreqHttpError::Join)??;
+
+        Ok(result)
     }
 
     fn supports_streaming(&self) -> bool {
@@ -305,13 +347,10 @@ impl HttpClient for UreqHttpClient {
                     req = req.header(key, value);
                 }
                 mark_if_dispatchable(&self.requested, &req, &request.url);
-                req.call()?
+                req.call().map_err(UreqHttpError::Ureq)?
             }
             method => {
-                return Err(anyhow::anyhow!(
-                    "Streaming only supports GET, got: {}",
-                    method
-                ));
+                return Err(UreqHttpError::StreamingUnsupportedMethod(method.to_string()).into());
             }
         };
 
@@ -340,10 +379,7 @@ impl HttpClient for UreqHttpClient {
         // No spawn_blocking — like execute_streaming, this is driven from within
         // a blocking context, and the reader is read on this thread.
         if request.method != "POST" {
-            return Err(anyhow::anyhow!(
-                "Upload streaming only supports POST, got: {}",
-                request.method
-            ));
+            return Err(UreqHttpError::UploadStreamingUnsupportedMethod(request.method).into());
         }
 
         let mut req = status_as_response(self.agent.post(&request.url));
@@ -356,7 +392,9 @@ impl HttpClient for UreqHttpClient {
         req = req.header("content-length", content_length.as_str());
 
         mark_if_dispatchable(&self.requested, &req, &request.url);
-        let response = req.send(ureq::SendBody::from_owned_reader(body))?;
+        let response = req
+            .send(ureq::SendBody::from_owned_reader(body))
+            .map_err(UreqHttpError::Ureq)?;
 
         let status_code = response.status().as_u16();
         let body = read_body(response, self.max_body_bytes)?;
@@ -400,6 +438,30 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn maps_ureq_timeouts_to_the_portable_http_error() {
+        let error = HttpError::from(UreqHttpError::Ureq(ureq::Error::Timeout(
+            ureq::Timeout::Connect,
+        )));
+        assert!(error.is_timeout());
+        assert!(
+            std::error::Error::source(&error).is_some_and(|source| source.is::<UreqHttpError>())
+        );
+    }
+
+    #[test]
+    fn adapter_error_retains_the_concrete_io_source() {
+        use std::error::Error;
+        let error = HttpError::from(UreqHttpError::Io(std::io::Error::other("fixture")));
+        let adapter = error.source().expect("adapter source");
+        assert!(adapter.is::<UreqHttpError>());
+        assert!(
+            adapter
+                .source()
+                .is_some_and(|source| source.is::<std::io::Error>())
+        );
+    }
 
     #[test]
     fn default_connect_budget_preserves_custom_agent_policy() {

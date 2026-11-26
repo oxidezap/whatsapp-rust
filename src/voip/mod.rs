@@ -82,8 +82,8 @@ pub use wacore::voip_control::{
 // name `wacore` for them while naming `whatsapp_rust` for the call is a paper cut on the one path
 // this crate now asks a platform to implement.
 pub use wacore::voip_control::transport::{
-    RelayEndpointParams, RelayTransport, RelayTransportEvent, RelayTransportFactory,
-    RelayTransportProvider,
+    RelayEndpointParams, RelayResult, RelayTransport, RelayTransportError, RelayTransportErrorKind,
+    RelayTransportEvent, RelayTransportFactory, RelayTransportProvider,
 };
 // `CallEvent::PeerVideoStateChanged` carries this; surface it next to CallEvent (it lives in wacore).
 pub use wacore::types::call::VideoState;

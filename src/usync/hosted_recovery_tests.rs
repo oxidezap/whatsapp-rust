@@ -303,7 +303,7 @@ impl Rotation {
     }
 
     /// Exercise production response validation and guarded publication.
-    async fn apply(&self) -> anyhow::Result<Vec<Jid>> {
+    async fn apply(&self) -> Result<Vec<Jid>, DeviceSyncError> {
         self.client
             .process_device_list_response(&self.response, crate::cache::Freshness::Refresh)
             .await

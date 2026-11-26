@@ -2,7 +2,6 @@
 //!
 //! Reference: WhatsApp Web `WAWebHandleBusinessNotification`
 
-use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use wacore_binary::Jid;
 use wacore_binary::NodeRef;
@@ -61,7 +60,7 @@ impl crate::stats::HeapSize for VerifiedName {
 }
 
 impl VerifiedName {
-    pub fn try_from_node(node: &NodeRef<'_>) -> Result<Self> {
+    pub fn from_node(node: &NodeRef<'_>) -> Self {
         use wacore_binary::NodeContentRef;
         let name = node
             .attrs()
@@ -103,12 +102,12 @@ impl VerifiedName {
             issuer = issuer.or(details.issuer);
         }
 
-        Ok(Self {
+        Self {
             name,
             serial,
             issuer,
             certificate,
-        })
+        }
     }
 }
 
@@ -144,31 +143,47 @@ pub struct BusinessNotification {
     pub subscriptions: Vec<BusinessSubscription>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BusinessNotificationError {
+    #[error("expected <notification>, got <{0}>")]
+    UnexpectedTag(String),
+    #[error("expected type='business'")]
+    UnexpectedType,
+    #[error("notification missing required 'from' attribute")]
+    MissingFrom,
+    #[error("notification timestamp {0} exceeds i64::MAX")]
+    TimestampOutOfRange(u64),
+}
+
 impl BusinessNotification {
-    pub fn try_parse(node: &NodeRef<'_>) -> Result<Self> {
+    pub fn try_parse(node: &NodeRef<'_>) -> Result<Self, BusinessNotificationError> {
         if node.tag != "notification" {
-            return Err(anyhow!("expected <notification>, got <{}>", node.tag));
+            return Err(BusinessNotificationError::UnexpectedTag(
+                node.tag.as_ref().to_owned(),
+            ));
         }
         if node
             .get_attr("type")
             .map(|v| v.as_str())
             .is_none_or(|s| s != "business")
         {
-            return Err(anyhow!("expected type='business'"));
+            return Err(BusinessNotificationError::UnexpectedType);
         }
 
         let mut attrs = node.attrs();
         let from = attrs
             .optional_jid("from")
-            .ok_or_else(|| anyhow!("notification missing required 'from' attribute"))?;
+            .ok_or(BusinessNotificationError::MissingFrom)?;
         let stanza_id = node
             .get_attr("id")
             .map(|v| v.as_str())
             .unwrap_or_default()
             .into_owned();
         let timestamp = match attrs.optional_u64("t") {
-            Some(t) => i64::try_from(t)
-                .map_err(|_| anyhow!("notification timestamp {} exceeds i64::MAX", t))?,
+            Some(t) => {
+                i64::try_from(t).map_err(|_| BusinessNotificationError::TimestampOutOfRange(t))?
+            }
             None => 0,
         };
 
@@ -180,7 +195,7 @@ impl BusinessNotification {
             product_ids,
             collection_ids,
             subscriptions,
-        ) = Self::parse_content(node)?;
+        ) = Self::parse_content(node);
 
         Ok(Self {
             from,
@@ -199,7 +214,7 @@ impl BusinessNotification {
     #[allow(clippy::type_complexity)]
     fn parse_content(
         node: &NodeRef<'_>,
-    ) -> Result<(
+    ) -> (
         BusinessNotificationType,
         Option<Jid>,
         Option<String>,
@@ -207,12 +222,12 @@ impl BusinessNotification {
         Vec<String>,
         Vec<String>,
         Vec<BusinessSubscription>,
-    )> {
+    ) {
         use wacore_binary::NodeContentRef;
 
         if let Some(remove_node) = node.get_optional_child("remove") {
             if let Some(jid) = remove_node.attrs().optional_jid("jid") {
-                return Ok((
+                return (
                     BusinessNotificationType::RemoveJid,
                     Some(jid),
                     None,
@@ -220,9 +235,9 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             } else if let Some(hash) = remove_node.attrs().optional_string("hash") {
-                return Ok((
+                return (
                     BusinessNotificationType::RemoveHash,
                     None,
                     Some(hash.to_string()),
@@ -230,14 +245,14 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             }
         }
 
         if let Some(vn_node) = node.get_optional_child("verified_name") {
-            let verified_name = VerifiedName::try_from_node(vn_node)?;
+            let verified_name = VerifiedName::from_node(vn_node);
             if let Some(jid) = vn_node.attrs().optional_jid("jid") {
-                return Ok((
+                return (
                     BusinessNotificationType::VerifiedNameJid,
                     Some(jid),
                     None,
@@ -245,9 +260,9 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             } else if let Some(hash) = vn_node.attrs().optional_string("hash") {
-                return Ok((
+                return (
                     BusinessNotificationType::VerifiedNameHash,
                     None,
                     Some(hash.to_string()),
@@ -255,13 +270,13 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             }
         }
 
         if let Some(profile_node) = node.get_optional_child("profile") {
             if let Some(hash) = profile_node.attrs().optional_string("hash") {
-                return Ok((
+                return (
                     BusinessNotificationType::ProfileHash,
                     None,
                     Some(hash.to_string()),
@@ -269,9 +284,9 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             }
-            return Ok((
+            return (
                 BusinessNotificationType::Profile,
                 None,
                 None,
@@ -279,7 +294,7 @@ impl BusinessNotification {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-            ));
+            );
         }
 
         if let Some(catalog_node) = node.get_optional_child("product_catalog")
@@ -302,7 +317,7 @@ impl BusinessNotification {
             }
 
             if !product_ids.is_empty() {
-                return Ok((
+                return (
                     BusinessNotificationType::Product,
                     None,
                     None,
@@ -310,10 +325,10 @@ impl BusinessNotification {
                     product_ids,
                     Vec::new(),
                     Vec::new(),
-                ));
+                );
             }
             if !collection_ids.is_empty() {
-                return Ok((
+                return (
                     BusinessNotificationType::Collection,
                     None,
                     None,
@@ -321,7 +336,7 @@ impl BusinessNotification {
                     Vec::new(),
                     collection_ids,
                     Vec::new(),
-                ));
+                );
             }
         }
 
@@ -349,7 +364,7 @@ impl BusinessNotification {
                 }
             }
             if !subscriptions.is_empty() {
-                return Ok((
+                return (
                     BusinessNotificationType::Subscriptions,
                     None,
                     None,
@@ -357,11 +372,11 @@ impl BusinessNotification {
                     Vec::new(),
                     Vec::new(),
                     subscriptions,
-                ));
+                );
             }
         }
 
-        Ok((
+        (
             BusinessNotificationType::Unknown,
             None,
             None,
@@ -369,7 +384,7 @@ impl BusinessNotification {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-        ))
+        )
     }
 
     #[inline]
@@ -445,7 +460,7 @@ mod tests {
         let node = NodeBuilder::new("verified_name")
             .bytes(cert.encode_to_vec())
             .build();
-        let vn = VerifiedName::try_from_node(&node.as_node_ref()).expect("parse");
+        let vn = VerifiedName::from_node(&node.as_node_ref());
         assert_eq!(vn.name.as_deref(), Some("Acme Inc"));
         assert_eq!(vn.serial.as_deref(), Some("42"));
         assert!(vn.certificate.is_some());
@@ -457,7 +472,7 @@ mod tests {
             .attr("name", "Attr Name")
             .attr("serial", "7")
             .build();
-        let vn = VerifiedName::try_from_node(&node.as_node_ref()).expect("parse");
+        let vn = VerifiedName::from_node(&node.as_node_ref());
         assert_eq!(vn.name.as_deref(), Some("Attr Name"));
         assert_eq!(vn.serial.as_deref(), Some("7"));
     }
@@ -618,7 +633,9 @@ mod tests {
             .build();
 
         let result = BusinessNotification::try_parse(&node.as_node_ref());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("type='business'"));
+        assert!(matches!(
+            result,
+            Err(BusinessNotificationError::UnexpectedType)
+        ));
     }
 }

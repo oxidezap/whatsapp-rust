@@ -1,6 +1,5 @@
 //! E2E Session management for Client.
 
-use anyhow::Result;
 use futures::FutureExt;
 use rand::rngs::StdRng;
 use std::sync::Arc;
@@ -17,6 +16,46 @@ use wacore_binary::Jid;
 use super::Client;
 use crate::types::events::{Event, OfflineSyncCompleted, OfflineSyncInterrupted};
 use wacore::send::PrimaryDeviceRejected;
+
+/// Failure waiting for initial offline and history sync to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StartupSyncError {
+    /// Connection closed or rotated before offline sync finished.
+    #[error("Connection ended before offline sync completed")]
+    ConnectionEndedDuringOfflineSync,
+    /// Timeout expired waiting for offline sync completion.
+    #[error("Timeout waiting for offline sync completion")]
+    OfflineSyncTimeout,
+    /// Connection closed or rotated before history sync tasks became idle.
+    #[error("Connection ended before history sync tasks became idle")]
+    ConnectionEndedDuringHistorySync,
+    /// Timeout expired waiting for history sync tasks to become idle.
+    #[error("Timeout waiting for history sync tasks to become idle")]
+    HistorySyncTimeout,
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum SessionEnsureError {
+    #[error("{0}")]
+    PreKeyFetch(#[from] crate::prekeys::PreKeyFetchError),
+    #[error("{0}")]
+    PrimaryRejected(#[from] PrimaryDeviceRejected),
+    #[error("{0}")]
+    Flush(#[from] crate::client::SignalMaintenanceError),
+    #[error(
+        "session establishment for {count} address(es) was abandoned by \
+         {passes} successive callers"
+    )]
+    Abandoned { count: usize, passes: usize },
+}
+
+impl std::fmt::Debug for SessionEnsureError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 /// Waiter side of an in-flight ensure: it never receives a value, only the
 /// close that the leader's drop produces. A leader that panics or is cancelled
@@ -722,9 +761,7 @@ impl Client {
     /// teardown and zeroes the task count while notifying every listener, so a
     /// waiter that only looked at the count would read the teardown's zero as
     /// "all tasks finished" and report a sync that never happened.
-    pub async fn wait_for_startup_sync(&self, timeout: Duration) -> Result<()> {
-        use anyhow::anyhow;
-
+    pub async fn wait_for_startup_sync(&self, timeout: Duration) -> Result<(), StartupSyncError> {
         let deadline = self.runtime.monotonic_time() + timeout;
         let wait_generation = self.connection_generation.load(Ordering::Acquire);
         let connection_ended = || {
@@ -744,11 +781,11 @@ impl Client {
                 break;
             }
             if connection_ended() {
-                return Err(anyhow!("Connection ended before offline sync completed"));
+                return Err(StartupSyncError::ConnectionEndedDuringOfflineSync);
             }
             let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             if remaining.is_zero() {
-                return Err(anyhow!("Timeout waiting for offline sync completion"));
+                return Err(StartupSyncError::OfflineSyncTimeout);
             }
             let _ = wacore::runtime::timeout(
                 &*self.runtime,
@@ -765,9 +802,7 @@ impl Client {
             // `reset()` zeroes the count, so this ordering is what tells a
             // genuine idle from the one teardown manufactures.
             if connection_ended() {
-                return Err(anyhow!(
-                    "Connection ended before history sync tasks became idle"
-                ));
+                return Err(StartupSyncError::ConnectionEndedDuringHistorySync);
             }
             if idle {
                 return Ok(());
@@ -776,14 +811,17 @@ impl Client {
             let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             wacore::runtime::timeout(&*self.runtime, remaining, history_fut)
                 .await
-                .map_err(|_| anyhow!("Timeout waiting for history sync tasks to become idle"))?;
+                .map_err(|_| StartupSyncError::HistorySyncTimeout)?;
         }
     }
 
     /// Ensure E2E sessions exist for the given device JIDs.
     /// Waits for offline delivery, resolves LID mappings, then batches prekey fetches.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure", level = "debug", skip_all, fields(count = device_jids.len()), err(Debug)))]
-    pub(crate) async fn ensure_e2e_sessions(&self, device_jids: &[Jid]) -> Result<()> {
+    pub(crate) async fn ensure_e2e_sessions(
+        &self,
+        device_jids: &[Jid],
+    ) -> Result<(), SessionEnsureError> {
         if device_jids.is_empty() {
             return Ok(());
         }
@@ -796,7 +834,10 @@ impl Client {
     /// caller already resolved JIDs to the correct namespace (e.g., after
     /// alternate PN/LID key normalization in retry handling).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_resolved", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    pub(crate) async fn ensure_e2e_sessions_resolved(&self, jids: &[Jid]) -> Result<()> {
+    pub(crate) async fn ensure_e2e_sessions_resolved(
+        &self,
+        jids: &[Jid],
+    ) -> Result<(), SessionEnsureError> {
         if jids.is_empty() {
             return Ok(());
         }
@@ -821,9 +862,8 @@ impl Client {
 /// The `<error code>` the server attaches to a device it no longer knows.
 const UNREGISTERED_DEVICE_CODE: u16 = 406;
 
-fn is_device_unregistered(err: &anyhow::Error) -> bool {
-    use crate::error::ErrorChainExt;
-    err.server_rejection()
+fn is_device_unregistered(err: &(dyn std::error::Error + 'static)) -> bool {
+    crate::error::ErrorChainExt::server_rejection(err)
         .is_some_and(|r| r.code == UNREGISTERED_DEVICE_CODE)
 }
 
@@ -857,7 +897,7 @@ impl Client {
 impl Client {
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
+    async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<(), SessionEnsureError> {
         // A pass returns only the addresses whose leader died without doing the
         // work — not everything it deferred. A leader that ran and found no
         // bundle has already asked the question, so repeating its fetch would
@@ -883,17 +923,19 @@ impl Client {
         // Reported, not swallowed: before coalescing, this caller would have
         // run its own fetch and propagated whatever that returned. Succeeding
         // here would hand the fan-out an address nobody ever fetched for.
-        Err(anyhow::anyhow!(
-            "session establishment for {} address(es) was abandoned by \
-             {ENSURE_PASSES} successive callers",
-            jids.len()
-        ))
+        Err(SessionEnsureError::Abandoned {
+            count: jids.len(),
+            passes: ENSURE_PASSES,
+        })
     }
 
     /// One claim-probe-fetch pass. Returns the jids whose in-flight leader
     /// ended without carrying them, for the caller to re-examine.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_pass", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    async fn ensure_sessions_pass(&self, mut jids: Vec<Jid>) -> Result<Vec<Jid>> {
+    async fn ensure_sessions_pass(
+        &self,
+        mut jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, SessionEnsureError> {
         use wacore::types::jid::JidExt;
 
         /// What the probe learned about one address.
@@ -1013,7 +1055,10 @@ impl Client {
     /// Fetch prekeys and establish sessions for a batch of JIDs.
     /// Returns the number of sessions successfully established.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_establish", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    async fn fetch_and_establish_sessions(&self, jids: &[Jid]) -> Result<usize, anyhow::Error> {
+    async fn fetch_and_establish_sessions(
+        &self,
+        jids: &[Jid],
+    ) -> Result<usize, SessionEnsureError> {
         if jids.is_empty() {
             return Ok(0);
         }
@@ -1051,14 +1096,14 @@ impl Client {
                 self.stats
                     .record_unkeyable_devices(UnkeyableDevice::BatchRefused, jids.len() as u64);
                 self.invalidate_device_caches_for(jids).await;
-                return Err(e);
+                return Err(e.into());
             }
             Err(e) => {
                 // Same devices left unkeyed as a refusal leaves, for a reason
                 // that names none of them: a timeout, a dropped socket, a 429.
                 self.stats
                     .record_unkeyable_devices(UnkeyableDevice::FetchFailed, jids.len() as u64);
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -1199,13 +1244,15 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn log_primary_phone_session_state(&self) -> Result<()> {
+    pub(crate) async fn log_primary_phone_session_state(
+        &self,
+    ) -> Result<(), crate::client::ClientError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let own_pn = device_snapshot
             .pn
             .clone()
-            .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
+            .ok_or(crate::client::ClientError::NotLoggedIn)?;
 
         let Some(ref own_lid) = device_snapshot.lid else {
             log::debug!("No own LID yet, skipping primary phone session check");
@@ -1242,7 +1289,10 @@ impl Client {
     /// pre-flight so the voip offer treats a session-present-but-unacked device as
     /// pkmsg too, not as plain msg.
     #[cfg(feature = "voip-control")]
-    pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+    pub(crate) async fn would_emit_pkmsg(
+        &self,
+        jid: &Jid,
+    ) -> Result<bool, wacore::send::SessionPreflightError> {
         let device_store = self.persistence_manager.clone();
         let mut adapter = self.signal_adapter_from(device_store);
         let signal_addr = jid.to_protocol_address();
@@ -1250,14 +1300,14 @@ impl Client {
     }
 
     /// Check if a session exists for the given JID.
-    pub(crate) async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+    pub(crate) async fn check_session_exists(
+        &self,
+        jid: &Jid,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let signal_addr = jid.to_protocol_address();
 
-        device_snapshot
-            .contains_session(&signal_addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid.observe(), e))
+        device_snapshot.contains_session(&signal_addr).await
     }
 }
 
@@ -1383,7 +1433,8 @@ mod tests {
             .expect("join")
             .expect_err("a rejected primary must not be reported as a clean fetch");
         assert!(
-            err.downcast_ref::<PrimaryDeviceRejected>().is_some(),
+            crate::error::ErrorChainExt::sources(&err)
+                .any(|source| source.is::<PrimaryDeviceRejected>()),
             "the caller must be able to match on this, not parse it: {err}"
         );
     }
@@ -1653,21 +1704,13 @@ mod tests {
         // Both spellings, because they are both real: this preflight calls
         // `fetch_pre_keys` directly and receives the first, while the fan-out
         // goes through `SendContextResolver`, which re-wraps it as the second.
-        let as_iq_error = |code| {
-            anyhow::Error::new(crate::test_utils::server_error_iq(
-                code,
-                "not-acceptable",
-                None,
-                None,
-            ))
-        };
-        let as_shared = |code| {
-            anyhow::Error::new(wacore::request::ServerErrorCode {
-                code,
-                text: "not-acceptable".to_string(),
-                error_type: None,
-                backoff: None,
-            })
+        let as_iq_error =
+            |code| crate::test_utils::server_error_iq(code, "not-acceptable", None, None);
+        let as_shared = |code| wacore::request::ServerErrorCode {
+            code,
+            text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
         };
 
         assert!(
@@ -1685,7 +1728,9 @@ mod tests {
         }
 
         // Not every failure is a server error at all.
-        assert!(!is_device_unregistered(&anyhow::anyhow!("socket closed")));
+        assert!(!is_device_unregistered(&std::io::Error::other(
+            "socket closed"
+        )));
     }
 
     /// A prekey batch is several devices of the same one or two users, and each

@@ -8,7 +8,6 @@ use crate::MessageRef;
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
-use anyhow::Result;
 use log::debug;
 use thiserror::Error;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
@@ -23,7 +22,7 @@ use waproto::whatsapp as wa;
 /// Error returned by app-state (syncd) requests — the shared failure domain of
 /// chat actions ([`ChatActions`]), labels ([`crate::Labels`]) and re-syncs
 /// ([`crate::Client::resync_app_state`]).
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum AppStateError {
     /// The mutation arguments are invalid (e.g. a past mute timestamp, a
@@ -38,7 +37,20 @@ pub enum AppStateError {
     NotConnected,
     /// Encoding, key lookup, or sending the app-state patch failed.
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<crate::client::AppStateSyncFailure> for AppStateError {
+    fn from(error: crate::client::AppStateSyncFailure) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl std::fmt::Debug for AppStateError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// WA Web uses `-1` for indefinite mute.
@@ -524,18 +536,18 @@ fn is_valid_contact_id(jid: &Jid) -> bool {
     jid.is_pn() && jid.device == 0
 }
 
-pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>, AppStateError> {
     let non_literal = schema
         .index_parts
         .iter()
         .filter(|p| !matches!(p, IndexPart::Literal { .. }))
         .count();
     if args.len() != non_literal {
-        anyhow::bail!(
+        return Err(AppStateError::InvalidRequest(format!(
             "index args for action '{}': expected {non_literal}, got {}",
             schema.name,
             args.len()
-        );
+        )));
     }
     let mut parts: Vec<&str> = Vec::with_capacity(schema.index_parts.len());
     let mut it = args.iter();
@@ -545,7 +557,7 @@ pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u
             _ => parts.push(it.next().expect("arg count checked above")),
         }
     }
-    Ok(serde_json::to_vec(&parts)?)
+    serde_json::to_vec(&parts).map_err(|e| AppStateError::Internal(Box::new(e)))
 }
 
 /// Access via `client.chat_actions()`.
@@ -1039,14 +1051,14 @@ impl Client {
             .backend
             .get_latest_sync_key_id()
             .await
-            .map_err(|e| anyhow::anyhow!(e))?
+            .map_err(|e| AppStateError::Internal(Box::new(e)))?
             .ok_or_else(|| {
                 AppStateError::InvalidRequest("no app state sync key available".into())
             })?;
         let keys = proc
             .get_app_state_key(&key_id)
             .await
-            .map_err(|e| AppStateError::Internal(e.into()))?;
+            .map_err(|e| AppStateError::Internal(Box::new(e)))?;
 
         let mut iv = [0u8; 16];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);

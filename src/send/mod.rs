@@ -7,7 +7,6 @@
 
 use crate::client::Client;
 use crate::types::message::EditAttribute;
-use anyhow::anyhow;
 use log::debug;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::send::{RecipientFanout, StanzaType};
@@ -42,8 +41,8 @@ pub(crate) use tctoken_lifecycle::is_own_identity;
 ///
 /// Wraps the shared [`ClientError`] (transport/connection/IQ) and surfaces the
 /// actionable send-time failure modes explicitly. `Internal` is the last-resort
-/// catch-all for crypto/encoding paths that still thread `anyhow` internally.
-#[derive(Debug, Error)]
+/// catch-all for internal encryption/encoding/resolution failures.
+#[derive(Error)]
 #[non_exhaustive]
 pub enum SendError {
     /// Invalid or incomplete target addressing, rejected before sending.
@@ -67,6 +66,15 @@ pub enum SendError {
     /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
     #[error("invalid send request: {0}")]
     InvalidRequest(String),
+    /// No requested status recipient resolved to an address.
+    #[error("{0}")]
+    StatusRecipients(#[from] wacore::send::StatusRecipientsError),
+    #[error("{0}")]
+    SenderKeyCache(
+        #[source] wacore::error::BoxedErrorSource<wacore::store::signal_cache::SenderKeyCacheError>,
+    ),
+    #[error("{0}")]
+    Store(#[source] wacore::error::BoxedErrorSource<wacore::store::error::StoreError>),
     /// A DM could not be encrypted for a single device of the recipient, so
     /// nothing was sent. Distinct from a transport failure: the connection is
     /// fine and the message id was never on the wire, so the useful retry is
@@ -80,54 +88,71 @@ pub enum SendError {
     /// immediate retry resolves them again rather than repeating the question.
     #[error("{0}")]
     PrimaryDeviceRejected(#[source] wacore::send::PrimaryDeviceRejected),
+    #[error("{0}")]
+    Reaction(#[from] wacore::reaction::ReactionError),
+    #[error("{0}")]
+    Addon(#[from] wacore::secret_enc_addon::AddonError),
+    #[error("{0}")]
+    SignalMaintenance(#[from] crate::client::SignalMaintenanceError),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
     /// resolution) that have no dedicated variant yet. `Display` forwards to
     /// the inner error while `source()` still exposes it for downcast.
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl SendError {
-    /// Map an `anyhow::Error` bubbled up from a helper that still threads
-    /// `anyhow` (e.g. `send_message_impl`, `require_pn`) into a typed
-    /// `SendError`, recovering the concrete [`ClientError`]. Without this the
-    /// blanket `#[from] anyhow::Error` would funnel a logged-out
-    /// `ClientError::NotLoggedIn` into the un-matchable `Internal` catch-all.
-    pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
-        // A validation deeper in the pipeline may already be a typed `SendError`
-        // (e.g. send_message_impl's newsletter/status guards); recover it so it
-        // stays matchable instead of collapsing into `Internal`.
-        let err = match err.downcast::<SendError>() {
-            Ok(send) => return send,
-            Err(other) => other,
-        };
-        // A DM that reached no device of its recipient is not an internal
-        // failure: the caller decides whether to refresh devices and retry, so
-        // it must be able to match on it instead of parsing a message.
-        let err = match err.downcast::<wacore::send::NoRecipientDeviceError>() {
-            Ok(no_recipient) => return SendError::NoRecipientDevice(no_recipient),
-            Err(other) => other,
-        };
-        // Same reasoning one layer down: the send never reached the wire, and
-        // the caller's answer is a device-refreshing retry rather than a resend.
-        let err = match err.downcast::<wacore::send::PrimaryDeviceRejected>() {
-            Ok(rejected) => return SendError::PrimaryDeviceRejected(rejected),
-            Err(other) => other,
-        };
-        // A group-metadata IQ in the send path (e.g. routing_info) bubbles up as
-        // `GroupError`; flatten it before the `ClientError` check so an IQ
-        // failure surfaces as `SendError::Iq`, not the `Internal` catch-all.
-        let err = match err.downcast::<GroupError>() {
-            Ok(group) => return group.into(),
-            Err(other) => other,
-        };
-        match err.downcast::<ClientError>() {
-            Ok(client) => client.into(),
-            Err(other) => match other.downcast::<IqError>() {
-                Ok(iq) => SendError::Iq(iq),
-                Err(other) => SendError::Internal(other),
-            },
-        }
+impl std::fmt::Debug for SendError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Error)]
+pub(crate) enum SendInternalError {
+    #[error("proven peer identity is missing")]
+    ProvenPeerIdentityMissing,
+    #[error("proven peer session is missing")]
+    ProvenPeerSessionMissing,
+    #[error("proven peer session has no current state")]
+    ProvenPeerSessionMissingState,
+    #[error("proven peer session has an invalid remote identity")]
+    ProvenPeerSessionInvalidIdentity,
+    #[error("proven peer session has no remote identity")]
+    ProvenPeerSessionMissingRemoteIdentity,
+    #[error("peer identity changed after proof validation")]
+    PeerIdentityChangedAfterProof,
+    #[error("LID not set, cannot send to group")]
+    MissingOwnLidForGroup,
+    #[error("connection changed while preparing group message")]
+    ConnectionChangedDuringGroupPrepare,
+    #[error("group-direct audience must contain user JIDs")]
+    InvalidGroupDirectAudience,
+    #[error("group-direct recipient is no longer a group member")]
+    GroupDirectRecipientNotMember,
+    #[error("group-direct audience became empty")]
+    EmptyGroupDirectAudience,
+    #[error("group-direct message lost its participant fanout")]
+    MissingGroupDirectFanout,
+    #[error("group history device resolution omitted a requested identity")]
+    HistoryDeviceResolutionIncomplete,
+    #[error("group repair could not encrypt for any missed device")]
+    GroupRepairNoEncryptedDevices,
+    #[cfg(test)]
+    #[error("injected app-state key-share preparation failure")]
+    AppStateKeySharePrepareFailed,
+}
+
+impl std::fmt::Debug for SendInternalError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<SendInternalError> for SendError {
+    fn from(error: SendInternalError) -> Self {
+        Self::Internal(Box::new(error))
     }
 }
 
@@ -141,17 +166,126 @@ impl From<ClientError> for SendError {
     }
 }
 
+impl From<wacore::send::DmStanzaError> for SendError {
+    fn from(error: wacore::send::DmStanzaError) -> Self {
+        match error {
+            wacore::send::DmStanzaError::NoRecipient(error) => Self::NoRecipientDevice(error),
+            other => Self::Internal(Box::new(other)),
+        }
+    }
+}
+
+impl From<wacore::store::signal_cache::SenderKeyCacheError> for SendError {
+    fn from(error: wacore::store::signal_cache::SenderKeyCacheError) -> Self {
+        Self::SenderKeyCache(wacore::error::BoxedErrorSource::new(error))
+    }
+}
+
+impl From<wacore::store::error::StoreError> for SendError {
+    fn from(error: wacore::store::error::StoreError) -> Self {
+        Self::Store(wacore::error::BoxedErrorSource::new(error))
+    }
+}
+
+impl From<wacore::send::GroupStanzaError> for SendError {
+    fn from(error: wacore::send::GroupStanzaError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<SignalProtocolError> for SendError {
+    fn from(error: SignalProtocolError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<wacore::send::PeerStanzaError> for SendError {
+    fn from(error: wacore::send::PeerStanzaError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<wacore::send::SessionSetupError> for SendError {
+    fn from(error: wacore::send::SessionSetupError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<wacore::send::DeviceIdentityError> for SendError {
+    fn from(error: wacore::send::DeviceIdentityError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<wacore::socket::EncryptSendError> for SendError {
+    fn from(error: wacore::socket::EncryptSendError) -> Self {
+        Self::Client(ClientError::EncryptSend(error))
+    }
+}
+
+impl From<wacore::send::PairwiseRetryError> for SendError {
+    fn from(error: wacore::send::PairwiseRetryError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<waproto::protobuf::DecodeError> for SendError {
+    fn from(error: waproto::protobuf::DecodeError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl From<crate::client::SessionEnsureError> for SendError {
+    fn from(error: crate::client::SessionEnsureError) -> Self {
+        match error {
+            crate::client::SessionEnsureError::PrimaryRejected(rejected) => {
+                Self::PrimaryDeviceRejected(rejected)
+            }
+            crate::client::SessionEnsureError::PreKeyFetch(
+                crate::prekeys::PreKeyFetchError::Iq(iq),
+            ) => Self::Iq(iq),
+            other => Self::Internal(Box::new(other)),
+        }
+    }
+}
+
+impl From<crate::usync::DeviceSyncError> for SendError {
+    fn from(error: crate::usync::DeviceSyncError) -> Self {
+        match error.into_iq() {
+            Ok(iq) => Self::Iq(iq),
+            Err(other) => Self::Internal(Box::new(other)),
+        }
+    }
+}
+
+impl From<crate::client::SenderKeyResetError> for SendError {
+    fn from(error: crate::client::SenderKeyResetError) -> Self {
+        match error {
+            crate::client::SenderKeyResetError::Store(store) => {
+                Self::Store(wacore::error::BoxedErrorSource::new(store))
+            }
+            other => Self::Internal(Box::new(other)),
+        }
+    }
+}
+
+impl From<crate::retry::RetryPrepareError> for SendError {
+    fn from(error: crate::retry::RetryPrepareError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
 impl From<GroupError> for SendError {
     fn from(err: GroupError) -> Self {
         match err {
             GroupError::Iq(iq) => SendError::Iq(iq),
             GroupError::InvalidRequest(msg) => SendError::InvalidRequest(msg),
-            GroupError::Internal(e) => SendError::from_anyhow(e),
+            GroupError::Internal(e) => SendError::Internal(e),
             // Preserve domain errors without a dedicated send variant as typed
             // sources rather than flattening their Display text.
             group @ (GroupError::Mex(_)
             | GroupError::DescriptionConflict
-            | GroupError::EmptyPicture) => SendError::Internal(group.into()),
+            | GroupError::EmptyPicture) => SendError::Internal(Box::new(group)),
         }
     }
 }
@@ -182,13 +316,13 @@ pub(crate) fn same_group_user(
                 .is_some_and(|lid_user| left.is_lid() && lid_user == left.user))
 }
 
-fn require_history_device_coverage(requested: &[Jid], devices: &[Jid]) -> anyhow::Result<()> {
+fn require_history_device_coverage(requested: &[Jid], devices: &[Jid]) -> Result<(), SendError> {
     if requested.iter().any(|user| {
         !devices.iter().any(|device| {
             !device.is_hosted() && device.user == user.user && device.server == user.server
         })
     }) {
-        anyhow::bail!("group history device resolution omitted a requested identity");
+        return Err(SendInternalError::HistoryDeviceResolutionIncomplete.into());
     }
     Ok(())
 }
@@ -363,7 +497,7 @@ where
 
 // Keep the large send state machine out of its callers under fat LTO.
 #[inline(never)]
-fn poll_send_pipeline<F: Future<Output = anyhow::Result<Option<RecipientFanout>>>>(
+fn poll_send_pipeline<F: Future<Output = Result<Option<RecipientFanout>, SendError>>>(
     future: std::pin::Pin<&mut F>,
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<F::Output> {
@@ -1732,8 +1866,7 @@ impl Client {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(SendError::from_anyhow)?;
+            .await?;
         Ok(SendResult {
             message_id: crate::MessageId::try_from(request_id)?,
             to: result_to,
@@ -1937,9 +2070,7 @@ impl Client {
         {
             Ok(prepared) => prepared,
             Err(e) => {
-                if let Some(SignalProtocolError::NoSenderKeyState(_)) =
-                    e.downcast_ref::<SignalProtocolError>()
-                {
+                if let Some(SignalProtocolError::NoSenderKeyState(_)) = e.signal_error() {
                     log::warn!("No sender key for status broadcast, forcing distribution.");
 
                     self.reset_sender_key_device_tracking(&to_str).await?;
@@ -2112,7 +2243,7 @@ impl Client {
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
         force_distribution: bool,
-    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Option<Vec<Jid>>, crate::usync::DeviceSyncError> {
         let cached_map = if force_distribution {
             None
         } else {
@@ -2620,7 +2751,7 @@ impl Client {
         &self,
         stanza: Node,
         group_info: &wacore::client::context::GroupRoutingInfo,
-    ) -> Result<Node, anyhow::Error> {
+    ) -> Result<Node, SendError> {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
     }
 
@@ -2705,7 +2836,7 @@ impl Client {
         {
             Ok(fanout) => fanout,
             Err(error) => {
-                return Err(GroupDirectSendError::Send(SendError::from_anyhow(error)));
+                return Err(GroupDirectSendError::Send(error));
             }
         };
 
@@ -2779,8 +2910,7 @@ impl Client {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(SendError::from_anyhow)?;
+            .await?;
         Ok(SendResult {
             message_id: crate::MessageId::try_from(request_id)?,
             to: result_to,
@@ -2835,7 +2965,7 @@ impl Client {
         to: Jid,
         message: &wa::Message,
         options: SendPipelineOptions<'_>,
-    ) -> Result<Option<RecipientFanout>, anyhow::Error> {
+    ) -> Result<Option<RecipientFanout>, SendError> {
         let mut pipeline = Box::pin(self.send_message_impl_inner(to, message, options));
         std::future::poll_fn(move |cx| poll_send_pipeline(pipeline.as_mut(), cx)).await
     }
@@ -2845,7 +2975,7 @@ impl Client {
         to: Jid,
         message: &wa::Message,
         options: SendPipelineOptions<'_>,
-    ) -> Result<Option<RecipientFanout>, anyhow::Error> {
+    ) -> Result<Option<RecipientFanout>, SendError> {
         let SendPipelineOptions {
             sent_at,
             request_id: request_id_override,
@@ -2879,11 +3009,12 @@ impl Client {
         if expected_peer_identity.is_some() && (!peer || to.is_group()) {
             return Err(SendError::InvalidRequest(
                 "expected identity requires an individual peer send".into(),
-            )
-            .into());
+            ));
         }
         if request_id_override.is_some_and(str::is_empty) {
-            return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
+            return Err(SendError::InvalidRequest(
+                "message ID must not be empty".into(),
+            ));
         }
         if (wacore::send::contains_group_history_payload(message)
             && message.message_history_bundle.is_unset()
@@ -2894,8 +3025,7 @@ impl Client {
             return Err(SendError::InvalidRequest(
                 "group history requires the add-with-history API and its authorized audience"
                     .into(),
-            )
-            .into());
+            ));
         }
         if to.is_group()
             && let Some(protocol) = message.protocol_message.as_option()
@@ -2916,8 +3046,7 @@ impl Client {
                 "newsletter JIDs are not valid on the E2E send path; use \
                  newsletter().edit_message/revoke_message (pin is unsupported on channels)"
                     .into(),
-            )
-            .into());
+            ));
         }
 
         // status@broadcast reactions fan out pairwise to the author's devices;
@@ -2980,8 +3109,7 @@ impl Client {
             if !to.is_group() {
                 return Err(SendError::InvalidRequest(
                     "group-direct fanout requires a group JID".into(),
-                )
-                .into());
+                ));
             }
             box_send_branch(self.send_group_direct_branch(GroupDirectBranchRequest {
                 to: &to,
@@ -3061,7 +3189,7 @@ impl Client {
                 .load(std::sync::atomic::Ordering::Acquire)
                 != send_generation
         {
-            anyhow::bail!("connection changed while preparing group message");
+            return Err(SendInternalError::ConnectionChangedDuringGroupPrepare.into());
         }
         let awaiting_history_ack = history_expected_phash.is_some();
         if let Some(slot) = history_expected_phash {
@@ -3207,7 +3335,7 @@ impl Client {
         message: &wa::Message,
         request_id: &str,
         expected_identity: Option<[u8; 32]>,
-    ) -> Result<SendBranchOutput, anyhow::Error> {
+    ) -> Result<SendBranchOutput, SendError> {
         let node = {
             // Peer messages are only valid for individual users, not groups
             // Resolve encryption JID and acquire lock ONLY for encryption
@@ -3228,23 +3356,23 @@ impl Client {
                     .signal_cache
                     .get_identity(&signal_addr, device_snapshot.backend.as_ref())
                     .await?
-                    .ok_or_else(|| anyhow!("proven peer identity is missing"))?;
+                    .ok_or(SendInternalError::ProvenPeerIdentityMissing)?;
                 let record = store_adapter
                     .session_store
                     .load_session(&signal_addr)
                     .await?
-                    .ok_or_else(|| anyhow!("proven peer session is missing"))?;
+                    .ok_or(SendInternalError::ProvenPeerSessionMissing)?;
                 let remote = record
                     .session_state()
-                    .ok_or_else(|| anyhow!("proven peer session has no current state"))?
+                    .ok_or(SendInternalError::ProvenPeerSessionMissingState)?
                     .remote_identity_key()
-                    .map_err(|_| anyhow!("proven peer session has an invalid remote identity"))?
-                    .ok_or_else(|| anyhow!("proven peer session has no remote identity"))?;
+                    .map_err(|_| SendInternalError::ProvenPeerSessionInvalidIdentity)?
+                    .ok_or(SendInternalError::ProvenPeerSessionMissingRemoteIdentity)?;
                 // Both comparisons bind public identity keys to the confirmed peer.
                 if cached.as_ref() != expected.as_slice()
                     || remote.public_key().public_key_bytes() != expected.as_slice()
                 {
-                    return Err(anyhow!("peer identity changed after proof validation"));
+                    return Err(SendInternalError::PeerIdentityChangedAfterProof.into());
                 }
             }
             wacore::send::prepare_peer_stanza_for_role(
@@ -3267,7 +3395,7 @@ impl Client {
     async fn send_group_branch(
         &self,
         request: GroupBranchRequest<'_>,
-    ) -> Result<SendBranchOutput, anyhow::Error> {
+    ) -> Result<SendBranchOutput, SendError> {
         let GroupBranchRequest {
             to,
             message,
@@ -3309,7 +3437,7 @@ impl Client {
             let own_lid = device_snapshot
                 .lid
                 .as_ref()
-                .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
+                .ok_or(SendInternalError::MissingOwnLidForGroup)?;
 
             // One encode feeds retry cache and wire; mci-hoist re-encodes (folded context).
             let shared_content = message
@@ -3379,7 +3507,10 @@ impl Client {
                     .and_then(|state| state.sender_chain_key())
                     .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
-                Ok::<(bool, bool), anyhow::Error>((key_exists, needs_rotation))
+                Ok::<(bool, bool), wacore::store::signal_cache::SenderKeyCacheError>((
+                    key_exists,
+                    needs_rotation,
+                ))
             };
 
             let (key_exists, needs_rotation) = read_sender_key_state().await?;
@@ -3590,9 +3721,7 @@ impl Client {
                     prepared.node
                 }
                 Err(e) => {
-                    if let Some(SignalProtocolError::NoSenderKeyState(_)) =
-                        e.downcast_ref::<SignalProtocolError>()
-                    {
+                    if let Some(SignalProtocolError::NoSenderKeyState(_)) = e.signal_error() {
                         log::warn!(
                             "No sender key for group {}, forcing distribution.",
                             to.observe()
@@ -3673,7 +3802,7 @@ impl Client {
                         group_devices = Some(retry_addressed);
                         retry_prepared.node
                     } else {
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             }
@@ -3731,7 +3860,7 @@ impl Client {
     async fn send_dm_branch(
         &self,
         request: DmBranchRequest<'_>,
-    ) -> Result<SendBranchOutput, anyhow::Error> {
+    ) -> Result<SendBranchOutput, SendError> {
         let DmBranchRequest {
             to,
             message,
@@ -3903,7 +4032,8 @@ impl Client {
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
                 },
             ))
-            .await?;
+            .await
+            .map_err(SendError::from)?;
             (prepared, dm_devices)
         };
         Ok(SendBranchOutput {
@@ -3938,7 +4068,7 @@ impl Client {
     async fn send_group_direct_branch(
         &self,
         request: GroupDirectBranchRequest<'_>,
-    ) -> Result<SendBranchOutput, anyhow::Error> {
+    ) -> Result<SendBranchOutput, SendError> {
         let GroupDirectBranchRequest {
             to,
             message,
@@ -3950,7 +4080,7 @@ impl Client {
                 .iter()
                 .any(|jid| !matches!(jid.server, Server::Pn | Server::Lid))
         {
-            anyhow::bail!("group-direct audience must contain user JIDs");
+            return Err(SendInternalError::InvalidGroupDirectAudience.into());
         }
 
         let group_info = self
@@ -3965,7 +4095,7 @@ impl Client {
         let own_lid = device_snapshot
             .lid
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("LID not set, cannot send to group"))?;
+            .ok_or(SendInternalError::MissingOwnLidForGroup)?;
 
         let mut group_recipients = Vec::with_capacity(recipients.len());
         for requested in recipients {
@@ -3974,7 +4104,7 @@ impl Client {
                 .iter()
                 .find(|member| same_group_user(member, requested, &group_info))
             else {
-                anyhow::bail!("group-direct recipient is no longer a group member");
+                return Err(SendInternalError::GroupDirectRecipientNotMember.into());
             };
             if !group_recipients
                 .iter()
@@ -3984,7 +4114,7 @@ impl Client {
             }
         }
         if group_recipients.is_empty() {
-            anyhow::bail!("group-direct audience became empty");
+            return Err(SendInternalError::EmptyGroupDirectAudience.into());
         }
 
         let mut device_queries = Vec::with_capacity(group_recipients.len() + 1);
@@ -4071,7 +4201,8 @@ impl Client {
                 pre_encoded: shared_content.as_deref().map(Vec::as_slice),
             },
         )
-        .await?;
+        .await
+        .map_err(SendError::from)?;
 
         prepared
             .node
@@ -4083,7 +4214,7 @@ impl Client {
         }
         match prepared.node.content.as_mut() {
             Some(NodeContent::Nodes(children)) => children.push(marker.build()),
-            _ => anyhow::bail!("group-direct message lost its participant fanout"),
+            _ => return Err(SendInternalError::MissingGroupDirectFanout.into()),
         }
 
         let sender_identity = match group_info.addressing_mode {
@@ -4472,13 +4603,14 @@ mod tests {
     fn a_dm_with_no_recipient_device_stays_typed_through_the_send_path() {
         use wacore::send::NoRecipientDeviceError;
 
-        let failed: anyhow::Error = NoRecipientDeviceError::EncryptionFailed {
-            attempted: 2,
-            source: anyhow!("session with 5511900000099:1 not found"),
-        }
-        .into();
-        // Wrapped the way the send path bubbles it: through `?` under context.
-        let mapped = SendError::from_anyhow(failed.context("sending dm"));
+        let failed =
+            wacore::send::DmStanzaError::NoRecipient(NoRecipientDeviceError::EncryptionFailed {
+                attempted: 2,
+                source: wacore::error::BoxedErrorSource::new(
+                    wacore::send::DeviceEncryptionError::NoCiphertext,
+                ),
+            });
+        let mapped = SendError::from(failed);
         let SendError::NoRecipientDevice(NoRecipientDeviceError::EncryptionFailed {
             attempted,
             ..
@@ -4488,14 +4620,64 @@ mod tests {
         };
         assert_eq!(*attempted, 2);
 
-        let unresolved = SendError::from_anyhow(NoRecipientDeviceError::Unresolved.into());
+        let typed = SendError::from(wacore::send::DmStanzaError::NoRecipient(
+            NoRecipientDeviceError::Unresolved,
+        ));
         assert!(matches!(
-            unresolved,
+            typed,
             SendError::NoRecipientDevice(NoRecipientDeviceError::Unresolved)
         ));
         assert!(
-            std::error::Error::source(&unresolved).is_some(),
+            std::error::Error::source(&typed).is_some(),
             "the typed cause must stay in the source chain"
+        );
+
+        let primary = SendError::from(crate::client::SessionEnsureError::PrimaryRejected(
+            wacore::send::PrimaryDeviceRejected::new(406),
+        ));
+        assert!(matches!(primary, SendError::PrimaryDeviceRejected(_)));
+    }
+
+    #[test]
+    fn prekey_fetch_iq_failures_remain_matchable() {
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::Iq(IqError::Timeout),
+        );
+        assert!(matches!(
+            SendError::from(error),
+            SendError::Iq(IqError::Timeout)
+        ));
+
+        let response = crate::test_utils::node_to_owned_ref(
+            &NodeBuilder::new("iq").attr("type", "error").build(),
+        );
+        let rejected = IqError::ServerError {
+            code: 429,
+            text: "rate limited".into(),
+            error_type: None,
+            backoff: Some(5),
+            response: crate::request::RejectionStanza::from(response),
+        };
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::Iq(rejected),
+        );
+        assert!(matches!(
+            SendError::from(error),
+            SendError::Iq(IqError::ServerError {
+                code: 429,
+                backoff: Some(5),
+                ..
+            })
+        ));
+
+        let error = crate::client::SessionEnsureError::PreKeyFetch(
+            crate::prekeys::PreKeyFetchError::PrimaryIdentityChanged,
+        );
+        let mapped = SendError::from(error);
+        assert!(matches!(mapped, SendError::Internal(_)));
+        assert!(
+            crate::ErrorChainExt::sources(&mapped)
+                .any(|source| source.is::<crate::prekeys::PreKeyFetchError>())
         );
     }
 
@@ -10922,7 +11104,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for PausedTransport {
-            async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 crate::transport::Transport::send(self.capture.as_ref(), data).await?;
                 self.entered.notify_one();
                 self.release.acquire().await.unwrap().forget();

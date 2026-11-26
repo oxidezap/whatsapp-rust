@@ -8,11 +8,11 @@ publish = false
 description = "Reference external metrics plugin for whatsapp-rust"
 
 [dependencies]
-anyhow = { workspace = true }
 bon = { workspace = true }
 portable-atomic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 whatsapp-rust = { path = "../..", default-features = false, features = ["plugins"] }
 
 [dev-dependencies]

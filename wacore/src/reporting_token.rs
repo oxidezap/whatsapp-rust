@@ -20,7 +20,6 @@
 use smallvec::SmallVec;
 use std::{fmt, sync::LazyLock};
 
-use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -28,6 +27,24 @@ use wacore_binary::Jid;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 use waproto::whatsapp as wa;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReportingTokenError {
+    #[error("Reporting token HKDF info length overflow")]
+    InfoLengthOverflow,
+    #[error("Failed to format reporting token JIDs")]
+    FormatJid,
+    #[error(
+        "Invalid message secret size: expected {}, got {actual}",
+        MESSAGE_SECRET_SIZE
+    )]
+    InvalidSecretLength { actual: usize },
+    #[error("HKDF expand failed: {0}")]
+    Hkdf(#[source] hkdf::InvalidLength),
+    #[error("Failed to create HMAC")]
+    Hmac,
+}
 
 /// Wire type constants for protobuf parsing
 mod wire_type {
@@ -346,17 +363,17 @@ fn build_hkdf_info_with(
     sender_len: usize,
     remote_len: usize,
     write_jids: impl FnOnce(&mut ReportingTokenInfo) -> fmt::Result,
-) -> Result<ReportingTokenInfo> {
+) -> Result<ReportingTokenInfo, ReportingTokenError> {
     let capacity = stanza_id
         .len()
         .checked_add(sender_len)
         .and_then(|len| len.checked_add(remote_len))
         .and_then(|len| len.checked_add(USE_CASE_REPORT_TOKEN.len()))
-        .ok_or_else(|| anyhow!("Reporting token HKDF info length overflow"))?;
+        .ok_or(ReportingTokenError::InfoLengthOverflow)?;
 
     let mut info = ReportingTokenInfo::with_capacity(capacity);
     info.extend_from_slice(stanza_id.as_bytes());
-    write_jids(&mut info).map_err(|_| anyhow!("Failed to format reporting token JIDs"))?;
+    write_jids(&mut info).map_err(|_| ReportingTokenError::FormatJid)?;
     info.extend_from_slice(USE_CASE_REPORT_TOKEN.as_bytes());
     Ok(info)
 }
@@ -365,7 +382,7 @@ fn build_hkdf_info(
     stanza_id: &str,
     sender_jid: &str,
     remote_jid: &str,
-) -> Result<ReportingTokenInfo> {
+) -> Result<ReportingTokenInfo, ReportingTokenError> {
     build_hkdf_info_with(stanza_id, sender_jid.len(), remote_jid.len(), |info| {
         info.extend_from_slice(sender_jid.as_bytes());
         info.extend_from_slice(remote_jid.as_bytes());
@@ -377,7 +394,7 @@ fn build_hkdf_info_for_jids(
     stanza_id: &str,
     sender_jid: &Jid,
     remote_jid: &Jid,
-) -> Result<ReportingTokenInfo> {
+) -> Result<ReportingTokenInfo, ReportingTokenError> {
     // Start inline and let the infallible writer promote only unusually long
     // protocol inputs. Avoiding a separate sizing pass formats each JID once.
     build_hkdf_info_with(stanza_id, 0, 0, |info| {
@@ -386,22 +403,20 @@ fn build_hkdf_info_for_jids(
     })
 }
 
-fn validate_message_secret(message_secret: &[u8]) -> Result<()> {
+fn validate_message_secret(message_secret: &[u8]) -> Result<(), ReportingTokenError> {
     if message_secret.len() == MESSAGE_SECRET_SIZE {
         return Ok(());
     }
 
-    Err(anyhow!(
-        "Invalid message secret size: expected {}, got {}",
-        MESSAGE_SECRET_SIZE,
-        message_secret.len()
-    ))
+    Err(ReportingTokenError::InvalidSecretLength {
+        actual: message_secret.len(),
+    })
 }
 
 fn derive_reporting_token_key_from_info(
     message_secret: &[u8],
     info: &[u8],
-) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
+) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE], ReportingTokenError> {
     // No-salt extract via the cached zero-keyed HMAC; output is byte-identical to
     // `Hkdf::new(None, message_secret)` but skips the constant ipad/opad schedule.
     let mut extract = REPORTING_TOKEN_EXTRACT_HMAC.clone();
@@ -411,7 +426,7 @@ fn derive_reporting_token_key_from_info(
     Hkdf::<Sha256>::from_prk(&prk)
         .expect("PRK is hash-sized")
         .expand(info, &mut key)
-        .map_err(|e| anyhow!("HKDF expand failed: {}", e))?;
+        .map_err(ReportingTokenError::Hkdf)?;
 
     Ok(key)
 }
@@ -431,7 +446,7 @@ pub fn derive_reporting_token_key(
     stanza_id: &str,
     sender_jid: &str,
     remote_jid: &str,
-) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
+) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE], ReportingTokenError> {
     validate_message_secret(message_secret)?;
     let info = build_hkdf_info(stanza_id, sender_jid, remote_jid)?;
     derive_reporting_token_key_from_info(message_secret, info.as_bytes())
@@ -442,7 +457,7 @@ fn derive_reporting_token_key_for_jids(
     stanza_id: &str,
     sender_jid: &Jid,
     remote_jid: &Jid,
-) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
+) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE], ReportingTokenError> {
     validate_message_secret(message_secret)?;
     let info = build_hkdf_info_for_jids(stanza_id, sender_jid, remote_jid)?;
     derive_reporting_token_key_from_info(message_secret, info.as_bytes())
@@ -714,9 +729,9 @@ pub fn generate_reporting_token_content(message: &wa::Message) -> Option<Vec<u8>
 pub fn calculate_reporting_token(
     reporting_token_key: &[u8; REPORTING_TOKEN_KEY_SIZE],
     content: &[u8],
-) -> Result<[u8; REPORTING_TOKEN_SIZE]> {
+) -> Result<[u8; REPORTING_TOKEN_SIZE], ReportingTokenError> {
     let mut mac = Hmac::<Sha256>::new_from_slice(reporting_token_key)
-        .map_err(|_| anyhow!("Failed to create HMAC"))?;
+        .map_err(|_| ReportingTokenError::Hmac)?;
     mac.update(content);
 
     let result = mac.finalize().into_bytes();
@@ -1096,6 +1111,19 @@ mod tests {
         let key3 = derive_reporting_token_key(&secret, "different_id", sender_jid, remote_jid)
             .expect("valid secret should derive key successfully");
         assert_ne!(key, key3);
+    }
+
+    #[test]
+    fn derive_key_reports_invalid_secret_length() {
+        let error = derive_reporting_token_key(&[0; 16], "id", "sender", "remote").unwrap_err();
+        assert!(matches!(
+            error,
+            ReportingTokenError::InvalidSecretLength { actual: 16 }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Invalid message secret size: expected 32, got 16"
+        );
     }
 
     #[test]

@@ -22,6 +22,63 @@ use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, Mess
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PdoError {
+    #[error("{0}")]
+    Client(#[from] crate::client::ClientError),
+    #[error("{0}")]
+    Send(#[from] crate::send::SendError),
+    #[error("internal PDO error: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    InvalidPlaceholder(&'static str),
+    #[error("{0} is not an app-state collection this client knows")]
+    UnknownCollection(String),
+    #[error("the block list is not recovered from the primary")]
+    BlockListRecoveryDisallowed,
+    #[error("the account has peer snapshot recovery turned off")]
+    PeerSnapshotRecoveryDisabled,
+    #[error("timed out waiting for an authenticated recovery connection")]
+    RecoveryConnectionTimeout,
+    #[error("snapshot recovery connection is {0:?}")]
+    RecoveryConnectionUnreachable(crate::client::Reachability),
+    #[error("connection changed twice while sending snapshot recovery")]
+    RecoveryConnectionChanged,
+}
+
+impl std::fmt::Debug for PdoError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<crate::client::SessionEnsureError> for PdoError {
+    fn from(error: crate::client::SessionEnsureError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+#[derive(thiserror::Error)]
+enum PdoMessageInfoError {
+    #[error("WebMessageInfo missing key")]
+    MissingKey,
+    #[error("MessageKey missing remoteJid")]
+    MissingRemoteJid,
+    #[error("{0}")]
+    InvalidRemoteJid(#[source] wacore_binary::jid::JidError),
+    #[error("{0}")]
+    InvalidParticipantJid(#[source] wacore_binary::jid::JidError),
+}
+
+impl std::fmt::Debug for PdoMessageInfoError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 /// How many unrequested recoveries may wait behind the one being applied.
 const MAX_QUEUED_UNREQUESTED_RECOVERIES: usize = 64;
 
@@ -384,7 +441,7 @@ impl Client {
     pub async fn send_pdo_placeholder_resend_request(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PdoError> {
         self.send_pdo_placeholder_resend_request_impl(info, false)
             .await
             .map(|_| ())
@@ -394,27 +451,29 @@ impl Client {
     pub async fn retry_pdo_placeholder_resend_request(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
-    ) -> Result<Option<String>, anyhow::Error> {
+    ) -> Result<Option<String>, PdoError> {
         use wacore_binary::Server;
-        anyhow::ensure!(!info.id.is_empty(), "message id is empty");
-        anyhow::ensure!(
-            !info.source.chat.user.is_empty()
-                && matches!(
-                    info.source.chat.server,
-                    Server::Pn | Server::Lid | Server::Group | Server::Broadcast
-                )
-                && info.source.is_group
-                    == matches!(info.source.chat.server, Server::Group | Server::Broadcast),
-            "invalid placeholder chat"
-        );
-        anyhow::ensure!(
-            !info.source.sender.user.is_empty()
-                && matches!(
-                    info.source.sender.server,
-                    Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid | Server::Bot
-                ),
-            "invalid placeholder sender"
-        );
+        if info.id.is_empty() {
+            return Err(PdoError::InvalidPlaceholder("message id is empty"));
+        }
+        if info.source.chat.user.is_empty()
+            || !matches!(
+                info.source.chat.server,
+                Server::Pn | Server::Lid | Server::Group | Server::Broadcast
+            )
+            || info.source.is_group
+                != matches!(info.source.chat.server, Server::Group | Server::Broadcast)
+        {
+            return Err(PdoError::InvalidPlaceholder("invalid placeholder chat"));
+        }
+        if info.source.sender.user.is_empty()
+            || !matches!(
+                info.source.sender.server,
+                Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid | Server::Bot
+            )
+        {
+            return Err(PdoError::InvalidPlaceholder("invalid placeholder sender"));
+        }
         if !self.is_socket_connected() {
             return Err(crate::client::ClientError::NotConnected.into());
         }
@@ -426,7 +485,7 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         explicit_retry: bool,
-    ) -> Result<Option<String>, anyhow::Error> {
+    ) -> Result<Option<String>, PdoError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
@@ -770,7 +829,7 @@ impl Client {
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
             );
-            return Err(e);
+            return Err(e.into());
         }
 
         memo.outcome
@@ -801,7 +860,7 @@ impl Client {
         oldest_msg_from_me: bool,
         oldest_msg_timestamp_ms: i64,
         count: i32,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, PdoError> {
         let request_id = self.generate_message_id();
         self.fetch_message_history_with_id(
             chat_jid,
@@ -829,7 +888,7 @@ impl Client {
         oldest_msg_timestamp_ms: i64,
         count: i32,
         request_id: &crate::MessageId,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PdoError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
         let msg = history_sync_on_demand_message(
@@ -868,7 +927,7 @@ impl Client {
     pub async fn request_syncd_snapshot_recovery(
         self: &Arc<Self>,
         collection: &str,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, PdoError> {
         // Both gates are enforced here as well as at the escalation, because this
         // is public and takes a name.
         //
@@ -881,9 +940,7 @@ impl Client {
             .parse::<wacore::appstate::patch_decode::WAPatchName>()
             .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
         if patch_name == wacore::appstate::patch_decode::WAPatchName::Unknown {
-            return Err(anyhow::anyhow!(
-                "{collection} is not an app-state collection this client knows"
-            ));
+            return Err(PdoError::UnknownCollection(collection.to_owned()));
         }
         // And the block list is refused, here and again where a reply is
         // applied, since a reply no longer has to match an ask to be applied.
@@ -891,9 +948,7 @@ impl Client {
         // the one collection where being wrong means talking to somebody who
         // was blocked.
         if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
-            return Err(anyhow::anyhow!(
-                "the block list is not recovered from the primary"
-            ));
+            return Err(PdoError::BlockListRecoveryDisallowed);
         }
 
         // And the rollout gate, for the same reason the two above are here: an
@@ -909,9 +964,7 @@ impl Client {
             .await
             .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
         {
-            return Err(anyhow::anyhow!(
-                "the account has peer snapshot recovery turned off"
-            ));
+            return Err(PdoError::PeerSnapshotRecoveryDisabled);
         }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -976,11 +1029,9 @@ impl Client {
                 self.wait_until_reachable(),
             )
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for an authenticated recovery connection")
-            })?;
+            .map_err(|_| PdoError::RecoveryConnectionTimeout)?;
             if reachable != crate::client::Reachability::Reachable {
-                anyhow::bail!("snapshot recovery connection is {reachable:?}");
+                return Err(PdoError::RecoveryConnectionUnreachable(reachable));
             }
             let generation = self
                 .connection_generation
@@ -1027,13 +1078,11 @@ impl Client {
                 Err(e) => {
                     // A replacement request must never lose its marker.
                     proc.take_recovery_request_by_id(&request_id).await;
-                    Err(e)
+                    Err(e.into())
                 }
             };
         }
-        Err(anyhow::anyhow!(
-            "connection changed twice while sending snapshot recovery"
-        ))
+        Err(PdoError::RecoveryConnectionChanged)
     }
 
     /// Sends a peer message using an ID recorded before the send starts.
@@ -1042,7 +1091,7 @@ impl Client {
         to: Jid,
         msg: &wa::Message,
         msg_id: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), PdoError> {
         // Send with peer category and high priority
         self.send_message_impl(
             to,
@@ -1801,9 +1850,9 @@ impl Client {
     async fn message_info_from_web_message_info(
         &self,
         web_msg: &wa::WebMessageInfo,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, PdoMessageInfoError> {
         let Some(key) = web_msg.key.as_option() else {
-            anyhow::bail!("WebMessageInfo missing key");
+            return Err(PdoMessageInfoError::MissingKey);
         };
 
         let participant = self.pdo_key_participant(web_msg);
@@ -1836,17 +1885,19 @@ impl Client {
         participant: Option<&str>,
         message_timestamp: Option<u64>,
         push_name: Option<&str>,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, PdoMessageInfoError> {
         let remote_jid: Jid = remote_jid
-            .ok_or_else(|| anyhow::anyhow!("MessageKey missing remoteJid"))?
-            .parse()?;
+            .ok_or(PdoMessageInfoError::MissingRemoteJid)?
+            .parse()
+            .map_err(PdoMessageInfoError::InvalidRemoteJid)?;
         let is_group = remote_jid.is_group();
         let is_from_me = from_me.unwrap_or(false);
 
         // The PDO response handler maps the top-level author, falling back to
         // the normalized key participant, for groups and broadcasts alike.
         let sender = if let Some(p) = participant {
-            p.parse()?
+            p.parse()
+                .map_err(PdoMessageInfoError::InvalidParticipantJid)?
         } else if is_from_me {
             self.persistence_manager
                 .get_device_snapshot()
@@ -1940,7 +1991,7 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{history_sync_on_demand_message, self_peer_target, wa};
+    use super::{PdoMessageInfoError, history_sync_on_demand_message, self_peer_target, wa};
     use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
 
@@ -2118,6 +2169,44 @@ mod tests {
             },
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn reconstruct_rejects_missing_keys_and_invalid_addresses() {
+        let client = setup_reconstruct_client().await;
+        let missing = wa::WebMessageInfo::default();
+        assert!(matches!(
+            client.message_info_from_web_message_info(&missing).await,
+            Err(PdoMessageInfoError::MissingKey)
+        ));
+
+        let mut missing_remote = wa::WebMessageInfo::default();
+        missing_remote.key = waproto::protobuf::MessageField::some(wa::MessageKey::default());
+        assert!(matches!(
+            client
+                .message_info_from_web_message_info(&missing_remote)
+                .await,
+            Err(PdoMessageInfoError::MissingRemoteJid)
+        ));
+
+        let invalid_remote = make_web_msg("not-a-jid", false, "PDO-ID", None);
+        let error = client
+            .message_info_from_web_message_info(&invalid_remote)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PdoMessageInfoError::InvalidRemoteJid(_)));
+        assert!(std::error::Error::source(&error).is_some());
+
+        let invalid_author = make_web_msg("status@broadcast", false, "PDO-ID", Some("not-a-jid"));
+        let error = client
+            .message_info_from_web_message_info(&invalid_author)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PdoMessageInfoError::InvalidParticipantJid(_)
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     /// The reconstruction path preserves the real author for status
@@ -4195,10 +4284,13 @@ mod tests {
             }
             #[async_trait::async_trait]
             impl crate::transport::Transport for GatedFailure {
-                async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+                async fn send(
+                    &self,
+                    _: bytes::Bytes,
+                ) -> Result<(), crate::transport::TransportError> {
                     self.entered.send(()).await.unwrap();
                     self.release.recv().await.unwrap();
-                    anyhow::bail!("synthetic send failure")
+                    return Err("synthetic send failure".into());
                 }
                 async fn disconnect(&self) {}
             }

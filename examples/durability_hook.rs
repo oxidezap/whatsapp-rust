@@ -103,7 +103,7 @@ impl InboundDurabilityHook for InboxArchiver {
         &self,
         _client: Arc<Client>,
         batch: &[InboundMessage],
-    ) -> anyhow::Result<()> {
+    ) -> whatsapp_rust::HookResult<()> {
         // Live traffic arrives one message at a time; an offline drain hands
         // over a whole batch. Either way the commit below is a single append +
         // fsync, so the durability cost amortizes over the batch.

@@ -4,7 +4,6 @@ use std::hash::BuildHasher;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
-use anyhow::Result;
 use async_lock::Mutex;
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
@@ -15,6 +14,104 @@ use crate::libsignal::protocol::{
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionCheckoutError {
+    #[error("session is already checked out")]
+    AlreadyCheckedOut,
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum SenderKeyCacheError {
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+    #[error("{0}")]
+    Signal(#[from] SignalProtocolError),
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum IdentityPersistenceError {
+    #[error("invalid bootstrap identity length")]
+    InvalidBootstrapIdentity,
+    #[error("invalid stored bootstrap identity length")]
+    InvalidStoredBootstrapIdentity,
+    #[error("identity persistence worker stopped")]
+    WorkerStopped,
+    #[error("{0}")]
+    Store(#[from] crate::store::error::StoreError),
+}
+
+#[non_exhaustive]
+pub enum SignalCacheFlushError {
+    Store(crate::error::BoxedErrorSource<crate::store::error::StoreError>),
+    InvalidIdentity {
+        address: Arc<str>,
+        length: usize,
+    },
+    SenderKeySerialization {
+        address: Arc<str>,
+        source: crate::error::BoxedErrorSource<SignalProtocolError>,
+    },
+}
+
+impl std::fmt::Display for SignalCacheFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source: Option<&(dyn std::error::Error + 'static)> = match self {
+            Self::Store(error) => {
+                write!(f, "{error}")?;
+                Some(error.as_ref())
+            }
+            Self::InvalidIdentity { address, length } => {
+                write!(
+                    f,
+                    "Corrupted identity key for {address}: expected 32 bytes, got {length}"
+                )?;
+                None
+            }
+            Self::SenderKeySerialization { address, source } => {
+                write!(f, "sender key serialize for {address}: {source}")?;
+                Some(source.as_ref())
+            }
+        };
+        if f.alternate() {
+            let mut source = source.and_then(std::error::Error::source);
+            for _ in 0..16 {
+                let Some(error) = source else { break };
+                write!(f, ": {error}")?;
+                source = error.source();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SignalCacheFlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error.as_ref()),
+            Self::InvalidIdentity { .. } => None,
+            Self::SenderKeySerialization { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+debug_as_display!(
+    SessionCheckoutError,
+    SenderKeyCacheError,
+    IdentityPersistenceError,
+    SignalCacheFlushError,
+);
+
+impl From<crate::store::error::StoreError> for SignalCacheFlushError {
+    fn from(error: crate::store::error::StoreError) -> Self {
+        Self::Store(crate::error::BoxedErrorSource::new(error))
+    }
+}
 
 type StoreIncarnation = [u8; 16];
 
@@ -1499,14 +1596,18 @@ impl SignalStoreCache {
     /// state with. Conservative on the cache side: any matching key counts
     /// (even a stale/checked-out marker), so it never reports "none" when state
     /// might exist.
-    pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
+    pub async fn has_state_for_user(
+        &self,
+        user: &str,
+        backend: &dyn SignalStore,
+    ) -> crate::store::error::Result<bool> {
         if self.lock_sessions().await.cache.has_user(user) {
             return Ok(true);
         }
         if self.identities.lock().await.cache.has_user(user) {
             return Ok(true);
         }
-        Ok(backend.has_signal_state_for_user(user).await?)
+        backend.has_signal_state_for_user(user).await
     }
 
     /// Collect cached history before reading durable history, so a concurrent
@@ -1516,7 +1617,7 @@ impl SignalStoreCache {
         &self,
         user: &str,
         backend: &dyn SignalStore,
-    ) -> Result<Vec<Arc<str>>> {
+    ) -> crate::store::error::Result<Vec<Arc<str>>> {
         let mut addresses = Vec::new();
         addresses.extend(
             self.lock_sessions()
@@ -1599,7 +1700,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<SessionRecord>> {
+    ) -> Result<Option<SessionRecord>, SessionCheckoutError> {
         let (record, checkout) = self.checkout_session(address, backend).await?;
         if record.is_none() {
             self.cancel_session_checkout(address, checkout);
@@ -1613,7 +1714,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<(Option<SessionRecord>, SessionCheckoutKey)> {
+    ) -> Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1624,7 +1725,7 @@ impl SignalStoreCache {
                     }
                     CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
                     CachedSessionCheckout::Busy => {
-                        anyhow::bail!("session is already checked out")
+                        return Err(SessionCheckoutError::AlreadyCheckedOut);
                     }
                     CachedSessionCheckout::Missing(_) => {}
                 }
@@ -1638,7 +1739,7 @@ impl SignalStoreCache {
                     return Ok((Some(record), checkout));
                 }
                 CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
-                CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+                CachedSessionCheckout::Busy => return Err(SessionCheckoutError::AlreadyCheckedOut),
                 CachedSessionCheckout::Missing(checkout) => checkout,
             };
             // See `UserIndexedCache::removal_seq`: absence alone cannot rule
@@ -1662,7 +1763,7 @@ impl SignalStoreCache {
                 return Ok((Some(record), checkout));
             }
             CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
-            CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+            CachedSessionCheckout::Busy => return Err(SessionCheckoutError::AlreadyCheckedOut),
             CachedSessionCheckout::Missing(checkout) => checkout,
         };
         let backend_result = backend.get_session(key).await?;
@@ -1696,14 +1797,12 @@ impl SignalStoreCache {
     pub fn try_checkout_session(
         &self,
         address: &ProtocolAddress,
-    ) -> Option<Result<(Option<SessionRecord>, SessionCheckoutKey)>> {
+    ) -> Option<Result<(Option<SessionRecord>, SessionCheckoutKey), SessionCheckoutError>> {
         let mut state = self.try_lock_sessions()?;
         match state.checkout(address.as_str()) {
             CachedSessionCheckout::Present(record, checkout) => Some(Ok((Some(record), checkout))),
             CachedSessionCheckout::Absent(checkout) => Some(Ok((None, checkout))),
-            CachedSessionCheckout::Busy => {
-                Some(Err(anyhow::anyhow!("session is already checked out")))
-            }
+            CachedSessionCheckout::Busy => Some(Err(SessionCheckoutError::AlreadyCheckedOut)),
             CachedSessionCheckout::Missing(_) => None,
         }
     }
@@ -1714,7 +1813,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<SessionRecord>>> {
+    ) -> crate::store::error::Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1792,7 +1891,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         record: SessionRecord,
-    ) -> core::result::Result<(), SessionRecord> {
+    ) -> Result<(), SessionRecord> {
         match self.try_lock_sessions() {
             Some(mut state) => {
                 state.put(address.as_str(), record);
@@ -1830,7 +1929,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> crate::store::error::Result<bool> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -1882,7 +1981,7 @@ impl SignalStoreCache {
         &self,
         addresses: &[ProtocolAddress],
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         let (missing, since) = {
             let state = self.lock_sessions().await;
             let mut missing = Vec::new();
@@ -1948,7 +2047,7 @@ impl SignalStoreCache {
         state: &mut ByteStoreState,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+    ) -> Result<IdentityChange, SignalProtocolError> {
         let previous = state.cache.get(address.as_str()).and_then(Option::as_deref);
         let change = match previous.filter(|bytes| !bytes.is_empty()) {
             None => IdentityChange::NewOrUnchanged,
@@ -1984,7 +2083,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> Option<std::result::Result<IdentityChange, SignalProtocolError>> {
+    ) -> Option<Result<IdentityChange, SignalProtocolError>> {
         let mut state = self.identities.try_lock()?;
         state.cache.get(address.as_str())?;
         Some(self.save_identity_locked(&mut state, address, identity))
@@ -1998,7 +2097,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         identity: &IdentityKey,
         backend: &dyn SignalStore,
-    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+    ) -> Result<IdentityChange, SignalProtocolError> {
         let key = address.as_str();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let since = {
@@ -2037,7 +2136,7 @@ impl SignalStoreCache {
         &self,
         addresses: &[ProtocolAddress],
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         if addresses.len() < 2 {
             return Ok(());
         }
@@ -2075,7 +2174,7 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<[u8]>>> {
+    ) -> crate::store::error::Result<Option<Arc<[u8]>>> {
         let key = address.as_str();
         // Cache check inside scoped lock so concurrent callers don't queue on
         // the mutex during the backend roundtrip. Mirrors get_session/has_session.
@@ -2128,7 +2227,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_if_absent_or_equal(address, None, data, backend)
             .await
     }
@@ -2142,7 +2241,7 @@ impl SignalStoreCache {
         alias: Option<&ProtocolAddress>,
         data: &[u8],
         backend: &dyn SignalStore,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identity_and_alias_in_epoch(
             address,
             alias,
@@ -2161,10 +2260,10 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
         epoch: Option<u64>,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let key: [u8; 32] = data
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
+            .map_err(|_| IdentityPersistenceError::InvalidBootstrapIdentity)?;
         // Serialize with full flushes so an older snapshot cannot overwrite
         // this write. Persist only this identity: session ratchets may belong
         // to an offline batch whose plaintext is not durable yet.
@@ -2180,10 +2279,9 @@ impl SignalStoreCache {
                     .await?
                     .map(Arc::from),
             };
-            anyhow::ensure!(
-                previous.as_deref().is_none_or(|known| known.len() == 32),
-                "invalid stored bootstrap identity length"
-            );
+            if previous.as_deref().is_some_and(|known| known.len() != 32) {
+                return Err(IdentityPersistenceError::InvalidStoredBootstrapIdentity);
+            }
             matches &= previous.as_deref().is_none_or(|known| known == data);
             // Preserve the observed absence/equality for change classification.
             // An uncached first write must not retire another request's epoch.
@@ -2249,7 +2347,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, None)
             .await
     }
@@ -2262,7 +2360,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         epoch: Option<u64>,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         self.persist_identities_if_equal_owned(identities, data, backend, runtime, Some(epoch))
             .await
     }
@@ -2274,7 +2372,7 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
         authentication_epoch: Option<Option<u64>>,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let cache = Arc::clone(self);
         let identities = identities.to_vec();
         let data = *data;
@@ -2292,7 +2390,7 @@ impl SignalStoreCache {
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("identity persistence worker stopped"))?
+            .map_err(|_| IdentityPersistenceError::WorkerStopped)?
     }
 
     /// Serialize the complete alias write while retaining old anchors on errors.
@@ -2302,7 +2400,7 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: &dyn SignalStore,
         authentication_epoch: Option<Option<u64>>,
-    ) -> Result<bool> {
+    ) -> Result<bool, IdentityPersistenceError> {
         let mut reloads = 0;
         let (_flush, mut state) = loop {
             // Preloads can be evicted while waiting for an earlier writer.
@@ -2558,7 +2656,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<Option<Arc<SenderKeyRecord>>> {
+    ) -> Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> {
         let key = name.cache_key();
         for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
@@ -2574,13 +2672,13 @@ impl SignalStoreCache {
             // half of the miss. Errors are held rather than raised, so a
             // concurrent write still wins the re-check below: an unreadable row
             // must not fail an operation the cache can already answer.
-            let decoded: Result<Option<Arc<SenderKeyRecord>>> =
+            let decoded: Result<Option<Arc<SenderKeyRecord>>, SenderKeyCacheError> =
                 match backend.get_sender_key(key).await {
                     Ok(Some(bytes)) => SenderKeyRecord::deserialize_for_store(&bytes, &incarnation)
                         .map(|record| Some(Arc::new(record)))
-                        .map_err(anyhow::Error::from),
+                        .map_err(SenderKeyCacheError::from),
                     Ok(None) => Ok(None),
-                    Err(error) => Err(anyhow::Error::from(error)),
+                    Err(error) => Err(SenderKeyCacheError::from(error)),
                 };
 
             let mut state = self.sender_keys.lock().await;
@@ -2735,7 +2833,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> crate::store::error::Result<()> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
         let _flush_guard = self.flush_lock.lock().await;
@@ -2774,7 +2872,7 @@ impl SignalStoreCache {
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<()> {
+    ) -> Result<(), SenderKeyCacheError> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
         let _flush_guard = self.flush_lock.lock().await;
@@ -2832,14 +2930,14 @@ impl SignalStoreCache {
     /// cover capture and confirmation of record writes. Consumed-prekey removal
     /// additionally excludes session mutations through its destructive I/O.
     /// A concurrent mutation stays dirty unless that exact record was persisted.
-    pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
+    pub async fn flush(&self, backend: &dyn SignalStore) -> Result<(), SignalCacheFlushError> {
         let _flush_guard = self.flush_lock.lock().await;
         self.flush_sessions(backend).await?;
         self.flush_identities(backend).await?;
         self.flush_sender_keys(backend).await
     }
 
-    async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_sessions(&self, backend: &dyn SignalStore) -> crate::store::error::Result<()> {
         let (batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -2962,7 +3060,10 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    async fn flush_identities(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_identities(
+        &self,
+        backend: &dyn SignalStore,
+    ) -> Result<(), SignalCacheFlushError> {
         let (batch, versions, deleted) = {
             let state = self.identities.lock().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -2970,10 +3071,10 @@ impl SignalStoreCache {
             for address in &state.dirty {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
-                        anyhow::anyhow!(
-                            "Corrupted identity key for {address}: expected 32 bytes, got {}",
-                            data.len()
-                        )
+                        SignalCacheFlushError::InvalidIdentity {
+                            address: Arc::clone(address),
+                            length: data.len(),
+                        }
                     })?;
                     batch.push((address.clone(), key));
                     versions.push((address.clone(), Arc::downgrade(data)));
@@ -3009,7 +3110,10 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    async fn flush_sender_keys(&self, backend: &dyn SignalStore) -> Result<()> {
+    async fn flush_sender_keys(
+        &self,
+        backend: &dyn SignalStore,
+    ) -> Result<(), SignalCacheFlushError> {
         let (batch, versions, deleted) = {
             let state = self.sender_keys.lock().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
@@ -3021,8 +3125,9 @@ impl SignalStoreCache {
                         let bytes =
                             record
                                 .serialize_for_store(&state.incarnation)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("sender key serialize for {address}: {e}")
+                                .map_err(|error| SignalCacheFlushError::SenderKeySerialization {
+                                    address: Arc::clone(address),
+                                    source: crate::error::BoxedErrorSource::new(error),
                                 })?;
                         batch.push((address.clone(), bytes::Bytes::from(bytes)));
                         versions.push((address.clone(), Arc::downgrade(record)));
@@ -3688,6 +3793,21 @@ mod sender_key_lock_tests {
             .expect("warm load")
             .expect("record present");
         assert_eq!(chain_id_of(&warm), 7);
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_sender_key_keeps_signal_error() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550003@g.us", "19995550004@s.whatsapp.net:0");
+        backend
+            .put_sender_key(name.cache_key(), &[0xff])
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get_sender_key(&name, &backend).await,
+            Err(SenderKeyCacheError::Signal(_))
+        ));
     }
 
     #[tokio::test]
@@ -4577,7 +4697,7 @@ mod sender_key_lock_tests {
             Ok(_) => panic!("a second owner must be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("already checked out"));
+        assert!(matches!(error, SessionCheckoutError::AlreadyCheckedOut));
         assert!(matches!(
             cache.restore_session_from_checkout(
                 &addr,
@@ -4879,6 +4999,33 @@ mod sender_key_lock_tests {
 #[cfg(test)]
 mod identity_save_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn flush_refuses_corrupt_identity_without_writing_it() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550009999", 0.into());
+        cache.put_identity(&address, &[11; 31]).await;
+        assert!(matches!(
+            cache.flush(&backend).await,
+            Err(SignalCacheFlushError::InvalidIdentity { length: 31, .. })
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+    }
 
     #[tokio::test]
     async fn corrupt_identity_saves_report_storage_failure_without_overwriting() {
@@ -6581,7 +6728,7 @@ mod pre_wire_gate_tests {
     async fn run_gated_flush(
         cache: Arc<SignalStoreCache>,
         backend: Arc<DeleteBarrierBackend>,
-    ) -> Result<()> {
+    ) -> Result<(), SignalCacheFlushError> {
         let flush_cache = cache.clone();
         let flush_backend = backend.clone();
         let task = tokio::spawn(async move { flush_cache.flush(flush_backend.as_ref()).await });
@@ -9557,6 +9704,40 @@ mod durability_chaos_tests;
 #[cfg(test)]
 mod identity_continuity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_bootstrap_identity_does_not_write() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550001000", 0.into());
+        assert!(matches!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 31], &backend)
+                .await,
+            Err(IdentityPersistenceError::InvalidBootstrapIdentity)
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cache.put_identity(&address, &[2; 31]).await;
+        assert!(matches!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], &backend)
+                .await,
+            Err(IdentityPersistenceError::InvalidStoredBootstrapIdentity)
+        ));
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn known_alias_transfer_requires_live_cached_anchors() {

@@ -43,7 +43,7 @@ impl GroupAdvRecoveryBudget {
 /// A failed list never authorizes replacing the account's trusted identity.
 #[derive(thiserror::Error)]
 #[error("device list ADV signature verification failed for {user} (hosted={hosted})")]
-struct DeviceListAdvError {
+pub(crate) struct DeviceListAdvError {
     user: Jid,
     hosted: bool,
     response: DeviceListResponse,
@@ -247,7 +247,7 @@ fn projection_requires_maintenance(
 }
 
 /// Group partial success applies only to trust conflicts, never storage faults.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum DeviceListIdentityConflict {
     #[error("conflicting account alias during ADV verification")]
     Alias,
@@ -255,6 +255,253 @@ pub(crate) enum DeviceListIdentityConflict {
     Primary,
     #[error("primary identity changed during ADV bootstrap")]
     Bootstrap,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeviceListIdentityError {
+    #[error("{0}")]
+    Cached(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    Conflict(#[from] DeviceListIdentityConflict),
+}
+
+pub(crate) struct DeviceSyncError(Box<DeviceSyncErrorKind>);
+
+impl DeviceSyncError {
+    pub(crate) fn new(kind: DeviceSyncErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub(crate) fn kind(&self) -> &DeviceSyncErrorKind {
+        &self.0
+    }
+
+    fn is_maintenance_required(&self) -> bool {
+        matches!(self.kind(), DeviceSyncErrorKind::MaintenanceRequired(_))
+    }
+
+    fn is_ownership_busy(&self) -> bool {
+        matches!(self.kind(), DeviceSyncErrorKind::OwnershipBusy(_))
+    }
+
+    fn is_eviction_alias_changed(&self) -> bool {
+        matches!(self.kind(), DeviceSyncErrorKind::EvictionAliasChanged(_))
+    }
+
+    fn is_adv_error(&self) -> bool {
+        matches!(self.kind(), DeviceSyncErrorKind::AdvVerification(_))
+    }
+
+    pub(crate) fn into_adv_error(self) -> Result<DeviceListAdvError, Self> {
+        match *self.0 {
+            DeviceSyncErrorKind::AdvVerification(error) => Ok(error),
+            other => Err(Self::new(other)),
+        }
+    }
+
+    pub(crate) fn into_iq(self) -> Result<IqError, Self> {
+        match *self.0 {
+            DeviceSyncErrorKind::Iq(error) => Ok(error),
+            other => Err(Self::new(other)),
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Debug for DeviceSyncError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for DeviceSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum DeviceSyncErrorKind {
+    #[error("{0}")]
+    Iq(#[from] IqError),
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    SignalMaintenance(#[from] crate::client::SignalMaintenanceError),
+    #[error("{0}")]
+    AdvVerification(#[from] DeviceListAdvError),
+    #[error("{0}")]
+    MaintenanceRequired(#[from] DeviceListMaintenanceRequired),
+    #[error("{0}")]
+    OwnershipBusy(#[from] DeviceListOwnershipBusy),
+    #[error("{0}")]
+    EvictionAliasChanged(#[from] DeviceListEvictionAliasChanged),
+    #[error("{0}")]
+    MappingLearning(#[from] crate::client::MappingLearningError),
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceListIdentityError),
+    #[error("{0}")]
+    CachedAdvIdentity(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    AdvIdentityQuery(#[from] crate::prekeys::AdvIdentityQueryError),
+    #[error("{0}")]
+    AdvBootstrap(#[from] crate::prekeys::AdvBootstrapError),
+    #[error("{0}")]
+    IdentityPersistence(#[from] wacore::store::signal_cache::IdentityPersistenceError),
+    #[error("{0}")]
+    AdvIdentityPersistence(#[from] AdvIdentityPersistenceError),
+    #[error("{0}")]
+    Cache(#[from] wacore::store::cache::CacheError),
+    #[error("device registry kept changing while a group refresh was in flight")]
+    GroupRegistryRefreshConflict,
+    #[error("device registry kept changing while an authoritative refresh was in flight")]
+    AuthoritativeRefreshConflict,
+    #[error("unchecked device response was stale")]
+    StaleDeviceResponse,
+    #[error("client ownership unavailable during {0}")]
+    ClientOwnershipUnavailable(&'static str),
+    #[error("device topology changed during ADV identity recovery")]
+    DeviceTopologyChangedDuringRecovery,
+    #[error("device registry no longer contains {0} after ADV recovery")]
+    MissingUserAfterRecovery(Jid),
+    #[error("account alias changed during ADV recovery")]
+    AccountAliasChangedDuringRecovery,
+    #[error("conflicting primary identities during ADV recovery")]
+    ConflictingPrimaryIdentitiesDuringRecovery,
+    #[error("invalid recovery alias namespaces")]
+    InvalidRecoveryAliasNamespaces,
+    #[error("durable account alias changed during ADV recovery")]
+    DurableAccountAliasChangedDuringRecovery,
+    #[error("ADV recovery cannot replace our paired primary through an alias")]
+    CannotReplaceOwnPrimaryThroughAlias,
+    #[error("account aliases changed during ADV lock acquisition")]
+    AccountAliasesChangedDuringLockAcquisition,
+    #[error("primary identity retired during ADV recovery")]
+    PrimaryIdentityRetiredDuringRecovery,
+    #[error("primary identity retired before ADV publication")]
+    PrimaryIdentityRetiredBeforePublication,
+    #[error("primary identity changed during ADV recovery")]
+    PrimaryIdentityChangedDuringRecovery,
+    #[error("primary identity changed during ADV preparation")]
+    PrimaryIdentityChangedDuringPreparation,
+    #[error("primary identity changed during hosted ADV verification for {0}")]
+    PrimaryIdentityChangedDuringHostedVerification(Jid),
+    #[error("companion device list omits ADV signature")]
+    CompanionDeviceListOmitsAdvSignature,
+    #[error("device-list refresh left no valid devices for {0}")]
+    EmptyDeviceListForUser(Jid),
+    #[error("conflicting account identities in ADV response")]
+    ConflictingAccountIdentitiesInResponse,
+    #[error("conflicting hosted identities in one device-list response")]
+    ConflictingHostedIdentitiesInResponse,
+    #[error("owned ordinary device sync worker stopped")]
+    OwnedOrdinaryWorkerStopped,
+    #[error("owned ADV device sync worker stopped")]
+    OwnedAdvWorkerStopped,
+    #[error("ADV eviction lacks an owned maintenance scope")]
+    AdvEvictionMissingMaintenanceScope,
+    #[error("device-list state changed during ADV cache eviction")]
+    DeviceListStateChangedDuringEviction,
+    #[error("unreadable device registry entry after ADV cache eviction")]
+    UnreadableRegistryAfterEviction,
+    #[error("device registry repeatedly refilled during ADV cache eviction")]
+    DeviceRegistryRefilledDuringEviction,
+    #[error("device list account identity unavailable")]
+    AccountIdentityUnavailable,
+    #[error("hosted list cannot replace our paired primary identity")]
+    HostedListCannotReplaceOwnPrimary,
+    #[error("ADV publication lacks reaction ownership")]
+    AdvPublicationLacksReactionOwnership,
+    #[error("ADV publication must own its maintenance scope")]
+    AdvPublicationMustOwnMaintenanceScope,
+    #[error("Cannot send a LID-addressed DM before the device LID is known")]
+    MissingOwnLidForLidDm,
+    #[error("invalid stored Signal address during hosted identity recovery")]
+    InvalidStoredSignalAddress,
+    #[error("invalid stored Signal device during hosted identity recovery")]
+    InvalidStoredSignalDevice,
+}
+
+impl std::fmt::Debug for DeviceSyncErrorKind {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+macro_rules! device_sync_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for DeviceSyncError {
+            fn from(error: $source) -> Self {
+                Self::new(DeviceSyncErrorKind::$variant(error))
+            }
+        })+
+    };
+}
+
+device_sync_error_from!(
+    IqError => Iq,
+    wacore::store::error::StoreError => Store,
+    crate::client::SignalMaintenanceError => SignalMaintenance,
+    DeviceListAdvError => AdvVerification,
+    DeviceListMaintenanceRequired => MaintenanceRequired,
+    DeviceListOwnershipBusy => OwnershipBusy,
+    DeviceListEvictionAliasChanged => EvictionAliasChanged,
+    crate::client::MappingLearningError => MappingLearning,
+    DeviceListIdentityError => DeviceIdentity,
+    crate::prekeys::CachedAdvIdentityError => CachedAdvIdentity,
+    crate::prekeys::AdvIdentityQueryError => AdvIdentityQuery,
+    crate::prekeys::AdvBootstrapError => AdvBootstrap,
+    wacore::store::signal_cache::IdentityPersistenceError => IdentityPersistence,
+    AdvIdentityPersistenceError => AdvIdentityPersistence,
+    wacore::store::cache::CacheError => Cache,
+);
+
+impl From<DeviceListIdentityConflict> for DeviceSyncError {
+    fn from(error: DeviceListIdentityConflict) -> Self {
+        Self::new(DeviceSyncErrorKind::DeviceIdentity(error.into()))
+    }
+}
+
+impl From<DeviceSyncErrorKind> for DeviceSyncError {
+    fn from(kind: DeviceSyncErrorKind) -> Self {
+        Self::new(kind)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AdvIdentityPersistenceError {
+    #[error("{0}")]
+    Account(#[from] DeviceListIdentityError),
+    #[error("{0}")]
+    Conflict(#[from] DeviceListIdentityConflict),
+    #[error("{0}")]
+    Persistence(#[from] wacore::store::signal_cache::IdentityPersistenceError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AdvBootstrapPersistenceError {
+    #[error("client ownership unavailable during bootstrap")]
+    ClientOwnershipUnavailable,
+    #[error("bootstrap identity worker stopped")]
+    WorkerStopped,
+    #[error("{0}")]
+    Persistence(#[from] AdvIdentityPersistenceError),
+}
+
+fn is_group_identity_rejection(error: &crate::prekeys::AdvBootstrapError) -> bool {
+    use crate::error::ErrorChainExt;
+
+    error.sources().any(|cause| {
+        cause.is::<DeviceListIdentityConflict>()
+            || cause.is::<crate::prekeys::AdvPrimaryBundleError>()
+    })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -341,14 +588,13 @@ impl AdvRecoverySnapshot {
     fn validate_primary_epoch(
         &self,
         continuity: &wacore::store::signal_cache::IdentityContinuity,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            continuity.unchanged_primary_for(
-                self.primary_epoch,
-                self.identities.iter().map(|(jid, _)| jid.user.as_str())
-            ),
-            "primary identity retired during ADV recovery"
-        );
+    ) -> Result<(), DeviceSyncError> {
+        if !continuity.unchanged_primary_for(
+            self.primary_epoch,
+            self.identities.iter().map(|(jid, _)| jid.user.as_str()),
+        ) {
+            return Err(DeviceSyncErrorKind::PrimaryIdentityRetiredDuringRecovery.into());
+        }
         Ok(())
     }
 
@@ -369,17 +615,16 @@ fn validate_recovery_mappings(
     response: &DeviceListResponse,
     user: &Jid,
     alias: Option<&Jid>,
-) -> anyhow::Result<()> {
+) -> Result<(), DeviceSyncError> {
     for mapping in &response.lid_mappings {
         let pn = Jid::pn(mapping.phone_number.as_str());
         let lid = Jid::lid(mapping.lid.as_str());
-        if pn == *user || lid == *user || alias.is_some_and(|alias| pn == *alias || lid == *alias) {
-            anyhow::ensure!(
-                alias.is_some_and(
-                    |alias| (pn == *user && lid == *alias) || (lid == *user && pn == *alias)
-                ),
-                "account alias changed during ADV recovery"
-            );
+        if (pn == *user || lid == *user || alias.is_some_and(|alias| pn == *alias || lid == *alias))
+            && !alias.is_some_and(|alias| {
+                (pn == *user && lid == *alias) || (lid == *user && pn == *alias)
+            })
+        {
+            return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
         }
     }
     Ok(())
@@ -388,15 +633,15 @@ fn validate_recovery_mappings(
 /// Retry outside topology guards when a response needs Signal mutation.
 #[derive(Debug, thiserror::Error)]
 #[error("device-list response requires Signal maintenance")]
-struct DeviceListMaintenanceRequired;
+pub(crate) struct DeviceListMaintenanceRequired;
 
 #[derive(Debug, thiserror::Error)]
 #[error("device ownership is busy during ADV publication")]
-struct DeviceListOwnershipBusy;
+pub(crate) struct DeviceListOwnershipBusy;
 
 #[derive(Debug, thiserror::Error)]
 #[error("account alias changed during ADV cache eviction")]
-struct DeviceListEvictionAliasChanged;
+pub(crate) struct DeviceListEvictionAliasChanged;
 
 /// A verified account trust change staged until the complete batch is accepted.
 struct AdvIdentityUpdate<'a> {
@@ -487,7 +732,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.usync.get_user_devices", level = "debug", skip_all, fields(users = jids.len()), err(Debug)))]
-    pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
+    pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, DeviceSyncError> {
         let mut owned = Vec::with_capacity(jids.len());
         owned.extend(jids.iter().map(Jid::to_non_ad));
         self.get_user_devices_owned(owned).await
@@ -496,7 +741,7 @@ impl Client {
     pub(crate) async fn get_user_devices_owned(
         &self,
         jids: Vec<Jid>,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         self.get_user_devices_cached_first(jids, false)
             .await
             .map(|(devices, _)| devices)
@@ -509,7 +754,7 @@ impl Client {
     pub(crate) async fn get_group_user_devices_owned(
         &self,
         jids: Vec<Jid>,
-    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+    ) -> Result<(Vec<Jid>, bool), DeviceSyncError> {
         self.get_user_devices_cached_first(jids, true).await
     }
 
@@ -517,7 +762,7 @@ impl Client {
         &self,
         jids: Vec<Jid>,
         group: bool,
-    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+    ) -> Result<(Vec<Jid>, bool), DeviceSyncError> {
         // One batched registry pass: the cache answers per user, and every
         // user it cannot answer goes to the backend in ONE read. The
         // previous per-user fan-out (16 concurrent `get_devices`) bought
@@ -564,7 +809,7 @@ impl Client {
     pub(crate) async fn refresh_user_devices(
         &self,
         mut jids: Vec<Jid>,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         for jid in &mut jids {
             jid.agent = 0;
             jid.device = 0;
@@ -579,7 +824,7 @@ impl Client {
     pub(crate) async fn refresh_group_user_devices(
         &self,
         jids: Vec<Jid>,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         self.fetch_group_user_devices(jids, crate::cache::Freshness::Refresh)
             .await
     }
@@ -588,7 +833,7 @@ impl Client {
         &self,
         mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         for jid in &mut jids {
             jid.agent = 0;
             jid.device = 0;
@@ -634,7 +879,7 @@ impl Client {
                 pending = Some(missing);
             }
         }
-        anyhow::bail!("device registry kept changing while a group refresh was in flight")
+        Err(DeviceSyncErrorKind::GroupRegistryRefreshConflict.into())
     }
 
     /// Recover rotated contacts individually before the group topology CAS.
@@ -685,7 +930,7 @@ impl Client {
             ))
             .await
             {
-                let category = if error.downcast_ref::<DeviceListAdvError>().is_some() {
+                let category = if error.is_adv_error() {
                     "signature verification"
                 } else {
                     "request or persistence"
@@ -705,7 +950,7 @@ impl Client {
         response: &DeviceListResponse,
         users: &[Jid],
         topology_generation: u64,
-    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Option<Vec<Jid>>, DeviceSyncError> {
         self.try_process_group_device_list_response_in_epoch(
             response,
             users,
@@ -721,7 +966,7 @@ impl Client {
         users: &[Jid],
         topology_generation: u64,
         authentication_epoch: Option<u64>,
-    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Option<Vec<Jid>>, DeviceSyncError> {
         self.apply_device_list_response_in_epoch(
             response,
             DeviceListApplyMode::GroupRefresh,
@@ -732,7 +977,7 @@ impl Client {
         .await
     }
 
-    async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, anyhow::Error> {
+    async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, DeviceSyncError> {
         self.fetch_user_devices_with_freshness(jids, crate::cache::Freshness::CachePreferred)
             .await
     }
@@ -743,13 +988,13 @@ impl Client {
         &self,
         jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, anyhow::Error>> {
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, DeviceSyncError>> {
         // Cache misses and explicit refreshes reuse one retry/recovery body.
         Box::pin(async move {
             match self.fetch_user_devices_once(jids, freshness).await {
                 Ok(devices) => Ok(devices),
                 Err(error) => {
-                    let failure = error.downcast::<DeviceListAdvError>()?;
+                    let failure = error.into_adv_error()?;
                     let user = failure.user.into_non_ad();
                     // Strict refresh bypasses the cached list. Keep the previous
                     // record until verification so normal application can compare
@@ -760,17 +1005,10 @@ impl Client {
                             crate::cache::Freshness::Refresh,
                         )
                         .await;
-                    let refreshed =
-                        match refreshed {
-                            Ok(devices) => devices,
-                            Err(error) => self.recover_ordinary_adv_identity(error).await.map_err(
-                                |error| {
-                                    let context =
-                                        format!("ADV device-list refresh for {user}: {error:#}");
-                                    error.context(context)
-                                },
-                            )?,
-                        };
+                    let refreshed = match refreshed {
+                        Ok(devices) => devices,
+                        Err(error) => self.recover_ordinary_adv_identity(error).await?,
+                    };
                     if failure.response.device_lists.len() == 1 {
                         return Ok(refreshed);
                     }
@@ -790,10 +1028,9 @@ impl Client {
                         let (current, missing) = self
                             .get_devices_from_registry_batch(vec![user.clone()])
                             .await;
-                        anyhow::ensure!(
-                            missing.is_empty(),
-                            "device registry no longer contains {user} after ADV recovery"
-                        );
+                        if !missing.is_empty() {
+                            return Err(DeviceSyncErrorKind::MissingUserAfterRecovery(user).into());
+                        }
                         devices.extend(current);
                     }
                     Ok(devices)
@@ -809,12 +1046,12 @@ impl Client {
     #[inline(never)]
     fn recover_ordinary_adv_identity(
         &self,
-        error: anyhow::Error,
-    ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<Vec<Jid>>> {
+        error: DeviceSyncError,
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, DeviceSyncError>> {
         // Group and individual refreshes share the full authenticated recovery
         // state machine, including its network request and owned publication.
         Box::pin(async move {
-            let Some(failure) = error.downcast_ref::<DeviceListAdvError>() else {
+            let DeviceSyncErrorKind::AdvVerification(failure) = error.kind() else {
                 return Err(error);
             };
             if failure.hosted {
@@ -851,13 +1088,9 @@ impl Client {
             if wacore::adv::verify_key_index_list(bytes, &identity).is_none() {
                 return Err(error);
             }
-            let client = self
-                .self_weak
-                .get()
-                .and_then(|weak| weak.upgrade())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("client ownership unavailable during ADV recovery")
-                })?;
+            let client = self.self_weak.get().and_then(|weak| weak.upgrade()).ok_or(
+                DeviceSyncErrorKind::ClientOwnershipUnavailable("ADV recovery"),
+            )?;
             let response = failure.response.clone();
             let generation = failure.topology_generation;
             let recovered = RecoveredAccountIdentity {
@@ -878,9 +1111,7 @@ impl Client {
                     Some(recovered),
                 )
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("device topology changed during ADV identity recovery")
-                })
+                .ok_or_else(|| DeviceSyncErrorKind::DeviceTopologyChangedDuringRecovery.into())
         })
     }
 
@@ -890,7 +1121,7 @@ impl Client {
         &self,
         user: &Jid,
         response: &DeviceListResponse,
-    ) -> anyhow::Result<AdvRecoverySnapshot> {
+    ) -> Result<AdvRecoverySnapshot, DeviceSyncError> {
         let primary_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let mut proposed = None;
         for mapping in &response.lid_mappings {
@@ -904,12 +1135,12 @@ impl Client {
                 None
             };
             if let Some(candidate) = candidate {
-                anyhow::ensure!(
-                    proposed
-                        .as_ref()
-                        .is_none_or(|previous| *previous == candidate),
-                    "account alias changed during ADV recovery"
-                );
+                if proposed
+                    .as_ref()
+                    .is_some_and(|previous| *previous != candidate)
+                {
+                    return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
+                }
                 proposed = Some(candidate);
             }
         }
@@ -918,15 +1149,11 @@ impl Client {
         let basis = {
             let _mapping = self.lid_pn_cache.lock_mutation().await;
             let observed_alias = self.device_list_identity_alias(user).await;
-            if let Some(alias) = &observed_alias {
-                anyhow::ensure!(
-                    self.device_list_identity_alias(alias).await.as_ref() == Some(user),
-                    "account alias changed during ADV recovery"
-                );
-                anyhow::ensure!(
-                    proposed.as_ref().is_none_or(|proposed| proposed == alias),
-                    "account alias changed during ADV recovery"
-                );
+            if let Some(alias) = &observed_alias
+                && (self.device_list_identity_alias(alias).await.as_ref() != Some(user)
+                    || proposed.as_ref().is_some_and(|proposed| proposed != alias))
+            {
+                return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
             }
             let publication_alias = proposed.or_else(|| observed_alias.clone());
             self.validate_adv_recovery_ownership(user, publication_alias.as_ref())?;
@@ -935,11 +1162,9 @@ impl Client {
             validate_recovery_mappings(response, user, publication_alias.as_ref())?;
             if observed_alias.is_none()
                 && let Some(alias) = &publication_alias
+                && self.device_list_identity_alias(alias).await.is_some()
             {
-                anyhow::ensure!(
-                    self.device_list_identity_alias(alias).await.is_none(),
-                    "account alias changed during ADV recovery"
-                );
+                return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
             }
             AdvRecoverySnapshot {
                 primary_epoch,
@@ -961,14 +1186,14 @@ impl Client {
         let mut identities = vec![(user.clone(), primary)];
         if let Some(alias) = &basis.publication_alias {
             let previous = self.cached_adv_account_identity(alias).await?;
-            anyhow::ensure!(
-                if basis.observed_alias.is_none() {
-                    previous.is_none() || previous == primary
-                } else {
-                    primary.is_none() || previous.is_none() || primary == previous
-                },
-                "conflicting primary identities during ADV recovery"
-            );
+            let valid = if basis.observed_alias.is_none() {
+                previous.is_none() || previous == primary
+            } else {
+                primary.is_none() || previous.is_none() || primary == previous
+            };
+            if !valid {
+                return Err(DeviceSyncErrorKind::ConflictingPrimaryIdentitiesDuringRecovery.into());
+            }
             identities.push((alias.clone(), previous));
         }
         Ok(AdvRecoverySnapshot {
@@ -985,7 +1210,7 @@ impl Client {
         user: &Jid,
         alias: Option<&Jid>,
         _mapping: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DeviceSyncError> {
         use wacore_binary::jid::Server;
         let Some(alias) = alias else {
             return Ok(());
@@ -993,45 +1218,45 @@ impl Client {
         let (phone, lid) = match (user.server, alias.server) {
             (Server::Pn, Server::Lid) => (user, alias),
             (Server::Lid, Server::Pn) => (alias, user),
-            _ => anyhow::bail!("invalid recovery alias namespaces"),
+            _ => return Err(DeviceSyncErrorKind::InvalidRecoveryAliasNamespaces.into()),
         };
         let backend = self.persistence_manager.backend();
         let candidate = backend.get_lid_mapping(&lid.user).await?;
-        if let Some(entry) = &candidate {
-            anyhow::ensure!(
-                entry.phone_number == phone.user.as_str() && entry.lid == lid.user.as_str(),
-                "durable account alias changed during ADV recovery"
-            );
+        if let Some(entry) = &candidate
+            && (entry.phone_number != phone.user.as_str() || entry.lid != lid.user.as_str())
+        {
+            return Err(DeviceSyncErrorKind::DurableAccountAliasChangedDuringRecovery.into());
         }
         if let Some(entry) = backend.get_pn_mapping(&phone.user).await? {
-            anyhow::ensure!(
-                entry.phone_number == phone.user.as_str(),
-                "durable account alias changed during ADV recovery"
-            );
+            if entry.phone_number != phone.user.as_str() {
+                return Err(DeviceSyncErrorKind::DurableAccountAliasChangedDuringRecovery.into());
+            }
             if entry.lid != lid.user.as_str() {
                 // Historical LIDs are retained. A seconds-resolution tie in
                 // get_pn_mapping cannot overrule the live, durably ACKed pair.
                 // This exception proves ownership from the candidate's own
                 // durable row; cold/cache-only aliases and newer rows still fail.
-                anyhow::ensure!(
-                    candidate
-                        .as_ref()
-                        .is_some_and(|row| row.updated_at == entry.updated_at)
-                        && self
-                            .lid_pn_cache
-                            .get_current_lid(&phone.user)
-                            .await
-                            .as_deref()
-                            == Some(lid.user.as_str())
-                        && self
-                            .lid_pn_cache
-                            .get_phone_number(&lid.user)
-                            .await
-                            .as_deref()
-                            == Some(phone.user.as_str())
-                        && self.lid_pn_cache.is_persisted(&phone.user, &lid.user).await,
-                    "durable account alias changed during ADV recovery"
-                );
+                let owns_pair = candidate
+                    .as_ref()
+                    .is_some_and(|row| row.updated_at == entry.updated_at)
+                    && self
+                        .lid_pn_cache
+                        .get_current_lid(&phone.user)
+                        .await
+                        .as_deref()
+                        == Some(lid.user.as_str())
+                    && self
+                        .lid_pn_cache
+                        .get_phone_number(&lid.user)
+                        .await
+                        .as_deref()
+                        == Some(phone.user.as_str())
+                    && self.lid_pn_cache.is_persisted(&phone.user, &lid.user).await;
+                if !owns_pair {
+                    return Err(
+                        DeviceSyncErrorKind::DurableAccountAliasChangedDuringRecovery.into(),
+                    );
+                }
             }
         }
         Ok(())
@@ -1041,16 +1266,16 @@ impl Client {
         &self,
         user: &Jid,
         alias: Option<&Jid>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DeviceSyncError> {
         let own = self.persistence_manager.get_device_snapshot();
-        anyhow::ensure!(
-            !std::iter::once(user).chain(alias).any(|alias| own
-                .pn
+        if std::iter::once(user).chain(alias).any(|alias| {
+            own.pn
                 .iter()
                 .chain(own.lid.iter())
-                .any(|jid| jid.is_same_chat_as(alias))),
-            "ADV recovery cannot replace our paired primary through an alias"
-        );
+                .any(|jid| jid.is_same_chat_as(alias))
+        }) {
+            return Err(DeviceSyncErrorKind::CannotReplaceOwnPrimaryThroughAlias.into());
+        }
         Ok(())
     }
 
@@ -1060,7 +1285,7 @@ impl Client {
         &self,
         mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, anyhow::Error>> {
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, DeviceSyncError>> {
         // Initial lookup, targeted refresh and batch rebuild all poll the same
         // query/application implementation instead of embedding three copies.
         Box::pin(async move {
@@ -1103,9 +1328,7 @@ impl Client {
                 }
 
                 if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
-                    anyhow::bail!(
-                        "device registry kept changing while an authoritative refresh was in flight"
-                    );
+                    return Err(DeviceSyncErrorKind::AuthoritativeRefreshConflict.into());
                 }
 
                 // The complete response contains every requested identity. Move its
@@ -1126,7 +1349,7 @@ impl Client {
         &self,
         response: &DeviceListResponse,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), DeviceSyncError> {
         // Learn LID↔PN mappings via the same batched, guarded learner routing_info
         // uses (one detached transaction, skipping already-durable pairs), so
         // per-mapping DB writes stay off the send's critical path. Client
@@ -1143,11 +1366,9 @@ impl Client {
         if response.lid_mappings.is_empty() {
             return Ok(());
         }
-        let client = self
-            .self_weak
-            .get()
-            .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during device sync"))?;
+        let client = self.self_weak.get().and_then(|weak| weak.upgrade()).ok_or(
+            DeviceSyncErrorKind::ClientOwnershipUnavailable("device sync"),
+        )?;
         let mappings: Vec<(String, String)> = response
             .lid_mappings
             .iter()
@@ -1178,7 +1399,7 @@ impl Client {
         &self,
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         self.process_device_list_response_in_epoch(
             response,
             freshness,
@@ -1192,7 +1413,7 @@ impl Client {
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
         authentication_epoch: Option<u64>,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         self.apply_device_list_response_in_epoch(
             response,
             freshness.into(),
@@ -1201,9 +1422,7 @@ impl Client {
             authentication_epoch,
         )
         .await
-        .and_then(|devices| {
-            devices.ok_or_else(|| anyhow::anyhow!("unchecked device response was stale"))
-        })
+        .and_then(|devices| devices.ok_or_else(|| DeviceSyncErrorKind::StaleDeviceResponse.into()))
     }
 
     /// Apply an authoritative result only if its queried topology is still current.
@@ -1213,7 +1432,7 @@ impl Client {
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
         topology_generation: u64,
-    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Option<Vec<Jid>>, DeviceSyncError> {
         self.try_process_refreshed_device_list_response_in_epoch(
             response,
             freshness,
@@ -1229,7 +1448,7 @@ impl Client {
         freshness: crate::cache::Freshness,
         topology_generation: u64,
         authentication_epoch: Option<u64>,
-    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Option<Vec<Jid>>, DeviceSyncError> {
         self.apply_device_list_response_in_epoch(
             response,
             freshness.into(),
@@ -1251,7 +1470,7 @@ impl Client {
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         self.apply_device_list_response_in_epoch(
             response,
             mode,
@@ -1270,7 +1489,7 @@ impl Client {
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
         authentication_epoch: Option<u64>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         // Share admission and hosted-worker dispatch across strict, cached and
         // group response callers, just as the guarded publication body is shared.
         Box::pin(async move {
@@ -1278,13 +1497,9 @@ impl Client {
                 prepared: self.prepare_device_list_identities(response, mode).await?,
                 primary_epoch: authentication_epoch,
             };
-            let client = self
-                .self_weak
-                .get()
-                .and_then(|weak| weak.upgrade())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("client ownership unavailable during device sync")
-                })?;
+            let client = self.self_weak.get().and_then(|weak| weak.upgrade()).ok_or(
+                DeviceSyncErrorKind::ClientOwnershipUnavailable("device sync"),
+            )?;
             if !response
                 .device_lists
                 .iter()
@@ -1328,8 +1543,8 @@ impl Client {
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
         identities: DeviceListIdentityContext<'a>,
-        admission: anyhow::Result<()>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+        admission: Result<(), crate::client::SignalMaintenanceError>,
+    ) -> wacore::runtime::BoxFuture<'a, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         Box::pin(async move {
             let mapping_has_history = self
                 .device_mapping_has_registry_history(&response.lid_mappings)
@@ -1345,7 +1560,7 @@ impl Client {
                         None,
                     )
                     .await;
-                if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>()) {
+                if !matches!(&result, Err(error) if error.is_maintenance_required()) {
                     return result;
                 }
             }
@@ -1373,8 +1588,8 @@ impl Client {
         topology_generation: Option<u64>,
         group_users: Option<Vec<Jid>>,
         prepared: DeviceListAuthentication,
-        admission: anyhow::Result<()>,
-    ) -> wacore::runtime::BoxFuture<'static, anyhow::Result<Option<Vec<Jid>>>> {
+        admission: Result<(), crate::client::SignalMaintenanceError>,
+    ) -> wacore::runtime::BoxFuture<'static, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         Box::pin(async move {
             let (mut send, receive) = futures::channel::oneshot::channel();
             let runtime = self.runtime.clone();
@@ -1415,12 +1630,12 @@ impl Client {
                     return;
                 };
                 if let Err(Err(error)) = send.send(result) {
-                    warn!("Owned ordinary device sync failed after caller cancellation: {error:#}");
+                    warn!("Owned ordinary device sync failed after caller cancellation: {error}");
                 }
             }));
             receive
                 .await
-                .map_err(|_| anyhow::anyhow!("owned ordinary device sync worker stopped"))?
+                .map_err(|_| DeviceSyncErrorKind::OwnedOrdinaryWorkerStopped)?
         })
     }
 
@@ -1435,7 +1650,7 @@ impl Client {
         group_users: Option<Vec<Jid>>,
         prepared: DeviceListAuthentication,
         recovered: Option<RecoveredAccountIdentity>,
-    ) -> wacore::runtime::BoxFuture<'static, anyhow::Result<Option<Vec<Jid>>>> {
+    ) -> wacore::runtime::BoxFuture<'static, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         Box::pin(async move {
             self.ensure_signal_maintenance_context()?;
             let (send, receive) = futures::channel::oneshot::channel();
@@ -1462,7 +1677,7 @@ impl Client {
                             .await
                         }
                         .await;
-                        if matches!(&result, Err(error) if error.is::<DeviceListOwnershipBusy>())
+                        if matches!(&result, Err(error) if error.is_ownership_busy())
                             && attempt + 1 < DEVICE_REFRESH_MAX_ATTEMPTS
                         {
                             // The complete attempt, including maintenance and
@@ -1478,12 +1693,12 @@ impl Client {
                 .await;
                 reactions.dispatch(&self);
                 if let Err(Err(error)) = send.send(result) {
-                    warn!("Owned ADV device sync failed after caller cancellation: {error:#}");
+                    warn!("Owned ADV device sync failed after caller cancellation: {error}");
                 }
             }));
             receive
                 .await
-                .map_err(|_| anyhow::anyhow!("owned ADV device sync worker stopped"))?
+                .map_err(|_| DeviceSyncErrorKind::OwnedAdvWorkerStopped)?
         })
     }
 
@@ -1500,14 +1715,13 @@ impl Client {
         group_users: Option<&'a [Jid]>,
         identities: DeviceListIdentityContext<'a>,
         borrowed_maintenance: Option<&'a SignalMaintenance<'a>>,
-    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<Option<Vec<Jid>>, DeviceSyncError>> {
         Box::pin(async move {
             let recovered_identity = identities.recovered;
             let mut owned_maintenance = if identities.reactions.is_some() {
-                anyhow::ensure!(
-                    borrowed_maintenance.is_none(),
-                    "ADV publication must own its maintenance scope"
-                );
+                if borrowed_maintenance.is_some() {
+                    return Err(DeviceSyncErrorKind::AdvPublicationMustOwnMaintenanceScope.into());
+                }
                 Some(self.begin_signal_maintenance().await?)
             } else {
                 None
@@ -1608,17 +1822,16 @@ impl Client {
                         Ok(current) if current == Some(*identity) => continue,
                         Err(error)
                             if mode != DeviceListApplyMode::GroupRefresh
-                                || !error.is::<DeviceListIdentityConflict>() =>
+                                || !matches!(&error, DeviceListIdentityError::Conflict(_)) =>
                         {
-                            return Err(error);
+                            return Err(error.into());
                         }
                         _ => {}
                     }
                 }
-                anyhow::ensure!(
-                    mode == DeviceListApplyMode::GroupRefresh,
-                    "primary identity changed during ADV preparation"
-                );
+                if mode != DeviceListApplyMode::GroupRefresh {
+                    return Err(DeviceSyncErrorKind::PrimaryIdentityChangedDuringPreparation.into());
+                }
                 rejected.push(user);
             }
             // Rejected group contacts retain their old fanout. Never let a
@@ -1662,10 +1875,9 @@ impl Client {
             eviction_keys.sort_unstable();
             eviction_keys.dedup();
             if !eviction_keys.is_empty() {
-                anyhow::ensure!(
-                    owned_maintenance.is_some(),
-                    "ADV eviction lacks an owned maintenance scope"
-                );
+                if owned_maintenance.is_none() {
+                    return Err(DeviceSyncErrorKind::AdvEvictionMissingMaintenanceScope.into());
+                }
                 let maintenance_generation = maintenance
                     .ok_or(DeviceListMaintenanceRequired)?
                     .generation();
@@ -1714,7 +1926,7 @@ impl Client {
                         .device_list_identity_guards_with_recovery(&users, None, Some(&aliases))
                         .await;
                     if mode == DeviceListApplyMode::StrictRefresh
-                        && matches!(&guards, Err(error) if error.is::<DeviceListEvictionAliasChanged>())
+                        && matches!(&guards, Err(error) if error.is_eviction_alias_changed())
                     {
                         return Ok(None);
                     }
@@ -1750,7 +1962,9 @@ impl Client {
                         if mode == DeviceListApplyMode::StrictRefresh {
                             return Ok(None);
                         }
-                        anyhow::bail!("device-list state changed during ADV cache eviction");
+                        return Err(
+                            DeviceSyncErrorKind::DeviceListStateChangedDuringEviction.into()
+                        );
                     }
                     if let Some(recovered) = recovered_identity {
                         self.validate_adv_recovery_state(recovered, &mapping_guard)
@@ -1763,20 +1977,22 @@ impl Client {
                             .is_absent_after_eviction(key)
                             .await?
                         {
-                            anyhow::ensure!(
-                                self.device_registry_cache.get(key).await.is_some(),
-                                "unreadable device registry entry after ADV cache eviction"
-                            );
+                            if self.device_registry_cache.get(key).await.is_none() {
+                                return Err(
+                                    DeviceSyncErrorKind::UnreadableRegistryAfterEviction.into()
+                                );
+                            }
                             absent = false;
                         }
                     }
                     if absent {
                         break;
                     }
-                    anyhow::ensure!(
-                        eviction_attempt < 2,
-                        "device registry repeatedly refilled during ADV cache eviction"
-                    );
+                    if eviction_attempt >= 2 {
+                        return Err(
+                            DeviceSyncErrorKind::DeviceRegistryRefilledDuringEviction.into()
+                        );
+                    }
                 }
             }
             let maintenance = owned_maintenance.as_ref().or(borrowed_maintenance);
@@ -1807,24 +2023,23 @@ impl Client {
         response: &DeviceListResponse,
         recovered: &RecoveredAccountIdentity,
         mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DeviceSyncError> {
         self.validate_adv_recovery_state(recovered, mapping_guard)
             .await?;
         let expected = recovered.snapshot.observed_alias.as_ref();
-        anyhow::ensure!(
-            self.device_list_identity_alias(&recovered.user)
-                .await
-                .as_ref()
-                == expected,
-            "account alias changed during ADV recovery"
-        );
+        if self
+            .device_list_identity_alias(&recovered.user)
+            .await
+            .as_ref()
+            != expected
+        {
+            return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
+        }
         if expected.is_none()
             && let Some(alias) = &recovered.snapshot.publication_alias
+            && self.device_list_identity_alias(alias).await.is_some()
         {
-            anyhow::ensure!(
-                self.device_list_identity_alias(alias).await.is_none(),
-                "account alias changed during ADV recovery"
-            );
+            return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
         }
         validate_recovery_mappings(
             response,
@@ -1839,7 +2054,7 @@ impl Client {
         &self,
         recovered: &RecoveredAccountIdentity,
         mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DeviceSyncError> {
         recovered
             .snapshot
             .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
@@ -1854,10 +2069,9 @@ impl Client {
         )
         .await?;
         for (jid, previous) in &recovered.snapshot.identities {
-            anyhow::ensure!(
-                self.cached_adv_account_identity(jid).await? == *previous,
-                "primary identity changed during ADV recovery"
-            );
+            if self.cached_adv_account_identity(jid).await? != *previous {
+                return Err(DeviceSyncErrorKind::PrimaryIdentityChangedDuringRecovery.into());
+            }
         }
         Ok(())
     }
@@ -1873,7 +2087,7 @@ impl Client {
         _mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
         registry_guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
         metadata_only: bool,
-    ) -> anyhow::Result<StagedDeviceLists> {
+    ) -> Result<StagedDeviceLists, DeviceSyncError> {
         use std::collections::HashMap;
         let mut accounts = StagedAccounts::default();
         for list in &response.device_lists {
@@ -2008,18 +2222,19 @@ impl Client {
                     );
                 }
                 if list.devices.iter().any(|device| device.device != 0) {
-                    anyhow::ensure!(
-                        mode == DeviceListApplyMode::GroupRefresh,
-                        "companion device list omits ADV signature"
-                    );
+                    if mode != DeviceListApplyMode::GroupRefresh {
+                        return Err(
+                            DeviceSyncErrorKind::CompanionDeviceListOmitsAdvSignature.into()
+                        );
+                    }
                     accounts.reject(&list.user.with_device(0));
                 }
                 if list.devices.is_empty() {
-                    anyhow::ensure!(
-                        mode != DeviceListApplyMode::StrictRefresh,
-                        "device-list refresh left no valid devices for {}",
-                        list.user
-                    );
+                    if mode == DeviceListApplyMode::StrictRefresh {
+                        return Err(
+                            DeviceSyncErrorKind::EmptyDeviceListForUser(list.user.clone()).into(),
+                        );
+                    }
                     if mode == DeviceListApplyMode::CachePreferred {
                         let index = accounts.track(&list.user.with_device(0));
                         accounts.rows[index].empty = true;
@@ -2043,10 +2258,9 @@ impl Client {
                         .chain(alias_for(&user).map(|alias| alias.user.as_str())),
                 )
             {
-                anyhow::ensure!(
-                    mode == DeviceListApplyMode::GroupRefresh,
-                    "primary identity retired before ADV publication"
-                );
+                if mode != DeviceListApplyMode::GroupRefresh {
+                    return Err(DeviceSyncErrorKind::PrimaryIdentityRetiredBeforePublication.into());
+                }
                 accounts.reject(&user);
                 continue;
             }
@@ -2115,11 +2329,11 @@ impl Client {
                 );
             }
             if devices.is_empty() {
-                anyhow::ensure!(
-                    mode != DeviceListApplyMode::StrictRefresh,
-                    "device-list refresh left no valid devices for {}",
-                    list.user
-                );
+                if mode == DeviceListApplyMode::StrictRefresh {
+                    return Err(
+                        DeviceSyncErrorKind::EmptyDeviceListForUser(list.user.clone()).into(),
+                    );
+                }
                 if mode == DeviceListApplyMode::CachePreferred {
                     let index = accounts.track(&user);
                     accounts.rows[index].empty = true;
@@ -2154,10 +2368,9 @@ impl Client {
                 break;
             }
         }
-        anyhow::ensure!(
-            accounts.rejected == 0 || mode == DeviceListApplyMode::GroupRefresh,
-            "conflicting account identities in ADV response"
-        );
+        if accounts.rejected != 0 && mode != DeviceListApplyMode::GroupRefresh {
+            return Err(DeviceSyncErrorKind::ConflictingAccountIdentitiesInResponse.into());
+        }
         let mut accepted = response.clone();
         accepted
             .device_lists
@@ -2258,10 +2471,13 @@ impl Client {
     async fn device_list_identity_guards(
         &self,
         users: &[Jid],
-    ) -> anyhow::Result<(
-        Vec<async_lock::MutexGuardArc<()>>,
-        crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    )> {
+    ) -> Result<
+        (
+            Vec<async_lock::MutexGuardArc<()>>,
+            crate::lid_pn_cache::LidPnMutationGuard<'_>,
+        ),
+        DeviceSyncError,
+    > {
         self.device_list_identity_guards_with_recovery(users, None, None)
             .await
     }
@@ -2273,10 +2489,13 @@ impl Client {
         users: &[Jid],
         recovery: Option<(&Jid, &AdvRecoverySnapshot)>,
         publication_aliases: Option<&[Option<Jid>]>,
-    ) -> anyhow::Result<(
-        Vec<async_lock::MutexGuardArc<()>>,
-        crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    )> {
+    ) -> Result<
+        (
+            Vec<async_lock::MutexGuardArc<()>>,
+            crate::lid_pn_cache::LidPnMutationGuard<'_>,
+        ),
+        DeviceSyncError,
+    > {
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let mut aliases = Vec::with_capacity(users.len());
             let mut addresses: Vec<_> = users
@@ -2287,19 +2506,16 @@ impl Client {
                 let alias = self.device_list_identity_alias(user).await;
                 // A continuation has already learned its own accepted mappings.
                 // Reject any later relation before waiting on its session lock.
-                anyhow::ensure!(
-                    publication_aliases
-                        .is_none_or(|expected| expected.get(position) == Some(&alias)),
-                    DeviceListEvictionAliasChanged
-                );
-                anyhow::ensure!(
-                    recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
-                        root,
-                        user,
-                        alias.as_ref()
-                    )),
-                    "account alias changed during ADV recovery"
-                );
+                if !publication_aliases
+                    .is_none_or(|expected| expected.get(position) == Some(&alias))
+                {
+                    return Err(DeviceListEvictionAliasChanged.into());
+                }
+                if !recovery.is_none_or(|(root, snapshot)| {
+                    snapshot.matches_observed_alias(root, user, alias.as_ref())
+                }) {
+                    return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
+                }
                 addresses.extend(alias.iter().map(wacore::types::jid::adv_account_jid));
                 aliases.push(alias);
             }
@@ -2310,21 +2526,18 @@ impl Client {
             let mut unchanged = true;
             for (user, alias) in users.iter().zip(&aliases) {
                 let current = self.device_list_identity_alias(user).await;
-                anyhow::ensure!(
-                    recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
-                        root,
-                        user,
-                        current.as_ref()
-                    )),
-                    "account alias changed during ADV recovery"
-                );
+                if !recovery.is_none_or(|(root, snapshot)| {
+                    snapshot.matches_observed_alias(root, user, current.as_ref())
+                }) {
+                    return Err(DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into());
+                }
                 unchanged &= current == *alias;
             }
             if unchanged {
                 return Ok((sessions, mapping));
             }
         }
-        anyhow::bail!("account aliases changed during ADV lock acquisition")
+        Err(DeviceSyncErrorKind::AccountAliasesChangedDuringLockAcquisition.into())
     }
 
     /// Only a known reciprocal alias can carry the same trusted primary across
@@ -2332,7 +2545,10 @@ impl Client {
     /// Callers hold the mapping mutation guard through the live reads and
     /// publication or cold CAS/ACK. That same guard excludes companion bootstrap
     /// without reacquiring session locks its caller may already own.
-    async fn device_list_account_identity(&self, user: &Jid) -> anyhow::Result<Option<[u8; 32]>> {
+    async fn device_list_account_identity(
+        &self,
+        user: &Jid,
+    ) -> Result<Option<[u8; 32]>, DeviceListIdentityError> {
         let primary = self.cached_adv_account_identity(user).await?;
         let Some(alias) = self.device_list_identity_alias(user).await else {
             return Ok(primary);
@@ -2355,7 +2571,7 @@ impl Client {
         &self,
         primary: &Jid,
         key: &[u8; 32],
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, AdvBootstrapPersistenceError> {
         self.persist_adv_bootstrap_identity_in_epoch(
             primary,
             key,
@@ -2369,26 +2585,27 @@ impl Client {
         primary: &Jid,
         key: &[u8; 32],
         epoch: Option<u64>,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, AdvBootstrapPersistenceError> {
         let client = self
             .self_weak
             .get()
             .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
+            .ok_or(AdvBootstrapPersistenceError::ClientOwnershipUnavailable)?;
         let primary = primary.clone();
         let key = *key;
         let (send, receive) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
             let result = client
                 .persist_adv_bootstrap_identity_inner(&primary, &key, epoch)
-                .await;
+                .await
+                .map_err(Into::into);
             if let Err(Err(error)) = send.send(result) {
                 warn!("Owned ADV bootstrap failed after caller cancellation: {error:#}");
             }
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("bootstrap identity worker stopped"))?
+            .map_err(|_| AdvBootstrapPersistenceError::WorkerStopped)?
     }
 
     /// Persist a first-contact anchor only while reciprocal aliases and the captured identity epoch remain valid.
@@ -2397,7 +2614,7 @@ impl Client {
         primary: &Jid,
         key: &[u8; 32],
         epoch: Option<u64>,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, AdvIdentityPersistenceError> {
         use wacore::types::jid::JidExt;
         let _mapping = self.lid_pn_cache.lock_mutation().await;
         // Retain the paired-account fallback check. The cache transaction below
@@ -2418,7 +2635,8 @@ impl Client {
         }
         let alias = alias.map(|alias| alias.to_protocol_address());
         let backend = self.persistence_manager.backend();
-        self.signal_cache
+        Ok(self
+            .signal_cache
             .persist_identity_and_alias_in_epoch(
                 &primary.to_protocol_address(),
                 alias.as_ref(),
@@ -2426,7 +2644,7 @@ impl Client {
                 backend.as_ref(),
                 epoch,
             )
-            .await
+            .await?)
     }
 
     /// Load ordinary account anchors before taking mapping/registry guards.
@@ -2436,7 +2654,7 @@ impl Client {
         &self,
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
-    ) -> anyhow::Result<PreparedDeviceListIdentities> {
+    ) -> Result<PreparedDeviceListIdentities, DeviceSyncError> {
         use futures::{StreamExt, TryStreamExt};
         let users: Vec<_> = response
             .device_lists
@@ -2465,12 +2683,14 @@ impl Client {
         &self,
         user: Jid,
         mode: DeviceListApplyMode,
-    ) -> anyhow::Result<(Jid, PreparedAccountIdentity)> {
-        let cached = {
+    ) -> Result<(Jid, PreparedAccountIdentity), DeviceSyncError> {
+        let cached: Result<Option<[u8; 32]>, crate::prekeys::AdvBootstrapError> = {
             let (_sessions, _mapping) = self
                 .device_list_identity_guards(std::slice::from_ref(&user))
                 .await?;
-            self.device_list_account_identity(&user).await
+            self.device_list_account_identity(&user)
+                .await
+                .map_err(Into::into)
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
@@ -2481,14 +2701,12 @@ impl Client {
             Ok(identity) => PreparedAccountIdentity::Trusted(identity),
             Err(error)
                 if mode == DeviceListApplyMode::GroupRefresh
-                    && (error.is::<DeviceListIdentityConflict>()
-                        || error.chain().any(|source| {
-                            source.is::<crate::prekeys::AdvPrimaryBundleError>()
-                        })) =>
+                    && is_group_identity_rejection(&error) =>
             {
                 PreparedAccountIdentity::Rejected
             }
-            Err(error) => return Err(error),
+            Err(crate::prekeys::AdvBootstrapError::Conflict(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
         };
         Ok((user, prepared))
     }
@@ -2525,19 +2743,20 @@ impl Client {
         maintenance: &SignalMaintenance<'_>,
         _ownership: DeviceListOwnershipProof<'_>,
         reactions: &AdvIdentityReactions,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DeviceSyncError> {
         maintenance.ensure_current()?;
-        anyhow::ensure!(
-            self.signal_cache.identity_continuity.unchanged_primary_for(
-                update.authentication_epoch,
-                update.identities.iter().map(|(address, _)| address
+        if !self.signal_cache.identity_continuity.unchanged_primary_for(
+            update.authentication_epoch,
+            update.identities.iter().map(|(address, _)| {
+                address
                     .name()
                     .split(['@', ':'])
                     .next()
-                    .unwrap_or(address.name())),
-            ),
-            "primary identity retired before ADV publication"
-        );
+                    .unwrap_or(address.name())
+            }),
+        ) {
+            return Err(DeviceSyncErrorKind::PrimaryIdentityRetiredBeforePublication.into());
+        }
         let alias = self.device_list_identity_alias(update.user).await;
         self.validate_adv_recovery_ownership(update.user, alias.as_ref())?;
         let changed = update.changes_trust();
@@ -2605,19 +2824,24 @@ impl Client {
         }
         let backend = self.persistence_manager.backend();
         maintenance.ensure_current()?;
-        anyhow::ensure!(
-            self.signal_cache
-                .persist_identities_if_equal_in_epoch(
-                    &update.identities,
-                    &update.identity,
-                    backend,
-                    self.runtime.as_ref(),
-                    update.authentication_epoch,
+        if !self
+            .signal_cache
+            .persist_identities_if_equal_in_epoch(
+                &update.identities,
+                &update.identity,
+                backend,
+                self.runtime.as_ref(),
+                update.authentication_epoch,
+            )
+            .await?
+        {
+            return Err(
+                DeviceSyncErrorKind::PrimaryIdentityChangedDuringHostedVerification(
+                    update.user.clone(),
                 )
-                .await?,
-            "primary identity changed during hosted ADV verification for {}",
-            update.user
-        );
+                .into(),
+            );
+        }
         if let Some(previous) = update.previous_identity
             && previous != update.identity
         {
@@ -2646,7 +2870,7 @@ impl Client {
         context: DeviceListIdentityContext<'a>,
         maintenance: Option<&SignalMaintenance<'_>>,
         proofs: Option<&[Option<VerifiedDeviceListEnvelope>]>,
-    ) -> anyhow::Result<DeviceListPlan<'a>> {
+    ) -> Result<DeviceListPlan<'a>, DeviceSyncError> {
         let recovered_identity = context.recovered;
         let mut fetched_devices = Vec::new();
         if mode != DeviceListApplyMode::GroupRefresh {
@@ -2710,23 +2934,29 @@ impl Client {
                             recovered.snapshot.publication_alias.as_ref(),
                         )?;
                         for (jid, previous) in &recovered.snapshot.identities {
-                            anyhow::ensure!(
-                                self.cached_adv_account_identity(jid).await? == *previous,
-                                "primary identity changed during ADV recovery"
+                            if self.cached_adv_account_identity(jid).await? != *previous {
+                                return Err(
+                                    DeviceSyncErrorKind::PrimaryIdentityChangedDuringRecovery
+                                        .into(),
+                                );
+                            }
+                        }
+                        if self
+                            .device_list_identity_alias(&user_list.user)
+                            .await
+                            .as_ref()
+                            != recovered.snapshot.publication_alias.as_ref()
+                        {
+                            return Err(
+                                DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into()
                             );
                         }
-                        anyhow::ensure!(
-                            self.device_list_identity_alias(&user_list.user)
-                                .await
-                                .as_ref()
-                                == recovered.snapshot.publication_alias.as_ref(),
-                            "account alias changed during ADV recovery"
-                        );
-                        if let Some(alias) = &recovered.snapshot.publication_alias {
-                            anyhow::ensure!(
-                                self.device_list_identity_alias(alias).await.as_ref()
-                                    == Some(&recovered.user),
-                                "account alias changed during ADV recovery"
+                        if let Some(alias) = &recovered.snapshot.publication_alias
+                            && self.device_list_identity_alias(alias).await.as_ref()
+                                != Some(&recovered.user)
+                        {
+                            return Err(
+                                DeviceSyncErrorKind::AccountAliasChangedDuringRecovery.into()
                             );
                         }
                         verified_identity = Some(recovered.identity);
@@ -2734,9 +2964,7 @@ impl Client {
                     } else {
                         self.device_list_account_identity(&user_list.user)
                             .await?
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("device list account identity unavailable")
-                            })?
+                            .ok_or(DeviceSyncErrorKind::AccountIdentityUnavailable)?
                     };
                     if let Some(proof) = proof {
                         // Envelope authentication is reusable; live primary
@@ -2765,7 +2993,7 @@ impl Client {
                     if mode == DeviceListApplyMode::GroupRefresh {
                         continue;
                     }
-                    anyhow::bail!("companion device list omits ADV signature");
+                    return Err(DeviceSyncErrorKind::CompanionDeviceListOmitsAdvSignature.into());
                 }
                 None
             };
@@ -2784,10 +3012,9 @@ impl Client {
                 {
                     continue;
                 }
-                anyhow::ensure!(
-                    !is_self || previous_identity == Some(identity),
-                    "hosted list cannot replace our paired primary identity"
-                );
+                if is_self && previous_identity != Some(identity) {
+                    return Err(DeviceSyncErrorKind::HostedListCannotReplaceOwnPrimary.into());
+                }
                 let mut identities = Vec::with_capacity(2);
                 use wacore::types::jid::JidExt as _;
                 identities.push((
@@ -2914,10 +3141,10 @@ impl Client {
             // empty one that get_user_devices then re-fetches on every send.
             if devices.is_empty() {
                 if mode == DeviceListApplyMode::StrictRefresh {
-                    anyhow::bail!(
-                        "device-list refresh left no valid devices for {}",
-                        user_list.user
-                    );
+                    return Err(DeviceSyncErrorKind::EmptyDeviceListForUser(
+                        user_list.user.clone(),
+                    )
+                    .into());
                 }
                 if mode == DeviceListApplyMode::GroupRefresh {
                     continue;
@@ -2970,10 +3197,11 @@ impl Client {
                             })
                         })
                 {
-                    anyhow::ensure!(
-                        earlier.identity == update.identity,
-                        "conflicting hosted identities in one device-list response"
-                    );
+                    if earlier.identity != update.identity {
+                        return Err(
+                            DeviceSyncErrorKind::ConflictingHostedIdentitiesInResponse.into()
+                        );
+                    }
                 } else {
                     identity_updates.push(update);
                 }
@@ -3050,7 +3278,7 @@ impl Client {
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
         context: DeviceListIdentityContext<'_>,
         maintenance: Option<&SignalMaintenance<'_>>,
-    ) -> anyhow::Result<Vec<Jid>> {
+    ) -> Result<Vec<Jid>, DeviceSyncError> {
         let DeviceListPlan {
             fetched_devices,
             device_records,
@@ -3073,7 +3301,7 @@ impl Client {
             let proof = DeviceListOwnershipProof::new(&ownership);
             let reactions = context
                 .reactions
-                .ok_or_else(|| anyhow::anyhow!("ADV publication lacks reaction ownership"))?;
+                .ok_or(DeviceSyncErrorKind::AdvPublicationLacksReactionOwnership)?;
             for update in identity_updates {
                 self.apply_adv_identity_update(
                     update,
@@ -3160,7 +3388,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn sync_own_device_list(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn sync_own_device_list(&self) -> Result<(), DeviceSyncError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let mut jids = Vec::with_capacity(2);
@@ -3252,6 +3480,39 @@ mod tests {
     use wacore::libsignal::protocol::{ProtocolAddress, SessionRecord};
     use wacore::store::traits::{DeviceInfo, DeviceListRecord};
     use wacore::types::jid::JidExt;
+
+    #[test]
+    fn group_identity_rejection_includes_shared_invalid_bundles_but_not_storage_errors() {
+        use crate::error::ErrorChainExt;
+        use crate::prekeys::{
+            AdvBootstrapError, AdvIdentityQueryError, AdvPrimaryBundleError,
+            CachedAdvIdentityError, PrimaryIdentityError,
+        };
+        use std::sync::Arc;
+
+        for bundle in [
+            AdvPrimaryBundleError::Missing,
+            AdvPrimaryBundleError::Invalid(PrimaryIdentityError::InvalidSignature),
+        ] {
+            let error = AdvBootstrapError::Shared(Arc::new(AdvBootstrapError::Query(
+                AdvIdentityQueryError::Bundle(Box::new(bundle)),
+            )));
+            assert!(is_group_identity_rejection(&error));
+        }
+        let conflict = AdvBootstrapError::Shared(Arc::new(AdvBootstrapError::Conflict(
+            DeviceListIdentityConflict::Alias,
+        )));
+        assert!(is_group_identity_rejection(&conflict));
+        let storage = AdvBootstrapError::Persistence(AdvIdentityPersistenceError::Account(
+            DeviceListIdentityError::Cached(CachedAdvIdentityError::InvalidStored),
+        ));
+        assert!(!is_group_identity_rejection(&storage));
+        assert!(
+            storage
+                .sources()
+                .any(|cause| cause.is::<CachedAdvIdentityError>())
+        );
+    }
 
     /// Sign fictitious key-index details with the shared test account.
     pub(super) fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {
@@ -3512,7 +3773,7 @@ mod tests {
                     );
                 } else {
                     let error = result.unwrap_err();
-                    assert!(error.downcast_ref::<DeviceListAdvError>().is_some());
+                    assert!(error.is_adv_error());
                     assert!(format!("{error:#}").contains(&user.to_string()));
                     assert!(error.to_string().contains("signature verification failed"));
                     assert!(client.load_device_record_for_jid(&user).await.is_some());
@@ -4595,12 +4856,13 @@ mod tests {
                 answer_iq(&client, &id, &response).await;
             }
             let error = operation.await.unwrap().unwrap_err();
-            let message = format!("{error:#}");
             assert!(
-                message.contains("device-list response omitted user"),
-                "{message}"
+                crate::ErrorChainExt::sources(&error).any(|cause| matches!(
+                    cause.downcast_ref::<wacore::iq::usync::UsyncProjectionError>(),
+                    Some(wacore::iq::usync::UsyncProjectionError::MissingUser(jid)) if jid == &user
+                )),
+                "{error:#}"
             );
-            assert!(message.contains(&user.to_string()), "{message}");
             assert_eq!(transport.sent().len(), 2);
             assert_eq!(
                 client.cached_adv_account_identity(&user).await.unwrap(),

@@ -11,7 +11,6 @@ use crate::iq::spec::IqSpec;
 use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
-use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wacore_binary::builder::NodeBuilder;
@@ -882,12 +881,13 @@ impl UsyncQuerySpec {
 
 impl IqSpec for UsyncQuerySpec {
     type Response = UsyncResponse;
+    type Error = UsyncParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         self.query.build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         parse_usync_response(response)
     }
 }
@@ -1170,10 +1170,49 @@ impl UsyncProtocolResult {
     }
 }
 
-pub(crate) fn parse_usync_response(response: &NodeRef<'_>) -> Result<UsyncResponse, anyhow::Error> {
+#[derive(Error)]
+#[non_exhaustive]
+pub enum UsyncParseError {
+    #[error("{0}")]
+    Binary(#[from] wacore_binary::error::BinaryError),
+    #[error("USync response is missing <{0}>")]
+    MissingResponse(&'static str),
+    #[error("USync device is missing 'id'")]
+    MissingDeviceId,
+    #[error("USync key-index-list is missing 'ts'")]
+    MissingTimestamp,
+    #[error("USync key-index-list contains non-binary signed key bytes")]
+    NonBinaryKeyIndex,
+    #[error("USync disappearing mode is missing 't'")]
+    MissingSettingTime,
+    #[error("<{node}> is missing required <{tag}> child")]
+    MissingChild { node: String, tag: &'static str },
+    #[error("<{0}> is missing text content")]
+    MissingText(&'static str),
+    #[error("<{node}> is missing required '{key}' attribute")]
+    MissingAttribute { node: String, key: &'static str },
+    #[error("<{node}> contains a non-LID '{key}' attribute")]
+    NonLid { node: String, key: &'static str },
+    #[error("'{attribute}' value {value} exceeds {width}")]
+    OutOfRange {
+        attribute: &'static str,
+        value: u64,
+        width: &'static str,
+    },
+}
+
+impl std::fmt::Debug for UsyncParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+pub(crate) fn parse_usync_response(
+    response: &NodeRef<'_>,
+) -> Result<UsyncResponse, UsyncParseError> {
     let usync = response
         .get_optional_child(TAG_USYNC)
-        .ok_or_else(|| anyhow!("USync response is missing <{TAG_USYNC}>"))?;
+        .ok_or(UsyncParseError::MissingResponse(TAG_USYNC))?;
 
     let protocol_states = match usync.get_optional_child(TAG_RESULT) {
         Some(result) => parse_protocol_states(result)?,
@@ -1182,7 +1221,7 @@ pub(crate) fn parse_usync_response(response: &NodeRef<'_>) -> Result<UsyncRespon
 
     let list = usync
         .get_optional_child(TAG_LIST)
-        .ok_or_else(|| anyhow!("USync response is missing <{TAG_LIST}>"))?;
+        .ok_or(UsyncParseError::MissingResponse(TAG_LIST))?;
     let capacity = list.children().map_or(0, <[_]>::len);
     let mut users = Vec::with_capacity(capacity);
     for user in list.get_children_by_tag(TAG_USER) {
@@ -1197,7 +1236,7 @@ pub(crate) fn parse_usync_response(response: &NodeRef<'_>) -> Result<UsyncRespon
     })
 }
 
-fn parse_protocol_states(result: &NodeRef<'_>) -> Result<Vec<UsyncProtocolState>, anyhow::Error> {
+fn parse_protocol_states(result: &NodeRef<'_>) -> Result<Vec<UsyncProtocolState>, UsyncParseError> {
     let capacity = result.children().map_or(0, <[_]>::len);
     let mut states = Vec::with_capacity(capacity);
     for node in result.children().into_iter().flatten() {
@@ -1208,7 +1247,7 @@ fn parse_protocol_states(result: &NodeRef<'_>) -> Result<Vec<UsyncProtocolState>
     Ok(states)
 }
 
-fn parse_protocol_state(node: &NodeRef<'_>) -> Result<Option<UsyncProtocolState>, anyhow::Error> {
+fn parse_protocol_state(node: &NodeRef<'_>) -> Result<Option<UsyncProtocolState>, UsyncParseError> {
     let Ok(protocol) = UsyncProtocolKind::try_from(node.tag.as_ref()) else {
         return Ok(None);
     };
@@ -1231,11 +1270,11 @@ fn parse_protocol_state(node: &NodeRef<'_>) -> Result<Option<UsyncProtocolState>
 /// protocol states and users have been parsed, as it is for a tree response.
 pub(crate) fn consume_usync_response(
     stream: &mut wacore_binary::NodeStream<'_>,
-) -> Result<UsyncResponse, anyhow::Error> {
+) -> Result<UsyncResponse, UsyncParseError> {
     loop {
         let Some(head) = stream.open()? else {
             stream.finish()?;
-            return Err(anyhow!("USync response is missing <{TAG_USYNC}>"));
+            return Err(UsyncParseError::MissingResponse(TAG_USYNC));
         };
         if head.tag == TAG_USYNC {
             break;
@@ -1293,7 +1332,7 @@ pub(crate) fn consume_usync_response(
     if let Some(error) = result_error {
         return Err(error);
     }
-    let users = users.ok_or_else(|| anyhow!("USync response is missing <{TAG_LIST}>"))?;
+    let users = users.ok_or(UsyncParseError::MissingResponse(TAG_LIST))?;
     if let Some(error) = list_error {
         return Err(error);
     }
@@ -1303,7 +1342,7 @@ pub(crate) fn consume_usync_response(
     })
 }
 
-fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyhow::Error> {
+fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, UsyncParseError> {
     let mut attrs = user.attrs();
     let id = attrs.optional_jid(ATTR_JID).map(normalize_usync_user_jid);
     let pn_jid = attrs
@@ -1338,7 +1377,7 @@ fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyh
 fn parse_protocol_result(
     tag: UsyncProtocolResultTag,
     node: &NodeRef<'_>,
-) -> Result<UsyncProtocolResult, anyhow::Error> {
+) -> Result<UsyncProtocolResult, UsyncParseError> {
     macro_rules! outcome {
         ($parser:expr) => {
             match parse_subprotocol_error(node)? {
@@ -1372,7 +1411,7 @@ fn parse_protocol_result(
             UsyncProtocolResult::Lid(outcome!(optional_lid(node, ATTR_VAL)))
         }
         UsyncProtocolResultTag::Username => {
-            UsyncProtocolResult::Username(outcome!(Ok::<_, anyhow::Error>(
+            UsyncProtocolResult::Username(outcome!(Ok::<_, UsyncParseError>(
                 node.content_as_string()
             )))
         }
@@ -1387,7 +1426,7 @@ fn parse_protocol_result(
 
 fn parse_subprotocol_error(
     protocol: &NodeRef<'_>,
-) -> Result<Option<UsyncSubprotocolError>, anyhow::Error> {
+) -> Result<Option<UsyncSubprotocolError>, UsyncParseError> {
     let Some(error) = protocol.get_optional_child(TAG_ERROR) else {
         return Ok(None);
     };
@@ -1411,7 +1450,7 @@ fn parse_subprotocol_error(
     }))
 }
 
-fn parse_contact(node: &NodeRef<'_>) -> Result<UsyncContactResult, anyhow::Error> {
+fn parse_contact(node: &NodeRef<'_>) -> Result<UsyncContactResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let contact_type = CompactString::from(attrs.required_string(ATTR_TYPE)?.as_ref());
     let username = attrs
@@ -1425,7 +1464,7 @@ fn parse_contact(node: &NodeRef<'_>) -> Result<UsyncContactResult, anyhow::Error
     })
 }
 
-fn parse_devices(node: &NodeRef<'_>) -> Result<UsyncDevicesResult, anyhow::Error> {
+fn parse_devices(node: &NodeRef<'_>) -> Result<UsyncDevicesResult, UsyncParseError> {
     let device_list = node
         .get_optional_child(TAG_DEVICE_LIST)
         .map(parse_device_list)
@@ -1440,7 +1479,7 @@ fn parse_devices(node: &NodeRef<'_>) -> Result<UsyncDevicesResult, anyhow::Error
     })
 }
 
-fn parse_device_list(node: &NodeRef<'_>) -> Result<UsyncDeviceListResult, anyhow::Error> {
+fn parse_device_list(node: &NodeRef<'_>) -> Result<UsyncDeviceListResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let hash = attrs
         .optional_string(ATTR_HASH)
@@ -1455,11 +1494,11 @@ fn parse_device_list(node: &NodeRef<'_>) -> Result<UsyncDeviceListResult, anyhow
     Ok(UsyncDeviceListResult { hash, devices })
 }
 
-fn parse_device(node: &NodeRef<'_>) -> Result<UsyncDeviceResult, anyhow::Error> {
+fn parse_device(node: &NodeRef<'_>) -> Result<UsyncDeviceResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let raw_id = attrs
         .optional_u64(ATTR_ID)
-        .ok_or_else(|| anyhow!("USync device is missing '{ATTR_ID}'"))?;
+        .ok_or(UsyncParseError::MissingDeviceId)?;
     let id = checked_u16(raw_id, ATTR_ID)?;
     let key_index = attrs
         .optional_u64(ATTR_KEY_INDEX)
@@ -1474,11 +1513,11 @@ fn parse_device(node: &NodeRef<'_>) -> Result<UsyncDeviceResult, anyhow::Error> 
     })
 }
 
-fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, anyhow::Error> {
+fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let timestamp = attrs
         .optional_unix_time(ATTR_TIMESTAMP)
-        .ok_or_else(|| anyhow!("USync key-index-list is missing '{ATTR_TIMESTAMP}'"))?;
+        .ok_or(UsyncParseError::MissingTimestamp)?;
     let expected_timestamp = attrs.optional_unix_time(ATTR_EXPECTED_TIMESTAMP);
     attrs.finish()?;
 
@@ -1486,9 +1525,7 @@ fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, anyhow::Er
         Some(NodeContentRef::Bytes(bytes)) => Some(bytes.to_vec()),
         None => None,
         Some(_) => {
-            return Err(anyhow!(
-                "USync key-index-list contains non-binary signed key bytes"
-            ));
+            return Err(UsyncParseError::NonBinaryKeyIndex);
         }
     };
     Ok(UsyncKeyIndexResult {
@@ -1498,7 +1535,7 @@ fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, anyhow::Er
     })
 }
 
-fn parse_status(node: &NodeRef<'_>) -> Result<UsyncStatusResult, anyhow::Error> {
+fn parse_status(node: &NodeRef<'_>) -> Result<UsyncStatusResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let code = attrs.optional_u64(ATTR_CODE);
     let timestamp = attrs.optional_unix_time(ATTR_TIME);
@@ -1512,7 +1549,7 @@ fn parse_status(node: &NodeRef<'_>) -> Result<UsyncStatusResult, anyhow::Error> 
     Ok(UsyncStatusResult { status, timestamp })
 }
 
-fn parse_text_status(node: &NodeRef<'_>) -> Result<UsyncTextStatusResult, anyhow::Error> {
+fn parse_text_status(node: &NodeRef<'_>) -> Result<UsyncTextStatusResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let text = attrs
         .optional_string(ATTR_TEXT)
@@ -1540,7 +1577,7 @@ fn parse_text_status(node: &NodeRef<'_>) -> Result<UsyncTextStatusResult, anyhow
 
 fn parse_disappearing_mode(
     node: &NodeRef<'_>,
-) -> Result<UsyncDisappearingModeResult, anyhow::Error> {
+) -> Result<UsyncDisappearingModeResult, UsyncParseError> {
     let mut attrs = node.attrs();
     let duration_seconds = attrs
         .optional_u64(ATTR_DURATION)
@@ -1549,7 +1586,7 @@ fn parse_disappearing_mode(
         .unwrap_or_default();
     let setting_timestamp = attrs
         .optional_unix_time(ATTR_TIME)
-        .ok_or_else(|| anyhow!("USync disappearing mode is missing '{ATTR_TIME}'"))?;
+        .ok_or(UsyncParseError::MissingSettingTime)?;
     let ephemerality_disabled = attrs
         .optional_bool_value(ATTR_EPHEMERALITY_DISABLED)
         .unwrap_or(false);
@@ -1561,10 +1598,10 @@ fn parse_disappearing_mode(
     })
 }
 
-fn parse_business(node: &NodeRef<'_>) -> Result<UsyncBusinessResult, anyhow::Error> {
+fn parse_business(node: &NodeRef<'_>) -> Result<UsyncBusinessResult, UsyncParseError> {
     let verified_name = match node.get_optional_child(TAG_VERIFIED_NAME) {
         Some(verified_name) if verified_name.get_optional_child(TAG_ERROR).is_none() => {
-            let parsed = VerifiedName::try_from_node(verified_name)?;
+            let parsed = VerifiedName::from_node(verified_name);
             (parsed.name.is_some()
                 || parsed.serial.is_some()
                 || parsed.issuer.is_some()
@@ -1586,7 +1623,7 @@ fn parse_business(node: &NodeRef<'_>) -> Result<UsyncBusinessResult, anyhow::Err
     })
 }
 
-fn parse_features(node: &NodeRef<'_>) -> Result<Vec<UsyncFeatureResult>, anyhow::Error> {
+fn parse_features(node: &NodeRef<'_>) -> Result<Vec<UsyncFeatureResult>, UsyncParseError> {
     let capacity = node.children().map_or(0, <[_]>::len);
     let mut features = Vec::with_capacity(capacity);
     for child in node.children().into_iter().flatten() {
@@ -1599,7 +1636,7 @@ fn parse_features(node: &NodeRef<'_>) -> Result<Vec<UsyncFeatureResult>, anyhow:
     Ok(features)
 }
 
-fn parse_bot_profile(node: &NodeRef<'_>) -> Result<UsyncBotProfileResult, anyhow::Error> {
+fn parse_bot_profile(node: &NodeRef<'_>) -> Result<UsyncBotProfileResult, UsyncParseError> {
     let profile = required_child(node, TAG_PROFILE)?;
     let name = required_child_text(profile, TAG_NAME)?;
     let attributes = required_child_text(profile, TAG_ATTRIBUTES)?;
@@ -1647,7 +1684,7 @@ fn parse_bot_profile(node: &NodeRef<'_>) -> Result<UsyncBotProfileResult, anyhow
     })
 }
 
-fn parse_bot_prompts(node: Option<&NodeRef<'_>>) -> Result<Vec<UsyncBotPrompt>, anyhow::Error> {
+fn parse_bot_prompts(node: Option<&NodeRef<'_>>) -> Result<Vec<UsyncBotPrompt>, UsyncParseError> {
     let Some(node) = node else {
         return Ok(Vec::new());
     };
@@ -1664,7 +1701,7 @@ fn parse_bot_prompts(node: Option<&NodeRef<'_>>) -> Result<Vec<UsyncBotPrompt>, 
 
 fn parse_bot_commands(
     node: Option<&NodeRef<'_>>,
-) -> Result<(Vec<UsyncBotCommand>, CompactString), anyhow::Error> {
+) -> Result<(Vec<UsyncBotCommand>, CompactString), UsyncParseError> {
     let Some(node) = node else {
         return Ok((Vec::new(), CompactString::default()));
     };
@@ -1682,15 +1719,24 @@ fn parse_bot_commands(
     ))
 }
 
-fn required_child<'a>(node: &'a NodeRef<'a>, tag: &str) -> Result<&'a NodeRef<'a>, anyhow::Error> {
+fn required_child<'a>(
+    node: &'a NodeRef<'a>,
+    tag: &'static str,
+) -> Result<&'a NodeRef<'a>, UsyncParseError> {
     node.get_optional_child(tag)
-        .ok_or_else(|| anyhow!("<{}> is missing required <{tag}> child", node.tag))
+        .ok_or_else(|| UsyncParseError::MissingChild {
+            node: node.tag.as_ref().to_owned(),
+            tag,
+        })
 }
 
-fn required_child_text(node: &NodeRef<'_>, tag: &str) -> Result<CompactString, anyhow::Error> {
+fn required_child_text(
+    node: &NodeRef<'_>,
+    tag: &'static str,
+) -> Result<CompactString, UsyncParseError> {
     required_child(node, tag)?
         .content_as_string()
-        .ok_or_else(|| anyhow!("<{tag}> is missing text content"))
+        .ok_or(UsyncParseError::MissingText(tag))
 }
 
 fn optional_child_text(node: &NodeRef<'_>, tag: &str) -> Option<CompactString> {
@@ -1701,7 +1747,7 @@ fn optional_child_text(node: &NodeRef<'_>, tag: &str) -> Option<CompactString> {
 fn optional_compact_string(
     node: &NodeRef<'_>,
     key: &str,
-) -> Result<Option<CompactString>, anyhow::Error> {
+) -> Result<Option<CompactString>, UsyncParseError> {
     let mut attrs = node.attrs();
     let value = attrs
         .optional_string(key)
@@ -1710,55 +1756,87 @@ fn optional_compact_string(
     Ok(value)
 }
 
-fn required_compact_string(node: &NodeRef<'_>, key: &str) -> Result<CompactString, anyhow::Error> {
+fn required_compact_string(
+    node: &NodeRef<'_>,
+    key: &str,
+) -> Result<CompactString, UsyncParseError> {
     let mut attrs = node.attrs();
     let value = CompactString::from(attrs.required_string(key)?.as_ref());
     attrs.finish()?;
     Ok(value)
 }
 
-fn required_u64(node: &NodeRef<'_>, key: &str) -> Result<u64, anyhow::Error> {
+fn required_u64(node: &NodeRef<'_>, key: &'static str) -> Result<u64, UsyncParseError> {
     let mut attrs = node.attrs();
     let value = attrs
         .optional_u64(key)
-        .ok_or_else(|| anyhow!("<{}> is missing required '{key}' attribute", node.tag))?;
+        .ok_or_else(|| UsyncParseError::MissingAttribute {
+            node: node.tag.as_ref().to_owned(),
+            key,
+        })?;
     attrs.finish()?;
     Ok(value)
 }
 
 fn parse_bot_professional_type(
     node: &NodeRef<'_>,
-) -> Result<UsyncBotProfessionalType, anyhow::Error> {
+) -> Result<UsyncBotProfessionalType, UsyncParseError> {
     let mut attrs = node.attrs();
     let value = UsyncBotProfessionalType::from(attrs.required_string(ATTR_TYPE)?.as_ref());
     attrs.finish()?;
     Ok(value)
 }
 
-fn optional_lid(node: &NodeRef<'_>, key: &str) -> Result<Option<Jid>, anyhow::Error> {
+fn optional_lid(node: &NodeRef<'_>, key: &'static str) -> Result<Option<Jid>, UsyncParseError> {
     let mut attrs = node.attrs();
     let value = attrs.optional_jid(key).map(|jid| jid.to_non_ad());
     attrs.finish()?;
     match value {
-        Some(jid) if !jid.server.is_lid_family() => Err(anyhow!(
-            "<{}> contains a non-LID '{key}' attribute",
-            node.tag
-        )),
+        Some(jid) if !jid.server.is_lid_family() => Err(UsyncParseError::NonLid {
+            node: node.tag.as_ref().to_owned(),
+            key,
+        }),
         value => Ok(value),
     }
 }
 
-fn checked_u16(value: u64, attribute: &str) -> Result<u16, anyhow::Error> {
-    u16::try_from(value).with_context(|| format!("'{attribute}' value {value} exceeds u16"))
+fn checked_u16(value: u64, attribute: &'static str) -> Result<u16, UsyncParseError> {
+    u16::try_from(value).map_err(|_| UsyncParseError::OutOfRange {
+        attribute,
+        value,
+        width: "u16",
+    })
 }
 
-fn checked_u32(value: u64, attribute: &str) -> Result<u32, anyhow::Error> {
-    u32::try_from(value).with_context(|| format!("'{attribute}' value {value} exceeds u32"))
+fn checked_u32(value: u64, attribute: &'static str) -> Result<u32, UsyncParseError> {
+    u32::try_from(value).map_err(|_| UsyncParseError::OutOfRange {
+        attribute,
+        value,
+        width: "u32",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usync_errors_distinguish_missing_response_and_invalid_device_id() {
+        let missing = NodeBuilder::new("iq").build();
+        assert!(matches!(
+            parse_usync_response(&missing.as_node_ref()),
+            Err(UsyncParseError::MissingResponse(TAG_USYNC))
+        ));
+        let device = NodeBuilder::new(TAG_DEVICE).attr(ATTR_ID, "65536").build();
+        assert!(matches!(
+            parse_device(&device.as_node_ref()),
+            Err(UsyncParseError::OutOfRange {
+                value: 65536,
+                width: "u16",
+                ..
+            })
+        ));
+    }
 
     const TEST_PHONE: &str = "13135550100";
     const TEST_E164_PHONE: &str = "+13135550100";

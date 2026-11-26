@@ -1288,45 +1288,65 @@ fn commit_decrypted_group_epoch(
 }
 
 #[cfg(feature = "voip-control")]
+#[derive(thiserror::Error)]
+enum GroupEpochDecryptError {
+    #[error("unsupported Signal envelope type")]
+    UnsupportedEnvelopeType,
+    #[error("Signal decrypt failed: {0}")]
+    Decrypt(#[from] crate::features::SignalError),
+    #[error("unsupported padding version")]
+    UnsupportedPaddingVersion,
+    #[error("message unpad failed: {0}")]
+    Unpad(#[from] wacore::messages::PaddingError),
+    #[error("message decode failed: {0}")]
+    Decode(#[from] waproto::protobuf::DecodeError),
+    #[error("message has no call key")]
+    MissingCallKey,
+    #[error("call key must contain exactly 32 bytes")]
+    InvalidCallKeyLength,
+}
+
+#[cfg(feature = "voip-control")]
+impl std::fmt::Debug for GroupEpochDecryptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(feature = "voip-control")]
 async fn decrypt_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
     sender: &Jid,
-) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+) -> Result<Zeroizing<Vec<u8>>, GroupEpochDecryptError> {
     let enc_type = EncType::from_wire(&rekey.encryption_type)
-        .ok_or_else(|| anyhow::anyhow!("unsupported Signal envelope type"))?;
+        .ok_or(GroupEpochDecryptError::UnsupportedEnvelopeType)?;
     let plaintext = Zeroizing::new(
         client
             .signal()
             .decrypt_message(sender, enc_type, &rekey.ciphertext)
-            .await
-            .map_err(|error| anyhow::anyhow!("Signal decrypt failed: {error}"))?,
+            .await?,
     );
-    let decoded = MessageUtils::unpad_message_ref(
-        &plaintext,
-        u8::try_from(rekey.encryption_version)
-            .map_err(|_| anyhow::anyhow!("unsupported padding version"))?,
-    )
-    .map_err(|error| anyhow::anyhow!("message unpad failed: {error}"))
-    .and_then(|unpadded| {
-        waproto::codec::message_decode(unpadded)
-            .map_err(|error| anyhow::anyhow!("message decode failed: {error}"))
-    })?;
+    let version = u8::try_from(rekey.encryption_version)
+        .map_err(|_| GroupEpochDecryptError::UnsupportedPaddingVersion)?;
+    let unpadded = MessageUtils::unpad_message_ref(&plaintext, version)?;
+    let decoded = waproto::codec::message_decode(unpadded)?;
     let raw_epoch = Zeroizing::new(
         decoded
             .call
             .into_option()
             .and_then(|call| call.call_key)
-            .ok_or_else(|| anyhow::anyhow!("message has no call key"))?,
+            .ok_or(GroupEpochDecryptError::MissingCallKey)?,
     );
     validate_group_epoch_key(&raw_epoch)?;
     Ok(raw_epoch)
 }
 
 #[cfg(feature = "voip-control")]
-fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
+fn validate_group_epoch_key(raw_epoch: &[u8]) -> Result<(), GroupEpochDecryptError> {
     if raw_epoch.len() != 32 {
-        anyhow::bail!("call key must contain exactly 32 bytes");
+        return Err(GroupEpochDecryptError::InvalidCallKeyLength);
     }
     Ok(())
 }
@@ -1389,15 +1409,16 @@ async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid
 
 #[cfg(feature = "voip-control")]
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
-async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
-    crate::voip::direct_ingress::send_offer_receipt(client, call)
-        .await
-        .map_err(anyhow::Error::from)
+async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> Result<(), CallError> {
+    crate::voip::direct_ingress::send_offer_receipt(client, call).await
 }
 
 #[cfg(not(feature = "voip-control"))]
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
-async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
+async fn send_offer_ack_receipt(
+    client: &Client,
+    call: &IncomingCall,
+) -> Result<(), crate::client::ClientError> {
     let own_from = match call.from.server {
         Server::Lid => client.lid(),
         _ => client.pn(),
@@ -3254,10 +3275,13 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for CountingTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
                 if self.failure_after.is_some_and(|limit| attempt >= limit) {
-                    return Err(anyhow::anyhow!("injected transport send failure"));
+                    return Err("injected transport send failure".into());
                 }
                 Ok(())
             }
@@ -3295,7 +3319,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for BlockingTransport {
-            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 let _ = self.release.recv().await;
                 Ok(())
@@ -4832,7 +4859,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for CountingTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -5724,7 +5751,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl crate::transport::Transport for OkTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 Ok(())
             }
             async fn disconnect(&self) {}

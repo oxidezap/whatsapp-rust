@@ -11,6 +11,7 @@ struct ContextSpec {
 
 impl IqSpec for ContextSpec {
     type Response = (Node, bool);
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         self.builds.fetch_add(1, Ordering::Relaxed);
@@ -30,7 +31,11 @@ impl IqSpec for ContextSpec {
         query
     }
 
-    fn encode_iq_direct(&self, id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+    fn encode_iq_direct(
+        &self,
+        id: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, wacore_binary::error::BinaryError> {
         if !self.direct {
             return Ok(false);
         }
@@ -39,7 +44,7 @@ impl IqSpec for ContextSpec {
         Ok(true)
     }
 
-    fn parse_response(&self, _: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         panic!("contextual spec must not use the legacy parser")
     }
     fn uses_contextual_response(&self) -> bool {
@@ -52,7 +57,7 @@ impl IqSpec for ContextSpec {
         &self,
         response: &NodeRef<'_>,
         request: &NodeRef<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
+    ) -> Result<Self::Response, Self::Error> {
         assert_eq!(
             request
                 .get_optional_child("query")

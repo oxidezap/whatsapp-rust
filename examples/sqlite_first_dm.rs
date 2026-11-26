@@ -4,7 +4,7 @@
 
 use whatsapp_rust::bench_support::connected_idle::sqlite_first_dm;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()

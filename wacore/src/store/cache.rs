@@ -8,6 +8,28 @@
 use async_trait::async_trait;
 use std::time::Duration;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CacheError(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+impl CacheError {
+    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+
+    pub fn from_boxed(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self(error)
+    }
+}
+
+impl From<std::io::Error> for CacheError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(error)
+    }
+}
+
+pub type CacheResult<T> = Result<T, CacheError>;
+
 /// Backend trait for pluggable cache storage.
 ///
 /// Keys and values are opaque strings / bytes — the typed cache wrapper in
@@ -33,7 +55,7 @@ use std::time::Duration;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait CacheStore: Send + Sync + 'static {
     /// Retrieve a cached value by namespace and key.
-    async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn get(&self, namespace: &str, key: &str) -> CacheResult<Option<Vec<u8>>>;
 
     /// Store a value with an optional TTL.
     ///
@@ -45,19 +67,19 @@ pub trait CacheStore: Send + Sync + 'static {
         key: &str,
         value: &[u8],
         ttl: Option<Duration>,
-    ) -> anyhow::Result<()>;
+    ) -> CacheResult<()>;
 
     /// Delete a single key from the given namespace.
-    async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()>;
+    async fn delete(&self, namespace: &str, key: &str) -> CacheResult<()>;
 
     /// Delete all keys in a namespace.
-    async fn clear(&self, namespace: &str) -> anyhow::Result<()>;
+    async fn clear(&self, namespace: &str) -> CacheResult<()>;
 
     /// Return the approximate number of entries in a namespace.
     ///
     /// Used only for diagnostics. Implementations that cannot cheaply
     /// report counts should return `Ok(0)`.
-    async fn entry_count(&self, _namespace: &str) -> anyhow::Result<u64> {
+    async fn entry_count(&self, _namespace: &str) -> CacheResult<u64> {
         Ok(0)
     }
 }

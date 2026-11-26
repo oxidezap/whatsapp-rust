@@ -17,12 +17,21 @@ use wacore_binary::{Jid, JidExt as _};
 use crate::client::Client;
 
 /// Error returned by the low-level Signal protocol operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum SignalError {
     /// A Signal protocol primitive (encrypt/decrypt/session) failed.
     #[error("{0}")]
     Protocol(#[from] SignalProtocolError),
+    /// Failed to establish a session before encrypting for devices.
+    #[error("{0}")]
+    SessionSetup(#[from] wacore::send::SessionSetupError),
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    SenderKeyCache(#[from] wacore::store::signal_cache::SenderKeyCacheError),
+    #[error("session check failed: {0}")]
+    SessionCheck(#[source] wacore::store::error::StoreError),
     /// The requested operation is not valid for this input (e.g. a sender-key
     /// or message-secret envelope passed to the pairwise decrypt path).
     #[error("unsupported signal operation: {0}")]
@@ -32,15 +41,34 @@ pub enum SignalError {
     InvalidInput(String),
     /// Catch-all for internal failures (device resolution, cache flush).
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Debug for SignalError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl From<crate::client::SignalMaintenanceError> for SignalError {
     fn from(err: crate::client::SignalMaintenanceError) -> Self {
         match err {
             crate::client::SignalMaintenanceError::Signal(e) => SignalError::Protocol(e),
-            other => SignalError::Internal(other.into()),
+            other => SignalError::Internal(Box::new(other)),
         }
+    }
+}
+
+impl From<crate::usync::DeviceSyncError> for SignalError {
+    fn from(err: crate::usync::DeviceSyncError) -> Self {
+        Self::Internal(Box::new(err))
+    }
+}
+
+impl From<crate::client::SessionEnsureError> for SignalError {
+    fn from(err: crate::client::SessionEnsureError) -> Self {
+        Self::Internal(Box::new(err))
     }
 }
 
@@ -599,7 +627,11 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         plaintext: &[u8],
     ) -> Result<(Option<Vec<u8>>, Vec<u8>), SignalError> {
-        let own_jid = self.client.get_own_jid_for_group(group_jid).await?;
+        let own_jid = self
+            .client
+            .get_own_jid_for_group(group_jid)
+            .await
+            .map_err(|e| SignalError::Internal(e.into()))?;
         let sender_addr = own_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_addr);
 
@@ -730,7 +762,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| SignalError::Internal(e.context("session check failed")))?;
+            .map_err(SignalError::SessionCheck)?;
         if exists || !self.migrate_legacy_pairwise_state(jid, &resolved).await? {
             return Ok(exists);
         }
@@ -738,7 +770,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| SignalError::Internal(e.context("session check failed")))
+            .map_err(SignalError::SessionCheck)
     }
 
     /// Delete Signal sessions and identity keys for the given JIDs.
@@ -1685,8 +1717,7 @@ mod tests {
                 None,
                 SessionPlan::assume_ready(devices.len()),
             )
-            .await
-            .unwrap();
+            .await;
             assert_eq!(result.encrypted_devices.len(), devices.len());
             assert_eq!(
                 provider.encrypts.load(Ordering::Relaxed) - before,

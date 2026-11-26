@@ -5,16 +5,16 @@
 //! No connection flags are set by this fixture. Unsupported initialization IQs get 503;
 //! active and keepalive IQs succeed. This is not full WhatsApp service emulation.
 
+#[macro_use]
 mod util;
+pub(crate) use util::{ContextExt, Result};
 
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use anyhow::{Context, Result, ensure};
-use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
 use wacore::handshake::{NoiseCipher, NoiseHandshake};
 use wacore::libsignal::protocol::{KeyPair, SenderKeyName};
 use wacore::store::traits::Backend;
@@ -169,7 +169,11 @@ impl EventHandler for Counts {
 struct Commit(Arc<Counts>);
 #[async_trait]
 impl InboundDurabilityHook for Commit {
-    async fn on_messages(&self, _: Arc<Client>, batch: &[InboundMessage]) -> Result<()> {
+    async fn on_messages(
+        &self,
+        _: Arc<Client>,
+        batch: &[InboundMessage],
+    ) -> crate::types::durability_hook::HookResult {
         self.0.committed.fetch_add(batch.len(), Ordering::Relaxed);
         self.0.commit_batches.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -795,10 +799,10 @@ impl Session {
             .await
             .context("first DM did not reach the receiver")??;
         let Event::Messages(batch) = event.as_ref() else {
-            anyhow::bail!("expected a message event");
+            bail!("expected a message event");
         };
         let [message] = &*batch.messages else {
-            anyhow::bail!("expected one first DM");
+            bail!("expected one first DM");
         };
         ensure!(
             message.info.id == FIRST_DM_ID
@@ -853,7 +857,7 @@ impl Session {
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await??;
         self.settle().await
@@ -991,7 +995,7 @@ impl Session {
                     .monotonic_time()
                     .saturating_duration_since(last);
                 if elapsed >= quiet {
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
                 }
                 self.client.runtime.sleep(quiet - elapsed).await;
             }
@@ -1037,11 +1041,11 @@ impl Session {
         let reader_result: Result<()> = match self.reader.take() {
             Some(mut reader) => match tokio::time::timeout(DEADLINE, &mut reader).await {
                 Ok(joined) => joined
-                    .map_err(anyhow::Error::from)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
                     .and_then(|result| result),
                 Err(elapsed) => {
                     reader.abort();
-                    Err(anyhow::Error::from(elapsed).context("fixture reader did not stop"))
+                    Err(format!("fixture reader did not stop: {elapsed}").into())
                 }
             },
             None => Ok(()),
@@ -1070,8 +1074,11 @@ impl Drop for Session {
 struct NoHttp;
 #[async_trait]
 impl HttpClient for NoHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
-        anyhow::bail!("connected idle fixture forbids HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> std::result::Result<HttpResponse, crate::http::HttpError> {
+        Err(std::io::Error::other("connected idle fixture forbids HTTP").into())
     }
 }
 
@@ -1080,7 +1087,10 @@ struct Factory(Arc<Wire>);
 impl TransportFactory for Factory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> std::result::Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        crate::transport::TransportError,
+    > {
         Ok((self.0.clone(), self.0.server_rx.clone()))
     }
 }
@@ -1194,7 +1204,9 @@ impl Wire {
                     .ephemeral
                     .context("client ephemeral")?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("ephemeral length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "ephemeral length".into()
+                    })?;
                 let identity = KeyPair::generate(&mut rand::rng());
                 let ephemeral = KeyPair::generate(&mut rand::rng());
                 // The same harness is compiled against the PR base and head.
@@ -1244,7 +1256,9 @@ impl Wire {
                 let peer: [u8; 32] = noise
                     .decrypt(&finish.r#static.context("client static")?)?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("client static length"))?;
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "client static length".into()
+                    })?;
                 noise.mix_shared_secret(ephemeral.private_key.serialize(), &peer)?;
                 let _payload = noise.decrypt(&finish.payload.context("client payload")?)?;
                 let (read, write) = noise.finish()?;
@@ -1276,7 +1290,7 @@ impl Wire {
                 };
                 Ok((None, Some(node), false))
             }
-            State::Closed => anyhow::bail!("fixture connection closed"),
+            State::Closed => bail!("fixture connection closed"),
         }
     }
 
@@ -1284,7 +1298,7 @@ impl Wire {
         let frame = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let State::Established { write, sent, .. } = &mut *state else {
-                anyhow::bail!("fixture handshake not complete");
+                bail!("fixture handshake not complete");
             };
             let encrypted = write.encrypt_with_counter(*sent, &marshal(&node)?)?;
             *sent = sent.checked_add(1).context("send counter exhausted")?;
@@ -1297,9 +1311,8 @@ impl Wire {
     }
 }
 
-#[async_trait]
-impl Transport for Wire {
-    async fn send(&self, data: Bytes) -> Result<()> {
+impl Wire {
+    async fn send_fixture(&self, data: Bytes) -> Result<()> {
         let hello = matches!(
             *self.state.lock().unwrap_or_else(|e| e.into_inner()),
             State::Hello
@@ -1313,11 +1326,15 @@ impl Transport for Wire {
         let mut batch_frames = 0;
         while !remaining.is_empty() {
             batch_frames += 1;
-            ensure!(remaining.len() >= 3, "short fixture frame");
+            if remaining.len() < 3 {
+                return Err(std::io::Error::other("short fixture frame").into());
+            }
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
                 | usize::from(remaining[2]);
-            ensure!(remaining.len() >= 3 + length, "truncated fixture frame");
+            if remaining.len() < 3 + length {
+                return Err(std::io::Error::other("truncated fixture frame").into());
+            }
             let (response, node, logged_in) = self.frame(&remaining[3..3 + length])?;
             if let Some(node) = &node {
                 self.observe_delivery_receipt(node.get());
@@ -1377,6 +1394,13 @@ impl Transport for Wire {
         self.max_batch_frames
             .fetch_max(batch_frames, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Transport for Wire {
+    async fn send(&self, data: Bytes) -> std::result::Result<(), crate::transport::TransportError> {
+        self.send_fixture(data).await
     }
 
     async fn disconnect(&self) {

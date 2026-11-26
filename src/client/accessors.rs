@@ -850,23 +850,17 @@ impl Client {
         }
     }
 
-    pub(crate) fn require_pn(&self) -> Result<Jid> {
-        self.pn().ok_or(ClientError::NotLoggedIn.into())
+    pub(crate) fn require_pn(&self) -> Result<Jid, ClientError> {
+        self.pn().ok_or(ClientError::NotLoggedIn)
     }
 
     /// Resolve our own JID for a group, respecting its addressing mode.
     ///
     /// Returns LID for LID-addressing groups, PN otherwise.
     /// Matches WhatsApp Web's `getMeUserLidOrJidForChat`.
-    pub(crate) async fn get_own_jid_for_group(
-        &self,
-        group_jid: &Jid,
-    ) -> Result<Jid, anyhow::Error> {
+    pub(crate) async fn get_own_jid_for_group(&self, group_jid: &Jid) -> Result<Jid, ClientError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let own_pn = device_snapshot
-            .pn
-            .clone()
-            .ok_or_else(|| anyhow::Error::from(ClientError::NotLoggedIn))?;
+        let own_pn = device_snapshot.pn.clone().ok_or(ClientError::NotLoggedIn)?;
 
         let addressing_mode = self
             .groups()
@@ -995,22 +989,24 @@ impl Client {
         drop(removed);
     }
 
-    fn should_downgrade_sync_error(&self, err: &anyhow::Error) -> bool {
+    fn should_downgrade_sync_error(&self, err: &(dyn std::error::Error + 'static)) -> bool {
         if self.is_shutting_down() {
             return true;
         }
 
-        matches!(
-            err.downcast_ref::<crate::request::IqError>(),
-            Some(
-                crate::request::IqError::NotConnected
-                    | crate::request::IqError::InternalChannelClosed
+        crate::error::ErrorChainExt::sources(err).any(|cause| {
+            matches!(
+                cause.downcast_ref::<crate::request::IqError>(),
+                Some(
+                    crate::request::IqError::NotConnected
+                        | crate::request::IqError::InternalChannelClosed
+                )
             )
-        )
+        })
     }
 
     /// Log a sync error, downgrading to debug level during shutdown/disconnect.
-    pub(crate) fn log_sync_error(&self, context: &str, err: &anyhow::Error) {
+    pub(crate) fn log_sync_error(&self, context: &str, err: &(dyn std::error::Error + 'static)) {
         if self.should_downgrade_sync_error(err) {
             debug!("Skipping {context} during shutdown: {err}");
         } else {

@@ -54,7 +54,6 @@ use crate::WireEnum;
 use crate::iq::spec::{IqSpec, IqStreamSpec};
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
-use anyhow::anyhow;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -241,18 +240,40 @@ const LEGACY_RESULT_PROTOCOLS: &[UsyncProtocolKind] = &[
     UsyncProtocolKind::Devices,
 ];
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum UsyncProjectionError {
+    #[error("{}", usync_subprotocol_error_message(.protocol.as_str(), .error))]
+    Subprotocol {
+        protocol: UsyncProtocolKind,
+        error: UsyncSubprotocolError,
+    },
+    #[error("device-list response has unvalidated companions for {0}")]
+    UnvalidatedCompanions(Jid),
+    #[error("username lookup answered without a contact result")]
+    MissingContact,
+    #[error("username lookup answered with an unknown contact type: {0}")]
+    UnknownContactType(CompactString),
+    #[error("device-list response omitted user {0}")]
+    MissingUser(Jid),
+    #[error("device-list response returned no devices for {0}")]
+    NoDevices(Jid),
+}
+
+debug_as_display!(UsyncProjectionError);
+
 fn reject_result_errors(
     response: &UsyncResponse,
     protocols: &[UsyncProtocolKind],
-) -> Result<(), anyhow::Error> {
+) -> Result<(), UsyncProjectionError> {
     for state in &response.protocol_states {
         if protocols.contains(&state.protocol)
             && let Some(error) = &state.error
         {
-            return Err(anyhow!(usync_subprotocol_error_message(
-                state.protocol.as_str(),
-                error
-            )));
+            return Err(UsyncProjectionError::Subprotocol {
+                protocol: state.protocol,
+                error: error.clone(),
+            });
         }
     }
     Ok(())
@@ -481,12 +502,13 @@ fn is_on_whatsapp_query(spec: &IsOnWhatsAppSpec) -> UsyncQuery {
 
 impl IqSpec for IsOnWhatsAppSpec {
     type Response = Vec<IsOnWhatsAppResult>;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         is_on_whatsapp_query(self).build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
         // A username the server declines to answer for is not a reason to fail
@@ -641,12 +663,13 @@ impl UsernameLookupSpec {
 
 impl IqSpec for UsernameLookupSpec {
     type Response = UsernameLookup;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         self.query.build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
 
@@ -661,12 +684,13 @@ impl IqSpec for UsernameLookupSpec {
         let contact = match user.protocol(UsyncProtocolKind::Contact) {
             Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => contact,
             Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
-                return Err(anyhow!(usync_subprotocol_error_message(
-                    UsyncProtocolKind::Contact.as_str(),
-                    error
-                )));
+                return Err(UsyncProjectionError::Subprotocol {
+                    protocol: UsyncProtocolKind::Contact,
+                    error: (**error).clone(),
+                }
+                .into());
             }
-            _ => return Err(anyhow!("username lookup answered without a contact result")),
+            _ => return Err(UsyncProjectionError::MissingContact.into()),
         };
         // WA Web only rejects "out" here, while the PN path of the same job
         // requires "in". Take the stricter reading: a type this parser cannot
@@ -676,10 +700,9 @@ impl IqSpec for UsernameLookupSpec {
             return Ok(UsernameLookup::NotFound);
         }
         if contact.contact_type != CONTACT_TYPE_IN {
-            return Err(anyhow!(
-                "username lookup answered with an unknown contact type: {}",
-                contact.contact_type
-            ));
+            return Err(
+                UsyncProjectionError::UnknownContactType(contact.contact_type.clone()).into(),
+            );
         }
         let username = contact
             .username
@@ -767,12 +790,13 @@ fn user_info_query(spec: &UserInfoSpec) -> UsyncQuery {
 
 impl IqSpec for UserInfoSpec {
     type Response = HashMap<Jid, UserInfo>;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         user_info_query(self).build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
         warn_result_error(&response, UsyncProtocolKind::Username);
@@ -845,7 +869,7 @@ impl IqSpec for UserInfoSpec {
 }
 
 // Re-export types from wacore::usync for convenience
-pub use crate::usync::{UserDeviceList, UsyncLidMapping};
+pub use crate::usync::{UserDeviceList, UsyncLidMapping, UsyncResponseError};
 
 /// Response from device list query containing device lists and any LID mappings.
 #[derive(Debug, Clone)]
@@ -967,14 +991,14 @@ pub(crate) fn device_list_query(
 
 pub(crate) fn project_device_list_response(
     response: UsyncResponse,
-) -> Result<DeviceListResponse, anyhow::Error> {
+) -> Result<DeviceListResponse, UsyncProjectionError> {
     project_device_list_response_checked(response, false)
 }
 
 fn project_device_list_response_checked(
     response: UsyncResponse,
     require_complete: bool,
-) -> Result<DeviceListResponse, anyhow::Error> {
+) -> Result<DeviceListResponse, UsyncProjectionError> {
     const NON_DEVICE_PROTOCOLS: &[UsyncProtocolKind] = &[
         UsyncProtocolKind::Contact,
         UsyncProtocolKind::Lid,
@@ -1042,7 +1066,7 @@ fn project_device_list_response_checked(
         let has_companion = parsed_devices.iter().any(|device| device.device != 0);
         if has_companion && key_index_bytes.is_none() {
             if require_complete {
-                anyhow::bail!("device-list response has unvalidated companions for {user_jid}");
+                return Err(UsyncProjectionError::UnvalidatedCompanions(user_jid));
             }
             parsed_devices.retain(|device| device.device == 0);
             if parsed_devices.is_empty() {
@@ -1079,13 +1103,16 @@ fn project_device_list_response_checked(
 
 impl IqSpec for DeviceListSpec {
     type Response = DeviceListResponse;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         device_list_query(&self.jids, Some(&self.hashes)).build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        project_device_list_response(parse_usync_response(response)?)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
+        Ok(project_device_list_response(parse_usync_response(
+            response,
+        )?)?)
     }
 }
 
@@ -1093,25 +1120,32 @@ impl IqStreamSpec for DeviceListSpec {
     fn consume_response(
         &self,
         stream: &mut wacore_binary::NodeStream<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
-        project_device_list_response(consume_usync_response(stream)?)
+    ) -> Result<Self::Response, Self::Error> {
+        Ok(project_device_list_response(consume_usync_response(
+            stream,
+        )?)?)
     }
 }
 
 impl IqSpec for CompleteDeviceListSpec {
     type Response = DeviceListResponse;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         self.0.build_iq()
     }
 
-    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+    fn encode_iq_direct(
+        &self,
+        request_id: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, wacore_binary::error::BinaryError> {
         self.0.encode_iq_direct(request_id, out)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let parsed = project_device_list_response_checked(parse_usync_response(response)?, true)?;
-        self.validate_response(parsed)
+        Ok(self.validate_response(parsed)?)
     }
 }
 
@@ -1119,9 +1153,9 @@ impl IqStreamSpec for CompleteDeviceListSpec {
     fn consume_response(
         &self,
         stream: &mut wacore_binary::NodeStream<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
+    ) -> Result<Self::Response, Self::Error> {
         let parsed = project_device_list_response_checked(consume_usync_response(stream)?, true)?;
-        self.validate_response(parsed)
+        Ok(self.validate_response(parsed)?)
     }
 }
 
@@ -1129,15 +1163,15 @@ impl CompleteDeviceListSpec {
     fn validate_response(
         &self,
         parsed: DeviceListResponse,
-    ) -> Result<DeviceListResponse, anyhow::Error> {
+    ) -> Result<DeviceListResponse, UsyncProjectionError> {
         for expected in &self.0.jids {
             let Some(returned) = parsed.device_lists.iter().find(|returned| {
                 device_list_identity_matches(&returned.user, expected, &parsed.lid_mappings)
             }) else {
-                anyhow::bail!("device-list response omitted user {expected}");
+                return Err(UsyncProjectionError::MissingUser(expected.clone()));
             };
             if returned.devices.is_empty() {
-                anyhow::bail!("device-list response returned no devices for {expected}");
+                return Err(UsyncProjectionError::NoDevices(expected.clone()));
             }
         }
         Ok(parsed)
@@ -1186,12 +1220,13 @@ pub struct LidQueryResponse {
 
 impl IqSpec for LidQuerySpec {
     type Response = LidQueryResponse;
+    type Error = UsyncResponseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         lid_query(self).build_info_query(&self.sid)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
 
@@ -1224,6 +1259,13 @@ impl IqSpec for LidQuerySpec {
 mod tests {
     use super::*;
     use wacore_binary::Server;
+
+    #[test]
+    fn projection_error_debug_keeps_the_affected_user() {
+        let user = Jid::pn("12025550123");
+        let error = UsyncProjectionError::MissingUser(user.clone());
+        assert!(format!("{error:?}").contains(&user.to_string()));
+    }
 
     /// Build a dummy key-index-list node for device IDs (used in test fixtures)
     fn build_test_key_index_list_node(device_ids: &[u16]) -> Node {

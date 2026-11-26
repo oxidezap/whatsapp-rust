@@ -2,7 +2,6 @@ use crate::libsignal::crypto::{
     DecryptionError as AesCbcDecryptionError, Error as CryptoError, aes_256_cbc_decrypt_in_place,
     hmac_sha256_two_part,
 };
-use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
 use core::mem::{size_of, size_of_val};
@@ -26,7 +25,7 @@ const WITHHELD: usize = MEDIA_MAC_SIZE + AES_BLOCK_SIZE;
 
 /// A local reason a media reference could not become a download request.
 /// Contains no URL, token or caller-provided text, so diagnostics can retain it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DownloadPreparationError {
     #[error("media_key must contain 32 bytes")]
@@ -65,7 +64,14 @@ pub enum DownloadPreparationError {
     UntrustedStaticUrl,
 }
 
-#[derive(Debug, Error)]
+impl std::fmt::Debug for DownloadPreparationError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Error)]
 #[non_exhaustive]
 pub enum MediaDecryptionError {
     #[error("downloaded file is too short to contain MAC")]
@@ -82,8 +88,44 @@ pub enum MediaDecryptionError {
     Mac(#[source] CryptoError),
     #[error("HMAC provider failed")]
     MacProvider(#[source] crate::libsignal::crypto::CryptoProviderError),
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
+    #[error("invalid final media size")]
+    InvalidFinalMediaSize,
+    #[error("empty plaintext after decrypt")]
+    EmptyPlaintext,
+    #[error("invalid PKCS7 padding")]
+    InvalidPkcs7Padding,
+    #[error("bad PKCS7 padding bytes")]
+    BadPkcs7PaddingBytes,
+    #[error("failed to initialize HMAC")]
+    HmacInit,
+    #[error("HKDF expand failed: {0}")]
+    HkdfExpand(String),
+    #[error("HKDF output has unexpected length for {0}")]
+    HkdfLength(&'static str),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("SHA-256 mismatch for plaintext media: expected {expected}, got {got}")]
+    PlaintextChecksumMismatch { expected: String, got: String },
+    #[error("SHA-256 mismatch for plaintext media")]
+    PlaintextHashMismatch,
+}
+
+impl std::fmt::Debug for MediaDecryptionError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum MobileMediaHttpProfileError {
+    #[error("invalid mobile media HTTP profile")]
+    InvalidProfile,
+    #[error("invalid mobile media Origin")]
+    InvalidOrigin,
+    #[error("invalid mobile media upload route")]
+    InvalidUploadRoute,
 }
 
 #[non_exhaustive]
@@ -465,7 +507,10 @@ pub const DEFAULT_MEDIA_HOSTS: [&str; 2] = ["mmg.whatsapp.net", "mmg-fallback.wh
 // WA Web 2.3000.1052559453, WAWebMediaUrlAllowlist, bundle a018f64e2c88a443...
 // bytes 810279..810903. Unlike its A/B-gated caller, this policy always applies.
 // Extra origins come from the explicit route, not the sender's media reference.
-fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
+fn validate_static_media_url(
+    url: &str,
+    hosts: &[MediaHost],
+) -> Result<(), DownloadPreparationError> {
     use fluent_uri::{Uri, component::Host};
     let parsed = Uri::parse(url).map_err(|_| DownloadPreparationError::UntrustedStaticUrl)?;
     let authority = parsed
@@ -479,7 +524,7 @@ fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
         || authority.userinfo().is_some()
         || authority.port().is_some_and(|p| p.is_empty())
     {
-        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+        return Err(DownloadPreparationError::UntrustedStaticUrl);
     }
     let host = authority.host();
     if match authority.host_parsed() {
@@ -493,7 +538,7 @@ fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
         Host::IpvFuture { .. } => true,
         _ => false,
     } {
-        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+        return Err(DownloadPreparationError::UntrustedStaticUrl);
     }
     let suffix = "whatsapp.net";
     let is_default_cdn = matches!(authority.host_parsed(), Host::RegName(_))
@@ -518,7 +563,7 @@ fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
             && origin.port_to_u16().is_ok_and(|p| p.unwrap_or(443) == port)
     });
     if !is_default_cdn && !is_explicit_origin {
-        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+        return Err(DownloadPreparationError::UntrustedStaticUrl);
     }
     Ok(())
 }
@@ -818,13 +863,13 @@ impl MediaDecryptStream {
         app_info: MediaType,
         check_encrypted: bool,
         check_plaintext: bool,
-    ) -> Result<Self> {
+    ) -> Result<Self, MediaDecryptionError> {
         use aes::cipher::{KeyInit, KeyIvInit};
         use sha2::Digest;
 
         let (iv, cipher_key, mac_key) = DownloadUtils::get_media_keys(media_key, app_info)?;
         let mut hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key)
-            .map_err(|_| anyhow!("Failed to init HMAC"))?;
+            .map_err(|_| MediaDecryptionError::HmacInit)?;
         hmac.update(&iv);
         Ok(Self {
             encrypted_hasher: check_encrypted.then(Sha256::new),
@@ -841,7 +886,11 @@ impl MediaDecryptStream {
         &mut self.buf[self.filled..]
     }
 
-    fn advance(&mut self, count: usize, writer: &mut impl std::io::Write) -> Result<()> {
+    fn advance(
+        &mut self,
+        count: usize,
+        writer: &mut impl std::io::Write,
+    ) -> Result<(), MediaDecryptionError> {
         use sha2::Digest;
         if let Some(hasher) = &mut self.encrypted_hasher {
             hasher.update(&self.buf[self.filled..self.filled + count]);
@@ -867,7 +916,11 @@ impl MediaDecryptStream {
         Ok(())
     }
 
-    pub fn push(&mut self, mut ciphertext: &[u8], writer: &mut impl std::io::Write) -> Result<()> {
+    pub fn push(
+        &mut self,
+        mut ciphertext: &[u8],
+        writer: &mut impl std::io::Write,
+    ) -> Result<(), MediaDecryptionError> {
         while !ciphertext.is_empty() {
             let input = self.input();
             let len = input.len().min(ciphertext.len());
@@ -883,7 +936,7 @@ impl MediaDecryptStream {
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
         writer: &mut impl std::io::Write,
-    ) -> Result<u64> {
+    ) -> Result<u64, MediaDecryptionError> {
         use sha2::Digest;
         let Self {
             encrypted_hasher,
@@ -896,7 +949,7 @@ impl MediaDecryptStream {
         } = self;
         let tail = &mut buf[..filled];
         if tail.len() < WITHHELD || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE) {
-            return Err(anyhow!("Invalid final media size"));
+            return Err(MediaDecryptionError::InvalidFinalMediaSize);
         }
         let mac_index = tail.len() - MEDIA_MAC_SIZE;
         let (final_ciphertext, mac_bytes) = tail.split_at_mut(mac_index);
@@ -904,27 +957,27 @@ impl MediaDecryptStream {
         let expected_mac_full = hmac.finalize().into_bytes();
         let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
         if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
-            return Err(MediaDecryptionError::InvalidMac.into());
+            return Err(MediaDecryptionError::InvalidMac);
         }
         if let Some((hasher, expected)) = encrypted_hasher.zip(expected_enc_sha256)
             && hasher.finalize().as_slice() != expected
         {
-            return Err(MediaDecryptionError::EncryptedSha256Mismatch.into());
+            return Err(MediaDecryptionError::EncryptedSha256Mismatch);
         }
 
         cbc_decrypt_blocks(&mut cbc, final_ciphertext);
         let pad_len = match final_ciphertext.last() {
             Some(&v) => v as usize,
-            None => return Err(anyhow!("Empty plaintext after decrypt")),
+            None => return Err(MediaDecryptionError::EmptyPlaintext),
         };
         if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_ciphertext.len() {
-            return Err(anyhow!("Invalid PKCS7 padding"));
+            return Err(MediaDecryptionError::InvalidPkcs7Padding);
         }
         if !final_ciphertext[final_ciphertext.len() - pad_len..]
             .iter()
             .all(|&b| b as usize == pad_len)
         {
-            return Err(anyhow!("Bad PKCS7 padding bytes"));
+            return Err(MediaDecryptionError::BadPkcs7PaddingBytes);
         }
         let final_plain = &final_ciphertext[..final_ciphertext.len() - pad_len];
         if let Some(hasher) = &mut plaintext_hasher {
@@ -936,11 +989,97 @@ impl MediaDecryptStream {
         if let Some((hasher, expected)) = plaintext_hasher.zip(expected_sha256)
             && hasher.finalize().as_slice() != expected
         {
-            return Err(MediaDecryptionError::PlaintextSha256Mismatch.into());
+            return Err(MediaDecryptionError::PlaintextSha256Mismatch);
         }
 
         Ok(bytes_written)
     }
+}
+
+#[inline(never)]
+fn build_host_download_request(
+    host: &MediaHost,
+    direct_path: &str,
+    token: &str,
+    decryption: &MediaDecryption,
+) -> Result<DownloadRequest, DownloadPreparationError> {
+    use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
+
+    let base = Uri::parse(format!("https://{}/", host.hostname))
+        .map_err(|_| DownloadPreparationError::InvalidRouteHost)?;
+    let base_authority = base
+        .authority()
+        .ok_or(DownloadPreparationError::InvalidRouteHost)?;
+    // CDN authorities must be DNS names or IP literals, not arbitrary
+    // RFC reg-names that an HTTP backend might interpret differently.
+    let valid_host = match base_authority.host_parsed() {
+        Host::IpvFuture { .. } => false,
+        Host::RegName(name) => {
+            !name.is_empty()
+                && name
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }
+        _ => true,
+    };
+    if !valid_host
+        || base_authority.userinfo().is_some()
+        || base.path().as_str() != "/"
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || base_authority.port().is_some_and(|port| port.is_empty())
+    {
+        return Err(DownloadPreparationError::InvalidRouteHost);
+    }
+    let base_port = base_authority
+        .port_to_u16()
+        .map_err(|_| DownloadPreparationError::InvalidRoutePort)?
+        .unwrap_or(443);
+    // Signed CDN references are already URI-encoded. Reject malformed
+    // escapes, raw whitespace and backslashes instead of repairing them.
+    let url = UriRef::parse(direct_path)
+        .map_err(|_| DownloadPreparationError::InvalidDirectPath)?
+        .resolve_against(&base)
+        .map_err(|_| DownloadPreparationError::InvalidDirectPath)?;
+    let authority = url
+        .authority()
+        .ok_or(DownloadPreparationError::OriginChanged)?;
+    if url.scheme() != base.scheme()
+        || !same_media_host(authority.host(), base_authority.host())
+        || authority
+            .port_to_u16()
+            .map_err(|_| DownloadPreparationError::InvalidDirectPathPort)?
+            .unwrap_or(443)
+            != base_port
+        || authority.userinfo().is_some()
+        || authority.port().is_some_and(|port| port.is_empty())
+    {
+        return Err(DownloadPreparationError::OriginChanged);
+    }
+    // Preserve the signed query byte-for-byte; only our URL-safe base64
+    // token is appended. The URI builder retains the fragment separately.
+    let mut query = url.query().map_or("", |q| q.as_str()).to_owned();
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("token=");
+    query.push_str(token);
+    let url = Uri::builder()
+        .scheme(url.scheme())
+        .authority(authority)
+        .path(url.path())
+        .query(EStr::new(&query).ok_or(DownloadPreparationError::InvalidQuery)?)
+        .optional(
+            |builder, fragment| builder.fragment(fragment),
+            url.fragment(),
+        )
+        .build()
+        .map_err(|_| DownloadPreparationError::InvalidUrl)?;
+    Ok(DownloadRequest {
+        url: url.into_string(),
+        decryption: decryption.clone(),
+    })
 }
 
 impl DownloadUtils {
@@ -950,7 +1089,7 @@ impl DownloadUtils {
     /// parameter container separately guarantees a 32-byte media key.
     pub fn validate_download_metadata(
         downloadable: &dyn Downloadable,
-    ) -> std::result::Result<(), DownloadPreparationError> {
+    ) -> Result<(), DownloadPreparationError> {
         let encrypted = downloadable.is_encrypted();
         let media_type = downloadable.app_info();
         if encrypted && !media_type.is_encrypted() {
@@ -992,16 +1131,17 @@ impl DownloadUtils {
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
         route: &MediaRoute,
-    ) -> Result<Vec<DownloadRequest>> {
+    ) -> Result<Vec<DownloadRequest>, DownloadPreparationError> {
         Self::prepare_download_requests_with_hosts(downloadable, &route.hosts)
     }
 
     /// Prepare requests using borrowed route hosts, without a temporary owned route.
     /// Applies the same origin and metadata validation as [`Self::prepare_download_requests`].
+    #[inline(never)]
     pub fn prepare_download_requests_with_hosts(
         downloadable: &dyn Downloadable,
         hosts: &[MediaHost],
-    ) -> Result<Vec<DownloadRequest>> {
+    ) -> Result<Vec<DownloadRequest>, DownloadPreparationError> {
         Self::validate_download_metadata(downloadable)?;
         let is_encrypted = downloadable.is_encrypted();
         let media_type = downloadable.app_info();
@@ -1052,85 +1192,9 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let candidates = hosts.iter().map(|host| -> Result<DownloadRequest> {
-            use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
-
-            let base = Uri::parse(format!("https://{}/", host.hostname))
-                .map_err(|_| DownloadPreparationError::InvalidRouteHost)?;
-            let base_authority = base
-                .authority()
-                .ok_or(DownloadPreparationError::InvalidRouteHost)?;
-            // CDN authorities must be DNS names or IP literals, not arbitrary
-            // RFC reg-names that an HTTP backend might interpret differently.
-            let valid_host = match base_authority.host_parsed() {
-                Host::IpvFuture { .. } => false,
-                Host::RegName(name) => {
-                    !name.is_empty()
-                        && name
-                            .as_str()
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-                }
-                _ => true,
-            };
-            if !valid_host
-                || base_authority.userinfo().is_some()
-                || base.path().as_str() != "/"
-                || base.query().is_some()
-                || base.fragment().is_some()
-                || base_authority.port().is_some_and(|port| port.is_empty())
-            {
-                return Err(DownloadPreparationError::InvalidRouteHost.into());
-            }
-            let base_port = base_authority
-                .port_to_u16()
-                .map_err(|_| DownloadPreparationError::InvalidRoutePort)?
-                .unwrap_or(443);
-            // Signed CDN references are already URI-encoded. Reject malformed
-            // escapes, raw whitespace and backslashes instead of repairing them.
-            let url = UriRef::parse(direct_path)
-                .map_err(|_| DownloadPreparationError::InvalidDirectPath)?
-                .resolve_against(&base)
-                .map_err(|_| DownloadPreparationError::InvalidDirectPath)?;
-            let authority = url
-                .authority()
-                .ok_or(DownloadPreparationError::OriginChanged)?;
-            if url.scheme() != base.scheme()
-                || !same_media_host(authority.host(), base_authority.host())
-                || authority
-                    .port_to_u16()
-                    .map_err(|_| DownloadPreparationError::InvalidDirectPathPort)?
-                    .unwrap_or(443)
-                    != base_port
-                || authority.userinfo().is_some()
-                || authority.port().is_some_and(|port| port.is_empty())
-            {
-                return Err(DownloadPreparationError::OriginChanged.into());
-            }
-            // Preserve the signed query byte-for-byte; only our URL-safe base64
-            // token is appended. The URI builder retains the fragment separately.
-            let mut query = url.query().map_or("", |q| q.as_str()).to_owned();
-            if !query.is_empty() {
-                query.push('&');
-            }
-            query.push_str("token=");
-            query.push_str(&token);
-            let url = Uri::builder()
-                .scheme(url.scheme())
-                .authority(authority)
-                .path(url.path())
-                .query(EStr::new(&query).ok_or(DownloadPreparationError::InvalidQuery)?)
-                .optional(
-                    |builder, fragment| builder.fragment(fragment),
-                    url.fragment(),
-                )
-                .build()
-                .map_err(|_| DownloadPreparationError::InvalidUrl)?;
-            Ok(DownloadRequest {
-                url: url.into_string(),
-                decryption: decryption.clone(),
-            })
-        });
+        let candidates = hosts
+            .iter()
+            .map(|host| build_host_download_request(host, direct_path, &token, &decryption));
         let mut requests = Vec::with_capacity(hosts.len());
         let mut last_error = None;
         for candidate in candidates {
@@ -1154,15 +1218,17 @@ impl DownloadUtils {
     /// Used for newsletter/channel media which is not encrypted but
     /// still needs integrity verification (matches WhatsApp Web's
     /// `validateFilehash()` call for unencrypted downloads).
-    pub fn validate_plaintext_sha256(data: &[u8], expected_sha256: &[u8]) -> Result<()> {
+    pub fn validate_plaintext_sha256(
+        data: &[u8],
+        expected_sha256: &[u8],
+    ) -> Result<(), MediaDecryptionError> {
         use sha2::Digest;
         let actual = Sha256::digest(data);
         if actual.as_slice() != expected_sha256 {
-            return Err(anyhow!(
-                "SHA-256 mismatch for plaintext media: expected {}, got {}",
-                hex::encode(expected_sha256),
-                hex::encode(actual),
-            ));
+            return Err(MediaDecryptionError::PlaintextChecksumMismatch {
+                expected: hex::encode(expected_sha256),
+                got: hex::encode(actual),
+            });
         }
         Ok(())
     }
@@ -1176,7 +1242,7 @@ impl DownloadUtils {
         mut reader: R,
         expected_sha256: &[u8],
         writer: &mut W,
-    ) -> Result<u64> {
+    ) -> Result<u64, MediaDecryptionError> {
         use sha2::Digest;
         let mut hasher = Sha256::new();
         let mut buf = [0u8; 8 * 1024];
@@ -1192,7 +1258,7 @@ impl DownloadUtils {
         }
         let actual = hasher.finalize();
         if actual.as_slice() != expected_sha256 {
-            return Err(anyhow!("SHA-256 mismatch for plaintext media"));
+            return Err(MediaDecryptionError::PlaintextHashMismatch);
         }
         Ok(total)
     }
@@ -1212,7 +1278,7 @@ impl DownloadUtils {
         media_key: &[u8],
         app_info: MediaType,
         writer: &mut W,
-    ) -> Result<u64> {
+    ) -> Result<u64, MediaDecryptionError> {
         Self::decrypt_stream_to_writer_with_hashes(reader, media_key, app_info, None, None, writer)
     }
 
@@ -1227,7 +1293,7 @@ impl DownloadUtils {
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
         writer: &mut W,
-    ) -> Result<u64> {
+    ) -> Result<u64, MediaDecryptionError> {
         let mut stream = MediaDecryptStream::new(
             media_key,
             app_info,
@@ -1251,16 +1317,17 @@ impl DownloadUtils {
         reader: R,
         media_key: &[u8],
         app_info: MediaType,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, MediaDecryptionError> {
         let mut buf = Vec::new();
         Self::decrypt_stream_to_writer(reader, media_key, app_info, &mut buf)?;
         Ok(buf)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn get_media_keys(
         media_key: &[u8],
         app_info: MediaType,
-    ) -> Result<([u8; 16], [u8; 32], [u8; 32])> {
+    ) -> Result<([u8; 16], [u8; 32], [u8; 32]), MediaDecryptionError> {
         let mut expanded = [0u8; 112];
         crate::crypto::hkdf_sha256_into(
             media_key,
@@ -1268,16 +1335,16 @@ impl DownloadUtils {
             app_info.app_info().as_bytes(),
             &mut expanded,
         )
-        .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
+        .map_err(|e| MediaDecryptionError::HkdfExpand(e.to_string()))?;
         let iv: [u8; 16] = expanded[0..16]
             .try_into()
-            .map_err(|_| anyhow!("HKDF output has unexpected length for IV"))?;
+            .map_err(|_| MediaDecryptionError::HkdfLength("IV"))?;
         let cipher_key: [u8; 32] = expanded[16..48]
             .try_into()
-            .map_err(|_| anyhow!("HKDF output has unexpected length for cipher key"))?;
+            .map_err(|_| MediaDecryptionError::HkdfLength("cipher key"))?;
         let mac_key: [u8; 32] = expanded[48..80]
             .try_into()
-            .map_err(|_| anyhow!("HKDF output has unexpected length for MAC key"))?;
+            .map_err(|_| MediaDecryptionError::HkdfLength("MAC key"))?;
         Ok((iv, cipher_key, mac_key))
     }
 
@@ -1285,7 +1352,7 @@ impl DownloadUtils {
         encrypted_payload: &[u8],
         media_key: &[u8],
         media_type: MediaType,
-    ) -> std::result::Result<Vec<u8>, MediaDecryptionError> {
+    ) -> Result<Vec<u8>, MediaDecryptionError> {
         let mut output = encrypted_payload.to_vec();
         Self::verify_and_decrypt_in_place(&mut output, media_key, media_type)?;
         Ok(output)
@@ -1304,7 +1371,7 @@ impl DownloadUtils {
         encrypted_payload: &mut Vec<u8>,
         media_key: &[u8],
         media_type: MediaType,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+    ) -> Result<(), MediaDecryptionError> {
         Self::verify_and_decrypt_using(
             encrypted_payload,
             media_key,
@@ -1322,7 +1389,7 @@ impl DownloadUtils {
         encrypted_payload: &mut Vec<u8>,
         media_key: &[u8],
         media_type: MediaType,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+    ) -> Result<(), MediaDecryptionError> {
         Self::verify_and_decrypt_using(
             encrypted_payload,
             media_key,
@@ -1354,14 +1421,9 @@ impl DownloadUtils {
             &[u8; 32],
             &[u8; 16],
             &[u8],
-        )
-            -> std::result::Result<[u8; 32], crate::libsignal::crypto::CryptoProviderError>,
-        decrypt: impl FnOnce(
-            &mut Vec<u8>,
-            &[u8; 32],
-            &[u8; 16],
-        ) -> std::result::Result<(), AesCbcDecryptionError>,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+        ) -> Result<[u8; 32], crate::libsignal::crypto::CryptoProviderError>,
+        decrypt: impl FnOnce(&mut Vec<u8>, &[u8; 32], &[u8; 16]) -> Result<(), AesCbcDecryptionError>,
+    ) -> Result<(), MediaDecryptionError> {
         if encrypted_payload.len() <= MEDIA_MAC_SIZE {
             return Err(MediaDecryptionError::PayloadTooShort);
         }
@@ -1400,7 +1462,7 @@ impl DownloadUtils {
         media_type: MediaType,
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+    ) -> Result<(), MediaDecryptionError> {
         Self::verify_and_decrypt_with_hashes_using(
             encrypted_payload,
             expected_enc_sha256,
@@ -1416,7 +1478,7 @@ impl DownloadUtils {
         media_type: MediaType,
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+    ) -> Result<(), MediaDecryptionError> {
         Self::verify_and_decrypt_with_hashes_using(
             encrypted_payload,
             expected_enc_sha256,
@@ -1433,8 +1495,8 @@ impl DownloadUtils {
         encrypted_payload: &mut Vec<u8>,
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
-        decrypt: impl FnOnce(&mut Vec<u8>) -> std::result::Result<(), MediaDecryptionError>,
-    ) -> std::result::Result<(), MediaDecryptionError> {
+        decrypt: impl FnOnce(&mut Vec<u8>) -> Result<(), MediaDecryptionError>,
+    ) -> Result<(), MediaDecryptionError> {
         use sha2::Digest;
         let encrypted_digest = expected_enc_sha256.map(|_| Sha256::digest(&*encrypted_payload));
         decrypt(encrypted_payload)?;
@@ -1835,8 +1897,8 @@ mod tests {
         let (result, output) = decode(&corrupt, &enc.file_enc_sha256, &enc.file_sha256);
         assert!(!output.is_empty(), "fixture must exercise emitted batches");
         assert!(matches!(
-            result.unwrap_err().downcast_ref::<MediaDecryptionError>(),
-            Some(MediaDecryptionError::InvalidMac)
+            result.unwrap_err(),
+            MediaDecryptionError::InvalidMac
         ));
         for (encrypted, plaintext_hash, expected) in [
             (
@@ -1851,10 +1913,9 @@ mod tests {
             ),
         ] {
             let (result, _) = decode(&enc.data_to_upload, encrypted, plaintext_hash);
-            let error = result.unwrap_err();
-            let actual = error.downcast_ref::<MediaDecryptionError>().unwrap();
+            let actual = result.unwrap_err();
             assert_eq!(
-                std::mem::discriminant(actual),
+                std::mem::discriminant(&actual),
                 std::mem::discriminant(&expected)
             );
         }
@@ -1905,8 +1966,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<MediaDecryptionError>(),
-                Some(MediaDecryptionError::PlaintextSha256Mismatch)
+                error,
+                MediaDecryptionError::PlaintextSha256Mismatch
             ));
             let error = DownloadUtils::verify_and_decrypt_in_place_with_hashes(
                 &mut enc.data_to_upload.clone(),
@@ -2906,24 +2967,24 @@ impl MobileMediaHttpProfile {
         user_agent: String,
         origin: Option<String>,
         upload_routes: Vec<(MediaType, String)>,
-    ) -> Result<Self> {
+    ) -> Result<Self, MobileMediaHttpProfileError> {
         if user_agent.trim().is_empty()
             || user_agent.len() > 1024
             || !user_agent.bytes().all(|b| (0x20..=0x7e).contains(&b))
             || upload_routes.len() > 64
         {
-            anyhow::bail!("invalid mobile media HTTP profile");
+            return Err(MobileMediaHttpProfileError::InvalidProfile);
         }
         if let Some(value) = &origin {
             if value.len() > 512 {
-                anyhow::bail!("invalid mobile media Origin");
+                return Err(MobileMediaHttpProfileError::InvalidOrigin);
             }
             use fluent_uri::{Uri, component::Host};
-            let parsed =
-                Uri::parse(value.as_str()).map_err(|_| anyhow::anyhow!("invalid media Origin"))?;
+            let parsed = Uri::parse(value.as_str())
+                .map_err(|_| MobileMediaHttpProfileError::InvalidOrigin)?;
             let authority = parsed
                 .authority()
-                .ok_or_else(|| anyhow::anyhow!("invalid media Origin"))?;
+                .ok_or(MobileMediaHttpProfileError::InvalidOrigin)?;
             let host_valid = match authority.host_parsed() {
                 Host::IpvFuture { .. } => false,
                 Host::RegName(name) => {
@@ -2944,7 +3005,7 @@ impl MobileMediaHttpProfile {
                 || authority.port().is_some_and(|p| p.is_empty())
                 || authority.port_to_u16().is_err()
             {
-                anyhow::bail!("invalid mobile media Origin");
+                return Err(MobileMediaHttpProfileError::InvalidOrigin);
             }
         }
         for (index, (kind, path)) in upload_routes.iter().enumerate() {
@@ -2958,7 +3019,7 @@ impl MobileMediaHttpProfile {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"/-_".contains(&b))
             {
-                anyhow::bail!("invalid mobile media upload route");
+                return Err(MobileMediaHttpProfileError::InvalidUploadRoute);
             }
         }
         Ok(Self {
@@ -2968,7 +3029,7 @@ impl MobileMediaHttpProfile {
         })
     }
     /// Explicit native routing profile; the caller supplies the exact versioned UA.
-    pub fn native_mms(user_agent: String) -> Result<Self> {
+    pub fn native_mms(user_agent: String) -> Result<Self, MobileMediaHttpProfileError> {
         Self::new(
             user_agent,
             None,

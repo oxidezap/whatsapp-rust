@@ -32,6 +32,40 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef, NodeStream};
 
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum PropsParseError {
+    #[error("expected <{expected}>, got <{actual}>")]
+    UnexpectedTag {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("missing {0} in prop")]
+    MissingAttribute(&'static str),
+    #[error("{0} must be >= 1")]
+    ZeroCode(&'static str),
+    #[error("sampling_weight out of range (-10000..=10000): {0}")]
+    SamplingWeight(i32),
+    #[error("prop has both config_code and event_code (attrs: {0})")]
+    BothCodes(String),
+    #[error("prop has neither config_code nor event_code (attrs: {0})")]
+    NeitherCode(String),
+    #[error("{0}")]
+    Integer(#[from] std::num::ParseIntError),
+    #[error("{0}")]
+    Structure(#[from] crate::iq::node::IqParseError),
+    #[error("{0}")]
+    Binary(#[from] wacore_binary::BinaryError),
+    #[error("incomplete group experiment property")]
+    IncompleteGroupProperty,
+    #[error("invalid group experiment code")]
+    InvalidGroupCode,
+    #[error("conflicting group experiment values")]
+    ConflictingGroupValues,
+}
+
+debug_as_display!(PropsParseError);
+
 /// IQ namespace for A/B props.
 pub const PROPS_NAMESPACE: &str = "abt";
 
@@ -727,6 +761,8 @@ pub struct AbProp {
 }
 
 impl ProtocolNode for AbProp {
+    type Error = PropsParseError;
+
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -743,21 +779,24 @@ impl ProtocolNode for AbProp {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         use crate::iq::node::optional_attr;
 
         if node.tag != "prop" {
-            return Err(anyhow::anyhow!("expected <prop>, got <{}>", node.tag));
+            return Err(PropsParseError::UnexpectedTag {
+                expected: "prop",
+                actual: node.tag.to_string(),
+            });
         }
 
         let config_code: u32 = optional_attr(node, "config_code")
-            .ok_or_else(|| anyhow::anyhow!("missing config_code in prop"))?
+            .ok_or(PropsParseError::MissingAttribute("config_code"))?
             .parse()?;
         if config_code == 0 {
-            return Err(anyhow::anyhow!("config_code must be >= 1"));
+            return Err(PropsParseError::ZeroCode("config_code"));
         }
         let config_value = optional_attr(node, "config_value")
-            .ok_or_else(|| anyhow::anyhow!("missing config_value in prop"))?;
+            .ok_or(PropsParseError::MissingAttribute("config_value"))?;
         let config_value = CompactString::from(config_value.as_ref());
         let config_expo_key = optional_attr(node, "config_expo_key").and_then(|s| s.parse().ok());
 
@@ -779,6 +818,8 @@ pub struct SamplingProp {
 }
 
 impl ProtocolNode for SamplingProp {
+    type Error = PropsParseError;
+
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -790,28 +831,28 @@ impl ProtocolNode for SamplingProp {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         use crate::iq::node::optional_attr;
 
         if node.tag != "prop" {
-            return Err(anyhow::anyhow!("expected <prop>, got <{}>", node.tag));
+            return Err(PropsParseError::UnexpectedTag {
+                expected: "prop",
+                actual: node.tag.to_string(),
+            });
         }
 
         let event_code: u32 = optional_attr(node, "event_code")
-            .ok_or_else(|| anyhow::anyhow!("missing event_code in prop"))?
+            .ok_or(PropsParseError::MissingAttribute("event_code"))?
             .parse()?;
         if event_code == 0 {
-            return Err(anyhow::anyhow!("event_code must be >= 1"));
+            return Err(PropsParseError::ZeroCode("event_code"));
         }
 
         let sampling_weight: i32 = optional_attr(node, "sampling_weight")
-            .ok_or_else(|| anyhow::anyhow!("missing sampling_weight in prop"))?
+            .ok_or(PropsParseError::MissingAttribute("sampling_weight"))?
             .parse()?;
         if !(-10000..=10000).contains(&sampling_weight) {
-            return Err(anyhow::anyhow!(
-                "sampling_weight out of range (-10000..=10000): {}",
-                sampling_weight
-            ));
+            return Err(PropsParseError::SamplingWeight(sampling_weight));
         }
 
         Ok(Self {
@@ -829,6 +870,8 @@ pub enum AbPropConfig {
 }
 
 impl ProtocolNode for AbPropConfig {
+    type Error = PropsParseError;
+
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -840,11 +883,14 @@ impl ProtocolNode for AbPropConfig {
         }
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         use crate::iq::node::optional_attr;
 
         if node.tag != "prop" {
-            return Err(anyhow::anyhow!("expected <prop>, got <{}>", node.tag));
+            return Err(PropsParseError::UnexpectedTag {
+                expected: "prop",
+                actual: node.tag.to_string(),
+            });
         }
 
         // Check discriminating attribute to avoid double-parse allocations
@@ -852,19 +898,13 @@ impl ProtocolNode for AbPropConfig {
         let has_event = optional_attr(node, "event_code").is_some();
 
         if has_config && has_event {
-            Err(anyhow::anyhow!(
-                "prop has both config_code and event_code (attrs: {:?})",
-                node.attrs
-            ))
+            Err(PropsParseError::BothCodes(format!("{:?}", node.attrs)))
         } else if has_config {
             Ok(Self::Experiment(AbProp::try_from_node_ref(node)?))
         } else if has_event {
             Ok(Self::Sampling(SamplingProp::try_from_node_ref(node)?))
         } else {
-            Err(anyhow::anyhow!(
-                "prop has neither config_code nor event_code (attrs: {:?})",
-                node.attrs
-            ))
+            Err(PropsParseError::NeitherCode(format!("{:?}", node.attrs)))
         }
     }
 }
@@ -888,6 +928,8 @@ pub struct PropsResponse {
 }
 
 impl ProtocolNode for PropsResponse {
+    type Error = PropsParseError;
+
     fn tag(&self) -> &'static str {
         "props"
     }
@@ -925,11 +967,14 @@ impl ProtocolNode for PropsResponse {
         builder.children(prop_nodes).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, anyhow::Error> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         use crate::iq::node::optional_attr;
 
         if node.tag != "props" {
-            return Err(anyhow::anyhow!("expected <props>, got <{}>", node.tag));
+            return Err(PropsParseError::UnexpectedTag {
+                expected: "props",
+                actual: node.tag.to_string(),
+            });
         }
 
         let ab_key = optional_attr(node, "ab_key").map(|s| s.into_owned());
@@ -1017,16 +1062,16 @@ impl PropsSpec {
 }
 
 impl IqStreamSpec for PropsSpec {
-    fn consume_response(
-        &self,
-        stream: &mut NodeStream<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
+    fn consume_response(&self, stream: &mut NodeStream<'_>) -> Result<Self::Response, Self::Error> {
         use crate::iq::node::optional_attr;
 
         // Descend into <props>, skipping any sibling in front of it.
         let mut response = loop {
             let Some(head) = stream.open()? else {
-                return Err(anyhow::anyhow!("<props> child not found"));
+                return Err(crate::iq::node::IqParseError::MissingChild {
+                    tag: "props".to_owned(),
+                }
+                .into());
             };
             if head.tag != "props" {
                 stream.close()?;
@@ -1067,6 +1112,7 @@ impl IqStreamSpec for PropsSpec {
 
 impl IqSpec for PropsSpec {
     type Response = PropsResponse;
+    type Error = PropsParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut builder = NodeBuilder::new("props").attr("protocol", PROPS_PROTOCOL_VERSION);
@@ -1086,7 +1132,7 @@ impl IqSpec for PropsSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         use crate::iq::node::required_child;
 
         let props_node = required_child(response, "props")?;
@@ -1128,6 +1174,7 @@ impl GroupPropsSpec {
 
 impl IqSpec for GroupPropsSpec {
     type Response = GroupPropsResponse;
+    type Error = PropsParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let props = NodeBuilder::new("props").attr("group", &self.group);
@@ -1138,7 +1185,7 @@ impl IqSpec for GroupPropsSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         use crate::iq::node::{optional_attr, required_child};
 
         let props = required_child(response, "props")?;
@@ -1153,12 +1200,16 @@ impl IqSpec for GroupPropsSpec {
             let (code, value) = match (code, value) {
                 (None, None) => continue,
                 (Some(code), Some(value)) => (code.parse::<u32>()?, value),
-                _ => anyhow::bail!("incomplete group experiment property"),
+                _ => return Err(PropsParseError::IncompleteGroupProperty),
             };
-            anyhow::ensure!(code > 0, "invalid group experiment code");
+            if code == 0 {
+                return Err(PropsParseError::InvalidGroupCode);
+            }
             let value = CompactString::from(value.as_ref());
             if let Some(previous) = values.insert(code, value.clone()) {
-                anyhow::ensure!(previous == value, "conflicting group experiment values");
+                if previous != value {
+                    return Err(PropsParseError::ConflictingGroupValues);
+                }
             } else {
                 parsed.experiment_props.push((code, value));
             }

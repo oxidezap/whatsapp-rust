@@ -5541,7 +5541,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-codegen"
 version = "0.2.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=2ff44531865451b99cf2840cbe9670d4eef3f8ef#2ff44531865451b99cf2840cbe9670d4eef3f8ef"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=3d9064051a176f75ce8e932528ced70c192cd09d#3d9064051a176f75ce8e932528ced70c192cd09d"
 dependencies = [
  "regex",
  "serde_json",
@@ -5551,17 +5551,15 @@ dependencies = [
 [[package]]
 name = "wa-fetch"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=eb16f595d455d8b0b3f7966a59444f4f9894c127#eb16f595d455d8b0b3f7966a59444f4f9894c127"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324#e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324"
 dependencies = [
- "anyhow",
  "serde_json",
- "wa-text",
 ]
 
 [[package]]
 name = "wa-ir"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=2ff44531865451b99cf2840cbe9670d4eef3f8ef#2ff44531865451b99cf2840cbe9670d4eef3f8ef"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=3d9064051a176f75ce8e932528ced70c192cd09d#3d9064051a176f75ce8e932528ced70c192cd09d"
 dependencies = [
  "serde",
 ]
@@ -5569,9 +5567,8 @@ dependencies = [
 [[package]]
 name = "wa-store"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=eb16f595d455d8b0b3f7966a59444f4f9894c127#eb16f595d455d8b0b3f7966a59444f4f9894c127"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324#e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324"
 dependencies = [
- "anyhow",
  "flate2",
  "lzma-rust2",
  "serde",
@@ -5586,7 +5583,7 @@ dependencies = [
 [[package]]
 name = "wa-text"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=eb16f595d455d8b0b3f7966a59444f4f9894c127#eb16f595d455d8b0b3f7966a59444f4f9894c127"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324#e86c3d2a72fd6bd5edd12c6abfb36d796dc8e324"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -5652,7 +5649,6 @@ dependencies = [
 name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "codspeed-divan-compat",
  "hex",
  "hkdf",
@@ -5737,7 +5733,6 @@ dependencies = [
 name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "bytes",
  "codspeed-divan-compat",
  "hkdf",
@@ -6230,11 +6225,11 @@ dependencies = [
 name = "whatsapp-rust-plugin-metrics"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bon",
  "portable-atomic",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "whatsapp-rust",
 ]
@@ -6243,7 +6238,6 @@ dependencies = [
 name = "whatsapp-rust-plugin-wam"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "log",
  "rand 0.10.4",
  "thiserror 2.0.21",
@@ -6281,7 +6275,6 @@ dependencies = [
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-channel",
  "async-trait",
  "bytes",
@@ -6290,6 +6283,7 @@ dependencies = [
  "log",
  "rcgen",
  "rustls",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-websockets",
@@ -6301,8 +6295,8 @@ dependencies = [
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-trait",
+ "thiserror 2.0.21",
  "tokio",
  "ureq",
  "wacore",
@@ -6363,6 +6357,7 @@ dependencies = [
  "anyhow",
  "heck",
  "prettyplease 0.3.0",
+ "proc-macro2",
  "quote",
  "serde",
  "serde_json",

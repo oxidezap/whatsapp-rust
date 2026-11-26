@@ -159,6 +159,28 @@ impl std::fmt::Debug for RejectionStanza {
     }
 }
 
+/// Failure to encode or validate an IQ request.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IqEncodeError {
+    #[error("{0}")]
+    Binary(#[from] wacore_binary::error::BinaryError),
+    #[error("{0}")]
+    UsyncValidation(#[from] wacore::iq::usync::UsyncValidationError),
+    #[error("direct IQ encoder did not preserve the request ID")]
+    RequestIdMismatch,
+    #[error("contextual IQ contracts require execute, not execute_streaming")]
+    StreamingContextUnsupported,
+}
+
+#[derive(Debug, Error)]
+enum IqInputError {
+    #[error("expected an <iq> stanza, got <{0}>")]
+    UnexpectedTag(String),
+    #[error("decoded response has no root node")]
+    MissingRoot,
+}
+
 #[derive(Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -173,7 +195,7 @@ pub enum IqError {
     // Boxed to break the `ClientError::Iq(IqError)` <-> `IqError::ClientState`
     // type cycle (both would otherwise be infinitely sized).
     #[error("client state prevented send: {0}")]
-    ClientState(#[source] Box<ClientError>),
+    ClientState(#[source] wacore::error::BoxedErrorSource<ClientError>),
     #[error("received disconnect node during IQ wait: {}", wacore_binary::diagnostics::NodeSummary::from(.0.as_ref()))]
     Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
@@ -202,10 +224,10 @@ pub enum IqError {
     Unclassified(#[source] wacore::request::IqError),
     #[error("IQ request ID is already in flight: {}", wacore_binary::diagnostics::ObservedId::new(.0))]
     DuplicateRequestId(String),
-    #[error("failed to encode IQ request: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
-    EncodeError(#[source] anyhow::Error),
+    #[error("failed to encode IQ request: {}", wacore::diagnostics::ErrorSummary(.0))]
+    EncodeError(#[source] IqEncodeError),
     #[error("failed to parse IQ response: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
-    ParseError(#[from] anyhow::Error),
+    ParseError(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 // The disconnect stanza stays on the public error for programmatic handling,
@@ -240,7 +262,7 @@ impl std::fmt::Debug for IqError {
                 .finish(),
             Self::EncodeError(value) => f
                 .debug_tuple("EncodeError")
-                .field(&wacore::diagnostics::ErrorSummary(value.as_ref()))
+                .field(&wacore::diagnostics::ErrorSummary(value))
                 .finish(),
             Self::ParseError(value) => f
                 .debug_tuple("ParseError")
@@ -507,10 +529,9 @@ impl Client {
         self.record_identity_on_current_span("wa.iq.node", module_path!());
 
         if node.tag.as_ref() != IQ_TAG {
-            return Err(IqError::ParseError(anyhow::anyhow!(
-                "expected an <iq> stanza, got <{}>",
-                node.tag
-            )));
+            return Err(IqError::ParseError(Box::new(IqInputError::UnexpectedTag(
+                node.tag.to_string(),
+            ))));
         }
 
         let req_id = node
@@ -563,7 +584,7 @@ impl Client {
         let mut prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
             Ok(true) => PreparedIq::Encoded(buf),
             Ok(false) => PreparedIq::Query(Box::new(spec.build_iq())),
-            Err(e) => return Err(IqError::EncodeError(e)),
+            Err(e) => return Err(IqError::EncodeError(e.into())),
         };
 
         let attributes = spec.additional_iq_attributes();
@@ -584,9 +605,7 @@ impl Client {
                         || node.get_attr(IQ_ID_ATTR).map(|v| v.as_str()).as_deref()
                             != Some(req_id.as_str())
                     {
-                        return Err(IqError::EncodeError(anyhow::anyhow!(
-                            "direct IQ encoder did not preserve the request ID"
-                        )));
+                        return Err(IqError::EncodeError(IqEncodeError::RequestIdMismatch));
                     }
                     node.to_owned()
                 }
@@ -611,9 +630,10 @@ impl Client {
                     None => spec.parse_response(response.get()),
                 };
                 parsed.map_err(|error| {
+                    let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
                     // A spec can report a typed rejection embedded in a result IQ.
                     // Attach its original response without changing ordinary parse errors.
-                    match error.downcast_ref::<wacore::request::IqError>() {
+                    match iq_parser_rejection(error.as_ref()) {
                         Some(wacore::request::IqError::ServerError {
                             code,
                             text,
@@ -650,16 +670,16 @@ impl Client {
         S::Response: Send + 'static,
     {
         if spec.uses_contextual_response() || spec.handles_iq_errors() {
-            return Err(IqError::EncodeError(anyhow::anyhow!(
-                "contextual IQ contracts require execute, not execute_streaming"
-            )));
+            return Err(IqError::EncodeError(
+                IqEncodeError::StreamingContextUnsupported,
+            ));
         }
         let req_id = self.generate_request_id();
         let mut buf = Vec::new();
         let prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
             Ok(true) => PreparedIq::Encoded(buf),
             Ok(false) => PreparedIq::Query(Box::new(spec.build_iq())),
-            Err(e) => return Err(IqError::EncodeError(e)),
+            Err(e) => return Err(IqError::EncodeError(e.into())),
         };
 
         let attributes = spec.additional_iq_attributes();
@@ -678,9 +698,9 @@ impl Client {
                         let mut stream = wacore_binary::NodeStream::from_node_bytes(&bytes);
                         match stream.open() {
                             Ok(Some(_)) => consume_streamed(&spec, &mut stream),
-                            Ok(None) => Err(IqError::ParseError(anyhow::anyhow!(
-                                "decoded response has no root node"
-                            ))),
+                            Ok(None) => {
+                                Err(IqError::ParseError(Box::new(IqInputError::MissingRoot)))
+                            }
                             Err(e) => Err(IqError::ParseError(e.into())),
                         }
                     }
@@ -905,7 +925,9 @@ impl Client {
                 // The send future only ever yields the transport/state errors
                 // above; any other (incl. future #[non_exhaustive]) variant is
                 // surfaced as a client-state failure.
-                other => Err(IqError::ClientState(Box::new(other))),
+                other => Err(IqError::ClientState(wacore::error::BoxedErrorSource::new(
+                    other,
+                ))),
             };
         }
 
@@ -921,6 +943,31 @@ impl Client {
 #[path = "request_context_tests.rs"]
 mod context_tests;
 
+fn iq_parser_rejection<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a wacore::request::IqError> {
+    // Brent's cycle detection reads each link once and does not cap valid chains.
+    let mut checkpoint = error;
+    let mut window = 1usize;
+    let mut remaining = window;
+    let mut cause = error;
+    loop {
+        if let Some(rejection) = cause.downcast_ref::<wacore::request::IqError>() {
+            return Some(rejection);
+        }
+        cause = cause.source()?;
+        if std::ptr::eq(cause, checkpoint) {
+            return None;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            checkpoint = cause;
+            window = window.saturating_mul(2);
+            remaining = window;
+        }
+    }
+}
+
 /// Run `spec` over a stream positioned inside the `<iq type="result">` root
 /// and close the stream out: the trailer is what says every inflated byte was
 /// the one the peer sent, and a tree decode validates it too.
@@ -928,9 +975,13 @@ fn consume_streamed<S: IqStreamSpec>(
     spec: &S,
     stream: &mut wacore_binary::NodeStream<'_>,
 ) -> Result<S::Response, IqError> {
-    spec.consume_response(stream)
-        .and_then(|parsed| stream.finish().map(|()| parsed).map_err(Into::into))
-        .map_err(IqError::ParseError)
+    let parsed = spec
+        .consume_response(stream)
+        .map_err(|error| IqError::ParseError(Box::new(error)))?;
+    stream
+        .finish()
+        .map_err(|error| IqError::ParseError(error.into()))?;
+    Ok(parsed)
 }
 
 /// The IQ outcome counter, recorded once per request at the point its final
@@ -950,6 +1001,48 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn iq_parser_rejection_handles_wrapped_and_cyclic_sources() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapper")]
+        struct Wrapped(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+        let mut rejection: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(wacore::request::IqError::ServerError {
+                code: 403,
+                text: String::new(),
+                error_type: None,
+                backoff: None,
+            });
+        for _ in 0..48 {
+            rejection = Box::new(Wrapped(rejection));
+        }
+        assert!(matches!(
+            super::iq_parser_rejection(rejection.as_ref()),
+            Some(wacore::request::IqError::ServerError { code: 403, .. })
+        ));
+
+        #[derive(Debug)]
+        struct Cyclic(std::cell::Cell<usize>);
+
+        impl std::fmt::Display for Cyclic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cyclic source")
+            }
+        }
+
+        impl std::error::Error for Cyclic {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                let calls = self.0.get();
+                assert!(calls < 3, "self-cycle was not detected");
+                self.0.set(calls + 1);
+                Some(self)
+            }
+        }
+
+        assert!(super::iq_parser_rejection(&Cyclic(0.into())).is_none());
+    }
 
     #[tokio::test]
     async fn typed_catalog_iq_sends_smax_id_on_the_root() {
@@ -996,10 +1089,11 @@ mod tests {
         }
         impl wacore::iq::spec::IqSpec for GuardedSpec {
             type Response = ();
+            type Error = std::convert::Infallible;
             fn build_iq(&self) -> super::InfoQuery<'static> {
                 unreachable!("a contextual contract must not build a streaming request")
             }
-            fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> anyhow::Result<()> {
+            fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), Self::Error> {
                 unreachable!("a contextual contract must not reach the legacy parser")
             }
             fn uses_contextual_response(&self) -> bool {
@@ -1013,7 +1107,7 @@ mod tests {
             fn consume_response(
                 &self,
                 _: &mut wacore_binary::NodeStream<'_>,
-            ) -> anyhow::Result<()> {
+            ) -> Result<(), Self::Error> {
                 unreachable!("a contextual contract must not reach the stream parser")
             }
         }

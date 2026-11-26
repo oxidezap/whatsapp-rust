@@ -211,7 +211,8 @@ pub(crate) fn fetch(root: &Path, captures: Option<&[&str]>) -> Result<()> {
         &wanted,
         &sources,
         &root.join(".cache/wa-wasm"),
-    )
+    )?;
+    Ok(())
 }
 
 pub(crate) fn verify(root: &Path, out: &Path, capture: &str, mode: VerifyMode) -> Result<()> {

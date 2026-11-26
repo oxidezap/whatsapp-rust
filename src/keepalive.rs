@@ -850,7 +850,9 @@ mod tests {
     #[test]
     fn test_classify_parse_error_is_transient() {
         assert_eq!(
-            classify_keepalive_error(&IqError::ParseError(anyhow::anyhow!("bad response"))),
+            classify_keepalive_error(&IqError::ParseError(
+                anyhow::anyhow!("bad response").into_boxed_dyn_error()
+            )),
             KeepaliveResult::TransientFailure,
             "ParseError should be transient — bad response, not a dead connection"
         );
@@ -889,13 +891,13 @@ mod tests {
         assert!(!is_benign_teardown(&IqError::EncryptSend(
             EncryptSendError::transport(anyhow::anyhow!("broken pipe"))
         )));
-        assert!(!is_benign_teardown(&IqError::EncodeError(anyhow::anyhow!(
-            "encode failed"
-        ))));
+        assert!(!is_benign_teardown(&IqError::EncodeError(
+            crate::request::IqEncodeError::RequestIdMismatch
+        )));
         assert!(!is_benign_teardown(&IqError::Timeout));
-        assert!(!is_benign_teardown(&IqError::ParseError(anyhow::anyhow!(
-            "bad response"
-        ))));
+        assert!(!is_benign_teardown(&IqError::ParseError(
+            anyhow::anyhow!("bad response").into_boxed_dyn_error()
+        )));
         assert!(!is_benign_teardown(&crate::test_utils::server_error_iq(
             500, "internal", None, None
         )));

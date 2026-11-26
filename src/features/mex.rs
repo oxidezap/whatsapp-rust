@@ -69,7 +69,7 @@ pub use wacore::iq::mex::{
 pub use wacore::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
 
 /// Error types for MEX operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum MexError {
     /// Payload missing or otherwise malformed in a way that has no underlying
@@ -94,6 +94,13 @@ pub enum MexError {
 
     #[error("JSON error")]
     Json(#[from] serde_json::Error),
+}
+
+impl std::fmt::Debug for MexError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A persisted MEX operation and its associated variables type.
@@ -461,7 +468,8 @@ impl<'a> Mex<'a> {
 
 fn classify_iq_error(source: IqError) -> MexError {
     if let IqError::ParseError(err) = &source
-        && let Some(fatal) = err.downcast_ref::<MexFatalError>()
+        && let Some(fatal) = crate::ErrorChainExt::sources(err.as_ref())
+            .find_map(|cause| cause.downcast_ref::<MexFatalError>())
     {
         return MexError::GraphQl {
             code: fatal.code,
@@ -559,6 +567,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorChainExt;
     use serde_json::json;
 
     #[tokio::test]
@@ -694,9 +703,8 @@ mod tests {
                             matches!(error, MexError::GraphQl { code: actual, .. } if actual == code)
                         );
                         let fatal = iq
-                            .source()
-                            .unwrap()
-                            .downcast_ref::<MexFatalError>()
+                            .sources()
+                            .find_map(|cause| cause.downcast_ref::<MexFatalError>())
                             .unwrap();
                         assert_eq!(fatal.query, get_username::NAME);
                         assert_eq!(fatal.code, code);
@@ -734,7 +742,7 @@ mod tests {
                 .children([NodeBuilder::new("result").bytes(payload.to_vec()).build()])
                 .build();
             let parse = spec.parse_response(&node.as_node_ref()).unwrap_err();
-            let error = classify_iq_error(IqError::ParseError(parse));
+            let error = classify_iq_error(IqError::ParseError(parse.into()));
             let iq = error.source().unwrap().downcast_ref::<IqError>().unwrap();
             let IqError::ParseError(inner) = iq else {
                 panic!("parse source")
@@ -742,14 +750,24 @@ mod tests {
             if graphql {
                 assert!(matches!(error, MexError::GraphQl { code: 404, .. }));
                 assert_eq!(
-                    inner.downcast_ref::<MexFatalError>().unwrap().query,
+                    inner
+                        .as_ref()
+                        .sources()
+                        .find_map(|cause| cause.downcast_ref::<MexFatalError>())
+                        .unwrap()
+                        .query,
                     get_username::NAME
                 );
-                assert!(iq.source().unwrap().is::<MexFatalError>());
+                assert!(iq.sources().any(|cause| cause.is::<MexFatalError>()));
             } else {
                 assert!(matches!(error, MexError::Request(_)));
-                assert!(inner.downcast_ref::<serde_json::Error>().is_some());
-                assert!(iq.source().unwrap().is::<serde_json::Error>());
+                assert!(
+                    inner
+                        .as_ref()
+                        .sources()
+                        .any(|cause| cause.is::<serde_json::Error>())
+                );
+                assert!(iq.sources().any(|cause| cause.is::<serde_json::Error>()));
             }
         }
         let error: MexError = serde_json::from_str::<serde_json::Value>("invalid-json")

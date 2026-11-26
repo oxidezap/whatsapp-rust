@@ -40,7 +40,7 @@ impl<'a> Events<'a> {
     ///
     /// ```no_run
     /// # use whatsapp_rust::{Client, Jid, EventCreationParams, EventResponseType};
-    /// # async fn example(client: &Client, chat: &Jid) -> whatsapp_rust::anyhow::Result<()> {
+    /// # async fn example(client: &Client, chat: &Jid) -> Result<(), Box<dyn std::error::Error>> {
     /// let params = EventCreationParams::builder().name("Launch".into()).build();
     /// let created = client.events().create(chat, params).await?;
     /// client.events().respond(&created.event_ref()?, EventResponseType::Going, None).await?;

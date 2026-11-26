@@ -7,6 +7,16 @@ pub use wacore_noise as noise;
 // Re-export derive macros
 pub use wacore_derive::{EmptyNode, ProtocolNode, WireEnum};
 
+macro_rules! debug_as_display {
+    ($($error:ty),+ $(,)?) => {
+        $(impl std::fmt::Debug for $error {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(self, formatter)
+            }
+        })+
+    };
+}
+
 pub mod adv;
 pub mod appstate_sync;
 pub mod bot_message;
@@ -16,6 +26,7 @@ pub mod companion_reg;
 pub mod crypto;
 pub mod diagnostics;
 pub mod download;
+pub mod error;
 pub mod identity_verification;
 pub mod iq;
 pub mod protocol;
