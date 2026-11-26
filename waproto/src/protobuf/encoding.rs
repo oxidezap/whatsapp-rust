@@ -67,7 +67,6 @@ impl Tag {
         }
         Ok(Self { number, kind })
     }
-    #[inline]
     pub fn decode(input: &mut impl bytes::Buf) -> Result<Self, DecodeError> {
         if let Some(&byte) = input.chunk().first()
             && byte < 128
