@@ -353,9 +353,7 @@ pub fn skip_field_depth(
         }
         WireType::Fixed64 => 8,
         WireType::Fixed32 => 4,
-        WireType::LengthDelimited => {
-            usize::try_from(decode_varint(input)?).map_err(|_| DecodeError::MessageTooLarge)?
-        }
+        WireType::LengthDelimited => return skip_length_delimited(input),
         WireType::EndGroup => return Err(DecodeError::InvalidWireType(4)),
         WireType::StartGroup => {
             let depth = depth
@@ -380,12 +378,26 @@ pub fn skip_field_depth(
     Ok(())
 }
 
+#[inline]
+fn skip_length_delimited(input: &mut impl bytes::Buf) -> Result<(), DecodeError> {
+    let length =
+        usize::try_from(decode_varint(input)?).map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    input.advance(length);
+    Ok(())
+}
+
 pub fn skip_unknown_field(
     tag: Tag,
     input: &mut impl bytes::Buf,
     context: super::DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     context.register_unknown_field()?;
+    if tag.kind == WireType::LengthDelimited {
+        return skip_length_delimited(input);
+    }
     if tag.kind != WireType::StartGroup {
         return skip_field_depth(tag, input, context.depth());
     }

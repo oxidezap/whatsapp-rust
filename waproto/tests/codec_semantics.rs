@@ -260,6 +260,23 @@ fn required_view_presence_distinguishes_absent_and_default_values() {
 }
 
 #[test]
+fn unknown_length_delimited_fields_validate_length_and_budget() {
+    use waproto::whatsapp::Message;
+
+    let input = [0x82, 0xb5, 0x18, 2, 0x01];
+    let options = DecodeOptions::new().with_unknown_field_limit(1);
+    assert_eq!(
+        options.decode_from_slice::<Message>(&input).unwrap_err(),
+        DecodeError::UnexpectedEof
+    );
+    let zero = DecodeOptions::new().with_unknown_field_limit(0);
+    assert_eq!(
+        zero.decode_from_slice::<Message>(&input).unwrap_err(),
+        DecodeError::UnknownFieldLimitExceeded
+    );
+}
+
+#[test]
 fn unknown_field_budget_is_shared_by_owned_and_view_decoders() {
     use waproto::whatsapp::{Message, MessageView};
 
