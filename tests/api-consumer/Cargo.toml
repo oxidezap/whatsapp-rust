@@ -15,8 +15,6 @@ resolver = "3"
 default = []
 core = ["dep:anyhow"]
 contracts = []
-protobuf-experiment = ["waproto/protobuf-experiment"]
-protobuf-experiment-oracle = ["protobuf-experiment"]
 sdk = ["dep:whatsapp-rust"]
 native = ["sdk", "whatsapp-rust/tokio-runtime", "dep:tokio", "dep:anyhow", "anyhow/std", "dep:async-channel", "dep:async-trait"]
 native-default = ["native", "whatsapp-rust/default"]
@@ -184,11 +182,6 @@ required-features = ["runtime-execution"]
 name = "mobile_probe"
 path = "src/mobile_probe.rs"
 required-features = ["mobile-core"]
-
-[[bin]]
-name = "protobuf_experiment"
-path = "../../waproto/examples/protobuf_experiment.rs"
-required-features = ["protobuf-experiment"]
 
 [[test]]
 name = "mobile_workflow"

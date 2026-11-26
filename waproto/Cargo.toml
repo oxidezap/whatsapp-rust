@@ -7,6 +7,7 @@ authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT AND Apache-2.0"
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
+exclude = ["generated-api.snapshot"]
 
 # Generated enums use serde_repr under `serde-enum-repr`.
 [package.metadata.cargo-machete]
@@ -19,28 +20,7 @@ serde-snake-case = ["serde-deserialize"]
 # Enums (de)serialize as their numeric repr instead of the variant name — what
 # the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
-protobuf-experiment = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor"]
-protobuf-experiment-oracle = ["protobuf-experiment"]
-
-[[example]]
-name = "protobuf_experiment"
-required-features = ["protobuf-experiment"]
-
-[[example]]
-name = "protobuf_compare"
-required-features = ["protobuf-experiment"]
-
-[[example]]
-name = "protobuf_target_inventory"
-required-features = ["protobuf-experiment"]
-
-[[example]]
-name = "protobuf_inventory"
-required-features = ["protobuf-experiment"]
-
-[[example]]
-name = "protobuf_owned_view_cost"
-required-features = ["protobuf-experiment"]
+protobuf-reference = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor"]
 
 [dependencies]
 buffa = { workspace = true, optional = true }

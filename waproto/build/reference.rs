@@ -44,10 +44,6 @@ mod pin_clone;
 #[path = "../codegen/policy.rs"]
 pub mod policy;
 
-#[cfg(feature = "protobuf-experiment")]
-#[path = "../experiment/generate.rs"]
-mod experiment;
-
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;
 #[path = "../codegen/project.rs"]
@@ -163,8 +159,6 @@ pub fn generate_reference() -> std::io::Result<()> {
     let encoded = fds.encode_to_vec();
 
     {
-        #[cfg(feature = "protobuf-experiment")]
-        experiment::generate(&fds, &out_path)?;
         let input = descriptor::FileDescriptorSet::decode_from_slice(&encoded)?;
         let projected = project::project(&input).map_err(std::io::Error::other)?;
         let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")

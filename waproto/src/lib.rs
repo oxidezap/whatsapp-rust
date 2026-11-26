@@ -18,14 +18,6 @@
 /// Compatibility path for the protobuf traits and containers used by this crate.
 pub use protobuf as buffa;
 
-#[cfg(feature = "protobuf-experiment")]
-#[doc(hidden)]
-pub use ::buffa as reference_runtime;
-
-#[cfg(feature = "protobuf-experiment")]
-#[doc(hidden)]
-pub mod experiment;
-
 /// Protobuf messages, views, containers, and encoding APIs owned by this crate.
 pub mod protobuf;
 
@@ -33,7 +25,7 @@ pub mod whatsapp {
     pub use crate::protobuf::generated::whatsapp::*;
 }
 
-#[cfg(feature = "protobuf-experiment")]
+#[cfg(feature = "protobuf-reference")]
 #[doc(hidden)]
 pub mod reference {
     // disallowed_methods: the generated impls call the buffa trait methods on
@@ -66,7 +58,7 @@ pub mod reference {
 /// (serialized as, and deserializable from, the raw integer).
 pub use protobuf::open_enum_serde;
 
-#[cfg(feature = "protobuf-experiment")]
+#[cfg(feature = "protobuf-reference")]
 mod reference_enum_serde;
 
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside

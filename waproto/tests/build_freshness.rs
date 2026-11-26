@@ -1,6 +1,6 @@
 //! The build script must leave the crate fresh after its first run.
 
-#![cfg(feature = "protobuf-experiment")]
+#![cfg(feature = "protobuf-reference")]
 
 use std::path::Path;
 use std::time::SystemTime;

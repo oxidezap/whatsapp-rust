@@ -19,7 +19,7 @@ mod policy;
 #[path = "codegen/project.rs"]
 #[allow(dead_code)]
 mod project;
-#[cfg(feature = "protobuf-experiment")]
+#[cfg(feature = "protobuf-reference")]
 #[path = "build/reference.rs"]
 #[allow(dead_code)]
 mod reference;
@@ -90,7 +90,7 @@ fn main() -> io::Result<()> {
     );
     std::fs::write(out.join("generated-whatsapp.rs"), source)?;
     std::fs::write(out.join("generated-tags.rs"), tags)?;
-    #[cfg(feature = "protobuf-experiment")]
+    #[cfg(feature = "protobuf-reference")]
     reference::generate_reference()?;
     Ok(())
 }

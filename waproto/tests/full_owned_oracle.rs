@@ -1,4 +1,4 @@
-#![cfg(feature = "protobuf-experiment")]
+#![cfg(feature = "protobuf-reference")]
 #![allow(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
