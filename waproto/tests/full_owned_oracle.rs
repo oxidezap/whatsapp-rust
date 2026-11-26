@@ -178,7 +178,7 @@ fn multiple_map_keys_preserve_semantics_and_duplicate_entries_replace_values() {
     let input = [
         10, 6, 8, 1, 18, 2, 8, 2, 10, 6, 8, 2, 18, 2, 8, 3, 10, 6, 8, 1, 18, 2, 16, 4,
     ];
-    let candidate = rt::generated::whatsapp::Config::decode_from_slice(&input).unwrap();
+    let candidate = waproto::whatsapp::Config::decode_from_slice(&input).unwrap();
     let reference = waproto::reference::Config::decode_from_slice(&input).unwrap();
     let expected = serde_json::to_value(&reference).unwrap();
     assert_eq!(serde_json::to_value(&candidate).unwrap(), expected);
@@ -186,7 +186,7 @@ fn multiple_map_keys_preserve_semantics_and_duplicate_entries_replace_values() {
     assert_eq!(candidate.field[&1].min_version, None);
     assert_eq!(candidate.field[&1].max_version, Some(4));
     assert_eq!(candidate.field[&2].min_version, Some(3));
-    let view = rt::generated::whatsapp::ConfigView::decode_view(&input).unwrap();
+    let view = waproto::whatsapp::ConfigView::decode_view(&input).unwrap();
     let old_view =
         <waproto::reference::ConfigView<'_> as buffa::MessageView>::decode_view(&input).unwrap();
     assert_eq!(view.field.len(), old_view.field.len());
@@ -211,7 +211,7 @@ fn multiple_map_keys_preserve_semantics_and_duplicate_entries_replace_values() {
     let reference_from_candidate =
         waproto::reference::Config::decode_from_slice(&candidate.encode_to_vec()).unwrap();
     let candidate_from_reference =
-        rt::generated::whatsapp::Config::decode_from_slice(&reference.encode_to_vec()).unwrap();
+        waproto::whatsapp::Config::decode_from_slice(&reference.encode_to_vec()).unwrap();
     assert_eq!(
         serde_json::to_value(reference_from_candidate).unwrap(),
         expected

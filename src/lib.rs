@@ -732,12 +732,7 @@ pub mod prelude {
         MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
     };
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
-    pub use waproto::codec as protobuf_codec;
-    pub use waproto::protobuf::{
-        Message as ProtoMessage, MessageField, MessageView as ProtoMessageView,
-    };
-    /// The protobuf namespace (`wa::Message`, `wa::message::*`).
-    pub use waproto::whatsapp as wa;
+    pub use waproto::prelude::*;
 }
 
 pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};

@@ -110,6 +110,7 @@ impl DecodeOptions {
         self
     }
 
+    #[inline]
     pub(crate) fn run<R>(
         &self,
         input_size: usize,
@@ -121,6 +122,7 @@ impl DecodeOptions {
         self.with_context(decode)
     }
 
+    #[inline]
     pub(crate) fn with_context<R>(
         &self,
         decode: impl for<'a> FnOnce(DecodeContext<'a>) -> Result<R, DecodeError>,

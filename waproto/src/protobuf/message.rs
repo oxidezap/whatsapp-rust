@@ -146,6 +146,7 @@ pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
     fn decode(input: &mut impl Buf) -> Result<Self, DecodeError> {
         DecodeOptions::new().decode(input)
     }
+    #[inline]
     fn decode_from_slice(input: &[u8]) -> Result<Self, DecodeError> {
         DecodeOptions::new().decode_from_slice(input)
     }
@@ -223,6 +224,7 @@ pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
 }
 
 impl DecodeOptions {
+    #[inline]
     pub fn decode<M: Message>(&self, input: &mut impl Buf) -> Result<M, DecodeError> {
         self.run(input.remaining(), |context| {
             let mut message = M::default();
@@ -230,6 +232,7 @@ impl DecodeOptions {
             Ok(message)
         })
     }
+    #[inline]
     pub fn decode_from_slice<M: Message>(&self, input: &[u8]) -> Result<M, DecodeError> {
         self.decode(&mut &*input)
     }

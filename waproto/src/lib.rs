@@ -25,6 +25,17 @@ pub mod whatsapp {
     pub use crate::protobuf::generated::whatsapp::*;
 }
 
+/// Common protobuf types, traits, and codecs.
+pub mod prelude {
+    pub use crate::codec as protobuf_codec;
+    pub use crate::protobuf::{
+        DecodeOptions as ProtoDecodeOptions, Message as ProtoMessage, MessageField,
+        MessageView as ProtoMessageView, OwnedView,
+    };
+    /// The WhatsApp protobuf namespace.
+    pub use crate::whatsapp as wa;
+}
+
 #[cfg(feature = "protobuf-reference")]
 #[doc(hidden)]
 pub mod reference {

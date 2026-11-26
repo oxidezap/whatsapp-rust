@@ -1785,7 +1785,7 @@ fn oracle_seed(schema: &Schema, id: MessageId, depth: usize) -> Vec<u8> {
 pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
     let new = Emitter {
         schema,
-        base: "rt::generated::whatsapp",
+        base: "waproto::whatsapp",
     };
     let old = Emitter {
         schema,
@@ -1880,7 +1880,7 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
 fn generate_view_oracle(schema: &Schema) -> String {
     let new = Emitter {
         schema,
-        base: "rt::generated::whatsapp",
+        base: "waproto::whatsapp",
     };
     let old = Emitter {
         schema,

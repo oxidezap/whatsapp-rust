@@ -42,7 +42,7 @@ pub use view::{
     clippy::disallowed_methods,
     clippy::let_and_return
 )]
-pub mod generated {
+pub(crate) mod generated {
     pub mod whatsapp {
         include!(concat!(env!("OUT_DIR"), "/generated-whatsapp.rs"));
     }
