@@ -857,12 +857,16 @@ impl Emitter<'_> {
         let mut out = String::new();
         if matches!(field.shape, FieldShape::Repeated { .. }) && value.is_packable() {
             let expression = self.read_value(value, field.bytes_storage, "&mut packed");
+            let charge = format!(
+                "context.register_element_memory(::std::mem::size_of::<{}>())?;",
+                self.value_type(value, field.bytes_storage)
+            );
             let push = if let ValueType::Enumeration(id) = value
                 && !self.schema.enumeration(id).open
             {
-                format!("if let Some(v)={expression}{{self.{slot}.push(v);}} ")
+                format!("if let Some(v)={expression}{{{charge}self.{slot}.push(v);}} ")
             } else {
-                format!("self.{slot}.push({expression});")
+                format!("let v={expression};{charge}self.{slot}.push(v);")
             };
             out.push_str(&format!("({number},{RT}::encoding::WireType::LengthDelimited)=>{{let n={RT}::encoding::decode_varint(input)?;let n=usize::try_from(n).map_err(|_|{RT}::DecodeError::MessageTooLarge)?;if n>input.remaining(){{return Err({RT}::DecodeError::UnexpectedEof);}}let mut packed=input.take(n);while packed.has_remaining(){{{push}}}Ok(())}},"));
         }
@@ -892,6 +896,12 @@ impl Emitter<'_> {
                 out.push_str(&format!("if let Some(value)={expr}{{"));
             } else {
                 out.push_str(&format!("let value={expr};"));
+            }
+            if matches!(field.shape, FieldShape::Repeated { .. }) && value.is_packable() {
+                out.push_str(&format!(
+                    "context.register_element_memory(::std::mem::size_of::<{}>())?;",
+                    self.value_type(value, field.bytes_storage)
+                ));
             }
             match field.shape {
                 FieldShape::Singular {
@@ -1198,11 +1208,15 @@ impl Emitter<'_> {
         let mut out = String::new();
         if matches!(field.shape, FieldShape::Repeated { .. }) && value.is_packable() {
             let expr = self.view_read(value, "&mut packed");
+            let charge = format!(
+                "context.register_element_memory(::std::mem::size_of::<{}>())?;",
+                self.view_value_type(value)
+            );
             let push = if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
-                format!("if let Some(v)={expr}{{self.{slot}.push(v);}} ")
+                format!("if let Some(v)={expr}{{{charge}self.{slot}.push(v);}} ")
             } else {
-                format!("self.{slot}.push({expr});")
+                format!("let v={expr};{charge}self.{slot}.push(v);")
             };
             out.push_str(&format!("({number},{RT}::encoding::WireType::LengthDelimited)=>{{let mut packed={RT}::types::borrow_bytes(input)?;while !packed.is_empty(){{{push}}}Ok(())}},"));
         }
@@ -1243,6 +1257,12 @@ impl Emitter<'_> {
                 out.push_str(&format!("if let Some(value)={expr}{{"));
             } else {
                 out.push_str(&format!("let value={expr};"));
+            }
+            if matches!(field.shape, FieldShape::Repeated { .. }) && value.is_packable() {
+                out.push_str(&format!(
+                    "context.register_element_memory(::std::mem::size_of::<{}>())?;",
+                    self.view_value_type(value)
+                ));
             }
             match field.shape {
                 FieldShape::Singular {

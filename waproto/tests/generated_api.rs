@@ -5,6 +5,8 @@
 mod emission;
 #[path = "../build_support/evolution.rs"]
 mod evolution;
+#[path = "../build_support/inventory.rs"]
+mod inventory;
 #[allow(dead_code)]
 #[path = "../build_support/names.rs"]
 mod names;
@@ -174,10 +176,15 @@ fn history_whitelist_covers_current_generated_fields() {
         );
     }
     assert_eq!(whitelists.len(), 2);
+    let source = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/generated-whatsapp.rs"))
+        .expect("generated protobuf source");
+    let file = syn::parse_file(&source).expect("generated protobuf syntax");
+    let mut api = BTreeSet::new();
+    inventory::inventory(&file.items, "whatsapp", &mut api);
     for ty in ["Message", "MessageContextInfo"] {
         let prefix = format!("field whatsapp::{ty}::");
-        let generated: BTreeSet<_> = include_str!(concat!(env!("OUT_DIR"), "/api.snapshot"))
-            .lines()
+        let generated: BTreeSet<_> = api
+            .iter()
             .filter_map(|line| line.strip_prefix(&prefix))
             .map(|line| {
                 line.split_whitespace()
