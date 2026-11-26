@@ -31,6 +31,7 @@ serde_repr = { version = "0.1", optional = true }
 thiserror = { workspace = true }
 
 [build-dependencies]
+thiserror = { workspace = true }
 # Buffa is used only to generate the differential reference.
 buffa = { workspace = true, optional = true }
 buffa-build = { workspace = true, optional = true }

@@ -16,6 +16,7 @@ name = "protobuf-codegen"
 path = "../../waproto/codegen/main.rs"
 
 [dependencies]
+thiserror = { workspace = true }
 xtask-support.workspace = true
 # `std` on each: the workspace pins these with default-features off for the
 # no_std/wasm builds, and none of that applies to a host-only binary that reads

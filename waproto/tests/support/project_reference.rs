@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use buffa_descriptor::features::{
     self, EnumType, FieldPresence, RepeatedFieldEncoding, ResolvedFeatures,
@@ -13,25 +12,25 @@ use buffa_descriptor::generated::descriptor::{
 
 use super::schema::*;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
+    #[error("Missing({0:?})")]
     Missing(&'static str),
+    #[error("DuplicateType({0:?})")]
     DuplicateType(String),
+    #[error("MissingType({0:?})")]
     MissingType(String),
+    #[error("WrongType({0:?})")]
     WrongType(String),
+    #[error("InvalidNumber({0:?}, {1:?})")]
     InvalidNumber(String, i32),
+    #[error("InvalidOneof({0:?}, {1:?})")]
     InvalidOneof(String, i32),
+    #[error("InvalidMap({0:?})")]
     InvalidMap(String),
+    #[error("UnsupportedPresence({0:?})")]
     UnsupportedPresence(String),
 }
-
-impl fmt::Display for ProjectionError {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, output)
-    }
-}
-
-impl std::error::Error for ProjectionError {}
 
 #[derive(Clone, Copy)]
 enum Symbol {

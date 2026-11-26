@@ -1786,6 +1786,7 @@ dependencies = [
  "serde",
  "sha2",
  "syn 3.0.6",
+ "thiserror",
 ]
 
 [[package]]
