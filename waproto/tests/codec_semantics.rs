@@ -43,6 +43,28 @@ fn ordinary_singular_fields_reuse_buffers() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
+fn required_fields_reuse_buffers() {
+    let mut keys = waproto::whatsapp::AddDeviceKeysOutput::default();
+    keys.device_public_key = Vec::with_capacity(64);
+    keys.device_public_key.extend_from_slice(b"old");
+    let pointer = keys.device_public_key.as_ptr();
+    keys.merge_from_slice(&[0x0a, 3, b'n', b'e', b'w']).unwrap();
+    assert_eq!(keys.device_public_key, b"new");
+    assert_eq!(keys.device_public_key.as_ptr(), pointer);
+
+    let mut conversation = waproto::whatsapp::Conversation::default();
+    conversation.id = String::with_capacity(64);
+    conversation.id.push_str("old");
+    let pointer = conversation.id.as_ptr();
+    conversation
+        .merge_from_slice(&[0x0a, 3, b'n', b'e', b'w'])
+        .unwrap();
+    assert_eq!(conversation.id, "new");
+    assert_eq!(conversation.id.as_ptr(), pointer);
+}
+
+#[test]
 #[cfg(feature = "protobuf-reference")]
 #[allow(clippy::disallowed_methods)]
 fn invalid_singular_fields_match_reference_presence() {

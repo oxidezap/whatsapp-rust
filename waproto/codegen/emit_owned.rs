@@ -889,21 +889,6 @@ impl Emitter<'_> {
         out.push_str(&format!(
             "({number},{RT}::encoding::WireType::{wire_name})=>{{"
         ));
-        // These app-state buffers are frequently decoded and may be merged repeatedly.
-        if self.schema.message(field.owner).full_name == ".whatsapp.SyncActionData"
-            && matches!(
-                field.shape,
-                FieldShape::Singular {
-                    presence: Presence::Explicit,
-                    ..
-                }
-            )
-            && matches!(value, ValueType::Scalar(Scalar::Bytes))
-            && field.bytes_storage == BytesStorage::Vector
-        {
-            out.push_str(&format!("{RT}::types::merge_bytes(self.{slot}.get_or_insert_with(::core::default::Default::default),input)?;Ok(())}},"));
-            return out;
-        }
         if matches!(
             field.shape,
             FieldShape::Singular {
@@ -934,7 +919,7 @@ impl Emitter<'_> {
         if matches!(
             field.shape,
             FieldShape::Singular {
-                presence: Presence::Implicit,
+                presence: Presence::Implicit | Presence::Required,
                 ..
             }
         ) {
