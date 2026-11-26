@@ -36,8 +36,10 @@ macro_rules! proto {
         message
     }};
     ($message:path { $($field:ident : $value:expr,)+ .. $base:expr $(,)? }) => {{
+        let values = ($($value,)+);
         let mut message: $message = $base;
-        $($crate::__proto_private::assign(&mut message.$field, $value);)+
+        let ($($field,)+) = values;
+        $($crate::__proto_private::assign(&mut message.$field, $field);)+
         message
     }};
     ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{

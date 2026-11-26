@@ -79,6 +79,25 @@ fn proto_macro_accepts_text_and_existing_field_conversions() {
 }
 
 #[test]
+fn proto_macro_update_evaluates_fields_before_base() {
+    use std::cell::RefCell;
+    use waproto::prelude::*;
+
+    let calls = RefCell::new(Vec::new());
+    let _message = proto!(wa::message::ImageMessage {
+        caption: {
+            calls.borrow_mut().push("field");
+            "Hello"
+        },
+        ..{
+            calls.borrow_mut().push("base");
+            wa::message::ImageMessage::default()
+        }
+    });
+    assert_eq!(*calls.borrow(), ["field", "base"]);
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn ordinary_singular_fields_reuse_buffers() {
     use bytes::Buf as _;
