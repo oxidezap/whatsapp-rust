@@ -12,6 +12,12 @@ impl MessageView<'static> for LeakingView {
         *LEAK.lock().unwrap() = Some(input);
         Ok(Self(input))
     }
+    fn decode_view_with_ctx(
+        input: &'static [u8],
+        _: DecodeContext<'_>,
+    ) -> Result<Self, DecodeError> {
+        Self::decode_view(input)
+    }
     fn merge_view_field(
         &mut self,
         _: Tag,

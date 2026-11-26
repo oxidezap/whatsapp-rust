@@ -92,11 +92,8 @@ impl DecodeOptions {
         self.recursion_limit = depth;
         self
     }
+    /// Set a byte limit, capped at the protobuf 2 GiB maximum.
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
-        debug_assert!(
-            bytes <= MAX_MESSAGE_BYTES as usize,
-            "slice size budget exceeds protobuf maximum"
-        );
         self.max_message_size = bytes.min(MAX_MESSAGE_BYTES as usize);
         self
     }
@@ -105,6 +102,10 @@ impl DecodeOptions {
         self.unknown_field_limit = count;
         self
     }
+    /// Limit the sum of generated repeated-field and map element sizes.
+    ///
+    /// This is not a total heap limit: it excludes payload buffers, allocation
+    /// capacity and singular messages. Set a message-size limit separately.
     pub fn with_element_memory_limit(mut self, bytes: usize) -> Self {
         self.element_memory_limit = bytes;
         self
@@ -188,5 +189,11 @@ mod tests {
             options.run::<()>(4, |_| panic!("must not decode")),
             Err(DecodeError::MessageTooLarge)
         );
+    }
+
+    #[test]
+    fn size_limit_above_protocol_maximum_is_clamped() {
+        let options = DecodeOptions::new().with_max_message_size(usize::MAX);
+        assert_eq!(options.max_message_size, MAX_MESSAGE_BYTES as usize);
     }
 }

@@ -5,6 +5,103 @@ use waproto::whatsapp::{
     ADVKeyIndexList, ADVKeyIndexListView, BotCapabilityMetadata, BotCapabilityMetadataView,
 };
 
+struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
+
+impl<'a> waproto::protobuf::MessageView<'a> for CustomIndexView<'a> {
+    type Owned = ADVKeyIndexList;
+
+    fn decode_view_with_ctx(
+        input: &'a [u8],
+        context: waproto::protobuf::DecodeContext<'_>,
+    ) -> Result<Self, DecodeError> {
+        ADVKeyIndexListView::decode_view_with_ctx(input, context).map(Self)
+    }
+
+    fn merge_view_field(
+        &mut self,
+        tag: waproto::protobuf::encoding::Tag,
+        input: &'a [u8],
+        before_tag: &'a [u8],
+        context: waproto::protobuf::DecodeContext<'_>,
+    ) -> Result<&'a [u8], DecodeError> {
+        self.0.merge_view_field(tag, input, before_tag, context)
+    }
+
+    fn to_owned_message(&self) -> Result<Self::Owned, DecodeError> {
+        self.0.to_owned_message()
+    }
+}
+
+#[test]
+fn custom_view_respects_decode_options() {
+    assert!(CustomIndexView::decode_view(&[0x22, 1, 0]).is_ok());
+    let options = DecodeOptions::new().with_element_memory_limit(0);
+    assert!(matches!(
+        options.decode_view::<CustomIndexView<'_>>(&[0x22, 1, 0]),
+        Err(DecodeError::ElementMemoryLimitExceeded)
+    ));
+    let options = DecodeOptions::new().with_unknown_field_limit(0);
+    assert!(matches!(
+        options.decode_view::<CustomIndexView<'_>>(&[0x80, 0xb5, 0x18, 1]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[cfg_attr(miri, ignore)]
+#[test]
+fn direct_view_rejects_input_above_protocol_size_limit() {
+    use std::ffi::c_void;
+
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_NORESERVE: i32 = 0x4000;
+
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            length: usize,
+            protection: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn munmap(address: *mut c_void, length: usize) -> i32;
+    }
+
+    struct Mapping(*mut c_void, usize);
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            // SAFETY: the mapping is owned here and has not been unmapped.
+            unsafe { munmap(self.0, self.1) };
+        }
+    }
+
+    let length = waproto::protobuf::MAX_MESSAGE_BYTES as usize + 1;
+    // SAFETY: an anonymous, read-only mapping with MAP_NORESERVE consumes no
+    // backing pages until read. The decoder must reject it before reading.
+    let address = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            length,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(address as isize, -1, "virtual mapping failed");
+    assert!(!address.is_null());
+    let mapping = Mapping(address, length);
+    // SAFETY: mapping owns this readable address range until after the decode.
+    let input = unsafe { std::slice::from_raw_parts(mapping.0.cast::<u8>(), mapping.1) };
+    assert!(matches!(
+        waproto::whatsapp::MessageView::decode_view(input),
+        Err(DecodeError::MessageTooLarge)
+    ));
+}
+
 #[test]
 fn proto_macro_constructs_messages_without_extra_copies() {
     use waproto::prelude::*;

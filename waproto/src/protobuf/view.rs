@@ -8,15 +8,19 @@ use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
+/// A protobuf message borrowing data from its wire buffer.
+///
+/// Custom implementations must enforce the supplied decode context's limits.
 pub trait MessageView<'a>: Sized {
     type Owned: Message;
-    fn decode_view(input: &'a [u8]) -> Result<Self, DecodeError>;
+    fn decode_view(input: &'a [u8]) -> Result<Self, DecodeError> {
+        DecodeOptions::new().decode_view(input)
+    }
+    /// Decode using the shared limits, passing the context to nested views.
     fn decode_view_with_ctx(
         input: &'a [u8],
-        _context: DecodeContext<'_>,
-    ) -> Result<Self, DecodeError> {
-        Self::decode_view(input)
-    }
+        context: DecodeContext<'_>,
+    ) -> Result<Self, DecodeError>;
     fn decode_view_ctx(input: &'a [u8], context: DecodeContext<'_>) -> Result<Self, DecodeError>
     where
         Self: Default,

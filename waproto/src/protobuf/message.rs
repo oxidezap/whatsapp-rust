@@ -40,6 +40,10 @@ pub trait MessageName {
     const TYPE_URL: &'static str;
 }
 
+/// A protobuf message with project-owned wire encoding and decoding.
+///
+/// Custom `merge_field` implementations must validate the wire format and
+/// charge the shared decode context for unknown fields and repeated elements.
 pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
     fn compute_size(&self, cache: &mut SizeCache) -> u32;
     fn write_to(&self, cache: &mut SizeCache, output: &mut impl EncodeSink);
@@ -185,22 +189,12 @@ pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
         input: &mut impl Buf,
         context: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
-        let context = context.descend()?;
-        let length = encoding::decode_varint(input)?;
-        if length > u64::from(MAX_MESSAGE_BYTES) {
-            return Err(DecodeError::MessageTooLarge);
+        // The condition folds per message type; wide dispatches share the larger path.
+        if size_of::<Self>() <= 2 * size_of::<usize>() {
+            merge_length_delimited_impl(self, input, context)
+        } else {
+            merge_length_delimited_outlined(self, input, context)
         }
-        let length = length as usize;
-        if length > input.remaining() {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        let limit = input.remaining() - length;
-        self.merge_to_limit(input, context, limit)?;
-        if input.remaining() < limit {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        input.advance(input.remaining() - limit);
-        Ok(())
     }
     fn merge_group(
         &mut self,
@@ -221,6 +215,39 @@ pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
             self.merge_field(tag, input, context)?;
         }
     }
+}
+
+#[inline]
+fn merge_length_delimited_impl<M: Message>(
+    message: &mut M,
+    input: &mut impl Buf,
+    context: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let context = context.descend()?;
+    let length = encoding::decode_varint(input)?;
+    if length > u64::from(MAX_MESSAGE_BYTES) {
+        return Err(DecodeError::MessageTooLarge);
+    }
+    let length = length as usize;
+    if length > input.remaining() {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let limit = input.remaining() - length;
+    message.merge_to_limit(input, context, limit)?;
+    if input.remaining() < limit {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    input.advance(input.remaining() - limit);
+    Ok(())
+}
+
+#[inline(never)]
+fn merge_length_delimited_outlined<M: Message>(
+    message: &mut M,
+    input: &mut impl Buf,
+    context: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    merge_length_delimited_impl(message, input, context)
 }
 
 impl DecodeOptions {

@@ -224,6 +224,12 @@ mod tests {
         fn decode_view(bytes: &'a [u8]) -> Result<Self, DecodeError> {
             Ok(Self { bytes })
         }
+        fn decode_view_with_ctx(
+            bytes: &'a [u8],
+            _: crate::protobuf::DecodeContext<'_>,
+        ) -> Result<Self, DecodeError> {
+            Self::decode_view(bytes)
+        }
         fn merge_view_field(
             &mut self,
             _: crate::protobuf::encoding::Tag,

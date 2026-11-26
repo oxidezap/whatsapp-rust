@@ -10,6 +10,7 @@ pub trait DefaultInstance: Default + 'static {
 
 pub trait ProtoBox<T>: Deref<Target = T> + DerefMut {
     fn new(value: T) -> Self;
+    /// Construct storage containing the same value as `Self::new(T::default())`.
     fn new_default() -> Self
     where
         T: Default,
@@ -60,6 +61,10 @@ impl<T> ProtoBox<T> for Inline<T> {
     }
 }
 
+/// An optional message with a separately observable presence bit.
+///
+/// An absent field dereferences to the shared default instance and compares
+/// equal to a present default value. Use `is_set` to distinguish their presence.
 pub struct MessageField<T: Default, P = Box<T>> {
     inner: Option<P>,
     _marker: PhantomData<T>,
