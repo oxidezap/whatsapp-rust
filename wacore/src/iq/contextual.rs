@@ -30,6 +30,7 @@ macro_rules! iq_ensure {
 
 /// Typed error returned by generated IQ response parsers.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IqResponseError {
     RequestContextNotIq,
     RequestContextMissingId,

@@ -32,3 +32,5 @@ pub mod spec;
 pub mod targets;
 pub mod tctoken;
 pub mod usync;
+
+pub use contextual::IqResponseError;

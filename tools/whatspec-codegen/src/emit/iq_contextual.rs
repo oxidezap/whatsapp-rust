@@ -91,9 +91,19 @@ pub fn generate(wa_version: &str) -> Result<String> {
     }
     ir.stanzas
         .retain(|s| MODULES.contains(&s.module_name.as_str()));
-    wa_codegen_iq::generate_iq_checked(&ir).map_err(|d| {
+    let generated = wa_codegen_iq::generate_iq_checked(&ir).map_err(|d| {
         anyhow::anyhow!("contextual IQ generation refused incomplete contracts: {d:#?}")
-    })
+    })?;
+    let declaration = "pub enum IqResponseError {";
+    ensure!(
+        generated.matches(declaration).count() == 1,
+        "expected one generated IQ response error declaration"
+    );
+    Ok(generated.replacen(
+        declaration,
+        "#[non_exhaustive]\npub enum IqResponseError {",
+        1,
+    ))
 }
 
 pub fn verify_projection(full: &str) -> Result<()> {
@@ -142,6 +152,7 @@ mod tests {
     fn pinned_projection_emits_and_wrong_source_or_version_fails() {
         let lock = source_lock().unwrap();
         let code = generate(&lock.wa_version).unwrap();
+        assert!(code.contains("#[non_exhaustive]\npub enum IqResponseError {"));
         assert!(code.contains("fn parse_response_with_context"));
         assert!(code.contains("fn handles_iq_errors"));
         assert!(code.contains("MakeGetCountryCodeRequestSpec"));
