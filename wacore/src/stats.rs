@@ -611,7 +611,7 @@ impl HeapSize for waproto::whatsapp::sync_action_value::StatusPrivacyAction {
                 .map(HeapSize::heap_bytes)
                 .sum::<usize>()
             + self.modes.capacity()
-                * size_of::<buffa::EnumValue<
+                * size_of::<waproto::protobuf::EnumValue<
                     waproto::whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode,
                 >>()
     }

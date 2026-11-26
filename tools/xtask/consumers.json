@@ -4,6 +4,17 @@
     "locked": true,
     "commands": [
       {
+        "lanes": ["native", "msrv"],
+        "mode": "check",
+        "features": ["proto-untrusted-owned-view"],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0277",
+          "contains": ["OwnedViewSource", "LeakingView"],
+          "source": "src/protobuf_contract/untrusted_owned_view.rs"
+        }
+      },
+      {
         "lanes": [
           "native",
           "msrv"

@@ -1299,7 +1299,7 @@ enum GroupEpochDecryptError {
     #[error("message unpad failed: {0}")]
     Unpad(#[from] wacore::messages::PaddingError),
     #[error("message decode failed: {0}")]
-    Decode(#[from] buffa::DecodeError),
+    Decode(#[from] waproto::protobuf::DecodeError),
     #[error("message has no call key")]
     MissingCallKey,
     #[error("call key must contain exactly 32 bytes")]

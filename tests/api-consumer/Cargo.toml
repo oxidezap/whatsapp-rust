@@ -34,6 +34,7 @@ sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-stora
 wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
 
 proto-owned-literal = ["sdk"]
+proto-untrusted-owned-view = ["sdk"]
 proto-view-literal = ["sdk"]
 proto-exhaustive-enum = ["sdk"]
 proto-exhaustive-oneof = ["sdk"]
@@ -78,6 +79,7 @@ group-action-exact-pattern = []
 group-action-exhaustive = []
 
 [dependencies]
+waproto = { path = "../../waproto", default-features = false }
 anyhow = { version = "1", default-features = false, optional = true }
 async-trait = { version = "0.1.91", optional = true }
 rand = { version = "0.10", optional = true }

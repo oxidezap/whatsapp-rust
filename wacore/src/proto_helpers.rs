@@ -177,10 +177,10 @@ impl MessageBuilderExt for wa::Message {
     fn text_with_context(text: impl Into<String>, context: wa::ContextInfo) -> wa::Message {
         {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text.into());
-                proto.context_info = buffa::MessageField::some(context);
+                proto.context_info = waproto::protobuf::MessageField::some(context);
                 proto
             });
             proto
@@ -219,7 +219,7 @@ pub trait MessageExt {
     /// let mut context_info = wa::ContextInfo::default();
     /// context_info.stanza_id = Some(message_id.clone());
     /// context_info.participant = Some(sender_jid.to_string());
-    /// context_info.quoted_message = buffa::MessageField::from_box(original_message.prepare_for_quote());
+    /// context_info.quoted_message = waproto::protobuf::MessageField::from_box(original_message.prepare_for_quote());
     /// ```
     fn prepare_for_quote(&self) -> Box<wa::Message>;
 
@@ -249,11 +249,11 @@ pub trait MessageExt {
         if let Some(image) = base.image_message.as_option() {
             let mut image = image.clone();
             image.caption = Some(caption.to_owned());
-            message.image_message = buffa::MessageField::some(image);
+            message.image_message = waproto::protobuf::MessageField::some(image);
         } else {
             let mut video = base.video_message.as_option()?.clone();
             video.caption = Some(caption.to_owned());
-            message.video_message = buffa::MessageField::some(video);
+            message.video_message = waproto::protobuf::MessageField::some(video);
         }
         Some(message)
     }
@@ -270,12 +270,12 @@ pub trait MessageExt {
     /// let mut image = wa::message::ImageMessage::default();
     /// // Set image fields here.
     /// let mut reply = wa::Message::default();
-    /// reply.image_message = buffa::MessageField::some(image);
+    /// reply.image_message = waproto::protobuf::MessageField::some(image);
     ///
     /// let mut context = wa::ContextInfo::default()
     ///     .with_stanza_id("original-msg-id")
     ///     .with_participant("sender@s.whatsapp.net");
-    /// context.quoted_message = buffa::MessageField::from_box(original_msg.prepare_for_quote());
+    /// context.quoted_message = waproto::protobuf::MessageField::from_box(original_msg.prepare_for_quote());
     ///
     /// reply.set_context_info(context);
     /// ```
@@ -332,7 +332,7 @@ pub trait MessageExt {
 impl MessageExt for wa::Message {
     fn get_base_message(&self) -> &wa::Message {
         let mut current = self;
-        for _ in 0..buffa::RECURSION_LIMIT {
+        for _ in 0..waproto::protobuf::RECURSION_LIMIT {
             macro_rules! peel {
                 ($field:ident) => {
                     if let Some(inner) = current
@@ -352,7 +352,7 @@ impl MessageExt for wa::Message {
     }
 
     fn into_base_message(mut self) -> wa::Message {
-        for _ in 0..buffa::RECURSION_LIMIT {
+        for _ in 0..waproto::protobuf::RECURSION_LIMIT {
             macro_rules! peel {
                 ($field:ident) => {
                     if let Some(inner) = self.$field.as_option_mut().and_then(|w| w.message.take())
@@ -522,10 +522,10 @@ impl MessageExt for wa::Message {
             }
             if !has_other {
                 let mut msg = wa::Message::default();
-                msg.extended_text_message = buffa::MessageField::some({
+                msg.extended_text_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ExtendedTextMessage::default();
                     proto.text = Some(text.clone());
-                    proto.context_info = buffa::MessageField::some({
+                    proto.context_info = waproto::protobuf::MessageField::some({
                         let mut proto = wa::ContextInfo::default();
                         proto.is_forwarded = Some(true);
                         proto.forwarding_score = Some(0);
@@ -542,7 +542,7 @@ impl MessageExt for wa::Message {
         // including for bot participants (no quote-preserve exception).
         strip_nested_context_info(&mut msg, true);
         // WA Web forward omits messageSecret; the send path generates a fresh one.
-        msg.message_context_info = buffa::MessageField::none();
+        msg.message_context_info = waproto::protobuf::MessageField::none();
 
         macro_rules! set_forward {
             ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
@@ -569,10 +569,10 @@ impl MessageExt for wa::Message {
         // Bare conversation carries no context_info; promote it like the other
         // setters do so the forward marker can attach.
         if let Some(text) = msg.conversation.take() {
-            msg.extended_text_message = buffa::MessageField::some({
+            msg.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text);
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(true);
                     proto.forwarding_score = Some(0);
@@ -589,7 +589,7 @@ impl MessageExt for wa::Message {
             ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
                 $(
                     if let Some(m) = self.$field.as_option_mut() {
-                        m.context_info = buffa::MessageField::some(context);
+                        m.context_info = waproto::protobuf::MessageField::some(context);
                         return true;
                     }
                 )+
@@ -600,10 +600,10 @@ impl MessageExt for wa::Message {
         // Promote bare conversation to extended_text_message so the context
         // can attach; matches WAWebMessageSendUtils.
         if let Some(text) = self.conversation.take() {
-            self.extended_text_message = buffa::MessageField::some({
+            self.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text);
-                proto.context_info = buffa::MessageField::some(context);
+                proto.context_info = waproto::protobuf::MessageField::some(context);
                 proto
             });
             return true;
@@ -649,10 +649,10 @@ impl MessageExt for wa::Message {
         // Promote bare conversation so the timer can attach; matches
         // WAWebMessageSendUtils.
         if let Some(text) = self.conversation.take() {
-            self.extended_text_message = buffa::MessageField::some({
+            self.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text);
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.expiration = Some(expiration);
                     proto
@@ -706,9 +706,9 @@ pub fn build_keep_in_chat_message(
     };
     {
         let mut proto = wa::Message::default();
-        proto.keep_in_chat_message = buffa::MessageField::some({
+        proto.keep_in_chat_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::KeepInChatMessage::default();
-            proto.key = buffa::MessageField::some(key);
+            proto.key = waproto::protobuf::MessageField::some(key);
             proto.keep_type = Some(keep_type);
             proto.timestamp_ms = Some(timestamp_ms);
             proto
@@ -862,9 +862,9 @@ pub fn merge_dsm_context(
 /// );
 ///
 /// let mut text = wa::message::ExtendedTextMessage::default().with_text("My reply");
-/// text.context_info = buffa::MessageField::some(context);
+/// text.context_info = waproto::protobuf::MessageField::some(context);
 /// let mut reply = wa::Message::default();
-/// reply.extended_text_message = buffa::MessageField::some(text);
+/// reply.extended_text_message = waproto::protobuf::MessageField::some(text);
 /// ```
 pub fn build_quote_context(
     message_id: impl Into<String>,
@@ -875,7 +875,8 @@ pub fn build_quote_context(
         let mut proto = wa::ContextInfo::default();
         proto.stanza_id = Some(message_id.into());
         proto.participant = Some(sender_jid.into());
-        proto.quoted_message = buffa::MessageField::from_box(quoted_message.prepare_for_quote());
+        proto.quoted_message =
+            waproto::protobuf::MessageField::from_box(quoted_message.prepare_for_quote());
         proto
     }
 }
@@ -914,7 +915,8 @@ pub fn build_quote_context_with_info(
         proto.stanza_id = Some(message_id.into());
         proto.participant = Some(participant);
         proto.remote_jid = remote_jid;
-        proto.quoted_message = buffa::MessageField::from_box(quoted_message.prepare_for_quote());
+        proto.quoted_message =
+            waproto::protobuf::MessageField::from_box(quoted_message.prepare_for_quote());
         proto
     }
 }
@@ -932,9 +934,9 @@ pub fn build_reaction_message(
 ) -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.reaction_message = buffa::MessageField::some({
+        proto.reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ReactionMessage::default();
-            proto.key = buffa::MessageField::some(key);
+            proto.key = waproto::protobuf::MessageField::some(key);
             proto.text = Some(emoji.into());
             proto.sender_timestamp_ms = Some(sender_timestamp_ms);
             proto
@@ -956,21 +958,21 @@ pub fn wrap_as_album_child(
     let association = {
         let mut proto = wa::MessageAssociation::default();
         proto.association_type = Some(wa::message_association::AssociationType::MEDIA_ALBUM);
-        proto.parent_message_key = buffa::MessageField::some(parent_key);
+        proto.parent_message_key = waproto::protobuf::MessageField::some(parent_key);
         proto
     };
 
     let mut outer_context = existing_context.unwrap_or_default();
-    outer_context.message_association = buffa::MessageField::some(association);
+    outer_context.message_association = waproto::protobuf::MessageField::some(association);
 
     {
         let mut proto = wa::Message::default();
-        proto.associated_child_message = buffa::MessageField::some({
+        proto.associated_child_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::FutureProofMessage::default();
-            proto.message = buffa::MessageField::some(inner_message);
+            proto.message = waproto::protobuf::MessageField::some(inner_message);
             proto
         });
-        proto.message_context_info = buffa::MessageField::some(outer_context);
+        proto.message_context_info = waproto::protobuf::MessageField::some(outer_context);
         proto
     }
 }
@@ -1025,10 +1027,10 @@ mod tests {
     fn create_message_with_mentions() -> wa::Message {
         {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("Hello @user1 @user2".to_string());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec![
                         "111111@s.whatsapp.net".to_string(),
@@ -1056,7 +1058,7 @@ mod tests {
         image.direct_path = Some("/synthetic/image".into());
         image.media_key = Some(vec![7; 32]);
         image.caption = Some("original".into());
-        message.image_message = buffa::MessageField::some(image.clone());
+        message.image_message = waproto::protobuf::MessageField::some(image.clone());
         let updated = message.media_with_caption("replacement").unwrap();
         image.caption = Some("replacement".into());
         assert_eq!(updated.image_message.as_option(), Some(&image));
@@ -1065,7 +1067,7 @@ mod tests {
         let mut video = wa::message::VideoMessage::default();
         video.direct_path = Some("/synthetic/video".into());
         message.image_message = Default::default();
-        message.video_message = buffa::MessageField::some(video.clone());
+        message.video_message = waproto::protobuf::MessageField::some(video.clone());
         video.caption = Some("updated".into());
         assert_eq!(
             message
@@ -1088,7 +1090,7 @@ mod tests {
 
         let original = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("Hello @user1 @user2".to_string());
                 proto.matched_text = Some("https://example.com".to_string());
@@ -1098,7 +1100,7 @@ mod tests {
                 proto.background_argb = Some(0x000000);
                 proto.font = Some(FontType::SYSTEM_BOLD);
                 proto.preview_type = Some(PreviewType::VIDEO);
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec![
                         "111111@s.whatsapp.net".to_string(),
@@ -1173,7 +1175,7 @@ mod tests {
     fn test_prepare_for_quote_preserves_media_fields() {
         let original = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.url = Some("https://mmg.whatsapp.net/...".to_string());
                 proto.mimetype = Some("image/jpeg".to_string());
@@ -1184,7 +1186,7 @@ mod tests {
                 proto.width = Some(1920);
                 proto.media_key = Some(vec![5, 6, 7, 8]);
                 proto.direct_path = Some("/v/t62.1234-5/...".to_string());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec!["someone@s.whatsapp.net".to_string()];
                     proto
@@ -1217,15 +1219,15 @@ mod tests {
     fn test_prepare_for_quote_breaks_quote_chain() {
         let original = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("This is a reply".to_string());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.stanza_id = Some("original-msg-id".to_string());
                     proto.participant = Some("original-sender@s.whatsapp.net".to_string());
                     proto.remote_jid = Some("chat@s.whatsapp.net".to_string());
-                    proto.quoted_message = buffa::MessageField::some({
+                    proto.quoted_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.conversation = Some("The original message".to_string());
                         proto
@@ -1285,7 +1287,7 @@ mod tests {
     fn test_set_context_info_extended_text() {
         let mut msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("Reply text".to_string());
                 proto
@@ -1313,7 +1315,7 @@ mod tests {
     fn test_set_context_info_image() {
         let mut msg = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.caption = Some("Image caption".to_string());
                 proto
@@ -1342,7 +1344,7 @@ mod tests {
     fn test_set_context_info_location() {
         let mut msg = {
             let mut proto = wa::Message::default();
-            proto.location_message = buffa::MessageField::some({
+            proto.location_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::LocationMessage::default();
                 proto.degrees_latitude = Some(40.7128);
                 proto.degrees_longitude = Some(-74.0060);
@@ -1433,9 +1435,10 @@ mod tests {
     fn test_prepare_for_quote_ephemeral() {
         let ephemeral_msg = {
             let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
+            proto.ephemeral_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(create_message_with_mentions());
+                proto.message =
+                    waproto::protobuf::MessageField::some(create_message_with_mentions());
                 proto
             });
             proto
@@ -1464,13 +1467,13 @@ mod tests {
     fn test_prepare_for_quote_view_once() {
         let view_once_msg = {
             let mut proto = wa::Message::default();
-            proto.view_once_message = buffa::MessageField::some({
+            proto.view_once_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.image_message = buffa::MessageField::some({
+                    proto.image_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ImageMessage::default();
-                        proto.context_info = buffa::MessageField::some({
+                        proto.context_info = waproto::protobuf::MessageField::some({
                             let mut proto = wa::ContextInfo::default();
                             proto.mentioned_jid = vec!["someone@s.whatsapp.net".to_string()];
                             proto
@@ -1507,15 +1510,15 @@ mod tests {
     fn test_prepare_for_quote_device_sent_message() {
         let device_sent_msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("1234567890@s.whatsapp.net".to_string());
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.extended_text_message = buffa::MessageField::some({
+                    proto.extended_text_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ExtendedTextMessage::default();
                         proto.text = Some("Message from other device".to_string());
-                        proto.context_info = buffa::MessageField::some({
+                        proto.context_info = waproto::protobuf::MessageField::some({
                             let mut proto = wa::ContextInfo::default();
                             proto.mentioned_jid = vec![
                                 "user1@s.whatsapp.net".to_string(),
@@ -1568,14 +1571,14 @@ mod tests {
     fn test_prepare_for_quote_edited_message() {
         let edited_msg = {
             let mut proto = wa::Message::default();
-            proto.edited_message = buffa::MessageField::some({
+            proto.edited_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.extended_text_message = buffa::MessageField::some({
+                    proto.extended_text_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ExtendedTextMessage::default();
                         proto.text = Some("Edited message text".to_string());
-                        proto.context_info = buffa::MessageField::some({
+                        proto.context_info = waproto::protobuf::MessageField::some({
                             let mut proto = wa::ContextInfo::default();
                             proto.mentioned_jid = vec!["mentioned@s.whatsapp.net".to_string()];
                             proto.group_mentions = vec![{
@@ -1624,19 +1627,19 @@ mod tests {
     fn test_prepare_for_quote_nested_wrappers() {
         let nested_wrapper_msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("dest@s.whatsapp.net".to_string());
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.ephemeral_message = buffa::MessageField::some({
+                    proto.ephemeral_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::FutureProofMessage::default();
-                        proto.message = buffa::MessageField::some({
+                        proto.message = waproto::protobuf::MessageField::some({
                             let mut proto = wa::Message::default();
-                            proto.image_message = buffa::MessageField::some({
+                            proto.image_message = waproto::protobuf::MessageField::some({
                                 let mut proto = wa::message::ImageMessage::default();
                                 proto.caption = Some("Nested image".to_string());
-                                proto.context_info = buffa::MessageField::some({
+                                proto.context_info = waproto::protobuf::MessageField::some({
                                     let mut proto = wa::ContextInfo::default();
                                     proto.mentioned_jid = vec!["deep@s.whatsapp.net".to_string()];
                                     proto
@@ -1677,32 +1680,33 @@ mod tests {
         let test_cases: Vec<wa::Message> = vec![
             {
                 let mut proto = wa::Message::default();
-                proto.video_message = buffa::MessageField::some(Default::default());
+                proto.video_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.audio_message = buffa::MessageField::some(Default::default());
+                proto.audio_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.document_message = buffa::MessageField::some(Default::default());
+                proto.document_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.sticker_message = buffa::MessageField::some(Default::default());
+                proto.sticker_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.contact_message = buffa::MessageField::some(Default::default());
+                proto.contact_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.poll_creation_message = buffa::MessageField::some(Default::default());
+                proto.poll_creation_message =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
         ];
@@ -1725,16 +1729,16 @@ mod tests {
     fn test_prepare_for_quote_preserves_bot_quote_chain() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("Bot reply".to_string());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default(); // Bot JID - starts with 1313555
 
                     proto.participant = Some("131355512345@s.whatsapp.net".to_string());
                     proto.stanza_id = Some("bot-msg-id".to_string());
                     proto.remote_jid = Some("chat@g.us".to_string());
-                    proto.quoted_message = buffa::MessageField::some({
+                    proto.quoted_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.conversation = Some("Original user message".to_string());
                         proto
@@ -1781,15 +1785,15 @@ mod tests {
     fn test_prepare_for_quote_preserves_bot_server_quote_chain() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("Bot reply".to_string());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default(); // Bot JID with @bot server
 
                     proto.participant = Some("mybot@bot".to_string());
                     proto.stanza_id = Some("bot-msg-id".to_string());
-                    proto.quoted_message = buffa::MessageField::some({
+                    proto.quoted_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.conversation = Some("Original".to_string());
                         proto
@@ -1820,7 +1824,7 @@ mod tests {
     fn test_prepare_for_quote_preserves_message_context_info_on_text() {
         let mut msg = wa::Message::default();
         msg.conversation = Some("hello".to_string());
-        msg.message_context_info = buffa::MessageField::some({
+        msg.message_context_info = waproto::protobuf::MessageField::some({
             let mut ctx = wa::MessageContextInfo::default();
             ctx.message_secret = Some(vec![1, 2, 3]);
             ctx
@@ -1892,12 +1896,12 @@ mod tests {
     fn test_into_base_message_unwraps_device_sent_reaction() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.reaction_message = buffa::MessageField::some({
+                    proto.reaction_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ReactionMessage::default();
                         proto.text = Some("\u{2764}".to_string());
                         proto
@@ -1934,14 +1938,14 @@ mod tests {
     fn test_into_base_message_unwraps_nested_dsm_ephemeral() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.ephemeral_message = buffa::MessageField::some({
+                    proto.ephemeral_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::FutureProofMessage::default();
-                        proto.message = buffa::MessageField::some({
+                        proto.message = waproto::protobuf::MessageField::some({
                             let mut proto = wa::Message::default();
                             proto.conversation = Some("secret".to_string());
                             proto
@@ -1981,7 +1985,7 @@ mod tests {
     fn test_into_base_message_empty_dsm() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
                 proto
@@ -2023,7 +2027,7 @@ mod tests {
             proto.message_secret = Some(vec![4, 5, 6]); // Distinguishable payload: is_set() alone cannot tell outer's
             // value apart from a default the merge might set on its own.
 
-            proto.limit_sharing_v2 = buffa::MessageField::some({
+            proto.limit_sharing_v2 = waproto::protobuf::MessageField::some({
                 let mut proto = wa::LimitSharing::default();
                 proto.sharing_limited = Some(true);
                 proto.limit_sharing_setting_timestamp = Some(12345);
@@ -2106,12 +2110,12 @@ mod tests {
         let outer_ls = wa::LimitSharing::default();
         let inner = {
             let mut proto = wa::MessageContextInfo::default();
-            proto.limit_sharing_v2 = buffa::MessageField::some(inner_ls);
+            proto.limit_sharing_v2 = waproto::protobuf::MessageField::some(inner_ls);
             proto
         };
         let outer = {
             let mut proto = wa::MessageContextInfo::default();
-            proto.limit_sharing_v2 = buffa::MessageField::some(outer_ls);
+            proto.limit_sharing_v2 = waproto::protobuf::MessageField::some(outer_ls);
             proto
         };
         let result = merge_dsm_context(Some(inner), Some(&outer)).unwrap();
@@ -2123,7 +2127,8 @@ mod tests {
         // When outer is None, inner's limit_sharing_v2 should be cleared
         let inner_with_ls = {
             let mut proto = wa::MessageContextInfo::default();
-            proto.limit_sharing_v2 = buffa::MessageField::some(wa::LimitSharing::default());
+            proto.limit_sharing_v2 =
+                waproto::protobuf::MessageField::some(wa::LimitSharing::default());
             proto
         };
         let result = merge_dsm_context(Some(inner_with_ls), None).unwrap();
@@ -2343,7 +2348,7 @@ mod tests {
     fn test_wrap_as_album_child_basic() {
         let inner = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.url = Some("https://mmg.whatsapp.net/test".to_string());
                 proto
@@ -2376,12 +2381,12 @@ mod tests {
         let secret = vec![1u8; 32];
         let inner = {
             let mut proto = wa::Message::default();
-            proto.video_message = buffa::MessageField::some({
+            proto.video_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::VideoMessage::default();
                 proto.url = Some("https://mmg.whatsapp.net/vid".to_string());
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(secret.clone());
                 proto
@@ -2400,9 +2405,9 @@ mod tests {
     fn is_view_once_detects_legacy_wrapper() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.view_once_message = buffa::MessageField::some({
+            proto.view_once_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(wa::Message::default());
+                proto.message = waproto::protobuf::MessageField::some(wa::Message::default());
                 proto
             });
             proto
@@ -2411,9 +2416,9 @@ mod tests {
 
         let msg_v2 = {
             let mut proto = wa::Message::default();
-            proto.view_once_message_v2 = buffa::MessageField::some({
+            proto.view_once_message_v2 = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(wa::Message::default());
+                proto.message = waproto::protobuf::MessageField::some(wa::Message::default());
                 proto
             });
             proto
@@ -2425,13 +2430,14 @@ mod tests {
     fn is_view_once_detects_wrapper_nested_in_device_sent() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.view_once_message_v2 = buffa::MessageField::some({
+                    proto.view_once_message_v2 = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::FutureProofMessage::default();
-                        proto.message = buffa::MessageField::some(wa::Message::default());
+                        proto.message =
+                            waproto::protobuf::MessageField::some(wa::Message::default());
                         proto
                     });
                     proto
@@ -2447,7 +2453,7 @@ mod tests {
     fn is_view_once_detects_inline_image_flag() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.view_once = Some(true);
                 proto
@@ -2461,7 +2467,7 @@ mod tests {
     fn is_view_once_detects_inline_video_flag() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.video_message = buffa::MessageField::some({
+            proto.video_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::VideoMessage::default();
                 proto.view_once = Some(true);
                 proto
@@ -2475,7 +2481,7 @@ mod tests {
     fn is_view_once_detects_inline_audio_flag() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.audio_message = buffa::MessageField::some({
+            proto.audio_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::AudioMessage::default();
                 proto.view_once = Some(true);
                 proto
@@ -2489,7 +2495,7 @@ mod tests {
     fn is_view_once_detects_inline_extended_text_flag() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.view_once = Some(true);
                 proto
@@ -2503,11 +2509,11 @@ mod tests {
     fn is_view_once_detects_inline_flag_through_device_sent() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.image_message = buffa::MessageField::some({
+                    proto.image_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ImageMessage::default();
                         proto.view_once = Some(true);
                         proto
@@ -2525,14 +2531,15 @@ mod tests {
     fn is_view_once_false_for_plain_image() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some(wa::message::ImageMessage::default());
+            proto.image_message =
+                waproto::protobuf::MessageField::some(wa::message::ImageMessage::default());
             proto
         };
         assert!(!msg.is_view_once());
 
         let msg_explicit_false = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.view_once = Some(false);
                 proto
@@ -2551,9 +2558,9 @@ mod tests {
     fn is_view_once_detects_v2_extension_wrapper() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.view_once_message_v2_extension = buffa::MessageField::some({
+            proto.view_once_message_v2_extension = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(wa::Message::default());
+                proto.message = waproto::protobuf::MessageField::some(wa::Message::default());
                 proto
             });
             proto
@@ -2590,17 +2597,18 @@ mod tests {
     fn is_view_once_detects_ephemeral_device_sent_view_once() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
+            proto.ephemeral_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.device_sent_message = buffa::MessageField::some({
+                    proto.device_sent_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::DeviceSentMessage::default();
-                        proto.message = buffa::MessageField::some({
+                        proto.message = waproto::protobuf::MessageField::some({
                             let mut proto = wa::Message::default();
-                            proto.view_once_message_v2 = buffa::MessageField::some({
+                            proto.view_once_message_v2 = waproto::protobuf::MessageField::some({
                                 let mut proto = wa::message::FutureProofMessage::default();
-                                proto.message = buffa::MessageField::some(wa::Message::default());
+                                proto.message =
+                                    waproto::protobuf::MessageField::some(wa::Message::default());
                                 proto
                             });
                             proto
@@ -2620,10 +2628,10 @@ mod tests {
     fn mentions_any_bot_true_for_bot_jid_in_extended_text() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("@MetaAI hi".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec![
                         "5511999998888@s.whatsapp.net".into(),
@@ -2644,10 +2652,10 @@ mod tests {
         // `@bot`-only string split would have missed this.
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("@MetaAI".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec!["13135550002@s.whatsapp.net".into()];
                     proto
@@ -2663,10 +2671,10 @@ mod tests {
     fn mentions_any_bot_false_without_bot_jid() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("hi friends".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.mentioned_jid = vec![
                         "5511999998888@s.whatsapp.net".into(),
@@ -2695,15 +2703,15 @@ mod tests {
     fn mentions_any_bot_sees_through_device_sent_wrapper() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
                 proto.destination_jid = Some("867051314767696@bot".into());
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
-                    proto.extended_text_message = buffa::MessageField::some({
+                    proto.extended_text_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ExtendedTextMessage::default();
                         proto.text = Some("@MetaAI".into());
-                        proto.context_info = buffa::MessageField::some({
+                        proto.context_info = waproto::protobuf::MessageField::some({
                             let mut proto = wa::ContextInfo::default();
                             proto.mentioned_jid = vec!["867051314767696@bot".into()];
                             proto
@@ -2726,10 +2734,10 @@ mod tests {
     fn is_forwarded_true_and_false() {
         let fwd = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("fwd".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(true);
                     proto
@@ -2749,10 +2757,11 @@ mod tests {
 
         let not_fwd = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("hi".into());
-                proto.context_info = buffa::MessageField::some(wa::ContextInfo::default());
+                proto.context_info =
+                    waproto::protobuf::MessageField::some(wa::ContextInfo::default());
                 proto
             });
             proto
@@ -2784,10 +2793,10 @@ mod tests {
     fn prepare_for_forward_bumps_score_when_source_already_forwarded() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("hi".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(true);
                     proto.forwarding_score = Some(0);
@@ -2814,10 +2823,10 @@ mod tests {
     fn prepare_for_forward_jumps_to_sentinel_at_threshold() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("hi".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(true); // n = 4 + 1 = 5 -> frequently-forwarded sentinel, not 5.
 
@@ -2843,14 +2852,14 @@ mod tests {
     fn prepare_for_forward_strips_quote_chain() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("reply".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.stanza_id = Some("QUOTED".into());
                     proto.participant = Some("123@s.whatsapp.net".into());
-                    proto.quoted_message = buffa::MessageField::some({
+                    proto.quoted_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.conversation = Some("orig".into());
                         proto
@@ -2883,14 +2892,14 @@ mod tests {
         // must always break it.
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("reply to bot".into());
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.stanza_id = Some("Q".into());
                     proto.participant = Some("mybot@bot".into());
-                    proto.quoted_message = buffa::MessageField::some({
+                    proto.quoted_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.conversation = Some("bot msg".into());
                         proto
@@ -2923,9 +2932,9 @@ mod tests {
         };
         let wrapped = {
             let mut proto = wa::Message::default();
-            proto.view_once_message_v2_extension = buffa::MessageField::some({
+            proto.view_once_message_v2_extension = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(inner);
+                proto.message = waproto::protobuf::MessageField::some(inner);
                 proto
             });
             proto
@@ -2963,7 +2972,8 @@ mod tests {
         // it must still attach the forwarded marker.
         let msg = {
             let mut proto = wa::Message::default();
-            proto.ptv_message = buffa::MessageField::some(wa::message::VideoMessage::default());
+            proto.ptv_message =
+                waproto::protobuf::MessageField::some(wa::message::VideoMessage::default());
             proto
         };
         let fwd = msg.prepare_for_forward();

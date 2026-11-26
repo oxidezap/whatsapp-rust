@@ -458,9 +458,9 @@ async fn group_newsletter_and_status_addon_keep_token_exclusions() {
     client
         .send_message(Jid::status_broadcast(), {
             let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some({
+            proto.reaction_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ReactionMessage::default();
-                proto.key = buffa::MessageField::some({
+                proto.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.remote_jid = Some(Jid::status_broadcast().to_string());
                     proto.from_me = Some(false);

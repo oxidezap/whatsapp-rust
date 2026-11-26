@@ -11,3 +11,5 @@
 tests/fixtures/** text eol=lf
 wacore/tests/fixtures/** text eol=lf
 
+*.rs.sha256 text eol=lf
+*.generated.rs text eol=lf linguist-generated=true

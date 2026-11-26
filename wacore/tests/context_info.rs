@@ -11,7 +11,7 @@ fn context() -> wa::ContextInfo {
         proto.forwarding_score = Some(2);
         proto.mentioned_jid = vec!["assistant@bot".into()];
         proto.expiration = Some(3600);
-        proto.quoted_message = buffa::MessageField::some({
+        proto.quoted_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::Message::default();
             proto.conversation = Some("quoted text".repeat(1024));
             proto
@@ -29,7 +29,7 @@ fn carriers() -> Vec<(&'static str, wa::Message)> {
             $(
                 let mut message = wa::Message::default();
                 message.$field.get_or_insert_default().context_info =
-                    buffa::MessageField::some(context());
+                    waproto::protobuf::MessageField::some(context());
                 messages.push((stringify!($field), message));
             )+
         };
@@ -189,7 +189,7 @@ fn context_is_borrowed_from_location_and_nested_wrappers() {
     message
         .location_message
         .get_or_insert_default()
-        .context_info = buffa::MessageField::some(context());
+        .context_info = waproto::protobuf::MessageField::some(context());
     let expected = message
         .location_message
         .as_option()
@@ -201,13 +201,13 @@ fn context_is_borrowed_from_location_and_nested_wrappers() {
     let expected_quote = expected.quoted_message.as_option().unwrap() as *const wa::Message;
     let wrapped = {
         let mut proto = wa::Message::default();
-        proto.device_sent_message = buffa::MessageField::some({
+        proto.device_sent_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DeviceSentMessage::default();
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
-                proto.ephemeral_message = buffa::MessageField::some({
+                proto.ephemeral_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some(message);
+                    proto.message = waproto::protobuf::MessageField::some(message);
                     proto
                 });
                 proto
@@ -259,7 +259,7 @@ fn context_absence_and_precedence_are_preserved() {
     message
         .location_message
         .get_or_insert_default()
-        .context_info = buffa::MessageField::some(context());
+        .context_info = waproto::protobuf::MessageField::some(context());
     assert!(message.context_info().is_some());
     message.extended_text_message.get_or_insert_default(); // no context: skip this carrier
     assert_eq!(
@@ -269,7 +269,7 @@ fn context_absence_and_precedence_are_preserved() {
     message
         .extended_text_message
         .get_or_insert_default()
-        .context_info = buffa::MessageField::some(wa::ContextInfo::default());
+        .context_info = waproto::protobuf::MessageField::some(wa::ContextInfo::default());
     assert!(!message.is_forwarded());
     assert!(!message.mentions_any_bot());
     assert!(message.context_info().unwrap().stanza_id.is_none());
@@ -283,7 +283,7 @@ fn context_absence_and_precedence_are_preserved() {
         .expiration = Some(0);
     assert_eq!(message.get_ephemeral_expiration(), Some(3600));
     message.ephemeral_message.get_or_insert_default().message =
-        buffa::MessageField::some(wa::Message::default());
+        waproto::protobuf::MessageField::some(wa::Message::default());
     // A present empty inner message wins over outer carriers.
     assert!(message.context_info().is_none());
     assert!(!message.is_forwarded());
@@ -365,16 +365,16 @@ fn context_follows_device_sent_inside_ephemeral() {
     inner
         .poll_creation_message_v5
         .get_or_insert_default()
-        .context_info = buffa::MessageField::some(context());
+        .context_info = waproto::protobuf::MessageField::some(context());
     let message = {
         let mut proto = wa::Message::default();
-        proto.ephemeral_message = buffa::MessageField::some({
+        proto.ephemeral_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::FutureProofMessage::default();
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
-                proto.device_sent_message = buffa::MessageField::some({
+                proto.device_sent_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::DeviceSentMessage::default();
-                    proto.message = buffa::MessageField::some(inner);
+                    proto.message = waproto::protobuf::MessageField::some(inner);
                     proto
                 });
                 proto
@@ -397,12 +397,12 @@ fn hd_image_child_exposes_the_media_caption_and_context() {
     let image = body.image_message.get_or_insert_default();
     image.caption = Some("original caption".into());
     image.media_key = Some(vec![7; 32]);
-    image.context_info = buffa::MessageField::some(context());
+    image.context_info = waproto::protobuf::MessageField::some(context());
     let mut wrapped = wa::Message::default();
     wrapped
         .associated_child_message
         .get_or_insert_default()
-        .message = buffa::MessageField::some(body);
+        .message = waproto::protobuf::MessageField::some(body);
     let association = wrapped
         .message_context_info
         .get_or_insert_default()

@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn for_props_invalid_platform_type_is_other_web_client() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
 
         let props = wa::DeviceProps::decode_from_slice(&[0x18, 0x8f, 0x4e]).unwrap();
         assert_eq!(

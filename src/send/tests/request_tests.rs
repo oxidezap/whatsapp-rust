@@ -55,7 +55,7 @@ async fn assert_secret_creation_edit_wire(is_event: bool) {
             )
         };
         let mut update = (*original.message).clone();
-        update.message_context_info = buffa::MessageField::none();
+        update.message_context_info = waproto::protobuf::MessageField::none();
         if is_event {
             update.event_message.get_or_insert_default().name = Some("Updated launch".into());
         } else {
@@ -444,14 +444,15 @@ async fn default_request_text_reply_quote_and_forward_preserve_their_preparation
     let source = wa::Message::text_with_context("source", {
         let mut proto = wa::ContextInfo::default();
         proto.stanza_id = Some("OLD_QUOTE".into());
-        proto.quoted_message = buffa::MessageField::some(wa::Message::text("old quote"));
+        proto.quoted_message =
+            waproto::protobuf::MessageField::some(wa::Message::text("old quote"));
         proto.forwarding_score = Some(2);
         proto.is_forwarded = Some(true);
         proto
     });
     let source = {
         let mut proto_ = source;
-        proto_.message_context_info = buffa::MessageField::some({
+        proto_.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![177; 32]);
             proto

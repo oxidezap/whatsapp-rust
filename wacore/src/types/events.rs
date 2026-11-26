@@ -3171,7 +3171,7 @@ pub struct CallLogHistory {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message;
+    use waproto::protobuf::Message;
     use waproto::whatsapp as wa;
 
     /// A new kind must go at the end. The discriminant doubles as an

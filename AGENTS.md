@@ -7,7 +7,7 @@ Ground truth for protocol behavior is WhatsApp Web itself: query the structured 
 ## Crates
 
 - **wacore** — platform-agnostic core: binary protocol, crypto, IQ types, state traits. No Tokio here. Browser WASM has maintained gates; ESP32 remains experimental. See `agent_docs/support.md` for qualified target/runtime/storage profiles.
-- **waproto** — buffa-generated protobufs from `whatsapp.proto`. No feature logic.
+- **waproto** — statically generated protobuf codecs from `whatsapp.proto`.
 - **whatsapp-rust** — Tokio runtime, SQLite persistence (Diesel), high-level API.
 - **whatspec-codegen** (`tools/`) — build tooling, never published and outside `default-members`. Regenerates every whatspec-derived file in one pass from a pinned IR commit. Nothing links it.
 
@@ -51,7 +51,7 @@ Things that look correct and are not:
 - **Wire-tagged enums.** Every protocol enum derives `WireEnum`, and its `#[wire = ...]` attribute is the single source of truth for the wire value. Do not also derive `serde::Serialize`/`Deserialize` or add `#[serde(rename_all)]` — the derive owns both. In tagged mode it generates a sibling `<Name>Tag`; parsers must dispatch on `<Name>Tag::try_from(node.tag.as_ref())` rather than string literals, so renaming a tag stays a one-attribute change. Modes and attributes: `agent_docs/architecture.md`.
 - **Event payloads are a frozen API.** Sealed with `#[non_exhaustive]` + `#[derive(bon::Builder)]` and constructed via `Type::builder()…build()`; a maybe-absent field is `Option<T>`, never an empty-string or zero sentinel. The full stability policy is the `Event` doc comment in `wacore/src/types/events.rs`.
 - **Generated files are generated, not edited.** Regenerate all domains together from the pinned whatspec commit; see `agent_docs/codegen.md`. Inspect the emitter and manifest for current catalog coverage. Unlisted protocol items belong in hand-written siblings.
-- **`whatsapp.proto` is not the whole persisted schema.** It comes from whatspec and is regenerated wholesale, so fields we persist but upstream does not declare live in `LOCAL_FIELDS` in `waproto/build.rs`, spliced into the descriptor at build time, and whole retained messages in `LOCAL_BLOCKS` in the codegen's proto emitter. Never hand-edit the `.proto` or `.desc` to add one — the next sync would drop it.
+- **`whatsapp.proto` is not the whole persisted schema.** It comes from whatspec and is regenerated wholesale, so fields we persist but upstream does not declare live in `LOCAL_FIELDS` in `waproto/codegen/retained.rs`, spliced into the descriptor before static generation, and whole retained messages in `LOCAL_BLOCKS` in the codegen's proto emitter. Never hand-edit the `.proto` or `.desc` to add one — the next sync would drop it.
 - **Blocking work** — `ureq`, heavy CPU — belongs in `tokio::task::spawn_blocking`; it shares a runtime with the read loop.
 - **let-chains**, never nested `if let`. Clippy's `collapsible_if` is denied in CI.
 - **No real PII in tests**, including vectors derived from production captures. Regenerate them from fictitious JIDs and numbers.

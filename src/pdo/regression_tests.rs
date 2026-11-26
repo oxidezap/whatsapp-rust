@@ -1,6 +1,6 @@
 use super::{make_group_message_info, make_placeholder_response, make_web_msg};
 use crate::client::Client;
-use buffa::Message as _;
+use waproto::protobuf::Message as _;
 use std::sync::Arc;
 use wacore::types::events::{ChannelEventHandler, InboundMessage};
 use wacore::types::jid::JidExt as _;

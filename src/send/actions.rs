@@ -226,14 +226,14 @@ impl Client {
     ) -> Result<SendResult, SendError> {
         let message = {
             let mut proto = wa::Message::default();
-            proto.pin_in_chat_message = buffa::MessageField::some({
+            proto.pin_in_chat_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::PinInChatMessage::default();
-                proto.key = buffa::MessageField::some(key);
+                proto.key = waproto::protobuf::MessageField::some(key);
                 proto.r#type = Some(pin_type);
                 proto.sender_timestamp_ms = Some(self.runtime.wall_time_millis());
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_add_on_duration_in_secs = Some(duration_secs);
                 proto

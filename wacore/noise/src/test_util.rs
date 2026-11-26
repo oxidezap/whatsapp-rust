@@ -5,7 +5,7 @@
 // Test fixtures may exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
-use buffa::Message;
+use waproto::protobuf::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 
 /// Builds a minimal `CertChain` blob whose leaf.key matches `server_static_pub`.
@@ -42,13 +42,13 @@ pub fn build_cert_chain_bytes(server_static_pub: &[u8; 32]) -> Vec<u8> {
 
     let chain = {
         let mut proto = wa::CertChain::default();
-        proto.leaf = buffa::MessageField::some({
+        proto.leaf = waproto::protobuf::MessageField::some({
             let mut proto = wa::cert_chain::NoiseCertificate::default();
             proto.details = Some(leaf_details_bytes);
             proto.signature = Some(vec![0u8; 64]);
             proto
         });
-        proto.intermediate = buffa::MessageField::some({
+        proto.intermediate = waproto::protobuf::MessageField::some({
             let mut proto = wa::cert_chain::NoiseCertificate::default();
             proto.details = Some(intermediate_details_bytes);
             proto.signature = Some(vec![0u8; 64]);

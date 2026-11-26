@@ -1,11 +1,11 @@
 use base64::Engine as _;
-use buffa::MessageView;
 use compact_str::CompactString;
 use sha2::{Digest, Sha256};
+use waproto::protobuf::MessageView;
 // Encode/decode of proto trees is routed through `waproto::codec` so the tree is
 // instantiated once in waproto; tests still call the trait methods directly.
 #[cfg(test)]
-use buffa::Message as _;
+use waproto::protobuf::Message as _;
 use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
@@ -27,9 +27,9 @@ pub enum PlaintextDecodeError {
     #[error("{0}")]
     Padding(#[from] PaddingError),
     #[error("{0}")]
-    Wire(#[from] buffa::DecodeError),
+    Wire(#[from] waproto::protobuf::DecodeError),
     #[error("Failed to decode decrypted plaintext: {0}")]
-    Decode(#[source] buffa::DecodeError),
+    Decode(#[source] waproto::protobuf::DecodeError),
     #[error("inline history-sync payload had no decoded notification")]
     MissingHistoryNotification,
 }
@@ -208,7 +208,7 @@ impl MessageUtils {
     /// over the whole tree on this per-recipient send hot path.
     pub fn encode_and_pad(msg: &wa::Message) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let mut cache = buffa::SizeCache::new();
+        let mut cache = waproto::protobuf::SizeCache::new();
         let size = waproto::codec::message_compute_size(msg, &mut cache);
         let mut buf = Vec::with_capacity(size + pad as usize);
         waproto::codec::message_write_to(msg, &mut cache, &mut buf);
@@ -241,13 +241,13 @@ impl MessageUtils {
         );
         push_wire_tag(
             TAG_SENDER_KEY_DISTRIBUTION_MESSAGE,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut buf,
         );
         push_varint(inner_len as u64, &mut buf);
         push_wire_tag(
             TAG_SKDM_GROUP_ID,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut buf,
         );
         push_varint(group_len as u64, &mut buf);
@@ -274,11 +274,11 @@ impl MessageUtils {
     ) -> Vec<u8> {
         let pad = Self::random_pad_len();
         // Size the extra mci once; the same cache feeds the write below.
-        let mut c_cache = buffa::SizeCache::new();
+        let mut c_cache = waproto::protobuf::SizeCache::new();
         let extra_inner = extra_context
             .map(|c| waproto::codec::message_context_info_compute_size(c, &mut c_cache));
         let extra_len = extra_inner.map_or(0, |sz| len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, sz));
-        let mut msg_cache = buffa::SizeCache::new();
+        let mut msg_cache = waproto::protobuf::SizeCache::new();
         let msg_size = waproto::codec::message_compute_size(msg, &mut msg_cache);
         let mut buf = Vec::with_capacity(msg_size + extra_len + pad as usize);
         waproto::codec::message_write_to(msg, &mut msg_cache, &mut buf);
@@ -304,7 +304,7 @@ impl MessageUtils {
         extra_context: Option<&wa::MessageContextInfo>,
     ) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let mut c_cache = buffa::SizeCache::new();
+        let mut c_cache = waproto::protobuf::SizeCache::new();
         let extra_inner = extra_context
             .map(|c| waproto::codec::message_context_info_compute_size(c, &mut c_cache));
         let extra_len = extra_inner.map_or(0, |sz| len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, sz));
@@ -370,13 +370,13 @@ impl MessageUtils {
         const MAX_PAD: usize = 16;
 
         let mci_field_len = extra_context.map_or(0, |m| {
-            let mut c = buffa::SizeCache::new();
+            let mut c = waproto::protobuf::SizeCache::new();
             len_delimited_len(
                 TAG_MESSAGE_CONTEXT_INFO,
                 waproto::codec::message_context_info_compute_size(m, &mut c),
             )
         });
-        let mut msg_cache = buffa::SizeCache::new();
+        let mut msg_cache = waproto::protobuf::SizeCache::new();
         let content_len = waproto::codec::message_compute_size(message, &mut msg_cache);
         let dest_len = destination_jid.encoded_len();
 
@@ -397,13 +397,13 @@ impl MessageUtils {
         let mut own_devices = Vec::with_capacity(own_cap);
         push_wire_tag(
             TAG_DEVICE_SENT_MESSAGE,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_wire_tag(
             TAG_DSM_DESTINATION_JID,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dest_len as u64, &mut own_devices);
@@ -441,7 +441,7 @@ impl MessageUtils {
         const MAX_PAD: usize = 16;
 
         let mci_field_len = extra_context.map_or(0, |m| {
-            let mut c = buffa::SizeCache::new();
+            let mut c = waproto::protobuf::SizeCache::new();
             len_delimited_len(
                 TAG_MESSAGE_CONTEXT_INFO,
                 waproto::codec::message_context_info_compute_size(m, &mut c),
@@ -459,13 +459,13 @@ impl MessageUtils {
         let mut own_devices = Vec::with_capacity(own_cap);
         push_wire_tag(
             TAG_DEVICE_SENT_MESSAGE,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_wire_tag(
             TAG_DSM_DESTINATION_JID,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dest_len as u64, &mut own_devices);
@@ -500,13 +500,13 @@ impl MessageUtils {
         // mci struct (not a temp Vec): it is small and encoded straight into each buffer.
         let mci = message.message_context_info.take();
         let mci_field_len = mci.as_ref().map_or(0, |m| {
-            let mut c = buffa::SizeCache::new();
+            let mut c = waproto::protobuf::SizeCache::new();
             len_delimited_len(
                 TAG_MESSAGE_CONTEXT_INFO,
                 waproto::codec::message_context_info_compute_size(m, &mut c),
             )
         });
-        let mut msg_cache = buffa::SizeCache::new();
+        let mut msg_cache = waproto::protobuf::SizeCache::new();
         let content_len = waproto::codec::message_compute_size(&message, &mut msg_cache);
         let dest_len = destination_jid.encoded_len();
 
@@ -519,13 +519,13 @@ impl MessageUtils {
         let mut own_devices = Vec::with_capacity(own_cap);
         push_wire_tag(
             TAG_DEVICE_SENT_MESSAGE,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_wire_tag(
             TAG_DSM_DESTINATION_JID,
-            buffa::encoding::WireType::LengthDelimited,
+            waproto::protobuf::encoding::WireType::LengthDelimited,
             &mut own_devices,
         );
         push_varint(dest_len as u64, &mut own_devices);
@@ -838,7 +838,7 @@ struct WireRedaction {
 /// share the carrier so even large inline payloads are not copied here.
 pub fn history_sync_notification_wire(
     source: &bytes::Bytes,
-) -> Result<Vec<bytes::Bytes>, buffa::DecodeError> {
+) -> Result<Vec<bytes::Bytes>, waproto::protobuf::DecodeError> {
     let path = if contains_nested_message_field(source, DEVICE_SENT_INNER_MESSAGE_PATH)? {
         DEVICE_SENT_HISTORY_PAYLOAD_PATH
     } else {
@@ -853,7 +853,7 @@ fn collect_nested_wire(
     source: &bytes::Bytes,
     path: &[u32],
     fragments: &mut Vec<bytes::Bytes>,
-) -> Result<(), buffa::DecodeError> {
+) -> Result<(), waproto::protobuf::DecodeError> {
     let Some((&field, rest)) = path.split_first() else {
         fragments.push(source.clone());
         return Ok(());
@@ -861,15 +861,19 @@ fn collect_nested_wire(
     let mut remaining = source.as_ref();
     while !remaining.is_empty() {
         let mut after_tag = remaining;
-        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+        let tag = waproto::protobuf::encoding::Tag::decode(&mut after_tag)?;
         if tag.field_number() == field
-            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+            && tag.wire_type() == waproto::protobuf::encoding::WireType::LengthDelimited
         {
             let range = length_delimited_value_range(source.len(), after_tag)?;
             collect_nested_wire(&source.slice(range.clone()), rest, fragments)?;
             remaining = &source[range.end..];
         } else {
-            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            waproto::protobuf::encoding::skip_field_depth(
+                tag,
+                &mut after_tag,
+                waproto::protobuf::RECURSION_LIMIT,
+            )?;
             remaining = after_tag;
         }
     }
@@ -882,7 +886,10 @@ fn collect_nested_wire(
 /// type for every segment in the supplied generated-tag paths. A mismatched
 /// known field is left for the regular decoder to reject with its canonical
 /// error after routing has been selected.
-fn contains_nested_message_field(message: &[u8], path: &[u32]) -> Result<bool, buffa::DecodeError> {
+fn contains_nested_message_field(
+    message: &[u8],
+    path: &[u32],
+) -> Result<bool, waproto::protobuf::DecodeError> {
     let Some((&field_number, remaining_path)) = path.split_first() else {
         return Ok(false);
     };
@@ -890,9 +897,9 @@ fn contains_nested_message_field(message: &[u8], path: &[u32]) -> Result<bool, b
     let mut remaining = message;
     while !remaining.is_empty() {
         let mut after_tag = remaining;
-        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+        let tag = waproto::protobuf::encoding::Tag::decode(&mut after_tag)?;
         if tag.field_number() == field_number
-            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+            && tag.wire_type() == waproto::protobuf::encoding::WireType::LengthDelimited
         {
             let value_range = length_delimited_value_range(message.len(), after_tag)?;
             if remaining_path.is_empty()
@@ -902,7 +909,11 @@ fn contains_nested_message_field(message: &[u8], path: &[u32]) -> Result<bool, b
             }
             remaining = &message[value_range.end..];
         } else {
-            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            waproto::protobuf::encoding::skip_field_depth(
+                tag,
+                &mut after_tag,
+                waproto::protobuf::RECURSION_LIMIT,
+            )?;
             remaining = after_tag;
         }
     }
@@ -917,7 +928,7 @@ fn redact_nested_bytes_field(
     message: &[u8],
     absolute_offset: usize,
     path: &[u32],
-) -> Result<WireRedaction, buffa::DecodeError> {
+) -> Result<WireRedaction, waproto::protobuf::DecodeError> {
     let Some((&field_number, remaining_path)) = path.split_first() else {
         return Ok(WireRedaction::default());
     };
@@ -929,10 +940,10 @@ fn redact_nested_bytes_field(
     while !remaining.is_empty() {
         let field_start = message.len() - remaining.len();
         let mut after_tag = remaining;
-        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+        let tag = waproto::protobuf::encoding::Tag::decode(&mut after_tag)?;
 
         if tag.field_number() == field_number
-            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+            && tag.wire_type() == waproto::protobuf::encoding::WireType::LengthDelimited
         {
             let tag_end = message.len() - after_tag.len();
             let value_range = length_delimited_value_range(message.len(), after_tag)?;
@@ -966,7 +977,11 @@ fn redact_nested_bytes_field(
 
             remaining = &message[value_range.end..];
         } else {
-            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            waproto::protobuf::encoding::skip_field_depth(
+                tag,
+                &mut after_tag,
+                waproto::protobuf::RECURSION_LIMIT,
+            )?;
             remaining = after_tag;
         }
     }
@@ -980,15 +995,16 @@ fn redact_nested_bytes_field(
 fn length_delimited_value_range(
     message_len: usize,
     mut after_tag: &[u8],
-) -> Result<std::ops::Range<usize>, buffa::DecodeError> {
-    let value_len = buffa::encoding::decode_varint(&mut after_tag)?;
-    let value_len = usize::try_from(value_len).map_err(|_| buffa::DecodeError::MessageTooLarge)?;
+) -> Result<std::ops::Range<usize>, waproto::protobuf::DecodeError> {
+    let value_len = waproto::protobuf::encoding::decode_varint(&mut after_tag)?;
+    let value_len =
+        usize::try_from(value_len).map_err(|_| waproto::protobuf::DecodeError::MessageTooLarge)?;
     let value_start = message_len - after_tag.len();
     let value_end = value_start
         .checked_add(value_len)
-        .ok_or(buffa::DecodeError::MessageTooLarge)?;
+        .ok_or(waproto::protobuf::DecodeError::MessageTooLarge)?;
     if value_end > message_len {
-        return Err(buffa::DecodeError::UnexpectedEof);
+        return Err(waproto::protobuf::DecodeError::UnexpectedEof);
     }
     Ok(value_start..value_end)
 }
@@ -1041,14 +1057,14 @@ pub fn sender_key_distribution_only_plaintext(
 
 pub fn has_only_sender_key_distribution_top_level_fields(
     encoded: &[u8],
-) -> Result<bool, buffa::DecodeError> {
+) -> Result<bool, waproto::protobuf::DecodeError> {
     // Generated tag constants, so a proto renumber updates the classifier
     // instead of silently misrouting SKDM-only messages.
     use waproto::tags::message as m;
     let mut cur = encoded;
     let mut has_sender_key_distribution = false;
     while !cur.is_empty() {
-        let tag = buffa::encoding::Tag::decode(&mut cur)?;
+        let tag = waproto::protobuf::encoding::Tag::decode(&mut cur)?;
         match tag.field_number() {
             m::SENDER_KEY_DISTRIBUTION_MESSAGE
             | m::FAST_RATCHET_KEY_SENDER_KEY_DISTRIBUTION_MESSAGE => {
@@ -1057,7 +1073,11 @@ pub fn has_only_sender_key_distribution_top_level_fields(
             m::MESSAGE_CONTEXT_INFO => {}
             _ => return Ok(false),
         }
-        buffa::encoding::skip_field_depth(tag, &mut cur, buffa::RECURSION_LIMIT)?;
+        waproto::protobuf::encoding::skip_field_depth(
+            tag,
+            &mut cur,
+            waproto::protobuf::RECURSION_LIMIT,
+        )?;
     }
     Ok(has_sender_key_distribution)
 }
@@ -1112,12 +1132,12 @@ fn push_varint(mut v: u64, out: &mut Vec<u8>) {
 }
 
 #[inline]
-fn wire_tag_value(field: u32, wire_type: buffa::encoding::WireType) -> u64 {
+fn wire_tag_value(field: u32, wire_type: waproto::protobuf::encoding::WireType) -> u64 {
     (u64::from(field) << PROTOBUF_WIRE_TYPE_BITS) | wire_type as u64
 }
 
 #[inline]
-fn push_wire_tag(field: u32, wire_type: buffa::encoding::WireType, out: &mut Vec<u8>) {
+fn push_wire_tag(field: u32, wire_type: waproto::protobuf::encoding::WireType, out: &mut Vec<u8>) {
     push_varint(wire_tag_value(field, wire_type), out);
 }
 
@@ -1126,7 +1146,11 @@ fn push_wire_tag(field: u32, wire_type: buffa::encoding::WireType, out: &mut Vec
 /// point that lets the shared content be reused without re-encoding it.
 #[inline]
 fn push_len_delimited(field: u32, bytes: &[u8], out: &mut Vec<u8>) {
-    push_wire_tag(field, buffa::encoding::WireType::LengthDelimited, out);
+    push_wire_tag(
+        field,
+        waproto::protobuf::encoding::WireType::LengthDelimited,
+        out,
+    );
     push_varint(bytes.len() as u64, out);
     out.extend_from_slice(bytes);
 }
@@ -1149,7 +1173,7 @@ fn varint_len(mut v: u64) -> usize {
 fn len_delimited_len(field: u32, payload_len: usize) -> usize {
     varint_len(wire_tag_value(
         field,
-        buffa::encoding::WireType::LengthDelimited,
+        waproto::protobuf::encoding::WireType::LengthDelimited,
     )) + varint_len(payload_len as u64)
         + payload_len
 }
@@ -1159,7 +1183,7 @@ fn len_delimited_len(field: u32, payload_len: usize) -> usize {
 /// `message_context_info` field on both plaintexts.
 #[inline]
 fn push_message_field(field: u32, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
-    let mut cache = buffa::SizeCache::new();
+    let mut cache = waproto::protobuf::SizeCache::new();
     let size = waproto::codec::message_context_info_compute_size(msg, &mut cache);
     push_message_field_sized(field, msg, size, &mut cache, out);
 }
@@ -1173,10 +1197,14 @@ fn push_message_field_sized(
     field: u32,
     msg: &wa::MessageContextInfo,
     size: usize,
-    cache: &mut buffa::SizeCache,
+    cache: &mut waproto::protobuf::SizeCache,
     out: &mut Vec<u8>,
 ) {
-    push_wire_tag(field, buffa::encoding::WireType::LengthDelimited, out);
+    push_wire_tag(
+        field,
+        waproto::protobuf::encoding::WireType::LengthDelimited,
+        out,
+    );
     push_varint(size as u64, out);
     waproto::codec::message_context_info_write_to(msg, cache, out);
 }
@@ -1214,11 +1242,11 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
                 inner.message_context_info.take(),
                 msg.message_context_info.as_option(),
             )
-            .map(buffa::MessageField::some)
+            .map(waproto::protobuf::MessageField::some)
             .unwrap_or_default();
             return inner;
         }
-        msg.device_sent_message = buffa::MessageField::some(dsm);
+        msg.device_sent_message = waproto::protobuf::MessageField::some(dsm);
     }
     msg
 }
@@ -1264,13 +1292,18 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
 
     // proto fields only encode when non-default, so encoded length 0 means all
     // remaining fields are at default — i.e. the message has no user content.
-    let mut cache = buffa::SizeCache::new();
+    let mut cache = waproto::protobuf::SizeCache::new();
     let only = waproto::codec::message_compute_size(msg, &mut cache) == 0;
 
-    msg.sender_key_distribution_message = skdm.map(buffa::MessageField::some).unwrap_or_default();
-    msg.fast_ratchet_key_sender_key_distribution_message =
-        fast.map(buffa::MessageField::some).unwrap_or_default();
-    msg.message_context_info = ctx.map(buffa::MessageField::some).unwrap_or_default();
+    msg.sender_key_distribution_message = skdm
+        .map(waproto::protobuf::MessageField::some)
+        .unwrap_or_default();
+    msg.fast_ratchet_key_sender_key_distribution_message = fast
+        .map(waproto::protobuf::MessageField::some)
+        .unwrap_or_default();
+    msg.message_context_info = ctx
+        .map(waproto::protobuf::MessageField::some)
+        .unwrap_or_default();
 
     only
 }
@@ -1793,7 +1826,7 @@ mod plaintext_view_tests {
         assert!(
             error
                 .source()
-                .is_some_and(|source| source.is::<buffa::DecodeError>())
+                .is_some_and(|source| source.is::<waproto::protobuf::DecodeError>())
         );
     }
 
@@ -1825,10 +1858,10 @@ mod plaintext_view_tests {
         {
             let mut proto_ = wa::Message::default();
             proto_.conversation = Some(text.to_owned());
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ProtocolMessage::default();
                 proto.history_sync_notification =
-                    buffa::MessageField::some(history_notification(payload));
+                    waproto::protobuf::MessageField::some(history_notification(payload));
                 proto
             });
             proto_
@@ -1902,10 +1935,10 @@ mod plaintext_view_tests {
         let inner_payload = vec![0x11; 64];
         let inner = message_with_history(inner_payload.clone(), "inner");
         let mut wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
-        wrapped.protocol_message = buffa::MessageField::some({
+        wrapped.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ProtocolMessage::default();
             proto.history_sync_notification =
-                buffa::MessageField::some(history_notification(vec![0x22; 32]));
+                waproto::protobuf::MessageField::some(history_notification(vec![0x22; 32]));
             proto
         });
 
@@ -1928,7 +1961,8 @@ mod plaintext_view_tests {
     fn sender_key_distribution_only_plaintext_returns_borrowed_axolotl() {
         let msg = {
             let mut proto = wa::Message::default();
-            proto.sender_key_distribution_message = buffa::MessageField::some(skdm(&[1, 2, 3]));
+            proto.sender_key_distribution_message =
+                waproto::protobuf::MessageField::some(skdm(&[1, 2, 3]));
             proto
         };
         let padded = padded(&msg);
@@ -1948,7 +1982,8 @@ mod plaintext_view_tests {
         let msg = {
             let mut proto = wa::Message::default();
             proto.conversation = Some("hello".to_string());
-            proto.sender_key_distribution_message = buffa::MessageField::some(skdm(&[1, 2, 3]));
+            proto.sender_key_distribution_message =
+                waproto::protobuf::MessageField::some(skdm(&[1, 2, 3]));
             proto
         };
         let padded = padded(&msg);
@@ -1964,7 +1999,7 @@ mod plaintext_view_tests {
         let msg = {
             let mut proto = wa::Message::default();
             proto.fast_ratchet_key_sender_key_distribution_message =
-                buffa::MessageField::some(skdm(&[4, 5, 6]));
+                waproto::protobuf::MessageField::some(skdm(&[4, 5, 6]));
             proto
         };
         let padded = padded(&msg);
@@ -2256,7 +2291,7 @@ mod parse_message_info_tests {
     #[test]
     #[allow(clippy::disallowed_methods)]
     fn envelope_verified_name_cert_is_decoded() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let details = {
             let mut proto = wa::verified_name_certificate::Details::default();
             proto.verified_name = Some("Fictitious Biz Ltd".into());
@@ -3208,7 +3243,7 @@ mod device_sent_tests {
     #[test]
     fn splice_tags_match_generated_schema() {
         fn first_field_number(mut bytes: &[u8]) -> u32 {
-            buffa::encoding::Tag::decode(&mut bytes)
+            waproto::protobuf::encoding::Tag::decode(&mut bytes)
                 .expect("probe should start with a valid protobuf tag")
                 .field_number()
         }
@@ -3276,7 +3311,7 @@ mod device_sent_tests {
 
             let reference = {
                 let mut proto = wa::Message::default();
-                proto.sender_key_distribution_message = buffa::MessageField::some({
+                proto.sender_key_distribution_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::SenderKeyDistributionMessage::default();
                     proto.group_id = Some(jid.to_string());
                     proto.axolotl_sender_key_distribution_message = Some(axolotl.clone());
@@ -3311,7 +3346,7 @@ mod device_sent_tests {
     #[test]
     fn skdm_wrapper_tags_match_generated_schema() {
         fn first_field_number(mut bytes: &[u8]) -> u32 {
-            buffa::encoding::Tag::decode(&mut bytes)
+            waproto::protobuf::encoding::Tag::decode(&mut bytes)
                 .expect("probe should start with a valid protobuf tag")
                 .field_number()
         }

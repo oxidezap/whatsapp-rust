@@ -79,6 +79,10 @@ jobs:
         if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo run -p whatspec-codegen -- --check
+      - name: Check protobuf generation and public API
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo xt proto-codecs --check
 
   clippy:
     name: Clippy Linter

@@ -11,18 +11,26 @@ rust-version.workspace = true
 publish = false
 description = "Regenerates the whatspec-derived artifacts committed in this repository."
 
+[[bin]]
+name = "protobuf-codegen"
+path = "../../waproto/codegen/main.rs"
+
 [dependencies]
+thiserror = { workspace = true }
 xtask-support.workspace = true
 # `std` on each: the workspace pins these with default-features off for the
 # no_std/wasm builds, and none of that applies to a host-only binary that reads
 # files and shells out.
 anyhow = { workspace = true, features = ["std"] }
+heck = { workspace = true }
+prettyplease = "0.3"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
+syn = { version = "3.0", features = ["full", "visit-mut"] }
 toml = "1"
-syn = { version = "3.0", features = ["full"] }
-proc-macro2 = { version = "1", features = ["span-locations"] }
 # IQ emitter is independently pinned from the stable input-catalog lock.
 wa-codegen-iq = { package = "wa-codegen", git = "https://github.com/oxidezap/whatspec.git", rev = "3d9064051a176f75ce8e932528ced70c192cd09d" }
 wa-ir-iq = { package = "wa-ir", git = "https://github.com/oxidezap/whatspec.git", rev = "3d9064051a176f75ce8e932528ced70c192cd09d" }

@@ -180,7 +180,7 @@ pub enum PreKeyUploadErrorKind {
     #[error("{0}")]
     Curve(#[source] wacore::libsignal::core::CurveError),
     #[error("{0}")]
-    Decode(#[source] buffa::DecodeError),
+    Decode(#[source] waproto::protobuf::DecodeError),
     #[error("{0}")]
     Iq(#[source] crate::request::IqError),
     #[error("failed to flush prekey watermarks: {0}")]
@@ -219,7 +219,7 @@ prekey_upload_error_from!(
     wacore::store::error::StoreError => Store,
     wacore::libsignal::protocol::SignalProtocolError => Signal,
     wacore::libsignal::core::CurveError => Curve,
-    buffa::DecodeError => Decode,
+    waproto::protobuf::DecodeError => Decode,
     crate::request::IqError => Iq,
 );
 
@@ -2471,10 +2471,10 @@ mod window_tests {
     /// heal advances FIRST to the next stored id and reuses it.
     #[tokio::test]
     async fn consumed_head_advances_to_next_live_window_key() {
-        use buffa::Message;
         use wacore::libsignal::protocol::KeyPair;
         use wacore::libsignal::store::record_helpers::new_pre_key_record;
         use wacore::store::commands::DeviceCommand;
+        use waproto::protobuf::Message;
 
         let client = crate::test_utils::create_test_client_with_name("prekey_window_heal").await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -2584,7 +2584,7 @@ mod window_tests {
             .expect("load");
         assert_eq!(window.len(), 5, "window = retry key + top-up");
 
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let structure =
             waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&after[0].1[..])
                 .expect("decode structure");

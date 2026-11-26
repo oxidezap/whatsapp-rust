@@ -104,7 +104,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.favorites_action = buffa::MessageField::some({
+                proto.favorites_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::FavoritesAction::default();
                     proto.favorites = ids
                         .iter()

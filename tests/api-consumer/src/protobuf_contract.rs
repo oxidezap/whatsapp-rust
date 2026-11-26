@@ -4,6 +4,9 @@
 
 use whatsapp_rust::waproto::whatsapp as wa;
 
+#[cfg(feature = "proto-untrusted-owned-view")]
+mod untrusted_owned_view;
+
 pub fn owned(text: &str) -> wa::Message {
     wa::Message::default().with_conversation(text)
 }

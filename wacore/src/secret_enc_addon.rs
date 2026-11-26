@@ -46,7 +46,7 @@ pub enum AddonError {
     #[error("addon GCM tag verification failed")]
     AuthenticationFailed,
     #[error("protobuf decode failed: {0}")]
-    ProtobufDecode(#[source] buffa::DecodeError),
+    ProtobufDecode(#[source] waproto::protobuf::DecodeError),
 }
 
 debug_as_display!(AddonError);

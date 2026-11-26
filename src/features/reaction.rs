@@ -8,8 +8,8 @@
 //! message's `messageSecret` and emits an `enc_reaction_message` envelope.
 //! [`Client::send_reaction`] applies the same gate transparently.
 
-use buffa::MessageField;
 use wacore_binary::{Jid, JidExt};
+use waproto::protobuf::MessageField;
 use waproto::whatsapp as wa;
 
 use crate::client::Client;

@@ -10,12 +10,12 @@
 //! Reference: WAWebCryptoMediaRetry, WAWebSendServerErrorReceiptJob,
 //! WAWebHandleMediaRetryNotification.
 
-use buffa::MessageView;
 use rand::Rng;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContentRef, NodeRef};
 use wacore_libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
+use waproto::protobuf::MessageView;
 use waproto::whatsapp as wa;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +38,7 @@ pub enum MediaRetryError {
     #[error("missing enc_iv in encrypt node")]
     MissingIv,
     #[error("protobuf decode failed: {0}")]
-    Decode(#[source] buffa::DecodeError),
+    Decode(#[source] waproto::protobuf::DecodeError),
     #[error("encrypted media retry notification missing stanza ID")]
     MissingStanzaId,
     #[error("stanza ID mismatch: expected {expected}, got {actual}")]
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // Test-only protobuf fixture; no production encode tree.
     fn encrypted_response_requires_matching_stanza_id() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let key = [42; 32];
         for id in [Some("MSG"), None, Some("OTHER")] {
             let plaintext = {

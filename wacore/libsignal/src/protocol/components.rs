@@ -18,7 +18,7 @@ use super::{SenderKeyRecord, SessionRecord, SessionState};
 use crate::core::PublicKey;
 use crate::engine::{self as engine, CryptoProvider};
 use crate::protocol::error::{Result, SignalProtocolError};
-use buffa::Message as _;
+use waproto::protobuf::Message as _;
 use waproto::whatsapp::{SessionStructure, session_structure};
 
 const PRIVATE_KEY_BYTES: usize = 32;
@@ -629,7 +629,7 @@ pub(crate) fn derived_keys(seed: &[u8; 32]) -> Result<([u8; 32], [u8; 32], [u8; 
 #[allow(clippy::disallowed_methods)]
 fn decode_session_proto(
     bytes: &[u8],
-) -> core::result::Result<SessionStructure, buffa::DecodeError> {
+) -> core::result::Result<SessionStructure, waproto::protobuf::DecodeError> {
     SessionStructure::decode_from_slice(bytes)
 }
 

@@ -1,0 +1,215 @@
+#![forbid(unsafe_code)]
+
+use super::{DecodeError, EncodeSink, encoding};
+use bytes::Buf;
+
+#[inline]
+pub fn int32_encoded_len(value: i32) -> usize {
+    encoding::varint_len(value as i64 as u64)
+}
+
+#[inline]
+pub fn encode_int32(value: i32, output: &mut impl EncodeSink) {
+    encoding::put_varint(value as i64 as u64, output);
+}
+
+#[inline]
+pub fn bytes_encoded_len(value: &[u8]) -> usize {
+    encoding::varint_len(value.len() as u64) + value.len()
+}
+
+#[inline]
+pub fn encode_bytes(value: &[u8], output: &mut impl EncodeSink) {
+    encoding::put_varint(value.len() as u64, output);
+    output.put_slice(value);
+}
+
+#[inline(always)]
+fn copy_chunks(
+    input: &mut impl Buf,
+    output: &mut Vec<u8>,
+    mut remaining: usize,
+) -> Result<(), DecodeError> {
+    while remaining != 0 {
+        let count = remaining.min(input.chunk().len());
+        if count == 0 {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        output.extend_from_slice(&input.chunk()[..count]);
+        input.advance(count);
+        remaining -= count;
+    }
+    Ok(())
+}
+
+pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let mut output = Vec::with_capacity(length);
+    copy_chunks(input, &mut output, length)?;
+    Ok(output)
+}
+
+#[inline]
+pub fn merge_bytes(output: &mut Vec<u8>, input: &mut impl Buf) -> Result<(), DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    output.clear();
+    output.reserve(length);
+    copy_chunks(input, output, length)
+}
+
+pub fn merge_optional_bytes(
+    output: &mut Option<Vec<u8>>,
+    input: &mut impl Buf,
+) -> Result<(), DecodeError> {
+    let value = output.get_or_insert_with(Vec::new);
+    if value.capacity() == 0 {
+        *value = decode_bytes(input)?;
+        Ok(())
+    } else {
+        merge_bytes(value, input)
+    }
+}
+
+pub fn decode_shared_bytes(input: &mut impl Buf) -> Result<bytes::Bytes, DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    Ok(input.copy_to_bytes(length))
+}
+
+pub fn decode_string(input: &mut impl Buf) -> Result<String, DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    if input.chunk().len() >= length {
+        let result = std::str::from_utf8(&input.chunk()[..length])
+            .map(str::to_owned)
+            .map_err(|_| DecodeError::InvalidUtf8);
+        input.advance(length);
+        return result;
+    }
+    let mut output = Vec::with_capacity(length);
+    copy_chunks(input, &mut output, length)?;
+    String::from_utf8(output).map_err(|_| DecodeError::InvalidUtf8)
+}
+
+pub fn merge_optional_string(
+    output: &mut Option<String>,
+    input: &mut impl Buf,
+) -> Result<(), DecodeError> {
+    merge_string(output.get_or_insert_with(String::new), input)
+}
+
+pub fn merge_string(output: &mut String, input: &mut impl Buf) -> Result<(), DecodeError> {
+    if output.capacity() == 0 {
+        *output = decode_string(input)?;
+        return Ok(());
+    }
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    if input.chunk().len() >= length {
+        let result = std::str::from_utf8(&input.chunk()[..length])
+            .map(|value| {
+                output.clear();
+                output.push_str(value);
+            })
+            .map_err(|_| {
+                output.clear();
+                DecodeError::InvalidUtf8
+            });
+        input.advance(length);
+        return result;
+    }
+    let mut bytes = std::mem::take(output).into_bytes();
+    bytes.clear();
+    bytes.reserve(length);
+    copy_chunks(input, &mut bytes, length)?;
+    match String::from_utf8(bytes) {
+        Ok(value) => {
+            *output = value;
+            Ok(())
+        }
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.clear();
+            *output = String::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8)?;
+            Err(DecodeError::InvalidUtf8)
+        }
+    }
+}
+
+pub fn decode_fixed32(input: &mut impl Buf) -> Result<u32, DecodeError> {
+    if input.remaining() < 4 {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    Ok(input.get_u32_le())
+}
+pub fn decode_fixed64(input: &mut impl Buf) -> Result<u64, DecodeError> {
+    if input.remaining() < 8 {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    Ok(input.get_u64_le())
+}
+
+#[inline]
+pub fn put_bytes(field: u32, value: &[u8], output: &mut impl EncodeSink) {
+    encoding::put_varint((u64::from(field) << 3) | 2, output);
+    encoding::put_varint(value.len() as u64, output);
+    output.put_slice(value);
+}
+
+#[inline]
+pub fn bytes_size(field: u32, length: usize) -> u64 {
+    encoding::varint_len((u64::from(field) << 3) | 2) as u64
+        + encoding::varint_len(length as u64) as u64
+        + length as u64
+}
+
+pub fn borrow_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.len() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let (value, tail) = input.split_at(length);
+    *input = tail;
+    Ok(value)
+}
+
+pub fn borrow_str<'a>(input: &mut &'a [u8]) -> Result<&'a str, DecodeError> {
+    std::str::from_utf8(borrow_bytes(input)?).map_err(|_| DecodeError::InvalidUtf8)
+}
+
+pub fn borrow_group<'a>(
+    input: &mut &'a [u8],
+    number: u32,
+    depth: u32,
+) -> Result<&'a [u8], DecodeError> {
+    let original = *input;
+    loop {
+        let before = input.len();
+        let tag = encoding::Tag::decode(input)?;
+        if tag.wire_type() == encoding::WireType::EndGroup {
+            if tag.field_number() != number {
+                return Err(DecodeError::InvalidEndGroup(tag.field_number()));
+            }
+            return Ok(&original[..original.len() - before]);
+        }
+        encoding::skip_field_depth(tag, input, depth)?;
+    }
+}

@@ -645,11 +645,11 @@ mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_test_client, node_to_owned_ref};
     use crate::types::events::EventHandler;
-    use buffa::Message as _;
     use std::sync::Mutex;
     use std::time::Duration;
     use wacore::libsignal::protocol::PublicKey;
     use wacore::stanza::wire_tags::NotificationType;
+    use waproto::protobuf::Message as _;
     use waproto::whatsapp as wa;
 
     fn server_notification(notif_type: &'static str, child: Option<Node>) -> Arc<OwnedNodeRef> {
@@ -1022,7 +1022,7 @@ mod tests {
             proto
         };
         let child = NodeBuilder::new(TAG_PRIMARY_EPHEMERAL_IDENTITY)
-            .bytes(buffa::Message::encode_to_vec(&primary))
+            .bytes(waproto::protobuf::Message::encode_to_vec(&primary))
             .build();
         client
             .process_node(server_notification(

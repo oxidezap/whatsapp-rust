@@ -189,7 +189,7 @@ fn quick_reply_value_at(
 ) -> wa::SyncActionValue {
     {
         let mut proto = wa::SyncActionValue::default();
-        proto.quick_reply_action = buffa::MessageField::some(action);
+        proto.quick_reply_action = waproto::protobuf::MessageField::some(action);
         proto.timestamp = Some(timestamp_ms);
         proto
     }

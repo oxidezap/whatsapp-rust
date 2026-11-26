@@ -7,11 +7,11 @@
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
-use buffa::Message;
 use wacore::appstate::WAPATCH_INTEGRITY;
 use wacore::appstate::hash::{HashState, generate_content_mac, generate_patch_mac};
 use wacore::appstate::keys::expand_app_state_keys;
 use wacore::appstate::processor::validate_patch_macs;
+use waproto::protobuf::Message;
 use waproto::whatsapp as wa;
 
 fn make_mutation(

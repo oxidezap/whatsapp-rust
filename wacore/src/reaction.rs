@@ -19,7 +19,7 @@ pub enum ReactionError {
     #[error("{0}")]
     Addon(#[from] crate::secret_enc_addon::AddonError),
     #[error("{0}")]
-    Decode(#[from] buffa::DecodeError),
+    Decode(#[from] waproto::protobuf::DecodeError),
 }
 
 debug_as_display!(ReactionError);

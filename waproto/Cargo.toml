@@ -4,12 +4,12 @@ version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
-license = "MIT"
+license = "MIT AND Apache-2.0"
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
+exclude = ["generated-api.snapshot"]
 
-# `build.rs` injects serde_repr derives into generated enums under
-# `serde-enum-repr`; static dependency scanners do not see those uses.
+# Generated enums use serde_repr under `serde-enum-repr`.
 [package.metadata.cargo-machete]
 ignored = ["serde_repr"]
 
@@ -20,28 +20,31 @@ serde-snake-case = ["serde-deserialize"]
 # Enums (de)serialize as their numeric repr instead of the variant name — what
 # the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
+protobuf-reference = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor"]
 
 [dependencies]
-buffa = { workspace = true }
+buffa = { workspace = true, optional = true }
 bytes = { workspace = true }
+hashbrown = { version = "0.15.5", default-features = false, features = ["default-hasher", "serde"] }
 serde = { workspace = true }
 serde_repr = { version = "0.1", optional = true }
+thiserror = { workspace = true }
 
 [build-dependencies]
-# buffa-build does the codegen; buffa-descriptor decodes+re-encodes the committed
-# camelCase descriptor so build.rs can snake_case field names for the Rust API
-# (the proto file stays in upstream/whatspec camelCase form); heck does the case
-# conversion; sha2 powers the descriptor-freshness guard.
-buffa = { workspace = true }
-buffa-build = { workspace = true }
-buffa-descriptor = { workspace = true }
+thiserror = { workspace = true }
+# Buffa is used only to generate the differential reference.
+buffa = { workspace = true, optional = true }
+buffa-build = { workspace = true, optional = true }
+buffa-descriptor = { workspace = true, optional = true }
 heck = { workspace = true }
 sha2 = { workspace = true }
 syn = { version = "3.0", features = ["full", "visit-mut"] }
-quote = "1"
-prettyplease = "0.3"
+quote = { version = "1" }
+prettyplease = { version = "0.3" }
 
 [dev-dependencies]
+buffa = { workspace = true }
+sha2 = { workspace = true }
 buffa-build = { workspace = true }
 buffa-descriptor = { workspace = true }
 heck = { workspace = true }

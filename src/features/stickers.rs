@@ -144,7 +144,7 @@ mod tests {
         sticker.is_favorite = Some(favorite);
         {
             let mut proto = wa::SyncActionValue::default();
-            proto.sticker_action = buffa::MessageField::some(sticker);
+            proto.sticker_action = waproto::protobuf::MessageField::some(sticker);
             proto.timestamp = Some(1_700_000_000_000);
             proto
         }
@@ -221,7 +221,7 @@ mod tests {
         for action_value in [
             Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.sticker_action = buffa::MessageField::some(sticker());
+                proto.sticker_action = waproto::protobuf::MessageField::some(sticker());
                 proto
             }),
             Some(wa::SyncActionValue::default()),
@@ -248,7 +248,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.remove_recent_sticker_action = buffa::MessageField::some({
+                proto.remove_recent_sticker_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::RemoveRecentStickerAction::default();
                     proto.last_sticker_sent_ts = Some(1_700_000_000_000);
                     proto

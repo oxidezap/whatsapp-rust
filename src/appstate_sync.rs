@@ -8,7 +8,6 @@ mod tests {
     use super::*;
     use async_lock::Mutex;
     use async_trait::async_trait;
-    use buffa::Message;
     use std::collections::HashMap;
     use std::sync::Arc;
     use wacore::appstate::WAPATCH_INTEGRITY;
@@ -25,6 +24,7 @@ mod tests {
         AppStateSyncKey, AppSyncStore, DeviceListRecord, DeviceStore, LidPnMappingEntry,
         MsgSecretStore, ProtocolStore, SignalStore,
     };
+    use waproto::protobuf::Message;
     use waproto::whatsapp as wa;
 
     type MockMacMap = Arc<Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>>;
@@ -450,19 +450,19 @@ mod tests {
         {
             let mut proto = wa::SyncdMutation::default();
             proto.operation = Some(op.into());
-            proto.record = buffa::MessageField::some({
+            proto.record = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdRecord::default();
-                proto.index = buffa::MessageField::some({
+                proto.index = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdIndex::default();
                     proto.blob = Some(index_mac.to_vec());
                     proto
                 });
-                proto.value = buffa::MessageField::some({
+                proto.value = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdValue::default();
                     proto.blob = Some(value_blob);
                     proto
                 });
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id_bytes.to_vec());
                     proto
@@ -476,7 +476,7 @@ mod tests {
     fn status_privacy_action() -> wa::sync_action_value::StatusPrivacyAction {
         {
             let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
-            proto.mode = Some(buffa::EnumValue::Unknown(99));
+            proto.mode = Some(waproto::protobuf::EnumValue::Unknown(99));
             proto.user_jid = vec!["120363000000000042@lid".into()];
             proto.custom_lists = vec![{
                 let mut proto = wa::sync_action_value::status_privacy_action::CustomList::default();
@@ -535,9 +535,9 @@ mod tests {
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
             proto.index = Some(br#"["status_privacy"]"#.to_vec());
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.status_privacy = buffa::MessageField::some(action.clone());
+                proto.status_privacy = waproto::protobuf::MessageField::some(action.clone());
                 proto
             });
             proto
@@ -558,13 +558,13 @@ mod tests {
                 patches: Vec::new(),
                 snapshot: Some({
                     let mut proto = wa::SyncdSnapshot::default();
-                    proto.version = buffa::MessageField::some({
+                    proto.version = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdVersion::default();
                         proto.version = Some(version);
                         proto
                     });
                     proto.records = vec![mutation.record.expect("status record")];
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(key_id);
                         proto
@@ -581,12 +581,12 @@ mod tests {
                 patches: vec![{
                     let mut proto = wa::SyncdPatch::default();
                     proto.mutations = vec![mutation];
-                    proto.version = buffa::MessageField::some({
+                    proto.version = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdVersion::default();
                         proto.version = Some(version);
                         proto
                     });
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(key_id);
                         proto
@@ -650,7 +650,7 @@ mod tests {
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
             proto.index = Some(br#"["pnForLidChat","100000001@lid"]"#.to_vec());
-            proto.value = buffa::MessageField::some(action.clone());
+            proto.value = waproto::protobuf::MessageField::some(action.clone());
             proto
         }
         .encode_to_vec();
@@ -669,13 +669,13 @@ mod tests {
                 patches: Vec::new(),
                 snapshot: Some({
                     let mut proto = wa::SyncdSnapshot::default();
-                    proto.version = buffa::MessageField::some({
+                    proto.version = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdVersion::default();
                         proto.version = Some(version);
                         proto
                     });
                     proto.records = vec![mutation.record.expect("status record")];
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(key_id);
                         proto
@@ -692,12 +692,12 @@ mod tests {
                 patches: vec![{
                     let mut proto = wa::SyncdPatch::default();
                     proto.mutations = vec![mutation];
-                    proto.version = buffa::MessageField::some({
+                    proto.version = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdVersion::default();
                         proto.version = Some(version);
                         proto
                     });
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(key_id);
                         proto
@@ -834,9 +834,9 @@ mod tests {
         let nct_plaintext = {
             let mut proto = wa::SyncActionData::default();
             proto.index = Some(br#"["nct_salt_sync"]"#.to_vec());
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.nct_salt_sync_action = buffa::MessageField::some({
+                proto.nct_salt_sync_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::NctSaltSyncAction::default();
                     proto.salt = Some(vec![1, 2, 3]);
                     proto
@@ -856,9 +856,10 @@ mod tests {
         let status_plaintext = {
             let mut proto = wa::SyncActionData::default();
             proto.index = Some(br#"["status_privacy"]"#.to_vec());
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.status_privacy = buffa::MessageField::some(status_privacy_action());
+                proto.status_privacy =
+                    waproto::protobuf::MessageField::some(status_privacy_action());
                 proto
             });
             proto
@@ -874,12 +875,12 @@ mod tests {
         let status_patch = {
             let mut proto = wa::SyncdPatch::default();
             proto.mutations = vec![status];
-            proto.version = buffa::MessageField::some({
+            proto.version = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdVersion::default();
                 proto.version = Some(2);
                 proto
             });
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(key_id.clone());
                 proto
@@ -893,13 +894,13 @@ mod tests {
                 patches: vec![status_patch],
                 snapshot: Some({
                     let mut proto = wa::SyncdSnapshot::default();
-                    proto.version = buffa::MessageField::some({
+                    proto.version = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdVersion::default();
                         proto.version = Some(1);
                         proto
                     });
                     proto.records = vec![nct.record.expect("nct snapshot record")];
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(key_id);
                         proto
@@ -917,12 +918,12 @@ mod tests {
                     {
                         let mut proto = wa::SyncdPatch::default();
                         proto.mutations = vec![nct];
-                        proto.version = buffa::MessageField::some({
+                        proto.version = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncdVersion::default();
                             proto.version = Some(1);
                             proto
                         });
-                        proto.key_id = buffa::MessageField::some({
+                        proto.key_id = waproto::protobuf::MessageField::some({
                             let mut proto = wa::KeyId::default();
                             proto.id = Some(key_id.clone());
                             proto
@@ -1046,7 +1047,7 @@ mod tests {
             patch.snapshot_mac = Some(Vec::new());
             patch.patch_mac = Some(Vec::new());
         }
-        status_patch.version = buffa::MessageField::some({
+        status_patch.version = waproto::protobuf::MessageField::some({
             let mut proto = wa::SyncdVersion::default();
             proto.version = Some(1);
             proto
@@ -1201,7 +1202,7 @@ mod tests {
     ) -> wa::SyncdSnapshotRecovery {
         {
             let mut proto = wa::SyncdSnapshotRecovery::default();
-            proto.version = buffa::MessageField::some({
+            proto.version = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdVersion::default();
                 proto.version = Some(version);
                 proto
@@ -1212,7 +1213,7 @@ mod tests {
                 .iter()
                 .map(|(index_json, value_mac)| {
                     let mut proto = wa::SyncdPlainTextRecord::default();
-                    proto.value = buffa::MessageField::some({
+                    proto.value = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncActionData::default();
                         proto.index = Some(index_json.as_bytes().to_vec());
                         proto.version = Some(version as i32); // Carried, because it is the whole point: every consumer
@@ -1220,9 +1221,9 @@ mod tests {
                         // that dropped it would pass a suite asserting only the
                         // index and the operation.
 
-                        proto.value = buffa::MessageField::some({
+                        proto.value = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncActionValue::default();
-                            proto.mute_action = buffa::MessageField::some({
+                            proto.mute_action = waproto::protobuf::MessageField::some({
                                 let mut proto = wa::sync_action_value::MuteAction::default();
                                 proto.muted = Some(true);
                                 proto
@@ -1277,8 +1278,8 @@ mod tests {
             .as_option_mut()
             .and_then(|data| data.value.as_option_mut())
             .expect("status recovery value");
-        value.mute_action = buffa::MessageField::none();
-        value.status_privacy = buffa::MessageField::some(action.clone());
+        value.mute_action = waproto::protobuf::MessageField::none();
+        value.status_privacy = waproto::protobuf::MessageField::some(action.clone());
 
         *backend.fail_status_privacy.lock().await = true;
         let processor =
@@ -1951,7 +1952,7 @@ mod tests {
 
         let original_plaintext = {
             let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(1000);
                 proto
@@ -2003,7 +2004,7 @@ mod tests {
 
         let new_plaintext = {
             let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(2000);
                 proto
@@ -2025,12 +2026,12 @@ mod tests {
             patches: vec![{
                 let mut proto = wa::SyncdPatch::default();
                 proto.mutations = vec![overwrite_mutation.clone()];
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(2);
                     proto
                 });
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id_bytes);
                     proto
@@ -2108,7 +2109,7 @@ mod tests {
             let keys = expand_app_state_keys(&master_key);
             let plaintext = {
                 let mut proto = wa::SyncActionData::default();
-                proto.value = buffa::MessageField::some({
+                proto.value = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncActionValue::default();
                     proto.timestamp = Some(1000 + i as i64);
                     proto
@@ -2126,12 +2127,12 @@ mod tests {
             patches.push({
                 let mut proto = wa::SyncdPatch::default();
                 proto.mutations = vec![mutation];
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(i as u64 + 1);
                     proto
                 });
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id);
                     proto
@@ -2212,7 +2213,7 @@ mod tests {
 
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(2000);
                 proto
@@ -2236,13 +2237,13 @@ mod tests {
             patches: vec![],
             snapshot: Some({
                 let mut proto = wa::SyncdSnapshot::default();
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(2);
                     proto
                 });
                 proto.records = vec![record];
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id_bytes);
                     proto
@@ -2269,7 +2270,7 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(3000);
                 proto
@@ -2288,12 +2289,12 @@ mod tests {
             patch_list.patches.push({
                 let mut proto = wa::SyncdPatch::default();
                 proto.mutations = vec![mutation];
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(version);
                     proto
                 });
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id_bytes.clone());
                     proto
@@ -2425,7 +2426,7 @@ mod tests {
 
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(5000);
                 proto
@@ -2597,7 +2598,7 @@ mod tests {
             has_more_patches: false,
             patches: vec![{
                 let mut proto = wa::SyncdPatch::default();
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(5);
                     proto
@@ -2662,7 +2663,7 @@ mod tests {
             has_more_patches: false,
             patches: vec![{
                 let mut proto = wa::SyncdPatch::default();
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(1);
                     proto
@@ -2703,7 +2704,7 @@ mod tests {
         let snapshot_key_id = b"snapshot-key-xyz".to_vec();
         let snapshot_bytes = {
             let mut proto = wa::SyncdSnapshot::default();
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(snapshot_key_id.clone());
                 proto
@@ -2812,7 +2813,7 @@ mod tests {
         let plaintext = {
             let mut proto = wa::SyncActionData::default();
             proto.index = Some(index.to_vec());
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncActionValue::default();
                 proto.timestamp = Some(timestamp);
                 proto
@@ -2874,7 +2875,7 @@ mod tests {
         ] {
             let mut patch = {
                 let mut proto = wa::SyncdPatch::default();
-                proto.version = buffa::MessageField::some({
+                proto.version = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdVersion::default();
                     proto.version = Some(version);
                     proto
@@ -2885,7 +2886,7 @@ mod tests {
                     &keys,
                     &key_id,
                 )];
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(key_id.clone());
                     proto
@@ -2972,13 +2973,13 @@ mod tests {
         snapshot_state.update_hash_from_records(std::slice::from_ref(&record));
         let snapshot = {
             let mut proto = wa::SyncdSnapshot::default();
-            proto.version = buffa::MessageField::some({
+            proto.version = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdVersion::default();
                 proto.version = Some(10);
                 proto
             });
             proto.records = vec![record];
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(key_id.clone());
                 proto
@@ -2991,13 +2992,13 @@ mod tests {
         // The trailing patch the diverged client pushed before it was reset.
         let mut trailing = {
             let mut proto = wa::SyncdPatch::default();
-            proto.version = buffa::MessageField::some({
+            proto.version = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdVersion::default();
                 proto.version = Some(11);
                 proto
             });
             proto.mutations = vec![validating_mutation(&[0x32; 32], 11_000, &keys, &key_id)];
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(key_id.clone());
                 proto

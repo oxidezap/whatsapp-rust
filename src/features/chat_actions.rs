@@ -123,7 +123,7 @@ pub fn message_range<'a>(
             .into_iter()
             .map(|(reference, ts)| {
                 let mut proto = wa::sync_action_value::SyncActionMessage::default();
-                proto.key = buffa::MessageField::some(reference.to_raw_key());
+                proto.key = waproto::protobuf::MessageField::some(reference.to_raw_key());
                 proto.timestamp = Some(ts);
                 proto
             })
@@ -669,7 +669,7 @@ impl<'a> ChatActions<'a> {
         );
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.mark_chat_as_read_action = buffa::MessageField::some({
+            proto.mark_chat_as_read_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::MarkChatAsReadAction::default();
                 proto.read = Some(read);
                 proto.message_range = message_range.into();
@@ -694,7 +694,7 @@ impl<'a> ChatActions<'a> {
         let delete_media_str = if delete_media { "1" } else { "0" };
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.delete_chat_action = buffa::MessageField::some({
+            proto.delete_chat_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::DeleteChatAction::default();
                 proto.message_range = message_range.into();
                 proto
@@ -763,7 +763,7 @@ impl<'a> ChatActions<'a> {
         let delete_media_str = bool_str(options.media == MediaDeletion::Delete);
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.clear_chat_action = buffa::MessageField::some({
+            proto.clear_chat_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::ClearChatAction::default();
                 proto.message_range = message_range.into();
                 proto
@@ -787,7 +787,7 @@ impl<'a> ChatActions<'a> {
         debug!("Setting userStatusMute for {} -> {muted}", redact_jid(jid));
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.user_status_mute_action = buffa::MessageField::some({
+            proto.user_status_mute_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::UserStatusMuteAction::default();
                 proto.muted = Some(muted);
                 proto
@@ -811,7 +811,7 @@ impl<'a> ChatActions<'a> {
         let (chat, participant) = message_key_owned(target);
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.delete_message_for_me_action = buffa::MessageField::some({
+            proto.delete_message_for_me_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::DeleteMessageForMeAction::default();
                 proto.delete_media = Some(delete_media);
                 proto.message_timestamp = message_timestamp;
@@ -859,7 +859,7 @@ impl<'a> ChatActions<'a> {
         debug!("Saving contact {}", redact_jid(jid));
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.contact_action = buffa::MessageField::some({
+            proto.contact_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::ContactAction::default();
                 proto.full_name = full_name;
                 proto.first_name = first_name;
@@ -898,8 +898,9 @@ impl<'a> ChatActions<'a> {
         debug!("Removing contact {}", redact_jid(jid));
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.contact_action =
-                buffa::MessageField::some(wa::sync_action_value::ContactAction::default());
+            proto.contact_action = waproto::protobuf::MessageField::some(
+                wa::sync_action_value::ContactAction::default(),
+            );
             proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
@@ -917,7 +918,7 @@ impl<'a> ChatActions<'a> {
     ) -> Result<(), AppStateError> {
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.archive_chat_action = buffa::MessageField::some({
+            proto.archive_chat_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::ArchiveChatAction::default();
                 proto.archived = Some(archived);
                 proto.message_range = message_range.into();
@@ -935,7 +936,7 @@ impl<'a> ChatActions<'a> {
     async fn send_pin_mutation(&self, jid: &Jid, pinned: bool) -> Result<(), AppStateError> {
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.pin_action = buffa::MessageField::some({
+            proto.pin_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::PinAction::default();
                 proto.pinned = Some(pinned);
                 proto
@@ -963,7 +964,7 @@ impl<'a> ChatActions<'a> {
         };
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.mute_action = buffa::MessageField::some({
+            proto.mute_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::MuteAction::default();
                 proto.muted = Some(muted);
                 proto.mute_end_timestamp = mute_end;
@@ -981,7 +982,7 @@ impl<'a> ChatActions<'a> {
     async fn send_lock_mutation(&self, jid: &Jid, locked: bool) -> Result<(), AppStateError> {
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.lock_chat_action = buffa::MessageField::some({
+            proto.lock_chat_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LockChatAction::default();
                 proto.locked = Some(locked);
                 proto
@@ -1003,7 +1004,7 @@ impl<'a> ChatActions<'a> {
         let (chat, participant) = message_key_owned(target);
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.star_action = buffa::MessageField::some({
+            proto.star_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::StarAction::default();
                 proto.starred = Some(starred);
                 proto
@@ -1706,7 +1707,7 @@ mod registry_tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.contact_action = buffa::MessageField::some({
+                proto.contact_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::ContactAction::default();
                     proto.full_name = Some("Alex Doe".into());
                     proto
@@ -1780,7 +1781,7 @@ mod registry_tests {
                 operation: wa::syncd_mutation::SyncdOperation::SET,
                 action_value: Some({
                     let mut proto = wa::SyncActionValue::default();
-                    proto.lock_chat_action = buffa::MessageField::some({
+                    proto.lock_chat_action = waproto::protobuf::MessageField::some({
                         let mut proto = wa::sync_action_value::LockChatAction::default();
                         proto.locked = Some(locked);
                         proto
@@ -1835,7 +1836,7 @@ mod registry_tests {
                     operation: wa::syncd_mutation::SyncdOperation::SET,
                     action_value: Some({
                         let mut value = wa::SyncActionValue::default();
-                        value.lock_chat_action = buffa::MessageField::some(
+                        value.lock_chat_action = waproto::protobuf::MessageField::some(
                             wa::sync_action_value::LockChatAction::default(),
                         );
                         value
@@ -1865,38 +1866,43 @@ mod registry_tests {
                 proto
             }),
         };
-        let range = || buffa::MessageField::some(message_range(1_700_000_000_000, None, vec![]));
+        let range = || {
+            waproto::protobuf::MessageField::some(message_range(1_700_000_000_000, None, vec![]))
+        };
         let message_key = ["120363000000000042@g.us", "MSGID", "0", CHAT];
         vec![
             set(&["mute", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.mute_action = buffa::MessageField::some(sav::MuteAction::default());
+                proto.mute_action =
+                    waproto::protobuf::MessageField::some(sav::MuteAction::default());
                 proto
             }),
             set(&["pin_v1", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.pin_action = buffa::MessageField::some(sav::PinAction::default());
+                proto.pin_action = waproto::protobuf::MessageField::some(sav::PinAction::default());
                 proto
             }),
             set(&["pin", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.pin_action = buffa::MessageField::some(sav::PinAction::default());
+                proto.pin_action = waproto::protobuf::MessageField::some(sav::PinAction::default());
                 proto
             }),
             set(&["archive", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
                 proto.archive_chat_action =
-                    buffa::MessageField::some(sav::ArchiveChatAction::default());
+                    waproto::protobuf::MessageField::some(sav::ArchiveChatAction::default());
                 proto
             }),
             set(&[&["star"][..], &message_key].concat(), {
                 let mut proto = wa::SyncActionValue::default();
-                proto.star_action = buffa::MessageField::some(sav::StarAction::default());
+                proto.star_action =
+                    waproto::protobuf::MessageField::some(sav::StarAction::default());
                 proto
             }),
             set(&["contact", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.contact_action = buffa::MessageField::some(sav::ContactAction::default());
+                proto.contact_action =
+                    waproto::protobuf::MessageField::some(sav::ContactAction::default());
                 proto
             }),
             Mutation {
@@ -1906,18 +1912,18 @@ mod registry_tests {
             set(&["markChatAsRead", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
                 proto.mark_chat_as_read_action =
-                    buffa::MessageField::some(sav::MarkChatAsReadAction::default());
+                    waproto::protobuf::MessageField::some(sav::MarkChatAsReadAction::default());
                 proto
             }),
             set(&["mark_chat_as_read", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
                 proto.mark_chat_as_read_action =
-                    buffa::MessageField::some(sav::MarkChatAsReadAction::default());
+                    waproto::protobuf::MessageField::some(sav::MarkChatAsReadAction::default());
                 proto
             }),
             set(&["deleteChat", CHAT, "1"], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.delete_chat_action = buffa::MessageField::some({
+                proto.delete_chat_action = waproto::protobuf::MessageField::some({
                     let mut proto = sav::DeleteChatAction::default();
                     proto.message_range = range();
                     proto
@@ -1926,7 +1932,7 @@ mod registry_tests {
             }),
             set(&["clearChat", CHAT, "0", "1"], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.clear_chat_action = buffa::MessageField::some({
+                proto.clear_chat_action = waproto::protobuf::MessageField::some({
                     let mut proto = sav::ClearChatAction::default();
                     proto.message_range = range();
                     proto
@@ -1935,7 +1941,7 @@ mod registry_tests {
             }),
             set(&["lock", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.lock_chat_action = buffa::MessageField::some({
+                proto.lock_chat_action = waproto::protobuf::MessageField::some({
                     let mut action = sav::LockChatAction::default();
                     action.locked = Some(true);
                     action
@@ -1945,13 +1951,13 @@ mod registry_tests {
             set(&["userStatusMute", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
                 proto.user_status_mute_action =
-                    buffa::MessageField::some(sav::UserStatusMuteAction::default());
+                    waproto::protobuf::MessageField::some(sav::UserStatusMuteAction::default());
                 proto
             }),
             set(&[&["deleteMessageForMe"][..], &message_key].concat(), {
                 let mut proto = wa::SyncActionValue::default();
                 proto.delete_message_for_me_action =
-                    buffa::MessageField::some(sav::DeleteMessageForMeAction::default());
+                    waproto::protobuf::MessageField::some(sav::DeleteMessageForMeAction::default());
                 proto
             }),
         ]

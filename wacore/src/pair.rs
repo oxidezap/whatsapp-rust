@@ -30,7 +30,7 @@ pub struct PairCryptoError {
 #[non_exhaustive]
 pub enum PairCryptoCause {
     #[error("{0}")]
-    Decode(#[from] buffa::DecodeError),
+    Decode(#[from] waproto::protobuf::DecodeError),
     #[error("{0}")]
     Curve(#[from] crate::libsignal::core::CurveError),
     #[error("{0}")]
@@ -513,8 +513,8 @@ impl PairUtils {
 mod tests {
     use super::*;
     use crate::adv::test_util::{self, ENCRYPTION_TYPES, TEST_PN};
-    use buffa::Message;
     use rand::RngExt;
+    use waproto::protobuf::Message;
 
     fn dummy_device_state() -> DeviceState {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -819,7 +819,7 @@ mod tests {
         account_type: Option<ADVEncryptionType>,
         details: wa::ADVDeviceIdentity,
     ) -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account_kp = KeyPair::generate(&mut rng);
@@ -843,7 +843,7 @@ mod tests {
         account_type: Option<ADVEncryptionType>,
         signed: Vec<u8>,
     ) -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(secret).unwrap();
         if account_type == Some(ADVEncryptionType::HOSTED) {
             mac.update(&[6, 5]);
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn pairing_account_and_device_types_are_independent() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let state = dummy_device_state();
         let types = ENCRYPTION_TYPES;
         for outer in types {
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn pairing_rejects_authenticated_invalid_identity() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         #[derive(Debug, Clone, Copy)]
         enum Corruption {
             Signature,
@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn pairing_does_not_try_an_alternate_account_signature_prefix() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let state = dummy_device_state();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn pairing_authenticates_container_before_decoding_inner_identity() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let state = dummy_device_state();
         for account_type in [
             None,

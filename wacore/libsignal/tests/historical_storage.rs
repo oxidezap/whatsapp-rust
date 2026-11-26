@@ -196,7 +196,7 @@ fn existing_v3_and_v4_sessions_resume_with_exact_historical_ciphertext() {
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn historical_unused_receiver_private_bytes_do_not_strand_sessions() {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let all = vectors();
     for row in all["pairwise"].as_array().unwrap() {
         for length in [0, 1, 31, 32, 33, 64] {
@@ -423,7 +423,7 @@ fn closed_receiver_chains_keep_large_historical_seed_backlogs() {
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn historical_expanded_keys_take_precedence_over_seed_fields() {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let all = vectors();
     let mut raw = waproto::whatsapp::RecordStructure::decode_from_slice(&bytes(
         &all["pairwise"][0],

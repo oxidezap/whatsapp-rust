@@ -36,7 +36,7 @@ fn open_field_serializes_like_a_closed_enum() {
 fn open_field_serializes_unknown_as_raw_integer() {
     let mutation = {
         let mut proto = wa::SyncdMutation::default();
-        proto.operation = Some(buffa::EnumValue::Unknown(7));
+        proto.operation = Some(waproto::protobuf::EnumValue::Unknown(7));
         proto
     };
     let json = serde_json::to_value(mutation).unwrap();
@@ -59,7 +59,10 @@ fn open_field_deserializes_from_lowercased_proto_name() {
 fn open_field_deserializes_unknown_integer() {
     let mutation: wa::SyncdMutation =
         serde_json::from_value(serde_json::json!({"operation": 7})).unwrap();
-    assert_eq!(mutation.operation, Some(buffa::EnumValue::Unknown(7)));
+    assert_eq!(
+        mutation.operation,
+        Some(waproto::protobuf::EnumValue::Unknown(7))
+    );
 
     let absent: wa::SyncdMutation = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(absent.operation, None);
@@ -70,8 +73,11 @@ fn status_privacy_unknown_modes_survive_wire_roundtrip() {
     let action = waproto::codec::status_privacy_action_decode(&[0x08, 0x63, 0x30, 0x64])
         .expect("decode status privacy action");
 
-    assert_eq!(action.mode, Some(buffa::EnumValue::Unknown(99)));
-    assert_eq!(action.modes, vec![buffa::EnumValue::Unknown(100)]);
+    assert_eq!(action.mode, Some(waproto::protobuf::EnumValue::Unknown(99)));
+    assert_eq!(
+        action.modes,
+        vec![waproto::protobuf::EnumValue::Unknown(100)]
+    );
 
     let encoded = waproto::codec::status_privacy_action_to_vec(&action);
     let restored =
@@ -87,7 +93,7 @@ fn status_privacy_open_fields_keep_enum_serde_contract() {
             wa::sync_action_value::status_privacy_action::StatusDistributionMode::CUSTOM_LIST
                 .into(),
         );
-        proto.modes = vec![buffa::EnumValue::Unknown(99)];
+        proto.modes = vec![waproto::protobuf::EnumValue::Unknown(99)];
         proto
     };
     let json = serde_json::to_value(action).unwrap();

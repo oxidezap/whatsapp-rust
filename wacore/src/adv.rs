@@ -5,9 +5,9 @@
 //!
 //! Reference: WAWebHandleAdvDeviceNotificationUtils.decodeSignedKeyIndexBytes()
 
-use buffa::view::MessageView as _;
 use smallvec::SmallVec;
 use wacore_binary::{Jid, JidExt};
+use waproto::protobuf::view::MessageView as _;
 use waproto::whatsapp::ADVEncryptionType;
 
 use crate::libsignal::protocol::PublicKey;
@@ -287,7 +287,7 @@ pub fn is_key_index_valid(key_index: Option<u32>, decoded: &DecodedKeyIndex) -> 
 mod tests {
     use super::test_util::{ENCRYPTION_TYPES, TEST_PN, device_cases};
     use super::*;
-    use buffa::Message;
+    use waproto::protobuf::Message;
 
     fn dev(id: u16, key_index: Option<u32>) -> DeviceInfo {
         DeviceInfo::new(id, key_index)
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn decode_roundtrip() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
 
         let key_index = {
             let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
