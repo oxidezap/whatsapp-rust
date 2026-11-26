@@ -64,7 +64,7 @@ struct SinkTransport;
 
 #[async_trait::async_trait]
 impl Transport for SinkTransport {
-    async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+    async fn send(&self, _data: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
         Ok(())
     }
 
@@ -77,7 +77,10 @@ struct SinkTransportFactory;
 impl TransportFactory for SinkTransportFactory {
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error> {
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        crate::transport::TransportError,
+    > {
         let (_tx, rx) = async_channel::bounded(1);
         Ok((Arc::new(SinkTransport), rx))
     }
@@ -87,7 +90,7 @@ struct NoopHttpClient;
 
 #[async_trait::async_trait]
 impl HttpClient for NoopHttpClient {
-    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         Ok(HttpResponse::new(200, Vec::new()))
     }
 }

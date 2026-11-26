@@ -580,11 +580,12 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
     ));
     assert_eq!(transport.sent_count(), 0);
     let own = MessageRef::new(&dm, MessageId::new("OWN").unwrap(), None, true).unwrap();
-    let err = client.mark_message_read(&own).await.unwrap_err();
-    assert_eq!(
-        err.downcast_ref::<MessageRefError>(),
-        Some(&MessageRefError::ExpectedIncoming)
-    );
+    assert!(matches!(
+        client.mark_message_read(&own).await,
+        Err(crate::ReceiptError::MessageRef(
+            MessageRefError::ExpectedIncoming
+        ))
+    ));
     assert_eq!(transport.sent_count(), 0);
 }
 
@@ -820,6 +821,19 @@ async fn review_live_newsletter_context_does_not_infer_ownership() {
         assert!(std::ptr::eq(target.chat(), owner_chat));
         assert_eq!(target.chat(), &inbound.info.source.chat);
     }
+}
+
+#[tokio::test]
+async fn newsletter_reaction_preserves_disconnected_client_error() {
+    let client = crate::test_utils::create_test_client().await;
+    let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+    assert!(matches!(
+        client
+            .newsletter()
+            .send_reaction_raw(&channel, 42, "👍")
+            .await,
+        Err(crate::NewsletterError::Client(ClientError::NotConnected))
+    ));
 }
 
 #[tokio::test]

@@ -63,6 +63,30 @@ fn bench_oneof_view_encode(bencher: divan::Bencher) {
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
+#[divan::bench]
+fn bench_clone_message_media(bencher: divan::Bencher) {
+    let mut context = wa::ContextInfo::default();
+    context.quoted_message = Some(wa::Message::default().with_conversation("quoted")).into();
+    let mut image = wa::message::ImageMessage::default()
+        .with_caption("Synthetic image")
+        .with_jpeg_thumbnail(vec![0x5a; 1024]);
+    image.context_info = Some(context).into();
+    let mut message = wa::Message::default();
+    message.image_message = Some(image).into();
+    bencher.bench(|| black_box(black_box(&message).clone()));
+}
+
+#[divan::bench]
+fn bench_clone_message_text_reply(bencher: divan::Bencher) {
+    let mut context = wa::ContextInfo::default();
+    context.quoted_message = Some(wa::Message::default().with_conversation("quoted")).into();
+    let mut text = wa::message::ExtendedTextMessage::default().with_text("Synthetic reply");
+    text.context_info = Some(context).into();
+    let mut message = wa::Message::default();
+    message.extended_text_message = Some(text).into();
+    bencher.bench(|| black_box(black_box(&message).clone()));
+}
+
 #[divan::bench(args = ["known", "future_first", "future_last"])]
 fn bench_oneof_owned_decode(bencher: divan::Bencher, shape: &str) {
     use buffa::Message as _;

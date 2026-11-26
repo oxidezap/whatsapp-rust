@@ -1,7 +1,23 @@
-use super::{authenticate_cold_primary_bundles, authenticated_primary_identity};
+use super::{
+    PrimaryIdentityError, authenticate_cold_primary_bundles, authenticated_primary_identity,
+};
 use wacore::libsignal::protocol::{IdentityKey, KeyPair, PreKeyBundle};
 use wacore::prekeys::PreKeyFetchOutcome;
 use wacore_binary::Jid;
+
+#[test]
+fn primary_identity_error_preserves_signal_source() {
+    use std::error::Error as _;
+    let error = PrimaryIdentityError::from(
+        wacore::libsignal::protocol::SignalProtocolError::InvalidArgument("test".into()),
+    );
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .is::<wacore::libsignal::protocol::SignalProtocolError>()
+    );
+}
 
 fn bundle(valid: bool) -> PreKeyBundle {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -105,12 +121,9 @@ fn an_invalid_later_primary_aborts_validation_before_publication() {
             authenticated_primary_identity(bundle)
         });
     assert_eq!(checks, 2);
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid primary signed prekey signature")
-    );
+    let error = result.unwrap_err();
+    assert!(matches!(error, PrimaryIdentityError::InvalidSignature));
+    assert_eq!(error.to_string(), "invalid primary signed prekey signature");
 }
 
 #[test]

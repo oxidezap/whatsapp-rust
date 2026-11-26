@@ -1,12 +1,48 @@
 use crate::http::{HTTP_STATUS_REDIRECTION_START, HttpClient, HttpRequest};
 use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
-use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use std::sync::Arc;
 use wacore::types::events::{AppVersionFallback, AppVersionFallbackReason};
 
 pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_meta_sdk_js, parse_sw_js};
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum VersionError {
+    #[error("HTTP request to {url} failed: {source}")]
+    Request {
+        url: &'static str,
+        #[source]
+        source: crate::http::HttpError,
+    },
+    #[error("HTTP request to {url} returned status {}", .source.status)]
+    Status {
+        url: &'static str,
+        #[source]
+        source: crate::http::HttpStatusError,
+    },
+    #[error("{0}")]
+    Shape(#[from] VersionShapeError),
+    #[error("Failed to fetch latest WhatsApp version: {0}")]
+    Resolve(#[source] wacore::error::BoxedErrorSource<VersionError>),
+}
+
+impl std::fmt::Debug for VersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl VersionError {
+    fn is_shape(&self) -> bool {
+        match self {
+            Self::Shape(_) => true,
+            Self::Resolve(error) => error.is_shape(),
+            Self::Request { .. } | Self::Status { .. } => false,
+        }
+    }
+}
 
 /// Where the client revision is read from on one target.
 struct VersionSource {
@@ -87,7 +123,7 @@ const fn version_source() -> VersionSource {
 
 pub async fn fetch_latest_app_version(
     http_client: &Arc<dyn HttpClient>,
-) -> Result<(u32, u32, u32)> {
+) -> Result<(u32, u32, u32), VersionError> {
     let source = version_source();
     let mut request = HttpRequest::get(source.url);
     for (key, value) in source.headers {
@@ -96,32 +132,34 @@ pub async fn fetch_latest_app_version(
     let response = http_client
         .execute(request)
         .await
-        .map_err(|e| anyhow!("HTTP request to {} failed: {}", source.url, e))?;
+        .map_err(|error| VersionError::Request {
+            url: source.url,
+            source: error,
+        })?;
 
     // `HttpClient` returns a non-2xx as a response, so name the status here
     // instead of letting an error page fall through to a parse failure.
     if response.status_code >= HTTP_STATUS_REDIRECTION_START {
         let status = response.status_code;
-        return Err(crate::http::HttpStatusError { status }.into_error(format!(
-            "HTTP request to {} returned status {status}",
-            source.url
-        )));
+        return Err(VersionError::Status {
+            url: source.url,
+            source: crate::http::HttpStatusError { status },
+        });
     }
 
     // A body that will not decode still came from a source that answered, so
     // it is the source's shape being wrong, not the source being out of reach.
-    let body_str = String::from_utf8(response.body).map_err(|e| {
-        anyhow::Error::new(VersionShapeError::Body {
-            url: source.url,
-            detail: e.to_string(),
-        })
+    let body_str = String::from_utf8(response.body).map_err(|e| VersionShapeError::Body {
+        url: source.url,
+        detail: e.to_string(),
     })?;
 
     (source.parse)(&body_str).ok_or_else(|| {
-        anyhow::Error::new(VersionShapeError::Field {
+        VersionShapeError::Field {
             field: source.field,
             url: source.url,
-        })
+        }
+        .into()
     })
 }
 
@@ -129,7 +167,8 @@ pub async fn fetch_latest_app_version(
 /// Typed so the resolution can tell it from a source it never reached: one is
 /// routine, the other is the source having changed shape.
 #[derive(Debug, thiserror::Error)]
-enum VersionShapeError {
+#[non_exhaustive]
+pub enum VersionShapeError {
     #[error("could not decode the response body from {url}: {detail}")]
     Body { url: &'static str, detail: String },
     #[error("could not find '{field}' in the response from {url}")]
@@ -179,7 +218,7 @@ pub async fn resolve_and_update_version(
     persistence_manager: &Arc<PersistenceManager>,
     http_client: &Arc<dyn HttpClient>,
     override_version: Option<(u32, u32, u32)>,
-) -> Result<Option<AppVersionFallback>> {
+) -> Result<Option<AppVersionFallback>, VersionError> {
     resolve_version_with_runtime(persistence_manager, http_client, override_version, None).await
 }
 
@@ -188,7 +227,7 @@ pub(crate) async fn resolve_and_update_version_on(
     http_client: &Arc<dyn HttpClient>,
     override_version: Option<(u32, u32, u32)>,
     runtime: &Arc<dyn wacore::runtime::Runtime>,
-) -> Result<Option<AppVersionFallback>> {
+) -> Result<Option<AppVersionFallback>, VersionError> {
     resolve_version_with_runtime(
         persistence_manager,
         http_client,
@@ -218,7 +257,7 @@ async fn resolve_version_with_runtime(
     http_client: &Arc<dyn HttpClient>,
     override_version: Option<(u32, u32, u32)>,
     runtime: Option<&Arc<dyn wacore::runtime::Runtime>>,
-) -> Result<Option<AppVersionFallback>> {
+) -> Result<Option<AppVersionFallback>, VersionError> {
     if let Some((p, s, t)) = override_version {
         debug!("Using user-provided override version: {}.{}.{}", p, s, t);
         stamp_version(persistence_manager, (p, s, t), runtime).await;
@@ -247,13 +286,7 @@ async fn resolve_version_with_runtime(
 
     if needs_fetch {
         debug!("WhatsApp version is stale or missing, fetching latest...");
-        // `.context`, not `anyhow!("… {e}")`: reformatting builds a new error
-        // and drops the chain, so the `HttpStatusError` the fetch attached
-        // would never reach a caller holding a `ConnectError::Version`. The
-        // message is the same either way; only the recoverability differs.
-        let fetched = fetch_latest_app_version(http_client)
-            .await
-            .context("Failed to fetch latest WhatsApp version");
+        let fetched = fetch_latest_app_version(http_client).await;
 
         let (p, s, t) = match fetched {
             Ok(version) => version,
@@ -263,7 +296,7 @@ async fn resolve_version_with_runtime(
                 // parser's fail-closed behaviour, so the two are reported
                 // apart. Both stay survivable: a DNS sinkhole that serves a
                 // page rather than refusing the request lands here too.
-                let reason = if e.chain().any(|c| c.is::<VersionShapeError>()) {
+                let reason = if e.is_shape() {
                     AppVersionFallbackReason::SourceUnparsable
                 } else {
                     AppVersionFallbackReason::SourceUnreachable
@@ -278,7 +311,11 @@ async fn resolve_version_with_runtime(
                 );
                 return Ok(Some(fallback));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(VersionError::Resolve(wacore::error::BoxedErrorSource::new(
+                    e,
+                )));
+            }
         };
 
         debug!("Fetched latest version: {}.{}.{}", p, s, t);
@@ -309,7 +346,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HttpClient for HeaderCapturingHttpClient {
-        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            request: HttpRequest,
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             *self.url.lock().unwrap() = Some(request.url.clone());
             *self.seen.lock().unwrap() = Some(request.headers);
             Ok(HttpResponse::new(200, b"client_revision:12345;".to_vec()))
@@ -318,7 +358,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HttpClient for StatusOnlyHttpClient {
-        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        async fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<HttpResponse, crate::http::HttpError> {
             Ok(HttpResponse::new(self.0, b"<html>error</html>".to_vec()))
         }
     }
@@ -341,7 +384,7 @@ mod tests {
             .await
             .expect_err("a 403 must not resolve a version");
 
-        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        let cause: &(dyn std::error::Error + 'static) = &err;
         assert_eq!(
             cause.http_status(),
             Some(403),
@@ -359,7 +402,7 @@ mod tests {
             .expect_err("a 403 must not be parsed as a version document");
         // Recoverable by type, not only readable — the same contract the media
         // paths answer, so a caller does not have to know which fetch it was.
-        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        let cause: &(dyn std::error::Error + 'static) = &err;
         assert_eq!(cause.http_status(), Some(403), "got: {err:?}");
         assert!(
             err.to_string().contains("403"),
@@ -373,7 +416,10 @@ mod tests {
 
         #[async_trait::async_trait]
         impl HttpClient for InvalidUtf8HttpClient {
-            async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+            async fn execute(
+                &self,
+                _: HttpRequest,
+            ) -> Result<HttpResponse, crate::http::HttpError> {
                 Ok(HttpResponse::new(
                     200,
                     b"client_revision:12345;\xff".to_vec(),
@@ -386,8 +432,8 @@ mod tests {
             .await
             .expect_err("invalid UTF-8 must reject the version document");
         assert!(matches!(
-            error.downcast_ref::<VersionShapeError>(),
-            Some(VersionShapeError::Body { .. })
+            error,
+            VersionError::Shape(VersionShapeError::Body { .. })
         ));
     }
 
@@ -553,24 +599,23 @@ mod tests {
     /// never answers is routine. Both survive, and they must not look alike.
     #[test]
     fn a_shape_failure_is_reported_apart_from_an_unreachable_source() {
-        let missing_field = anyhow::Error::new(VersionShapeError::Field {
+        let missing_field = VersionError::Shape(VersionShapeError::Field {
             field: "JSSDKRuntimeConfig.revision",
             url: "https://example.invalid/sdk.js",
-        })
-        .context("Failed to fetch latest WhatsApp version");
-        assert!(missing_field.chain().any(|c| c.is::<VersionShapeError>()));
+        });
+        assert!(missing_field.is_shape());
 
-        // A body that will not decode is the same class: the source answered.
-        let bad_body = anyhow::Error::new(VersionShapeError::Body {
+        let bad_body = VersionError::Shape(VersionShapeError::Body {
             url: "https://example.invalid/sdk.js",
             detail: "invalid utf-8".to_owned(),
-        })
-        .context("Failed to fetch latest WhatsApp version");
-        assert!(bad_body.chain().any(|c| c.is::<VersionShapeError>()));
+        });
+        assert!(bad_body.is_shape());
 
-        let unreachable = anyhow!("HTTP request to https://example.invalid/sdk.js failed: refused")
-            .context("Failed to fetch latest WhatsApp version");
-        assert!(!unreachable.chain().any(|c| c.is::<VersionShapeError>()));
+        let unreachable = VersionError::Request {
+            url: "https://example.invalid/sdk.js",
+            source: crate::http::HttpError::adapter(std::io::Error::other("refused")),
+        };
+        assert!(!unreachable.is_shape());
     }
 
     /// A hung source is unreachability with a longer wait, so the fatal source

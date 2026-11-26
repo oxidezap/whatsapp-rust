@@ -12,8 +12,13 @@ use whatsapp_rust::{Client, ClientBuilderError, ClientOptions, PresencePolicy, T
 struct HostHttp;
 #[async_trait::async_trait]
 impl HttpClient for HostHttp {
-    async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
-        anyhow::bail!("offline construction must not use HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
+        Err(whatsapp_rust::http::HttpError::adapter(
+            std::io::Error::other("offline construction must not use HTTP"),
+        ))
     }
 }
 
@@ -22,8 +27,11 @@ struct HostTransport;
 impl TransportFactory for HostTransport {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
-        anyhow::bail!("offline construction must not connect")
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        whatsapp_rust::transport::TransportError,
+    > {
+        Err("offline construction must not connect".into())
     }
 }
 

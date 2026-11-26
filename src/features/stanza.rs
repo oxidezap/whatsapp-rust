@@ -62,7 +62,7 @@ impl From<NackReason> for StanzaRejection {
 }
 
 /// Failure while confirming or rejecting an inbound stanza.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum StanzaResponseError {
     #[error("stanza is missing required '{0}' attribute")]
@@ -75,6 +75,13 @@ pub enum StanzaResponseError {
     Encoding(#[from] wacore_binary::error::BinaryError),
     #[error("{0}")]
     Client(#[from] ClientError),
+}
+
+impl std::fmt::Debug for StanzaResponseError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Options for requesting retransmission of one inbound message stanza.
@@ -164,7 +171,7 @@ pub enum RetryRequestOutcome {
 }
 
 /// Failure while parsing or sending a retransmission request.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum RetryRequestError {
     #[error("retry requests require a message stanza")]
@@ -173,12 +180,29 @@ pub enum RetryRequestError {
     MissingAttribute(&'static str),
     #[error("the local device identity is unavailable")]
     MissingLocalIdentity,
+    #[error("{0}")]
+    DeviceIdentity(#[from] wacore::send::DeviceIdentityError),
     #[error("invalid message stanza")]
-    InvalidStanza(#[source] anyhow::Error),
+    InvalidStanza(#[source] wacore::messages::MessageInfoError),
     #[error("{0}")]
     Client(#[from] ClientError),
+    #[error("{0}")]
+    PreKey(#[from] crate::prekeys::PreKeyUploadError),
     #[error("failed to prepare retry request")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<crate::store::error::StoreError> for RetryRequestError {
+    fn from(error: crate::store::error::StoreError) -> Self {
+        Self::Internal(Box::new(error))
+    }
+}
+
+impl std::fmt::Debug for RetryRequestError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A request to retransmit an already-sent message to one requesting device.
@@ -291,7 +315,8 @@ mod tests {
     fn internal_retry_error_preserves_its_source() {
         use std::error::Error as _;
 
-        let error = RetryRequestError::from(anyhow::anyhow!("storage sentinel"));
+        let error =
+            RetryRequestError::Internal(Box::new(std::io::Error::other("storage sentinel")));
         assert_eq!(
             error.source().map(ToString::to_string).as_deref(),
             Some("storage sentinel")

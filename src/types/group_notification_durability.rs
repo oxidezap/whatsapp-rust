@@ -1,4 +1,3 @@
-use anyhow::Result;
 use std::sync::Arc;
 use wacore_binary::OwnedNodeRef;
 
@@ -48,5 +47,8 @@ pub trait GroupNotificationDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// successful return does not promise effects or an ACK: the connection
     /// may have retired while this future was pending. Implementations must
     /// therefore publish downstream work atomically with their durable record.
-    async fn on_notification(&self, node: Arc<OwnedNodeRef>) -> Result<()>;
+    async fn on_notification(
+        &self,
+        node: Arc<OwnedNodeRef>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

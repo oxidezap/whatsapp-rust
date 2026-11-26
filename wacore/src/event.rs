@@ -3,11 +3,10 @@
 //! Thin wrapper over [`secret_enc_addon`](crate::secret_enc_addon) specialised for the
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
-use anyhow::{Result, ensure};
 use waproto::whatsapp::message::EventResponseMessage;
 
 use crate::secret_enc_addon::{
-    AddonContext, MESSAGE_SECRET_SIZE, ModificationType, decrypt_addon, encrypt_addon,
+    AddonContext, AddonError, MESSAGE_SECRET_SIZE, ModificationType, decrypt_addon, encrypt_addon,
 };
 
 const GCM_IV_SIZE: usize = 12;
@@ -33,12 +32,13 @@ pub fn encrypt_event_response_with_secret(
     stanza_id: &str,
     event_creator_jid: &str,
     responder_jid: &str,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE]), AddonError> {
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(AddonError::InvalidSecretSize {
+            expected: MESSAGE_SECRET_SIZE,
+            got: message_secret.len(),
+        });
+    }
     let plaintext = waproto::codec::event_response_message_to_vec(response);
     encrypt_addon(
         &plaintext,
@@ -58,7 +58,7 @@ pub fn decrypt_event_response_with_secret(
     stanza_id: &str,
     event_creator_jid: &str,
     responder_jid: &str,
-) -> Result<EventResponseMessage> {
+) -> Result<EventResponseMessage, AddonError> {
     let plaintext = decrypt_event_response_payload_with_secret(
         enc_payload,
         iv,
@@ -67,7 +67,7 @@ pub fn decrypt_event_response_with_secret(
         event_creator_jid,
         responder_jid,
     )?;
-    Ok(waproto::codec::event_response_message_decode(&plaintext)?)
+    waproto::codec::event_response_message_decode(&plaintext).map_err(AddonError::ProtobufDecode)
 }
 
 /// Decrypt an event response and return its encoded protobuf payload.
@@ -81,13 +81,14 @@ pub fn decrypt_event_response_payload_with_secret(
     stanza_id: &str,
     event_creator_jid: &str,
     responder_jid: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, AddonError> {
     // The IV length is validated downstream by decrypt_addon (try_into [u8; 12]).
-    ensure!(
-        message_secret.len() == MESSAGE_SECRET_SIZE,
-        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
-        message_secret.len()
-    );
+    if message_secret.len() != MESSAGE_SECRET_SIZE {
+        return Err(AddonError::InvalidSecretSize {
+            expected: MESSAGE_SECRET_SIZE,
+            got: message_secret.len(),
+        });
+    }
     decrypt_addon(
         enc_payload,
         iv,

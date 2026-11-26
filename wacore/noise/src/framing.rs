@@ -1,3 +1,4 @@
+use crate::error::NoiseError;
 use bytes::{Buf, Bytes, BytesMut};
 use log::trace;
 
@@ -50,7 +51,7 @@ pub fn encode_frame_into(
     payload: &[u8],
     header: Option<&[u8]>,
     out: &mut impl FrameBuf,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), NoiseError> {
     out.clear();
     append_frame_into(payload, header, out)
 }
@@ -69,13 +70,12 @@ pub fn append_frame_header_into(
     payload_len: usize,
     header: Option<&[u8]>,
     out: &mut impl FrameBuf,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), NoiseError> {
     if payload_len >= FRAME_MAX_SIZE {
-        return Err(anyhow::anyhow!(
-            "Frame is too large (max: {}, got: {})",
-            FRAME_MAX_SIZE,
-            payload_len
-        ));
+        return Err(NoiseError::FrameTooLarge {
+            max: FRAME_MAX_SIZE,
+            got: payload_len,
+        });
     }
 
     let header_len = header.map(|h| h.len()).unwrap_or(0);
@@ -101,7 +101,7 @@ pub fn append_frame_into(
     payload: &[u8],
     header: Option<&[u8]>,
     out: &mut impl FrameBuf,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), NoiseError> {
     append_frame_header_into(payload.len(), header, out)?;
     out.extend_from_slice(payload);
 
@@ -110,7 +110,7 @@ pub fn append_frame_into(
 
 /// Encodes a payload into a WhatsApp frame with length prefix.
 /// For performance-critical paths, prefer `encode_frame_into`.
-pub fn encode_frame(payload: &[u8], header: Option<&[u8]>) -> Result<Vec<u8>, anyhow::Error> {
+pub fn encode_frame(payload: &[u8], header: Option<&[u8]>) -> Result<Vec<u8>, NoiseError> {
     let header_len = header.map(|h| h.len()).unwrap_or(0);
     let prefix_len = header_len + FRAME_LENGTH_SIZE;
     let mut data = Vec::with_capacity(prefix_len + payload.len());

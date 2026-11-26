@@ -28,7 +28,7 @@ use wacore_binary::Jid;
 const SUBGROUP_QUERY_CONTEXT: &str = "INTERACTIVE";
 
 /// Error returned by community operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum CommunityError {
     /// A `w:g2` IQ to the server failed.
@@ -56,6 +56,13 @@ pub enum CommunityError {
         #[source]
         source: Box<GroupError>,
     },
+}
+
+impl std::fmt::Debug for CommunityError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A follow-up step after remote community creation.

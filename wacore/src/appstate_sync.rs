@@ -3,7 +3,6 @@ pub mod preparation;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -31,7 +30,7 @@ pub struct CommittedMutationsError {
     state: HashState,
     collection: WAPatchName,
     #[source]
-    source: anyhow::Error,
+    source: AppStateProcessingError,
 }
 
 impl std::fmt::Debug for CommittedMutationsError {
@@ -48,7 +47,14 @@ impl std::fmt::Debug for CommittedMutationsError {
 
 impl CommittedMutationsError {
     /// Split the committed work from the error that stopped the next patch.
-    pub fn into_parts(self) -> (Vec<Mutation>, HashState, WAPatchName, anyhow::Error) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Mutation>,
+        HashState,
+        WAPatchName,
+        AppStateProcessingError,
+    ) {
         (self.mutations, self.state, self.collection, self.source)
     }
 }
@@ -62,7 +68,7 @@ impl CommittedMutationsError {
 pub struct CommittedPatchListsError {
     results: Vec<(Vec<Mutation>, HashState, PatchList)>,
     #[source]
-    source: anyhow::Error,
+    source: AppStateProcessingError,
 }
 
 impl std::fmt::Debug for CommittedPatchListsError {
@@ -77,17 +83,22 @@ impl std::fmt::Debug for CommittedPatchListsError {
 
 impl CommittedPatchListsError {
     /// Split the committed collection results from the later error.
-    pub fn into_parts(self) -> (Vec<(Vec<Mutation>, HashState, PatchList)>, anyhow::Error) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(Vec<Mutation>, HashState, PatchList)>,
+        AppStateProcessingError,
+    ) {
         (self.results, self.source)
     }
 }
 
 fn committed_mutations_error(
-    source: anyhow::Error,
+    source: AppStateProcessingError,
     mutations: Vec<Mutation>,
     state: &HashState,
     collection: WAPatchName,
-) -> anyhow::Error {
+) -> AppStateProcessingError {
     if mutations.is_empty() {
         source
     } else {
@@ -225,6 +236,189 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
     macs
 }
 
+#[derive(Error)]
+#[non_exhaustive]
+pub enum AppStatePreparationErrorKind {
+    #[error("{0}")]
+    Validation(#[source] crate::appstate::validation::ValidationError),
+    #[error("{0}")]
+    SnapshotIntegrity(#[source] crate::appstate::validation::ValidationError),
+    #[error("{0}")]
+    ExternalBlob(#[source] ExternalBlobError),
+    #[error("download external snapshot for {name:?}")]
+    DownloadSnapshot {
+        name: WAPatchName,
+        #[source]
+        source: ExternalBlobError,
+    },
+    #[error("decode external snapshot for {name:?}")]
+    DecodeSnapshot {
+        name: WAPatchName,
+        #[source]
+        source: buffa::DecodeError,
+    },
+    #[error("download external mutations for {name:?} v{version}")]
+    DownloadMutations {
+        name: WAPatchName,
+        version: u64,
+        #[source]
+        source: ExternalBlobError,
+    },
+    #[error("decode external mutations for {name:?} v{version}")]
+    DecodeMutations {
+        name: WAPatchName,
+        version: u64,
+        #[source]
+        source: buffa::DecodeError,
+    },
+}
+
+debug_as_display!(AppStatePreparationErrorKind);
+
+pub struct AppStatePreparationError(Box<AppStatePreparationErrorKind>);
+
+impl AppStatePreparationError {
+    pub fn new(kind: AppStatePreparationErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &AppStatePreparationErrorKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> AppStatePreparationErrorKind {
+        *self.0
+    }
+
+    pub fn validation_error(&self) -> Option<&crate::appstate::validation::ValidationError> {
+        match self.kind() {
+            AppStatePreparationErrorKind::Validation(error)
+            | AppStatePreparationErrorKind::SnapshotIntegrity(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::appstate::validation::ValidationError> for AppStatePreparationError {
+    fn from(error: crate::appstate::validation::ValidationError) -> Self {
+        Self::new(AppStatePreparationErrorKind::Validation(error))
+    }
+}
+
+impl From<ExternalBlobError> for AppStatePreparationError {
+    fn from(error: ExternalBlobError) -> Self {
+        Self::new(AppStatePreparationErrorKind::ExternalBlob(error))
+    }
+}
+
+impl std::fmt::Display for AppStatePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        display_error_chain(&*self.0, formatter)
+    }
+}
+
+debug_as_display!(AppStatePreparationError);
+
+impl std::error::Error for AppStatePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+#[derive(Error)]
+#[non_exhaustive]
+pub enum AppStateProcessingErrorKind {
+    #[error("{0}")]
+    Preparation(#[source] AppStatePreparationError),
+    #[error("{0}")]
+    Store(#[source] crate::store::error::StoreError),
+    #[error("{0}")]
+    Sync(#[source] AppStateSyncError),
+    #[error("{0}")]
+    AppState(#[source] crate::appstate::AppStateError),
+    #[error("{0}")]
+    CommittedMutations(#[source] CommittedMutationsError),
+    #[error("{0}")]
+    CommittedPatchLists(#[source] CommittedPatchListsError),
+}
+
+debug_as_display!(AppStateProcessingErrorKind);
+
+pub struct AppStateProcessingError(Box<AppStateProcessingErrorKind>);
+
+impl AppStateProcessingError {
+    pub fn new(kind: AppStateProcessingErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn kind(&self) -> &AppStateProcessingErrorKind {
+        &self.0
+    }
+
+    pub fn into_kind(self) -> AppStateProcessingErrorKind {
+        *self.0
+    }
+
+    pub fn preparation_error(&self) -> Option<&AppStatePreparationError> {
+        match self.kind() {
+            AppStateProcessingErrorKind::Preparation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+macro_rules! processing_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for AppStateProcessingError {
+            fn from(error: $source) -> Self {
+                Self::new(AppStateProcessingErrorKind::$variant(error))
+            }
+        })+
+    };
+}
+
+processing_error_from!(
+    AppStatePreparationError => Preparation,
+    crate::store::error::StoreError => Store,
+    AppStateSyncError => Sync,
+    crate::appstate::AppStateError => AppState,
+    CommittedMutationsError => CommittedMutations,
+    CommittedPatchListsError => CommittedPatchLists,
+);
+
+impl std::fmt::Display for AppStateProcessingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        display_error_chain(&*self.0, formatter)
+    }
+}
+
+fn display_error_chain(
+    error: &(dyn std::error::Error + 'static),
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    write!(formatter, "{error}")?;
+    if formatter.alternate() {
+        let mut source = error.source();
+        for _ in 0..16 {
+            let Some(cause) = source else { return Ok(()) };
+            write!(formatter, ": {cause}")?;
+            source = cause.source();
+        }
+        if source.is_some() {
+            formatter.write_str(": ...")?;
+        }
+    }
+    Ok(())
+}
+
+debug_as_display!(AppStateProcessingError);
+
+impl std::error::Error for AppStateProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
 /// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
 /// linear scan instead of a sort; above it the sort wins despite allocating
 /// every MAC before deduping.
@@ -241,7 +435,7 @@ struct PatchListProgress {
 /// Validate collection metadata before admitting external downloads.
 /// Large lists belong on a blocking worker, as in [`AppStateProcessor::prepare_patch_list`].
 #[inline(never)]
-pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
+pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<(), AppStatePreparationError> {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     prepared_validation_tests::METADATA_VALIDATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     let name = pl.name;
@@ -261,21 +455,27 @@ pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
 }
 
 #[inline(never)]
-fn validate_snapshot_for_processing(collection: &str, snapshot: &wa::SyncdSnapshot) -> Result<()> {
+fn validate_snapshot_for_processing(
+    collection: &str,
+    snapshot: &wa::SyncdSnapshot,
+) -> Result<(), AppStatePreparationError> {
     crate::appstate::validation::validate_snapshot(collection, snapshot).map_err(|error| {
         if matches!(
             error.metric.as_deref(),
             Some("MISSING_SNAPSHOT_MAC" | "MISSING_SNAPSHOT_KEY_ID")
         ) {
-            anyhow::Error::new(error).context(crate::appstate::AppStateError::SnapshotMACMissing)
+            AppStatePreparationError::new(AppStatePreparationErrorKind::SnapshotIntegrity(error))
         } else {
-            anyhow::Error::new(error)
+            error.into()
         }
     })
 }
 
 #[cfg(test)]
-fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
+fn download_external_blobs(
+    pl: &mut PatchList,
+    download: &BlobDownloadFn<'_>,
+) -> Result<(), AppStatePreparationError> {
     validate_patch_list_metadata(pl)?;
     decode_external_blobs(pl, download, true)
 }
@@ -285,16 +485,24 @@ fn decode_external_blobs(
     pl: &mut PatchList,
     download: &BlobDownloadFn<'_>,
     validate: bool,
-) -> Result<()> {
+) -> Result<(), AppStatePreparationError> {
     let name = pl.name;
     let collection = name.as_str();
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
-        let data =
-            download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = waproto::codec::syncd_snapshot_decode(&data)
-            .with_context(|| format!("decode external snapshot for {name:?}"))?;
+        let data = download(ext).map_err(|source| {
+            AppStatePreparationError::new(AppStatePreparationErrorKind::DownloadSnapshot {
+                name,
+                source,
+            })
+        })?;
+        let snapshot = waproto::codec::syncd_snapshot_decode(&data).map_err(|source| {
+            AppStatePreparationError::new(AppStatePreparationErrorKind::DecodeSnapshot {
+                name,
+                source,
+            })
+        })?;
         if validate {
             validate_snapshot_for_processing(collection, &snapshot)?;
         }
@@ -308,10 +516,21 @@ fn decode_external_blobs(
                 .as_option()
                 .and_then(|x| x.version)
                 .unwrap_or(0);
-            let data = download(ext)
-                .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = waproto::codec::syncd_mutations_decode(&data)
-                .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
+            let data = download(ext).map_err(|source| {
+                AppStatePreparationError::new(AppStatePreparationErrorKind::DownloadMutations {
+                    name,
+                    version: v,
+                    source,
+                })
+            })?;
+            let ext_mutations =
+                waproto::codec::syncd_mutations_decode(&data).map_err(|source| {
+                    AppStatePreparationError::new(AppStatePreparationErrorKind::DecodeMutations {
+                        name,
+                        version: v,
+                        source,
+                    })
+                })?;
             if validate {
                 for mutation in &ext_mutations.mutations {
                     crate::appstate::validation::validate_mutation(collection, mutation)?;
@@ -351,7 +570,7 @@ fn decode_external_blobs(
 #[derive(Debug)]
 pub struct MetadataValidatedPatchList {
     list: PatchList,
-    error: Option<anyhow::Error>,
+    error: Option<AppStatePreparationError>,
 }
 impl MetadataValidatedPatchList {
     /// Validate an owned list. Large collections belong on a blocking worker.
@@ -376,7 +595,7 @@ impl MetadataValidatedPatchList {
 #[derive(Debug)]
 pub struct PreparedPatchList {
     list: PatchList,
-    error: Option<anyhow::Error>,
+    error: Option<AppStatePreparationError>,
 }
 impl PreparedPatchList {
     pub fn list(&self) -> &PatchList {
@@ -387,22 +606,113 @@ impl PreparedPatchList {
     }
 }
 
+#[derive(Error)]
+#[non_exhaustive]
+pub enum ExternalBlobError {
+    #[error("external blob has no directPath")]
+    MissingDirectPath,
+    #[error("external blob not pre-downloaded: {0}")]
+    NotPrefetched(String),
+    #[error("{0}")]
+    Download(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+debug_as_display!(ExternalBlobError);
+
+impl ExternalBlobError {
+    pub fn download(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Download(Box::new(error))
+    }
+}
+
 /// External-blob resolver as a trait object, so the large download/decode/apply
 /// bodies below instantiate once instead of per closure type. Returns `Bytes`
 /// so a resolver serving from a prefetch map hands out a refcount instead of
 /// copying the blob.
-pub type BlobDownloadFn<'a> =
-    dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + Send + Sync + 'a;
+pub type BlobDownloadFn<'a> = dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes, ExternalBlobError>
+    + Send
+    + Sync
+    + 'a;
+
+/// Reason a SyncdSnapshotRecovery payload was refused.
+#[derive(Error)]
+#[non_exhaustive]
+pub enum SnapshotRecoveryError {
+    #[error("snapshot recovery names no collection")]
+    MissingCollectionName,
+    #[error("snapshot recovery is for {found}, not the {expected} that was asked for")]
+    CollectionMismatch { found: String, expected: String },
+    #[error("snapshot recovery for {collection} carries no version")]
+    MissingVersion { collection: String },
+    #[error("snapshot recovery for {collection} carries no ltHash")]
+    MissingLtHash { collection: String },
+    #[error("snapshot recovery for {collection} carries a {actual}-byte ltHash, not 128")]
+    InvalidLtHashLength { collection: String, actual: usize },
+    #[error("recovery record {record_index} of {collection} carries no key id")]
+    MissingRecordKeyId {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no value")]
+    MissingRecordValue {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no action value")]
+    MissingRecordActionValue {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no MAC")]
+    MissingRecordMac {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries a {actual}-byte MAC, not 32")]
+    InvalidRecordMacLength {
+        collection: String,
+        record_index: usize,
+        actual: usize,
+    },
+    #[error("recovery record {record_index} of {collection} carries no index")]
+    MissingRecordIndex {
+        collection: String,
+        record_index: usize,
+    },
+    #[error("recovery record {record_index} of {collection} has an unreadable index: {error}")]
+    UnreadableRecordIndex {
+        collection: String,
+        record_index: usize,
+        error: String,
+    },
+    #[error("recovery record {record_index} of {collection} carries an empty index")]
+    EmptyRecordIndex {
+        collection: String,
+        record_index: usize,
+    },
+}
+
+impl std::fmt::Debug for SnapshotRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
     KeyNotFound(String),
-    #[error("store error")]
+    #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
     #[error("{0}")]
-    Other(#[from] anyhow::Error),
+    SnapshotRecovery(#[from] SnapshotRecoveryError),
+    #[error("external blob was not resolved")]
+    ExternalBlobNotResolved,
+    #[error("no app state sync key available")]
+    NoSyncKeyAvailable,
+    #[error("{0}")]
+    AppState(#[from] crate::appstate::AppStateError),
 }
 
 /// One outstanding ask, and the id the answer will carry back.
@@ -550,7 +860,10 @@ impl AppStateProcessor {
         self
     }
 
-    async fn persist_mutation_effects(&self, mutations: &[Mutation]) -> Result<()> {
+    async fn persist_mutation_effects(
+        &self,
+        mutations: &[Mutation],
+    ) -> Result<(), crate::store::error::StoreError> {
         let Some(persistence) = self.mutation_persistence.as_ref() else {
             return Ok(());
         };
@@ -825,7 +1138,7 @@ impl AppStateProcessor {
     pub async fn get_app_state_key(
         &self,
         key_id: &[u8],
-    ) -> std::result::Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
+    ) -> Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD_NO_PAD;
         if let Some(cached) = self.key_cache.lock().await.get(key_id) {
@@ -874,25 +1187,29 @@ impl AppStateProcessor {
         recovery: wa::SyncdSnapshotRecovery,
         expected_collection: &str,
         still_current: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<RecoveryOutcome> {
+    ) -> Result<RecoveryOutcome, AppStateSyncError> {
         // The response says which collection it is, and the request said which
         // one was asked for. WA Web compares the two and refuses on mismatch;
         // so does this, because the reply is not correlated by anything else.
         let name = recovery
             .collection_name
             .as_deref()
-            .ok_or_else(|| anyhow!("snapshot recovery names no collection"))?;
+            .ok_or(SnapshotRecoveryError::MissingCollectionName)?;
         if name != expected_collection {
-            return Err(anyhow!(
-                "snapshot recovery is for {name}, not the {expected_collection} that was asked for"
-            ));
+            return Err(SnapshotRecoveryError::CollectionMismatch {
+                found: name.to_string(),
+                expected: expected_collection.to_string(),
+            }
+            .into());
         }
 
         let version = recovery
             .version
             .as_option()
             .and_then(|v| v.version)
-            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no version"))?;
+            .ok_or_else(|| SnapshotRecoveryError::MissingVersion {
+                collection: name.to_string(),
+            })?;
 
         // Asked here, before the ltHash is read and before a single record is
         // looked at. Nothing waits for this reply, so the collection can have
@@ -918,26 +1235,30 @@ impl AppStateProcessor {
             });
         }
 
-        let lthash = recovery
-            .collection_lthash
-            .as_deref()
-            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no ltHash"))?;
-        let hash: [u8; 128] = lthash.try_into().map_err(|_| {
-            anyhow!(
-                "snapshot recovery for {name} carries a {}-byte ltHash, not 128",
-                lthash.len()
-            )
+        let lthash = recovery.collection_lthash.as_deref().ok_or_else(|| {
+            SnapshotRecoveryError::MissingLtHash {
+                collection: name.to_string(),
+            }
         })?;
+        let hash: [u8; 128] =
+            lthash
+                .try_into()
+                .map_err(|_| SnapshotRecoveryError::InvalidLtHashLength {
+                    collection: name.to_string(),
+                    actual: lthash.len(),
+                })?;
 
         // The keys first, because looking one up may reach the store and the
         // work below may not. Distinct ids only: a collection is usually keyed
         // by one or two, and the cache behind this makes a repeat cheap anyway.
         let mut keys_by_id: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> = HashMap::new();
         for (i, record) in recovery.mutation_records.iter().enumerate() {
-            let key_id = record
-                .key_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no key id"))?;
+            let key_id = record.key_id.as_deref().ok_or_else(|| {
+                SnapshotRecoveryError::MissingRecordKeyId {
+                    collection: name.to_string(),
+                    record_index: i,
+                }
+            })?;
             if !keys_by_id.contains_key(key_id) {
                 let keys = self.get_app_state_key(key_id).await?;
                 keys_by_id.insert(key_id.to_vec(), keys);
@@ -1006,7 +1327,10 @@ impl AppStateProcessor {
                     continue;
                 }
                 let action = record.value.into_option().ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no value")
+                    SnapshotRecoveryError::MissingRecordValue {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    }
                 })?;
                 // The payload itself, not just the envelope around it. A record
                 // whose `SyncActionData` omits its value produces a mutation
@@ -1016,19 +1340,28 @@ impl AppStateProcessor {
                 // update is gone. The snapshot path does not count a value-less
                 // record as part of the collection either.
                 if action.value.is_unset() {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries no action value"
-                    ));
+                    return Err(SnapshotRecoveryError::MissingRecordActionValue {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    });
                 }
-                let key_id = record.key_id.ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no key id")
-                })?;
+                let key_id =
+                    record
+                        .key_id
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordKeyId {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 // The record's own MAC is the value MAC the store keeps: the
                 // primary sends what it computed over the encrypted form, so
                 // nothing here has to re-encrypt a record to arrive at it.
-                let value_mac = record
-                    .mac
-                    .ok_or_else(|| anyhow!("recovery record {i} of {owned_name} carries no MAC"))?;
+                let value_mac =
+                    record
+                        .mac
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordMac {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 // The store keeps this as a value MAC and a later patch
                 // subtracts it from the ltHash to overwrite or remove the index.
                 // A MAC of the wrong length would be subtracted just the same,
@@ -1036,14 +1369,19 @@ impl AppStateProcessor {
                 // collection behind another MAC failure -- the very thing this
                 // recovery exists to end.
                 if value_mac.len() != 32 {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries a {}-byte MAC, not 32",
-                        value_mac.len()
-                    ));
+                    return Err(SnapshotRecoveryError::InvalidRecordMacLength {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                        actual: value_mac.len(),
+                    });
                 }
-                let index = action.index.ok_or_else(|| {
-                    anyhow!("recovery record {i} of {owned_name} carries no index")
-                })?;
+                let index =
+                    action
+                        .index
+                        .ok_or_else(|| SnapshotRecoveryError::MissingRecordIndex {
+                            collection: owned_name.clone(),
+                            record_index: i,
+                        })?;
                 let keys = keys_by_id
                     .get(&key_id)
                     .expect("every key id was fetched above");
@@ -1060,7 +1398,11 @@ impl AppStateProcessor {
                 // losing a record is exactly the failure this recovery exists to
                 // end, and every other field here is already required.
                 let parsed_index: Vec<String> = serde_json::from_slice(&index).map_err(|e| {
-                    anyhow!("recovery record {i} of {owned_name} has an unreadable index: {e}")
+                    SnapshotRecoveryError::UnreadableRecordIndex {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                        error: e.to_string(),
+                    }
                 })?;
                 // `[]` parses, and then names nothing:
                 // `dispatch_app_state_mutation` returns early on an empty index,
@@ -1068,9 +1410,10 @@ impl AppStateProcessor {
                 // committed and the version written -- the same silent loss the
                 // unreadable index above is refused for, one step further along.
                 if parsed_index.is_empty() {
-                    return Err(anyhow!(
-                        "recovery record {i} of {owned_name} carries an empty index"
-                    ));
+                    return Err(SnapshotRecoveryError::EmptyRecordIndex {
+                        collection: owned_name.clone(),
+                        record_index: i,
+                    });
                 }
 
                 mutations.push(Mutation {
@@ -1082,7 +1425,7 @@ impl AppStateProcessor {
                     operation: wa::syncd_mutation::SyncdOperation::SET,
                 });
             }
-            Ok::<_, anyhow::Error>((mutations, macs))
+            Ok((mutations, macs))
         })
         .await?;
 
@@ -1154,7 +1497,7 @@ impl AppStateProcessor {
     async fn prefetch_keys(
         &self,
         pl: &PatchList,
-    ) -> Result<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>> {
+    ) -> Result<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>, AppStateSyncError> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut keys = HashMap::with_capacity(key_ids.len());
         for key_id in key_ids {
@@ -1163,7 +1506,7 @@ impl AppStateProcessor {
                     keys.insert(key_id.to_vec(), expanded);
                 }
                 Err(AppStateSyncError::KeyNotFound(_)) => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         Ok(keys)
@@ -1173,14 +1516,14 @@ impl AppStateProcessor {
     /// then decoding and applying it.
     ///
     /// If a later patch fails after earlier mutations were committed, the error
-    /// downcasts to [`CommittedMutationsError`].
+    /// contains [`AppStateProcessingErrorKind::CommittedMutations`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
         pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let prepared = self.prepare_patch_list(pl, download).await;
         self.process_prepared_patch_list(prepared, validate_macs)
             .await
@@ -1244,7 +1587,7 @@ impl AppStateProcessor {
                 Err(error) => {
                     return PreparedPatchList {
                         list: pl,
-                        error: Some(error),
+                        error: Some(error.into()),
                     };
                 }
             }
@@ -1258,7 +1601,9 @@ impl AppStateProcessor {
                 blobs
                     .get(position.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                     .cloned()
-                    .ok_or_else(|| anyhow!("external blob was not resolved"))
+                    .ok_or_else(|| {
+                        ExternalBlobError::download(AppStateSyncError::ExternalBlobNotResolved)
+                    })
             };
             let error = decode_external_blobs(&mut pl, &resolver, true).err();
             PreparedPatchList { list: pl, error }
@@ -1270,10 +1615,10 @@ impl AppStateProcessor {
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let PreparedPatchList { list, error } = prepared;
         if let Some(error) = error {
-            return Err(error);
+            return Err(error.into());
         }
         if list.error.is_some() {
             let state = self
@@ -1289,7 +1634,7 @@ impl AppStateProcessor {
     /// Process already-parsed patch lists and download any external blobs.
     ///
     /// If a later collection fails after earlier collections were committed,
-    /// the error downcasts to [`CommittedPatchListsError`]. Its results still
+    /// the error contains [`AppStateProcessingErrorKind::CommittedPatchLists`]. Its results still
     /// require dispatch. The source retains any [`CommittedMutationsError`]
     /// raised within the failed collection.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
@@ -1298,7 +1643,7 @@ impl AppStateProcessor {
         patch_lists: Vec<PatchList>,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>, AppStateProcessingError> {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for pl in patch_lists {
@@ -1328,7 +1673,7 @@ impl AppStateProcessor {
         pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let prepared = self.prepare_patch_list(pl, download).await;
         self.process_one_prepared_patch_list(prepared, validate_macs)
             .await
@@ -1338,7 +1683,7 @@ impl AppStateProcessor {
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         let PreparedPatchList {
             list: mut pl,
             error,
@@ -1357,16 +1702,14 @@ impl AppStateProcessor {
         // patch (silent data loss). Mark the collection retryable and skip it, so
         // the caller re-fetches it instead of persisting partial state.
         if let Some(e) = error {
-            if matches!(
-                e.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(
-                    crate::appstate::AppStateError::SnapshotMACMissing
-                        | crate::appstate::AppStateError::SnapshotMACMismatch
-                )
-            ) {
-                return Err(e);
+            if matches!(e.kind(), AppStatePreparationErrorKind::SnapshotIntegrity(_)) {
+                return Err(e.into());
             }
-            log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e:#}", pl.name);
+            if let Some(cause) = std::error::Error::source(e.kind()) {
+                log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e}: {cause}", pl.name);
+            } else {
+                log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e}", pl.name);
+            }
             pl.error = Some(CollectionSyncError::Retry {
                 code: 0,
                 text: e.to_string(),
@@ -1385,14 +1728,14 @@ impl AppStateProcessor {
     /// Process one patch list whose external blobs have already been inlined.
     ///
     /// If a later patch fails after earlier mutations were committed, the error
-    /// downcasts to [`CommittedMutationsError`]. Its mutations still require
+    /// contains [`AppStateProcessingErrorKind::CommittedMutations`]. Its mutations still require
     /// dispatch, and its state is the last committed cursor.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,
         mut pl: PatchList,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList), AppStateProcessingError> {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
@@ -1580,7 +1923,7 @@ impl AppStateProcessor {
         &self,
         collection_name: &str,
         mutations: Vec<wa::SyncdMutation>,
-    ) -> Result<(Vec<u8>, u64)> {
+    ) -> Result<(Vec<u8>, u64), AppStateSyncError> {
         use crate::appstate::hash::generate_patch_mac;
 
         // Get active key
@@ -1588,7 +1931,7 @@ impl AppStateProcessor {
             .backend
             .get_latest_sync_key_id()
             .await?
-            .ok_or_else(|| anyhow!("No app state sync key available"))?;
+            .ok_or(AppStateSyncError::NoSyncKeyAvailable)?;
         let keys = self.get_app_state_key(&key_id).await?;
 
         // Get current hash state — save base version for the caller
@@ -1645,7 +1988,10 @@ impl AppStateProcessor {
         Ok((patch_bytes, base_version))
     }
 
-    pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
+    pub async fn get_missing_key_ids(
+        &self,
+        pl: &PatchList,
+    ) -> crate::store::error::Result<Vec<Vec<u8>>> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
@@ -1663,7 +2009,7 @@ impl AppStateProcessor {
         keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
         progress: &mut PatchListProgress,
         validate_macs: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateProcessingError> {
         let collection_name = pl.name.as_str();
         let collection_name_owned = collection_name.to_string();
 
@@ -1683,8 +2029,8 @@ impl AppStateProcessor {
         // Carried as itself rather than flattened to a string: a snapshot MAC
         // that does not match is the one error with an answer -- asking the
         // primary for the collection -- and a caller can only tell it apart
-        // from a missing key or a bad decode by downcasting to it.
-        .map_err(anyhow::Error::new)?;
+        // from a missing key or a bad decode by matching its variant.
+        ?;
 
         let (snapshot, snapshot_state, snapshot_result) = result.into_parts();
         pl.snapshot = Some(snapshot);
@@ -1733,7 +2079,7 @@ impl AppStateProcessor {
         progress: &mut PatchListProgress,
         validate_macs: bool,
         final_page: bool,
-    ) -> Result<wa::SyncdPatch> {
+    ) -> Result<wa::SyncdPatch, AppStateProcessingError> {
         let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
         // Fetch previous value MACs in one backend round-trip instead of a
@@ -1766,7 +2112,7 @@ impl AppStateProcessor {
         .await;
         let mut prepared = match processed {
             Ok(prepared) => prepared,
-            Err(error) => return Err(anyhow!("{}", error)),
+            Err(error) => return Err(AppStateSyncError::AppState(error).into()),
         };
         if final_page {
             prepared.mark_bootstrapped();
@@ -1802,12 +2148,12 @@ impl AppStateProcessor {
         &self,
         pl: &mut PatchList,
         download: &BlobDownloadFn<'_>,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Vec<u8>>, AppStateProcessingError> {
         // Check the original metadata before inlining can erase conflicting
         // inline mutations. Owned runtime callers use blocking preparation.
         validate_patch_list_metadata(pl)?;
         decode_external_blobs(pl, download, false)?;
-        self.get_missing_key_ids(pl).await
+        Ok(self.get_missing_key_ids(pl).await?)
     }
 }
 
@@ -1891,8 +2237,10 @@ mod external_blob_tests {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
         let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow!("simulated failure"))
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Err(ExternalBlobError::download(std::io::Error::other(
+                "simulated failure",
+            )))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));
@@ -1903,7 +2251,7 @@ mod external_blob_tests {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
         let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
@@ -1921,8 +2269,10 @@ mod external_blob_tests {
             snapshot_ref: None,
             error: None,
         };
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-            Err(anyhow!("simulated failure"))
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Err(ExternalBlobError::download(std::io::Error::other(
+                "simulated failure",
+            )))
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert!(format!("{error:#}").contains("simulated failure"));
@@ -1942,7 +2292,7 @@ mod external_blob_tests {
         };
         let fetches = std::sync::atomic::AtomicUsize::new(0);
         // An empty buffer decodes as a `SyncdMutations` with no mutations.
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(bytes::Bytes::new())
         };
@@ -1955,8 +2305,9 @@ mod external_blob_tests {
     #[test]
     fn no_external_refs_is_ok() {
         let mut pl = pl_with_snapshot_ref(None);
-        let download =
-            |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> { Ok(bytes::Bytes::new()) };
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
+            Ok(bytes::Bytes::new())
+        };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
     }
 
@@ -1966,16 +2317,12 @@ mod external_blob_tests {
         let mut patch = valid_external_patch();
         patch.mutations.push(wa::SyncdMutation::default());
         pl.patches.push(patch);
-        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes, ExternalBlobError> {
             panic!("invalid patch reached downloader")
         };
         let error = download_external_blobs(&mut pl, &download).unwrap_err();
         assert_eq!(
-            error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
-                .unwrap()
-                .metric
-                .as_deref(),
+            error.validation_error().unwrap().metric.as_deref(),
             Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
         );
         assert!(pl.patches[0].external_mutations.is_set());
@@ -2309,7 +2656,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2323,7 +2671,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2400,12 +2749,15 @@ mod prepared_validation_tests {
                 .await
                 .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+                error
+                    .preparation_error()
+                    .map(AppStatePreparationError::kind),
+                Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
             ));
             assert!(
                 error
-                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .preparation_error()
+                    .and_then(AppStatePreparationError::validation_error)
                     .is_some()
             );
             let prepared = processor
@@ -2416,12 +2768,15 @@ mod prepared_validation_tests {
                 .await
                 .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<crate::appstate::AppStateError>(),
-                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+                error
+                    .preparation_error()
+                    .map(AppStatePreparationError::kind),
+                Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
             ));
             assert!(
                 error
-                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .preparation_error()
+                    .and_then(AppStatePreparationError::validation_error)
                     .is_some()
             );
         }
@@ -2435,6 +2790,10 @@ mod prepared_validation_tests {
         snapshot.key_id = Default::default();
         let validated = metadata_token(&processor, list(snapshot)).await;
         assert!(!validated.can_download());
+        assert!(matches!(
+            validated.error.as_ref().map(AppStatePreparationError::kind),
+            Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
+        ));
         let prepared = processor
             .prepare_metadata_validated_patch_list(validated, &|_| panic!("invalid metadata"))
             .await;
@@ -2444,15 +2803,18 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
             Some("MISSING_SNAPSHOT_MAC")
         );
         assert!(matches!(
-            error.downcast_ref::<crate::appstate::AppStateError>(),
-            Some(crate::appstate::AppStateError::SnapshotMACMissing)
+            error
+                .preparation_error()
+                .map(AppStatePreparationError::kind),
+            Some(AppStatePreparationErrorKind::SnapshotIntegrity(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
@@ -2492,7 +2854,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),
@@ -2531,7 +2894,8 @@ mod prepared_validation_tests {
             .unwrap_err();
         assert_eq!(
             error
-                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .preparation_error()
+                .and_then(AppStatePreparationError::validation_error)
                 .unwrap()
                 .metric
                 .as_deref(),

@@ -8,12 +8,19 @@ use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 
 /// Error returned by chat-state (typing indicator) operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ChatStateError {
     /// Connection/transport failure sending the `<chatstate>` stanza.
     #[error("{0}")]
     Client(#[from] ClientError),
+}
+
+impl std::fmt::Debug for ChatStateError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Feature handle for chat state operations.

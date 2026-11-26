@@ -27,7 +27,9 @@ pub enum HandshakeError {
     #[error("Mobile handshake error: {0}")]
     Mobile(#[from] crate::mobile::MobileSessionError),
     #[error("Transport error: {0}")]
-    Transport(#[from] anyhow::Error),
+    Transport(#[from] crate::net::TransportError),
+    #[error("Framing error: {0}")]
+    Framing(#[from] NoiseError),
     #[error("Core handshake error: {0}")]
     Core(#[from] CoreHandshakeError),
     #[error("Timed out waiting for handshake response")]
@@ -54,6 +56,7 @@ impl HandshakeError {
             HandshakeError::Mobile(_) => false,
             HandshakeError::MobileDeviceRequiresProfile
             | HandshakeError::Transport(_)
+            | HandshakeError::Framing(_)
             | HandshakeError::Core(_)
             | HandshakeError::StreamClosed
             | HandshakeError::Disconnected
@@ -90,7 +93,8 @@ impl HandshakeError {
             | CoreHandshakeError::Noise(NoiseError::Encrypt(_))
             | CoreHandshakeError::Noise(NoiseError::HkdfExpandFailed)
             | CoreHandshakeError::Noise(NoiseError::InvalidPatternLength { .. })
-            | CoreHandshakeError::Noise(NoiseError::CounterExhausted) => false,
+            | CoreHandshakeError::Noise(NoiseError::CounterExhausted)
+            | CoreHandshakeError::Noise(NoiseError::FrameTooLarge { .. }) => false,
         }
     }
 }
@@ -180,8 +184,7 @@ pub async fn run_xx_handshake(
         handshake_state.read_server_hello_and_build_client_finish(&resp_frame)?;
 
     debug!("[socket] continueFullHandshakeCore client finish and deriving secrets");
-    let framed = crate::framing::encode_frame(&client_finish_bytes, None)
-        .map_err(HandshakeError::Transport)?;
+    let framed = crate::framing::encode_frame(&client_finish_bytes, None)?;
     transport.send(bytes::Bytes::from(framed)).await?;
 
     let outcome = handshake_state.finish()?;
@@ -251,8 +254,7 @@ pub async fn run_ik_handshake(
             debug!(
                 "[socket] continueFullHandshakeCore client finish and deriving secrets (XXfallback)"
             );
-            let framed = crate::framing::encode_frame(&client_finish_bytes, None)
-                .map_err(HandshakeError::Transport)?;
+            let framed = crate::framing::encode_frame(&client_finish_bytes, None)?;
             transport.send(bytes::Bytes::from(framed)).await?;
             let outcome = fb.finish()?;
             info!("Handshake complete (XXfallback), switching to encrypted communication");
@@ -276,8 +278,7 @@ pub async fn send_first_handshake_message(
     } else if device.edge_routing_info.is_some() {
         warn!("Edge routing info provided but not used (possibly too large)");
     }
-    let framed = crate::framing::encode_frame(payload_bytes, Some(&header))
-        .map_err(HandshakeError::Transport)?;
+    let framed = crate::framing::encode_frame(payload_bytes, Some(&header))?;
     transport.send(bytes::Bytes::from(framed)).await?;
     Ok(())
 }
@@ -336,7 +337,10 @@ mod mobile_boundary_tests {
     struct NoTransport;
     #[async_trait::async_trait]
     impl Transport for NoTransport {
-        async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            _: bytes::Bytes,
+        ) -> std::result::Result<(), crate::net::TransportError> {
             panic!("mobile credentials must never be sent by the Web runner")
         }
         async fn disconnect(&self) {

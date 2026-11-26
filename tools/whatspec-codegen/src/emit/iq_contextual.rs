@@ -1,5 +1,6 @@
 //! Bounded, checked full-RPC consumers. Admission is separate from qualification.
 use anyhow::{Context, Result, ensure};
+use syn::spanned::Spanned as _;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,9 +92,34 @@ pub fn generate(wa_version: &str) -> Result<String> {
     }
     ir.stanzas
         .retain(|s| MODULES.contains(&s.module_name.as_str()));
-    wa_codegen_iq::generate_iq_checked(&ir).map_err(|d| {
+    let generated = wa_codegen_iq::generate_iq_checked(&ir).map_err(|d| {
         anyhow::anyhow!("contextual IQ generation refused incomplete contracts: {d:#?}")
-    })
+    })?;
+    let module = syn::parse_file(&generated).context("parsing generated IQ module")?;
+    let mut errors = module.items.iter().filter_map(|item| match item {
+        syn::Item::Enum(item) if item.ident == "IqResponseError" => Some(item),
+        _ => None,
+    });
+    let error = errors
+        .next()
+        .context("missing generated IQ response error")?;
+    ensure!(
+        errors.next().is_none(),
+        "duplicate generated IQ response error"
+    );
+    ensure!(
+        matches!(error.vis, syn::Visibility::Public(_)),
+        "generated IQ response error must be public"
+    );
+    let mut generated = generated;
+    if !error
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("non_exhaustive"))
+    {
+        generated.insert_str(error.vis.span().byte_range().start, "#[non_exhaustive]\n");
+    }
+    Ok(generated)
 }
 
 pub fn verify_projection(full: &str) -> Result<()> {
@@ -142,6 +168,7 @@ mod tests {
     fn pinned_projection_emits_and_wrong_source_or_version_fails() {
         let lock = source_lock().unwrap();
         let code = generate(&lock.wa_version).unwrap();
+        assert!(code.contains("#[non_exhaustive]\npub enum IqResponseError {"));
         assert!(code.contains("fn parse_response_with_context"));
         assert!(code.contains("fn handles_iq_errors"));
         assert!(code.contains("MakeGetCountryCodeRequestSpec"));

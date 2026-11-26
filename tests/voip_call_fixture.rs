@@ -1,12 +1,13 @@
 //! External-consumer coverage of the opt-in fixture and current handler policy.
 #![cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
 
-use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use wacore::types::events::Event;
 use wacore_binary::{Jid, Node, Server, builder::NodeBuilder};
 use whatsapp_rust::{test_support::CallFixture, voip::CallHandle};
+
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
 
 fn start(
     fixture: &CallFixture,

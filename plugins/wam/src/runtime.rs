@@ -914,7 +914,7 @@ mod tests {
         async fn execute(
             &self,
             _: whatsapp_rust::http::HttpRequest,
-        ) -> anyhow::Result<whatsapp_rust::http::HttpResponse> {
+        ) -> Result<whatsapp_rust::http::HttpResponse, whatsapp_rust::http::HttpError> {
             let revision = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(whatsapp_rust::http::HttpResponse::new(
                 200,

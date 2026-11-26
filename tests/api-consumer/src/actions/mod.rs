@@ -23,7 +23,7 @@ use whatsapp_rust::{
     ClearChatOptions, Client, EventCreationParams, MediaDeletion, MessageRef, NewsletterMessage,
     NewsletterMessageRef, NewsletterMessageType, NewsletterMetadata, NewsletterPollVote,
     NewsletterReactionCount, NewsletterState, NewsletterVerification, PinDuration, RevokeType,
-    StanzaId, StarredMessages, anyhow, async_trait, waproto::whatsapp as proto,
+    StanzaId, StarredMessages, async_trait, waproto::whatsapp as proto,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

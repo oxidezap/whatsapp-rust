@@ -1,12 +1,36 @@
 //! Sender key tracking and message cache methods for Client.
 
-use anyhow::Result;
 use smallvec::SmallVec;
 use wacore::types::message::ChatMessageId;
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 use super::Client;
+
+#[derive(thiserror::Error)]
+pub(crate) enum SenderKeyResetError {
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("sender-key tracker clear failed ({clear}); fallback read failed: {fallback}")]
+    FallbackRead {
+        #[source]
+        clear: wacore::store::error::StoreError,
+        fallback: wacore::store::error::StoreError,
+    },
+    #[error("sender-key tracker clear failed ({clear}); cold-mark fallback failed: {fallback}")]
+    FallbackWrite {
+        #[source]
+        clear: wacore::store::error::StoreError,
+        fallback: wacore::store::error::StoreError,
+    },
+}
+
+impl std::fmt::Debug for SenderKeyResetError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.set_sender_key_status", level = "debug", skip_all, fields(count = device_jids.len(), has_key = has_key), err(Debug)))]
@@ -16,7 +40,7 @@ impl Client {
         device_jids: &[Jid],
         has_key: bool,
         exclude_own_devices: bool,
-    ) -> Result<()> {
+    ) -> Result<(), wacore::store::error::StoreError> {
         let snapshot = if exclude_own_devices {
             Some(self.persistence_manager.get_device_snapshot())
         } else {
@@ -81,14 +105,17 @@ impl Client {
         &self,
         group_jid: &str,
         device_jids: &[Jid],
-    ) -> Result<()> {
+    ) -> Result<(), wacore::store::error::StoreError> {
         self.set_sender_key_status_for_devices(group_jid, device_jids, false, true)
             .await?;
         Ok(())
     }
 
     /// Redistribution must not inherit delivery marks from an earlier pass.
-    pub(crate) async fn reset_sender_key_device_tracking(&self, group_jid: &str) -> Result<()> {
+    pub(crate) async fn reset_sender_key_device_tracking(
+        &self,
+        group_jid: &str,
+    ) -> Result<(), SenderKeyResetError> {
         self.reset_sender_key_device_tracking_scoped(group_jid, None)
             .await
     }
@@ -97,7 +124,7 @@ impl Client {
         &self,
         group_jid: &str,
         scope: Option<super::NotificationScope<'_>>,
-    ) -> Result<()> {
+    ) -> Result<(), SenderKeyResetError> {
         if scope.is_some_and(|scope| !scope.is_current(self)) {
             return Ok(());
         }
@@ -110,16 +137,19 @@ impl Client {
             if scope.is_some_and(|scope| !scope.is_current(self)) {
                 return Ok(());
             }
-            let rows = self
+            let rows = match self
                 .persistence_manager
                 .get_sender_key_devices(group_jid)
                 .await
-                .map_err(|fallback_error| {
-                    anyhow::anyhow!(
-                        "sender-key tracker clear failed ({clear_error}); \
-                         fallback read failed: {fallback_error}"
-                    )
-                })?;
+            {
+                Ok(rows) => rows,
+                Err(fallback) => {
+                    return Err(SenderKeyResetError::FallbackRead {
+                        clear: clear_error,
+                        fallback,
+                    });
+                }
+            };
             if !rows.is_empty() {
                 if scope.is_some_and(|scope| !scope.is_current(self)) {
                     return Ok(());
@@ -128,19 +158,20 @@ impl Client {
                     .iter()
                     .map(|(device_jid, _)| (device_jid.as_str(), false))
                     .collect();
-                self.persistence_manager
+                if let Err(fallback) = self
+                    .persistence_manager
                     .set_sender_key_status(group_jid, &entries)
                     .await
-                    .map_err(|fallback_error| {
-                        anyhow::anyhow!(
-                            "sender-key tracker clear failed ({clear_error}); \
-                             cold-mark fallback failed: {fallback_error}"
-                        )
-                    })?;
+                {
+                    return Err(SenderKeyResetError::FallbackWrite {
+                        clear: clear_error,
+                        fallback,
+                    });
+                }
             }
             log::warn!(
                 "reset_sender_key_device_tracking: clear failed for {group_jid}; \
-                 marked {} existing rows cold: {clear_error}",
+                 marked {} existing rows cold",
                 rows.len(),
                 group_jid = wacore_binary::jid::ObservedJid::from(group_jid)
             );
@@ -209,7 +240,7 @@ impl Client {
         &self,
         group_jid: &Jid,
         removed_user_ids: &[&str],
-    ) -> Result<()> {
+    ) -> Result<(), SenderKeyResetError> {
         if removed_user_ids.is_empty() {
             return Ok(());
         }
@@ -294,7 +325,10 @@ impl Client {
         drop(distribution_guard);
     }
 
-    pub(crate) async fn force_rotate_own_sender_key_locked(&self, group_jid: &Jid) -> Result<()> {
+    pub(crate) async fn force_rotate_own_sender_key_locked(
+        &self,
+        group_jid: &Jid,
+    ) -> Result<(), SenderKeyResetError> {
         self.rotate_own_sender_key_state(&group_jid.to_string())
             .await
     }
@@ -302,7 +336,7 @@ impl Client {
     /// Retire only these outbound chains. A global flush would take the drain's
     /// message permit while this caller holds the group lock, which a message
     /// holder can itself need. It would also flush unrelated inbound state.
-    async fn rotate_own_sender_key_state(&self, group_id: &str) -> Result<()> {
+    async fn rotate_own_sender_key_state(&self, group_id: &str) -> Result<(), SenderKeyResetError> {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
@@ -322,7 +356,7 @@ impl Client {
         // redelivered remove would see no recipient with the retired chain
         // and skip retrying a backend deletion that may not have committed.
         match failure {
-            Some(error) => Err(error),
+            Some(error) => Err(error.into()),
             None => self.reset_sender_key_device_tracking(group_id).await,
         }
     }

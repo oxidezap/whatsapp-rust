@@ -9,12 +9,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::demux::{RelayPacketKind, classify_relay_packet};
-use super::transport::{RelayTransport, RelayTransportEvent, RelayTransportFactory};
+use super::transport::{
+    RelayResult as Result, RelayTransport, RelayTransportError, RelayTransportErrorKind,
+    RelayTransportEvent, RelayTransportFactory,
+};
 use crate::runtime::Runtime;
 
 /// Inbound-forwarding channel depth for [`TappedFactory`]. VoIP is loss tolerant, so the forwarder
@@ -131,7 +133,9 @@ impl RelayTransport for TappedTransport {
         async_channel::Receiver<RelayTransportEvent>,
     )> {
         let Some(runtime) = self.runtime.clone() else {
-            bail!("tapped transport was built without a runtime and cannot rewrap {endpoint}")
+            return Err(RelayTransportError::new(
+                RelayTransportErrorKind::TapRuntimeUnavailable(endpoint),
+            ));
         };
         let (inner_transport, inner_rx) = self.inner.reconnect(endpoint).await?;
         Ok(tap_channel(

@@ -14,8 +14,8 @@ default = []
 danger-skip-tls-verify = []
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 wacore = { workspace = true }

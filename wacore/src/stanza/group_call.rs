@@ -6,7 +6,6 @@
 
 use core::mem::size_of;
 
-use anyhow::{Result, anyhow, bail};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef, Server};
 
@@ -28,6 +27,150 @@ const MAX_RELAY_TOKENS: usize = 64;
 // Call links may queue more users for approval than the 32 endpoints that can be connected at once.
 const MAX_WAITING_ROOM_USERS: usize = 128;
 const MAX_WAITING_ROOM_RETAINED_BYTES: usize = 1024 * 1024;
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupCallBuildError {
+    #[error("call id is required")]
+    MissingCallId,
+    #[error("call stanza id is required")]
+    MissingStanzaId,
+    #[error("call creator is required")]
+    MissingCreator,
+    #[error("group-bound offer requires self and at least one remote participant")]
+    GroupOfferNeedsRemote,
+    #[error("group offer requires self and at least two remote participants")]
+    OfferNeedsTwoRemotes,
+    #[error("group offer has {actual} participants, maximum is {max}", max = GROUP_CALL_MAX_PARTICIPANTS)]
+    TooManyParticipants { actual: usize },
+    #[error("group offer audio rate must be non-zero")]
+    InvalidAudioRate,
+    #[error("group offer group_jid must use @g.us")]
+    InvalidGroupJid,
+    #[error("group invite target is required")]
+    MissingInviteTarget,
+    #[error("group invite requires at least one target device")]
+    MissingInviteDevices,
+    #[error("group invite requires an active roster")]
+    MissingInviteRoster,
+    #[error("group invite device orientation must be quarter turns in 0..=3")]
+    InvalidOrientation,
+    #[error("participant {participant} has no jid")]
+    MissingParticipantJid { participant: usize },
+    #[error("participant {participant} has no devices")]
+    MissingParticipantDevices { participant: usize },
+    #[error("participant {participant} device {device} has no jid")]
+    MissingParticipantDeviceJid { participant: usize, device: usize },
+    #[error("{0}")]
+    DeviceIdentity(#[from] crate::send::DeviceIdentityError),
+    #[error("group epoch transaction id must be non-zero")]
+    MissingTransactionId,
+    #[error("group epoch ciphertext target does not match stanza target")]
+    EpochTargetMismatch,
+    #[error("group epoch ciphertext is empty")]
+    EmptyEpochCiphertext,
+    #[error("unsupported group epoch encryption type")]
+    UnsupportedEpochEncryption,
+    #[error("pre-key group epoch requires device identity")]
+    MissingDeviceIdentity,
+    #[error("call-link token is required")]
+    MissingLinkToken,
+    #[error("call-link capability is required")]
+    MissingLinkCapability,
+    #[error("call request id is required")]
+    MissingRequestId,
+    #[error("waiting-room user is required")]
+    MissingWaitingRoomUser,
+    #[error("raise-hand target is required")]
+    MissingRaiseHandTarget,
+    #[error("screen-share target is required")]
+    MissingScreenShareTarget,
+}
+
+debug_as_display!(GroupCallBuildError);
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupCallParseError {
+    #[error("group_update is missing group_info")]
+    MissingGroupInfo,
+    #[error("unexpected group snapshot envelope")]
+    InvalidSnapshotEnvelope,
+    #[error("group offer rejected with error {0}")]
+    OfferRejected(String),
+    #[error("group_info group-jid does not match offer")]
+    GroupJidMismatch,
+    #[error("group_info call-id does not match offer")]
+    CallIdMismatch,
+    #[error("group_info call-creator does not match offer")]
+    CreatorMismatch,
+    #[error("expected an enc_rekey stanza")]
+    ExpectedEncRekey,
+    #[error("enc_rekey is missing encopt")]
+    MissingEncopt,
+    #[error("enc_rekey is missing enc")]
+    MissingEnc,
+    #[error("unsupported group epoch encryption")]
+    UnsupportedEpochEncryption,
+    #[error("enc_rekey has no ciphertext")]
+    MissingCiphertext,
+    #[error("requested call-link token is empty")]
+    EmptyRequestedToken,
+    #[error("<link_join> ack has neither waiting_room nor group_info")]
+    MissingJoinResult,
+    #[error("waiting-room token differs from the requested call link")]
+    WaitingRoomTokenMismatch,
+    #[error("<link_join> waiting-room-only ack is not enabled")]
+    WaitingRoomNotEnabled,
+    #[error("waiting-room and admitted group identities differ")]
+    WaitingRoomIdentityMismatch,
+    #[error("waiting-room and admitted group media modes differ")]
+    WaitingRoomMediaMismatch,
+    #[error("expected a waiting_room_update stanza")]
+    ExpectedWaitingRoomUpdate,
+    #[error("waiting_room_update is missing waiting_room")]
+    MissingWaitingRoom,
+    #[error("waiting-room update identity mismatch")]
+    WaitingRoomUpdateMismatch,
+    #[error("expected a waiting_room stanza")]
+    ExpectedWaitingRoom,
+    #[error("waiting-room snapshot exceeds the user limit")]
+    WaitingRoomUserLimit,
+    #[error("waiting-room snapshot exceeds the retained-byte limit")]
+    WaitingRoomByteLimit,
+    #[error("expected a user_action stanza")]
+    ExpectedUserAction,
+    #[error("unsupported group user action")]
+    UnsupportedUserAction,
+    #[error("user_action is missing raise_hand")]
+    MissingRaiseHand,
+    #[error("invalid raise-hand-state")]
+    InvalidRaiseHandState,
+    #[error("expected a screen_share stanza")]
+    ExpectedScreenShare,
+    #[error("unsupported screen-share state")]
+    UnsupportedScreenShareState,
+    #[error("unexpected {expected} ack envelope")]
+    InvalidAckEnvelope { expected: String },
+    #[error("{expected} rejected with error {error}")]
+    AckRejected { expected: String, error: String },
+    #[error("<ack type={expected}> missing payload")]
+    MissingAckPayload { expected: String },
+    #[error("unsupported call-link media")]
+    UnsupportedLinkMedia,
+    #[error("unexpected group-call attributes")]
+    UnexpectedAttributes,
+    #[error("missing group-call string attribute")]
+    MissingStringAttribute,
+    #[error("missing or invalid group-call jid")]
+    MissingJidAttribute,
+    #[error("missing group-call integer attribute")]
+    MissingIntegerAttribute,
+    #[error("invalid group-call integer attribute")]
+    InvalidIntegerAttribute,
+}
+
+debug_as_display!(GroupCallParseError);
 
 // Group signaling is control-plane traffic. Marking its entry points cold keeps fat LTO from
 // expanding parser and builder error paths into the default call handler.
@@ -74,7 +217,7 @@ pub fn build_active_group_preaccept(
     call_creator: &Jid,
     request_id: &str,
     video: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_preaccept(
         call_id,
@@ -93,7 +236,7 @@ pub fn build_active_group_accept(
     call_creator: &Jid,
     request_id: &str,
     video: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_accept(&AcceptParams {
         call_id,
@@ -113,23 +256,24 @@ pub fn build_active_group_accept(
 
 /// Build an initial group offer in the server-enforced child order.
 #[cold]
-pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result<Node> {
+pub fn build_initial_group_offer(
+    params: &InitialGroupOfferParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     let min_remote = group_call_min_remote_participants(params.group_jid.is_some());
     if params.participants.len() < 1 + min_remote {
         if params.group_jid.is_some() {
-            bail!("group-bound offer requires self and at least one remote participant");
+            return Err(GroupCallBuildError::GroupOfferNeedsRemote);
         }
-        bail!("group offer requires self and at least two remote participants");
+        return Err(GroupCallBuildError::OfferNeedsTwoRemotes);
     }
     if params.participants.len() > GROUP_CALL_MAX_PARTICIPANTS {
-        bail!(
-            "group offer has {} participants, maximum is {GROUP_CALL_MAX_PARTICIPANTS}",
-            params.participants.len()
-        );
+        return Err(GroupCallBuildError::TooManyParticipants {
+            actual: params.participants.len(),
+        });
     }
     if params.audio_rate == 0 {
-        bail!("group offer audio rate must be non-zero");
+        return Err(GroupCallBuildError::InvalidAudioRate);
     }
 
     let users = build_group_users(params.participants, Some(params.call_creator), params.video)?;
@@ -146,7 +290,7 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
     let mut action = call_action("offer", params.call_id, params.call_creator, children);
     if let Some(group_jid) = params.group_jid {
         if group_jid.server != Server::Group {
-            bail!("group offer group_jid must use @g.us");
+            return Err(GroupCallBuildError::InvalidGroupJid);
         }
         action.attrs.insert("group-jid", group_jid);
     }
@@ -159,20 +303,22 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
 
 /// Build a singular offer for a participant joining an already-active call.
 #[cold]
-pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<Node> {
+pub fn build_group_invite_offer(
+    params: &GroupInviteOfferParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     if params.to.user.is_empty() {
-        bail!("group invite target is required");
+        return Err(GroupCallBuildError::MissingInviteTarget);
     }
     if params.target_devices.is_empty() {
-        bail!("group invite requires at least one target device");
+        return Err(GroupCallBuildError::MissingInviteDevices);
     }
     if params.participants.is_empty() {
-        bail!("group invite requires an active roster");
+        return Err(GroupCallBuildError::MissingInviteRoster);
     }
 
     if params.device_orientation > 3 {
-        bail!("group invite device orientation must be quarter turns in 0..=3");
+        return Err(GroupCallBuildError::InvalidOrientation);
     }
 
     let mut children = vec![audio_opus("16000")];
@@ -197,15 +343,19 @@ pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<N
 
 #[cold]
 #[inline(never)]
-fn validate_call_identity(call_id: &str, id: &str, creator: &Jid) -> Result<()> {
+fn validate_call_identity(
+    call_id: &str,
+    id: &str,
+    creator: &Jid,
+) -> Result<(), GroupCallBuildError> {
     if call_id.is_empty() {
-        bail!("call id is required");
+        return Err(GroupCallBuildError::MissingCallId);
     }
     if id.is_empty() {
-        bail!("call stanza id is required");
+        return Err(GroupCallBuildError::MissingStanzaId);
     }
     if creator.user.is_empty() {
-        bail!("call creator is required");
+        return Err(GroupCallBuildError::MissingCreator);
     }
     Ok(())
 }
@@ -216,19 +366,26 @@ fn build_group_users(
     participants: &[GroupCallParticipant],
     video_creator: Option<&Jid>,
     video: bool,
-) -> Result<Vec<Node>> {
+) -> Result<Vec<Node>, GroupCallBuildError> {
     let mut users = Vec::with_capacity(participants.len());
     for (participant_index, participant) in participants.iter().enumerate() {
         if participant.jid.user.is_empty() {
-            bail!("participant {participant_index} has no jid");
+            return Err(GroupCallBuildError::MissingParticipantJid {
+                participant: participant_index,
+            });
         }
         if participant.devices.is_empty() {
-            bail!("participant {participant_index} has no devices");
+            return Err(GroupCallBuildError::MissingParticipantDevices {
+                participant: participant_index,
+            });
         }
         let mut devices = Vec::with_capacity(participant.devices.len());
         for (device_index, device) in participant.devices.iter().enumerate() {
             if device.jid.user.is_empty() {
-                bail!("participant {participant_index} device {device_index} has no jid");
+                return Err(GroupCallBuildError::MissingParticipantDeviceJid {
+                    participant: participant_index,
+                    device: device_index,
+                });
             }
             let mut builder = NodeBuilder::new("device").attr("jid", &device.jid);
             if !device.capability.is_empty() {
@@ -265,20 +422,24 @@ fn build_group_users(
 
 /// Parse the group snapshot embedded in an active-call invitation.
 #[cold]
-pub fn parse_group_invite_snapshot(offer: &NodeRef<'_>) -> Result<Option<GroupCallUpdate>> {
+pub fn parse_group_invite_snapshot(
+    offer: &NodeRef<'_>,
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     parse_group_snapshot(offer, GroupSnapshotEnvelope::Offer)
 }
 
 /// Parse an authoritative `<group_update>` action.
 #[cold]
-pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate> {
+pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate, GroupCallParseError> {
     parse_group_snapshot(node, GroupSnapshotEnvelope::Update)?
-        .ok_or_else(|| group_stanza_error("group_update is missing group_info"))
+        .ok_or(GroupCallParseError::MissingGroupInfo)
 }
 
 /// Parse the group snapshot returned by an initial offer or link join.
 #[cold]
-pub fn parse_initial_group_call_ack(node: &NodeRef<'_>) -> Result<Option<GroupCallUpdate>> {
+pub fn parse_initial_group_call_ack(
+    node: &NodeRef<'_>,
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     parse_group_snapshot(node, GroupSnapshotEnvelope::Ack)
 }
 
@@ -331,14 +492,14 @@ fn offer_ack_status(node: &NodeRef<'_>) -> OfferAckStatus {
 fn parse_group_snapshot(
     node: &NodeRef<'_>,
     envelope: GroupSnapshotEnvelope,
-) -> Result<Option<GroupCallUpdate>> {
+) -> Result<Option<GroupCallUpdate>, GroupCallParseError> {
     let expected_tag = match envelope {
         GroupSnapshotEnvelope::Offer => CallActionTag::Offer.as_str(),
         GroupSnapshotEnvelope::Update => CallActionTag::GroupUpdate.as_str(),
         GroupSnapshotEnvelope::Ack => "ack",
     };
     if node.tag != expected_tag {
-        return Err(group_stanza_error("unexpected group snapshot envelope"));
+        return Err(GroupCallParseError::InvalidSnapshotEnvelope);
     }
     // The ack's `error` is a status, not by itself a refusal of the whole call: `0` serves the
     // action and `207` serves it while individual participants fail, and both still deliver the
@@ -349,7 +510,7 @@ fn parse_group_snapshot(
         match offer_ack_status(node) {
             OfferAckStatus::Success | OfferAckStatus::MultiStatus => {}
             OfferAckStatus::Refused(code) => {
-                return Err(anyhow!("group offer rejected with error {code}"));
+                return Err(GroupCallParseError::OfferRejected(code));
             }
         }
     }
@@ -357,9 +518,7 @@ fn parse_group_snapshot(
     let group_info = node.get_optional_child("group_info");
     let Some(group_info) = group_info else {
         return match envelope {
-            GroupSnapshotEnvelope::Update => {
-                Err(group_stanza_error("group_update is missing group_info"))
-            }
+            GroupSnapshotEnvelope::Update => Err(GroupCallParseError::MissingGroupInfo),
             GroupSnapshotEnvelope::Offer | GroupSnapshotEnvelope::Ack => Ok(None),
         };
     };
@@ -384,7 +543,7 @@ fn parse_group_snapshot(
                     .as_ref()
                     .is_some_and(|nested| nested != &group_jid)
                 {
-                    bail!("group_info group-jid does not match offer");
+                    return Err(GroupCallParseError::GroupJidMismatch);
                 }
                 update.group_jid = Some(group_jid);
             }
@@ -392,12 +551,12 @@ fn parse_group_snapshot(
             if let Some(group_call_id) = group_attrs.optional_string("call-id")
                 && group_call_id != update.call_id
             {
-                bail!("group_info call-id does not match offer");
+                return Err(GroupCallParseError::CallIdMismatch);
             }
             if let Some(group_creator) = group_attrs.optional_jid("call-creator")
                 && group_creator != update.call_creator
             {
-                bail!("group_info call-creator does not match offer");
+                return Err(GroupCallParseError::CreatorMismatch);
             }
             if let Some(joinable) = attrs.optional_string("joinable") {
                 update.joinable = joinable.as_ref() == "1";
@@ -431,7 +590,7 @@ fn parse_group_info(
     envelope: GroupSnapshotEnvelope,
     call_id: String,
     call_creator: Jid,
-) -> Result<GroupCallUpdate> {
+) -> Result<GroupCallUpdate, GroupCallParseError> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
     let media = required_string(&mut attrs, "media")?;
@@ -475,7 +634,9 @@ fn parse_group_info(
 
 #[cold]
 #[inline(never)]
-fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
+fn parse_group_participant(
+    node: &NodeRef<'_>,
+) -> Result<GroupCallParticipant, GroupCallParseError> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid")?;
     let pn = attrs.optional_jid("user_pn");
@@ -508,7 +669,7 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
+fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice, GroupCallParseError> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid")?;
     let platform = attrs
@@ -536,7 +697,7 @@ fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
+fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay, GroupCallParseError> {
     let mut attrs = node.attrs();
     let transaction_id = optional_u32(&mut attrs, "transaction-id")?;
     let self_pid = optional_u32(&mut attrs, "self_pid")?;
@@ -576,7 +737,9 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
 
 #[cold]
 #[inline(never)]
-fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoint> {
+fn parse_group_relay_endpoint(
+    node: &NodeRef<'_>,
+) -> Result<GroupCallRelayEndpoint, GroupCallParseError> {
     let mut attrs = node.attrs();
     let relay_id = required_u32(&mut attrs, "relay_id")?;
     let token_id = required_u32(&mut attrs, "token_id")?;
@@ -636,7 +799,9 @@ fn parse_indexed_tokens(children: &[NodeRef<'_>], tag: &str) -> Vec<Vec<u8>> {
 
 /// Build one keygen-v2 group epoch delivery.
 #[cold]
-pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
+pub fn build_group_enc_rekey(
+    params: &GroupEncRekeyParams<'_>,
+) -> Result<Node, GroupCallBuildError> {
     build_group_enc_rekey_for_role(params, crate::send::SenderIdentityRole::Companion)
 }
 
@@ -645,7 +810,7 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
 pub fn build_group_enc_rekey_for_role(
     params: &GroupEncRekeyParams<'_>,
     sender_role: crate::send::SenderIdentityRole,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     use crate::send::{PrimaryDeviceIdentityPolicy, SenderIdentityRole};
     sender_role.validate()?;
     let device_identity = match sender_role {
@@ -654,22 +819,22 @@ pub fn build_group_enc_rekey_for_role(
     };
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     if params.transaction_id == 0 {
-        bail!("group epoch transaction id must be non-zero");
+        return Err(GroupCallBuildError::MissingTransactionId);
     }
     if params.device_key.device_jid != *params.to {
-        bail!("group epoch ciphertext target does not match stanza target");
+        return Err(GroupCallBuildError::EpochTargetMismatch);
     }
     if params.device_key.ciphertext.is_empty() {
-        bail!("group epoch ciphertext is empty");
+        return Err(GroupCallBuildError::EmptyEpochCiphertext);
     }
     if !matches!(params.device_key.enc_type.as_str(), "msg" | "pkmsg") {
-        bail!("unsupported group epoch encryption type");
+        return Err(GroupCallBuildError::UnsupportedEpochEncryption);
     }
     if params.device_key.enc_type == "pkmsg"
         && device_identity.is_none()
         && sender_role == SenderIdentityRole::Companion
     {
-        bail!("pre-key group epoch requires device identity");
+        return Err(GroupCallBuildError::MissingDeviceIdentity);
     }
     let mut children = vec![
         NodeBuilder::new("encopt").attr("keygen", "2").build(),
@@ -698,9 +863,9 @@ pub fn build_group_enc_rekey_for_role(
 
 /// Parse one keygen-v2 group epoch delivery.
 #[cold]
-pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
+pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::EncRekey.as_str() {
-        return Err(group_stanza_error("expected an enc_rekey stanza"));
+        return Err(GroupCallParseError::ExpectedEncRekey);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -709,10 +874,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
     finish_attrs(&attrs)?;
     let encopt = node
         .get_optional_child("encopt")
-        .ok_or_else(|| group_stanza_error("enc_rekey is missing encopt"))?;
+        .ok_or(GroupCallParseError::MissingEncopt)?;
     let enc = node
         .get_optional_child("enc")
-        .ok_or_else(|| group_stanza_error("enc_rekey is missing enc"))?;
+        .ok_or(GroupCallParseError::MissingEnc)?;
     let mut encopt_attrs = encopt.attrs();
     let key_generation = required_u32(&mut encopt_attrs, "keygen")?;
     let mut enc_attrs = enc.attrs();
@@ -722,12 +887,12 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
         || encryption_version != 2
         || !matches!(encryption_type.as_str(), "msg" | "pkmsg")
     {
-        bail!("unsupported group epoch encryption");
+        return Err(GroupCallParseError::UnsupportedEpochEncryption);
     }
     let ciphertext = enc
         .content_bytes()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| group_stanza_error("enc_rekey has no ciphertext"))?
+        .ok_or(GroupCallParseError::MissingCiphertext)?
         .to_vec();
     Ok(GroupCallEncRekey::builder()
         .call_id(call_id)
@@ -742,7 +907,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
 
 /// Build a call-link creation request.
 #[cold]
-pub fn build_call_link_create(media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_create(
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     build_call_service_request(
         request_id,
         NodeBuilder::new("link_create")
@@ -753,9 +921,13 @@ pub fn build_call_link_create(media: CallLinkMedia, request_id: &str) -> Result<
 
 /// Build a call-link preview request.
 #[cold]
-pub fn build_call_link_query(token: &str, media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_query(
+    token: &str,
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     if token.trim().is_empty() {
-        bail!("call-link token is required");
+        return Err(GroupCallBuildError::MissingLinkToken);
     }
     build_call_service_request(
         request_id,
@@ -768,7 +940,11 @@ pub fn build_call_link_query(token: &str, media: CallLinkMedia, request_id: &str
 
 /// Build a call-link join request with the media capabilities of this client.
 #[cold]
-pub fn build_call_link_join(token: &str, media: CallLinkMedia, request_id: &str) -> Result<Node> {
+pub fn build_call_link_join(
+    token: &str,
+    media: CallLinkMedia,
+    request_id: &str,
+) -> Result<Node, GroupCallBuildError> {
     let capability = if media == CallLinkMedia::Video {
         &CAPABILITY_VIDEO_OFFER
     } else {
@@ -784,12 +960,12 @@ pub fn build_call_link_join_with_capability(
     media: CallLinkMedia,
     request_id: &str,
     capability: &[u8],
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     if token.trim().is_empty() {
-        bail!("call-link token is required");
+        return Err(GroupCallBuildError::MissingLinkToken);
     }
     if capability.is_empty() {
-        bail!("call-link capability is required");
+        return Err(GroupCallBuildError::MissingLinkCapability);
     }
     let mut children = vec![audio_opus("16000")];
     if media == CallLinkMedia::Video {
@@ -820,16 +996,16 @@ pub fn build_call_link_join_with_capability(
 
 #[cold]
 #[inline(never)]
-fn build_call_service_request(request_id: &str, action: Node) -> Result<Node> {
+fn build_call_service_request(request_id: &str, action: Node) -> Result<Node, GroupCallBuildError> {
     if request_id.is_empty() {
-        bail!("call request id is required");
+        return Err(GroupCallBuildError::MissingRequestId);
     }
     Ok(call_wrap(&Jid::new("", Server::Call), request_id, action))
 }
 
 /// Parse a link-creation response.
 #[cold]
-pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
+pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink, GroupCallParseError> {
     let child = validated_call_ack_child(node, "link_create")?;
     let mut attrs = child.attrs();
     let token = required_string(&mut attrs, "token")?;
@@ -839,7 +1015,9 @@ pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
 
 /// Parse a link-preview response.
 #[cold]
-pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> {
+pub fn parse_call_link_query_ack(
+    node: &NodeRef<'_>,
+) -> Result<CallLinkPreview, GroupCallParseError> {
     let child = validated_call_ack_child(node, "link_query")?;
     let mut attrs = child.attrs();
     let token = required_string(&mut attrs, "token")?;
@@ -866,9 +1044,12 @@ pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> 
 
 /// Parse a link join that either admitted this endpoint or placed it in a waiting room.
 #[cold]
-pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Result<CallLinkJoin> {
+pub fn parse_call_link_join_ack(
+    node: &NodeRef<'_>,
+    requested_token: &str,
+) -> Result<CallLinkJoin, GroupCallParseError> {
     if requested_token.is_empty() {
-        bail!("requested call-link token is empty");
+        return Err(GroupCallParseError::EmptyRequestedToken);
     }
     validate_call_ack(node, "link_join")?;
     let waiting = node
@@ -891,26 +1072,26 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Re
             false,
             false,
         ),
-        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+        (None, None) => return Err(GroupCallParseError::MissingJoinResult),
     };
     if waiting
         .as_ref()
         .is_some_and(|waiting| waiting.link_token != requested_token)
     {
-        bail!("waiting-room token differs from the requested call link");
+        return Err(GroupCallParseError::WaitingRoomTokenMismatch);
     }
     if group.is_none() && !waiting_room_enabled {
-        bail!("<link_join> waiting-room-only ack is not enabled");
+        return Err(GroupCallParseError::WaitingRoomNotEnabled);
     }
     if let Some(group) = &group
         && (group.call_id != call_id || group.call_creator != call_creator)
     {
-        bail!("waiting-room and admitted group identities differ");
+        return Err(GroupCallParseError::WaitingRoomIdentityMismatch);
     }
     if let Some(group) = &group
         && group.media != media.as_str()
     {
-        bail!("waiting-room and admitted group media modes differ");
+        return Err(GroupCallParseError::WaitingRoomMediaMismatch);
     }
     Ok(CallLinkJoin {
         token: requested_token.to_string(),
@@ -930,7 +1111,7 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Re
 /// The read loop uses this to bind pre-registration controls to the exact call while the request
 /// task is still asleep. Full token, media, roster, and creator validation remains in
 /// [`parse_call_link_join_ack`].
-pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
+pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String, GroupCallParseError> {
     validate_call_ack(node, "link_join")?;
     let waiting_call_id = node
         .get_optional_child("waiting_room")
@@ -942,17 +1123,17 @@ pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
         .transpose()?;
     match (waiting_call_id, group_call_id) {
         (Some(waiting), Some(group)) if waiting == group => Ok(waiting),
-        (Some(_), Some(_)) => bail!("waiting-room and admitted group identities differ"),
+        (Some(_), Some(_)) => Err(GroupCallParseError::WaitingRoomIdentityMismatch),
         (Some(call_id), None) | (None, Some(call_id)) => Ok(call_id),
-        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+        (None, None) => Err(GroupCallParseError::MissingJoinResult),
     }
 }
 
 /// Parse one authoritative waiting-room update action.
 #[cold]
-pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
+pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::WaitingRoomUpdate.as_str() {
-        return Err(group_stanza_error("expected a waiting_room_update stanza"));
+        return Err(GroupCallParseError::ExpectedWaitingRoomUpdate);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -960,19 +1141,19 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     finish_attrs(&attrs)?;
     let waiting = node
         .get_optional_child("waiting_room")
-        .ok_or_else(|| group_stanza_error("waiting_room_update is missing waiting_room"))?;
+        .ok_or(GroupCallParseError::MissingWaitingRoom)?;
     let room = parse_waiting_room(waiting)?;
     if room.call_id != call_id || room.call_creator != creator {
-        bail!("waiting-room update identity mismatch");
+        return Err(GroupCallParseError::WaitingRoomUpdateMismatch);
     }
     Ok(room)
 }
 
 #[cold]
 #[inline(never)]
-fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
+fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom, GroupCallParseError> {
     if node.tag != "waiting_room" {
-        return Err(group_stanza_error("expected a waiting_room stanza"));
+        return Err(GroupCallParseError::ExpectedWaitingRoom);
     }
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id")?;
@@ -989,7 +1170,7 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
             continue;
         }
         if users.len() >= MAX_WAITING_ROOM_USERS {
-            bail!("waiting-room snapshot exceeds the user limit");
+            return Err(GroupCallParseError::WaitingRoomUserLimit);
         }
         let mut attrs = child.attrs();
         let user = WaitingRoomUser::builder()
@@ -1002,7 +1183,7 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
             .saturating_add(size_of::<WaitingRoomUser>())
             .saturating_add(user.heap_bytes());
         if retained_bytes > MAX_WAITING_ROOM_RETAINED_BYTES {
-            bail!("waiting-room snapshot exceeds the retained-byte limit");
+            return Err(GroupCallParseError::WaitingRoomByteLimit);
         }
         users.push(user);
     }
@@ -1025,7 +1206,7 @@ pub fn build_waiting_room_toggle(
     creator: &Jid,
     enabled: bool,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     Ok(build_waiting_room_request(
         "waiting_room_toggle",
@@ -1043,7 +1224,7 @@ pub fn build_waiting_room_heartbeat(
     call_id: &str,
     creator: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     Ok(build_waiting_room_request(
         "heartbeat",
@@ -1062,7 +1243,7 @@ pub fn build_waiting_room_admit(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_admit", call_id, creator, user, request_id)
 }
@@ -1074,23 +1255,23 @@ pub fn build_waiting_room_deny(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_deny", call_id, creator, user, request_id)
 }
 
 /// Validate the service acknowledgement for a waiting-room approval toggle.
-pub fn parse_waiting_room_toggle_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_toggle_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_toggle")
 }
 
 /// Validate the service acknowledgement for admitting one waiting user.
-pub fn parse_waiting_room_admit_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_admit_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_admit")
 }
 
 /// Validate the service acknowledgement for denying one waiting user.
-pub fn parse_waiting_room_deny_ack(node: &NodeRef<'_>) -> Result<()> {
+pub fn parse_waiting_room_deny_ack(node: &NodeRef<'_>) -> Result<(), GroupCallParseError> {
     validate_call_ack(node, "waiting_room_deny")
 }
 
@@ -1102,9 +1283,9 @@ fn build_waiting_room_user_action(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     if user.user.is_empty() {
-        bail!("waiting-room user is required");
+        return Err(GroupCallBuildError::MissingWaitingRoomUser);
     }
     Ok(build_waiting_room_request(
         tag,
@@ -1146,10 +1327,10 @@ pub fn build_raise_hand(
     creator: &Jid,
     request_id: &str,
     raised: bool,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     if to.user.is_empty() {
-        bail!("raise-hand target is required");
+        return Err(GroupCallBuildError::MissingRaiseHandTarget);
     }
     Ok(call_wrap(
         to,
@@ -1167,9 +1348,9 @@ pub fn build_raise_hand(
 
 /// Parse a persistent raise/lower-hand transition.
 #[cold]
-pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
+pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::RaiseHand.as_str() {
-        return Err(group_stanza_error("expected a user_action stanza"));
+        return Err(GroupCallParseError::ExpectedUserAction);
     }
     let mut attrs = node.attrs();
     let action = required_string(&mut attrs, "action")?;
@@ -1177,17 +1358,17 @@ pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
     let _ = required_jid(&mut attrs, "call-creator")?;
     finish_attrs(&attrs)?;
     if action != "raise_hand" {
-        return Err(group_stanza_error("unsupported group user action"));
+        return Err(GroupCallParseError::UnsupportedUserAction);
     }
     let state = node
         .get_optional_child("raise_hand")
-        .ok_or_else(|| group_stanza_error("user_action is missing raise_hand"))?
+        .ok_or(GroupCallParseError::MissingRaiseHand)?
         .attrs()
         .optional_string("raise-hand-state");
     match state.as_deref() {
         Some("1") => Ok(true),
         Some("0") => Ok(false),
-        _ => bail!("invalid raise-hand-state"),
+        _ => Err(GroupCallParseError::InvalidRaiseHandState),
     }
 }
 
@@ -1200,10 +1381,10 @@ pub fn build_screen_share(
     request_id: &str,
     state: ScreenShareState,
     screen_share_id: Option<u32>,
-) -> Result<Node> {
+) -> Result<Node, GroupCallBuildError> {
     validate_call_identity(call_id, request_id, creator)?;
     if to.user.is_empty() {
-        bail!("screen-share target is required");
+        return Err(GroupCallBuildError::MissingScreenShareTarget);
     }
     let mut action = NodeBuilder::new(CallActionTag::ScreenShare.as_str())
         .attr("call-id", call_id)
@@ -1218,18 +1399,18 @@ pub fn build_screen_share(
 
 /// Parse one versioned screen-share transition.
 #[cold]
-pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
+pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare, GroupCallParseError> {
     if node.tag.as_ref() != CallActionTag::ScreenShare.as_str() {
-        return Err(group_stanza_error("expected a screen_share stanza"));
+        return Err(GroupCallParseError::ExpectedScreenShare);
     }
     let mut attrs = node.attrs();
     let _ = required_string(&mut attrs, "call-id")?;
     let _ = required_jid(&mut attrs, "call-creator")?;
     let state_value = required_u32(&mut attrs, "screenshare_state")?;
-    let state_code = i32::try_from(state_value)
-        .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
+    let state_code =
+        i32::try_from(state_value).map_err(|_| GroupCallParseError::UnsupportedScreenShareState)?;
     let state = ScreenShareState::try_from(state_code)
-        .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
+        .map_err(|_| GroupCallParseError::UnsupportedScreenShareState)?;
     let version = required_u32(&mut attrs, "version")?;
     let screen_share_id = optional_u32(&mut attrs, "screen_share_id")?;
     finish_attrs(&attrs)?;
@@ -1248,21 +1429,26 @@ pub fn build_call_control_ack(original: &NodeRef<'_>, action_type: &str) -> Opti
 
 #[cold]
 #[inline(never)]
-fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<()> {
+fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<(), GroupCallParseError> {
     let class = node.get_attr("class").map(|value| value.as_str());
     let response_type = node.get_attr("type").map(|value| value.as_str());
     if node.tag != "ack"
         || class.as_deref() != Some("call")
         || response_type.as_deref() != Some(expected_type)
     {
-        bail!("unexpected {expected_type} ack envelope");
+        return Err(GroupCallParseError::InvalidAckEnvelope {
+            expected: expected_type.to_owned(),
+        });
     }
     if let Some(error) = node
         .get_attr("error")
         .map(|value| value.as_str())
         .filter(|error| !error.is_empty())
     {
-        bail!("{expected_type} rejected with error {error}");
+        return Err(GroupCallParseError::AckRejected {
+            expected: expected_type.to_owned(),
+            error: error.to_string(),
+        });
     }
     Ok(())
 }
@@ -1271,16 +1457,17 @@ fn validate_call_ack(node: &NodeRef<'_>, expected_type: &str) -> Result<()> {
 fn validated_call_ack_child<'a, 'b>(
     node: &'b NodeRef<'a>,
     expected_type: &str,
-) -> Result<&'b NodeRef<'a>> {
+) -> Result<&'b NodeRef<'a>, GroupCallParseError> {
     validate_call_ack(node, expected_type)?;
     node.get_optional_child(expected_type)
-        .ok_or_else(|| anyhow!("<ack type={expected_type}> missing payload"))
+        .ok_or_else(|| GroupCallParseError::MissingAckPayload {
+            expected: expected_type.to_owned(),
+        })
 }
 
 #[inline(never)]
-fn parse_call_link_media(value: String) -> Result<CallLinkMedia> {
-    CallLinkMedia::try_from(value.as_str())
-        .map_err(|_| group_stanza_error("unsupported call-link media"))
+fn parse_call_link_media(value: String) -> Result<CallLinkMedia, GroupCallParseError> {
+    CallLinkMedia::try_from(value.as_str()).map_err(|_| GroupCallParseError::UnsupportedLinkMedia)
 }
 
 #[inline(never)]
@@ -1289,46 +1476,51 @@ fn bool_attr(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> bool {
 }
 
 #[inline(never)]
-fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>) -> Result<()> {
+fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>) -> Result<(), GroupCallParseError> {
     attrs
         .finish()
-        .map_err(|_| group_stanza_error("unexpected group-call attributes"))
+        .map_err(|_| GroupCallParseError::UnexpectedAttributes)
 }
 
-fn required_string(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<String> {
+fn required_string(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<String, GroupCallParseError> {
     attrs
         .optional_string(name)
         .filter(|value| !value.is_empty())
         .map(|value| value.into_owned())
-        .ok_or_else(|| group_stanza_error("missing group-call string attribute"))
+        .ok_or(GroupCallParseError::MissingStringAttribute)
 }
 
 #[inline(never)]
-fn required_jid(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Jid> {
+fn required_jid(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<Jid, GroupCallParseError> {
     attrs
         .optional_jid(name)
-        .ok_or_else(|| group_stanza_error("missing or invalid group-call jid"))
+        .ok_or(GroupCallParseError::MissingJidAttribute)
 }
 
 #[inline(never)]
-fn required_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<u32> {
-    optional_u32(attrs, name)?
-        .ok_or_else(|| group_stanza_error("missing group-call integer attribute"))
+fn required_u32(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<u32, GroupCallParseError> {
+    optional_u32(attrs, name)?.ok_or(GroupCallParseError::MissingIntegerAttribute)
 }
 
-fn optional_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Option<u32>> {
+fn optional_u32(
+    attrs: &mut wacore_binary::AttrParserRef<'_>,
+    name: &str,
+) -> Result<Option<u32>, GroupCallParseError> {
     let Some(raw) = attrs.optional_string(name) else {
         return Ok(None);
     };
     raw.parse::<u32>()
         .map(Some)
-        .map_err(|_| group_stanza_error("invalid group-call integer attribute"))
-}
-
-#[cold]
-#[inline(never)]
-fn group_stanza_error(message: &'static str) -> anyhow::Error {
-    anyhow::Error::msg(message)
+        .map_err(|_| GroupCallParseError::InvalidIntegerAttribute)
 }
 
 #[cold]
@@ -1673,12 +1865,14 @@ mod tests {
 
         let err = build_initial_group_offer(&params(None, &pair))
             .expect_err("an ad-hoc call to one person is a 1:1 call");
+        assert!(matches!(err, GroupCallBuildError::OfferNeedsTwoRemotes));
         assert_eq!(
             err.to_string(),
             "group offer requires self and at least two remote participants"
         );
         let err = build_initial_group_offer(&params(Some(&group), &pair[..1]))
             .expect_err("a group-bound call still rings someone");
+        assert!(matches!(err, GroupCallBuildError::GroupOfferNeedsRemote));
         assert_eq!(
             err.to_string(),
             "group-bound offer requires self and at least one remote participant"
@@ -1936,6 +2130,7 @@ mod tests {
             .build();
         let error = parse_initial_group_call_ack(&ack.as_node_ref())
             .expect_err("a refusal is not a snapshot");
+        assert!(matches!(&error, GroupCallParseError::OfferRejected(code) if code == "427"));
         assert!(
             error.to_string().contains("rejected with error 427"),
             "unexpected parse error: {error:#}"

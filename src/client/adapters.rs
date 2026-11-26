@@ -1,7 +1,6 @@
 //! Signal/sender-key store adapters, per-session locks and noise socket access.
 
 use super::*;
-use anyhow::Context as _;
 
 /// Own the receive quiescence before acquiring session/mapping/registry locks.
 /// Pending rows are committed before this scope is exposed, so its flushes
@@ -22,22 +21,24 @@ impl SignalMaintenance<'_> {
         (self.connection_generation, self.semaphore_generation)
     }
 
-    pub(crate) fn ensure_current(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.client.connection_generation.load(Ordering::Acquire) == self.connection_generation
-                && self
-                    .client
-                    .message_semaphore_generation
-                    .load(Ordering::SeqCst)
-                    == self.semaphore_generation,
-            "connection or processing permit changed during Signal maintenance"
-        );
+    pub(crate) fn ensure_current(&self) -> Result<(), SignalMaintenanceError> {
+        if self.client.connection_generation.load(Ordering::Acquire) != self.connection_generation
+            || self
+                .client
+                .message_semaphore_generation
+                .load(Ordering::SeqCst)
+                != self.semaphore_generation
+        {
+            return Err(SignalMaintenanceError::ConnectionChanged);
+        }
         Ok(())
     }
 
     // Keep the cache-flush polling body shared by recovery and notifications.
     #[inline(never)]
-    pub(crate) fn flush(&self) -> wacore::runtime::BoxFuture<'_, Result<()>> {
+    pub(crate) fn flush(
+        &self,
+    ) -> wacore::runtime::BoxFuture<'_, Result<(), SignalMaintenanceError>> {
         Box::pin(async move {
             self.ensure_current()?;
             self.client.flush_signal_cache().await?;
@@ -50,7 +51,7 @@ impl SignalMaintenance<'_> {
         &'a self,
         user: &'a str,
         record: &'a wacore::store::traits::DeviceListRecord,
-    ) -> wacore::runtime::BoxFuture<'a, Result<()>> {
+    ) -> wacore::runtime::BoxFuture<'a, Result<(), SignalMaintenanceError>> {
         Box::pin(async move {
             self.ensure_current()?;
             let _change = self
@@ -91,7 +92,7 @@ impl Client {
     #[inline(never)]
     pub(crate) fn begin_signal_maintenance(
         self: &Arc<Self>,
-    ) -> wacore::runtime::BoxFuture<'_, Result<SignalMaintenance<'_>>> {
+    ) -> wacore::runtime::BoxFuture<'_, Result<SignalMaintenance<'_>, SignalMaintenanceError>> {
         // Share this state machine across recovery, refresh and notification
         // callers instead of duplicating the commit/permit polling branches.
         Box::pin(async move {
@@ -100,24 +101,23 @@ impl Client {
             loop {
                 let (semaphore_generation, _) = self.read_message_semaphore();
                 let permits = self.acquire_message_quiescence().await;
-                anyhow::ensure!(
-                    self.connection_generation.load(Ordering::Acquire) == connection_generation,
-                    "connection changed while entering Signal maintenance"
-                );
+                if self.connection_generation.load(Ordering::Acquire) != connection_generation {
+                    return Err(SignalMaintenanceError::ConnectionChanged);
+                }
                 if self.message_semaphore_generation.load(Ordering::SeqCst) != semaphore_generation
                 {
                     drop(permits);
                     continue;
                 }
-                anyhow::ensure!(
-                    self.commit_inbound_batch_quiesced(Some(connection_generation))
-                        .await,
-                    "pending inbound rows could not commit before Signal maintenance"
-                );
-                anyhow::ensure!(
-                    self.connection_generation.load(Ordering::Acquire) == connection_generation,
-                    "connection changed while committing Signal maintenance rows"
-                );
+                if !self
+                    .commit_inbound_batch_quiesced(Some(connection_generation))
+                    .await
+                {
+                    return Err(SignalMaintenanceError::DrainCommitFailed);
+                }
+                if self.connection_generation.load(Ordering::Acquire) != connection_generation {
+                    return Err(SignalMaintenanceError::ConnectionChanged);
+                }
                 // Completing a deferred drain can widen the semaphore. Re-enter
                 // on the new instance before exposing a permit ownership proof.
                 if self.message_semaphore_generation.load(Ordering::SeqCst) != semaphore_generation
@@ -218,7 +218,9 @@ impl Client {
     /// Flush the in-memory signal cache to the database backend. Invoked by the
     /// send path (synchronously, pre-wire), the receive-path coalescer, and the
     /// drain/retry/teardown recovery paths — not unconditionally per message.
-    pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn flush_signal_cache(
+        &self,
+    ) -> Result<(), wacore::store::signal_cache::SignalCacheFlushError> {
         // Clone the backend before awaiting so a slow write cannot retain the
         // device guard and stall every concurrent Device write.
         let backend = self
@@ -226,10 +228,7 @@ impl Client {
             .get_device_snapshot()
             .backend
             .clone();
-        self.signal_cache
-            .flush(&*backend)
-            .await
-            .context("Failed to flush signal cache")
+        self.signal_cache.flush(&*backend).await
     }
 
     /// Signal-cache flush that is safe while the offline drain is active.
@@ -303,7 +302,8 @@ impl Client {
     /// statement about what this send REQUIRES, not a promise it never flushes.
     pub(crate) async fn confirm_signal_state_pre_wire(
         &self,
-    ) -> Result<wacore::session_engine::publication::SignalCommitOutcome, anyhow::Error> {
+    ) -> Result<wacore::session_engine::publication::SignalCommitOutcome, SignalMaintenanceError>
+    {
         use wacore::session_engine::publication::SignalCommitOutcome;
         if self.signal_cache.needs_pre_wire_flush().await {
             Box::pin(self.flush_signal_cache_batch_safe()).await?;
@@ -348,16 +348,13 @@ mod tests {
         crate::test_utils::seed_peer_session(&client, &peer).await;
         backend.set_fail_session_writes(true);
 
+        use crate::error::ErrorChainExt;
         let error = client
             .flush_signal_cache()
             .await
             .expect_err("injected backend failure must propagate");
-        let chain: Vec<String> = error.chain().map(ToString::to_string).collect();
+        let chain: Vec<String> = error.sources().map(ToString::to_string).collect();
 
-        assert_eq!(
-            chain.first().map(String::as_str),
-            Some("Failed to flush signal cache")
-        );
         assert!(
             chain
                 .iter()

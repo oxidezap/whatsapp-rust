@@ -3,7 +3,25 @@
 #[path = "../src/bench_support/connected_idle/util.rs"]
 mod fixture_util;
 
-use anyhow::{Result, ensure};
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+macro_rules! ensure {
+    ($cond:expr $(,)?) => {
+        if !$cond {
+            return Err(concat!("condition failed: ", stringify!($cond)).into());
+        }
+    };
+    ($cond:expr, $msg:literal $(,)?) => {
+        if !$cond {
+            return Err($msg.into());
+        }
+    };
+    ($cond:expr, $fmt:expr, $($arg:tt)*) => {
+        if !$cond {
+            return Err(format!($fmt, $($arg)*).into());
+        }
+    };
+}
 use whatsapp_rust::bench_support::connected_idle::{
     BackendFixture, COMMIT_BATCHES, LANES, MESSAGES, Session,
 };
@@ -90,7 +108,7 @@ async fn shutdown_releases_active_workers_before_backend_cleanup() -> Result<()>
                 session.checkpoint().await.running_workers > 0,
                 "test must disconnect before idle retirement"
             );
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;
         let shutdown = session.shutdown().await;

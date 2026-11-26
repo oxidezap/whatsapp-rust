@@ -1,6 +1,6 @@
 //! Compile-shaped proof that a downstream crate can build message literals and
 //! implement the async traits using only this crate's re-exports (no direct
-//! buffa/bytes/anyhow/async-trait dependency of its own).
+//! buffa/bytes/async-trait dependency of its own).
 #![cfg(test)]
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
@@ -53,7 +53,7 @@ impl whatsapp_rust::InboundDurabilityHook for NoopHook {
         &self,
         _client: std::sync::Arc<whatsapp_rust::Client>,
         _batch: &[whatsapp_rust::types::events::InboundMessage],
-    ) -> whatsapp_rust::anyhow::Result<()> {
+    ) -> whatsapp_rust::HookResult<()> {
         Ok(())
     }
 }

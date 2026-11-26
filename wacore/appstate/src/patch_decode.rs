@@ -1,11 +1,28 @@
 //! Patch list parsing (snapshot + patches) - partial port of Go appstate/decode.go
 
-use anyhow::{Result, anyhow};
 use std::str::FromStr;
+use thiserror::Error;
 use wacore_binary::node::{Node, NodeRef};
 use waproto::whatsapp as wa;
 
 pub use crate::schemas::WAPatchName;
+
+/// Errors that can occur during patch list parsing.
+#[derive(Debug, Error)]
+pub enum PatchDecodeError {
+    #[error("missing sync/collection")]
+    MissingSyncCollection,
+    #[error("missing sync node in response")]
+    MissingSyncNode,
+    #[error("collection missing 'name' attribute")]
+    MissingCollectionName,
+    #[error("attribute error: {0}")]
+    Binary(#[from] wacore_binary::BinaryError),
+    #[error("failed to unmarshal patch: {0}")]
+    UnmarshalPatch(#[from] buffa::DecodeError),
+}
+
+pub type Result<T> = std::result::Result<T, PatchDecodeError>;
 
 #[derive(Debug, Clone)]
 pub struct PatchList {
@@ -46,7 +63,7 @@ impl std::fmt::Display for CollectionSyncError {
 pub fn parse_patch_list(node: &Node) -> Result<PatchList> {
     let collection = node
         .get_optional_child_by_tag(&["sync", "collection"]) // naive path descent
-        .ok_or_else(|| anyhow!("missing sync/collection"))?;
+        .ok_or(PatchDecodeError::MissingSyncCollection)?;
     parse_single_collection(collection)
 }
 
@@ -60,7 +77,7 @@ pub fn parse_patch_list(node: &Node) -> Result<PatchList> {
 pub fn parse_patch_list_ref(node: &NodeRef<'_>) -> Result<PatchList> {
     let collection = node
         .get_optional_child_by_tag(&["sync", "collection"]) // naive path descent
-        .ok_or_else(|| anyhow!("missing sync/collection"))?;
+        .ok_or(PatchDecodeError::MissingSyncCollection)?;
     parse_single_collection_ref(collection)
 }
 
@@ -75,7 +92,7 @@ pub fn parse_patch_lists_ref(node: &NodeRef<'_>) -> Result<Vec<PatchList>> {
         node
     } else {
         node.get_optional_child("sync")
-            .ok_or_else(|| anyhow!("missing sync node in response"))?
+            .ok_or(PatchDecodeError::MissingSyncNode)?
     };
 
     let Some(children) = sync_node.children() else {
@@ -94,7 +111,7 @@ pub fn parse_patch_lists(node: &Node) -> Result<Vec<PatchList>> {
         node
     } else {
         node.get_optional_child("sync")
-            .ok_or_else(|| anyhow!("missing sync node in response"))?
+            .ok_or(PatchDecodeError::MissingSyncNode)?
     };
 
     let Some(children) = sync_node.children() else {
@@ -113,7 +130,7 @@ fn parse_single_collection(collection: &Node) -> Result<PatchList> {
     let mut ag = collection.attrs();
     let name_str = ag
         .optional_string("name")
-        .ok_or_else(|| anyhow!("collection missing 'name' attribute"))?
+        .ok_or(PatchDecodeError::MissingCollectionName)?
         .to_string();
     let has_more = ag.optional_bool("has_more_patches");
 
@@ -157,7 +174,7 @@ fn parse_single_collection(collection: &Node) -> Result<PatchList> {
             {
                 match waproto::codec::syncd_patch_decode(raw.as_slice()) {
                     Ok(p) => patches.push(p),
-                    Err(e) => return Err(anyhow!("failed to unmarshal patch: {e}")),
+                    Err(e) => return Err(PatchDecodeError::UnmarshalPatch(e)),
                 }
             }
         }
@@ -221,7 +238,7 @@ fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
     let mut ag = collection.attrs();
     let name_str = ag
         .optional_string("name")
-        .ok_or_else(|| anyhow!("collection missing 'name' attribute"))?;
+        .ok_or(PatchDecodeError::MissingCollectionName)?;
     let has_more = ag.optional_bool("has_more_patches");
 
     // Check for per-collection error (WA Web: `3JJWKHeu5-P.js:54222-54254`)
@@ -257,7 +274,7 @@ fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
             {
                 match waproto::codec::syncd_patch_decode(raw) {
                     Ok(p) => patches.push(p),
-                    Err(e) => return Err(anyhow!("failed to unmarshal patch: {e}")),
+                    Err(e) => return Err(PatchDecodeError::UnmarshalPatch(e)),
                 }
             }
         }

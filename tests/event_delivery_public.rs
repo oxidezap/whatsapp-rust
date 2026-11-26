@@ -15,14 +15,19 @@ use whatsapp_rust::wacore::runtime::{AbortHandle, BoxFuture, Runtime};
 use whatsapp_rust::wacore::store::in_memory::InMemoryBackend;
 use whatsapp_rust::{
     CallbackEventHandler, Client, EventDelivery, NodeBuilder, RunCompletionReason, TokioRuntime,
-    anyhow, async_channel, wacore_binary,
+    async_channel, wacore_binary,
 };
 
 struct OfflineHttp;
 #[whatsapp_rust::async_trait]
 impl HttpClient for OfflineHttp {
-    async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
-        anyhow::bail!("offline observer HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
+        Err(whatsapp_rust::http::HttpError::adapter(
+            std::io::Error::other("offline observer HTTP"),
+        ))
     }
 }
 struct OfflineTransport;
@@ -30,8 +35,11 @@ struct OfflineTransport;
 impl TransportFactory for OfflineTransport {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
-        anyhow::bail!("offline observer transport")
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        whatsapp_rust::transport::TransportError,
+    > {
+        Err("offline observer transport".into())
     }
 }
 async fn client() -> Arc<Client> {

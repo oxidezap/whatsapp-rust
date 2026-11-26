@@ -193,7 +193,7 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                 (AttrType::Jid, false, _) => {
                     quote! {
                         #field_ident: node.attrs().optional_jid(#attr_name)
-                            .ok_or_else(|| ::anyhow::anyhow!("missing required attribute '{}'", #attr_name))?
+                            .ok_or(::wacore::protocol::ProtocolNodeError::MissingAttribute { name: #attr_name })?
                     }
                 }
                 (AttrType::Jid, true, _) => {
@@ -238,7 +238,7 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                     quote! {
                         #field_ident: ::wacore::protocol::parse_string_enum(
                             &node.attrs().optional_string(#attr_name)
-                                .ok_or_else(|| ::anyhow::anyhow!("missing required attribute '{}'", #attr_name))?
+                                .ok_or(::wacore::protocol::ProtocolNodeError::MissingAttribute { name: #attr_name })?
                         )?
                     }
                 }
@@ -253,7 +253,7 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                 (AttrType::U64, false, _) => {
                     quote! {
                         #field_ident: node.attrs().optional_u64(#attr_name)
-                            .ok_or_else(|| ::anyhow::anyhow!("missing required attribute '{}'", #attr_name))?
+                            .ok_or(::wacore::protocol::ProtocolNodeError::MissingAttribute { name: #attr_name })?
                     }
                 }
                 (AttrType::U64, true, _) => {
@@ -266,8 +266,8 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                         #field_ident: node.attrs().optional_u64(#attr_name)
                             .map(|v| u32::try_from(v))
                             .transpose()
-                            .map_err(|_| ::anyhow::anyhow!("attribute '{}' value exceeds u32::MAX", #attr_name))?
-                            .ok_or_else(|| ::anyhow::anyhow!("missing required attribute '{}'", #attr_name))?
+                            .map_err(|_| ::wacore::protocol::ProtocolNodeError::AttributeOverflow { name: #attr_name })?
+                            .ok_or(::wacore::protocol::ProtocolNodeError::MissingAttribute { name: #attr_name })?
                     }
                 }
                 (AttrType::U32, true, _) => {
@@ -275,7 +275,7 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                         #field_ident: node.attrs().optional_u64(#attr_name)
                             .map(|v| u32::try_from(v))
                             .transpose()
-                            .map_err(|_| ::anyhow::anyhow!("attribute '{}' value exceeds u32::MAX", #attr_name))?
+                            .map_err(|_| ::wacore::protocol::ProtocolNodeError::AttributeOverflow { name: #attr_name })?
                     }
                 }
             }
@@ -325,6 +325,8 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl ::wacore::protocol::ProtocolNode for #name {
+            type Error = ::wacore::protocol::ProtocolNodeError;
+
             fn tag(&self) -> &'static str {
                 #tag
             }
@@ -335,9 +337,12 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                 builder.build()
             }
 
-            fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::anyhow::Result<Self> {
+            fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::core::result::Result<Self, Self::Error> {
                 if node.tag != #tag {
-                    return Err(::anyhow::anyhow!("expected <{}>, got <{}>", #tag, node.tag));
+                    return Err(::wacore::protocol::ProtocolNodeError::UnexpectedTag {
+                        expected: #tag,
+                        actual: node.tag.as_ref().to_owned(),
+                    });
                 }
                 Ok(Self {
                     #(#field_parsers),*
@@ -389,6 +394,8 @@ pub fn derive_empty_node(input: TokenStream) -> TokenStream {
 fn generate_empty_impl(name: &syn::Ident, tag: &str) -> proc_macro2::TokenStream {
     quote! {
         impl ::wacore::protocol::ProtocolNode for #name {
+            type Error = ::wacore::protocol::ProtocolNodeError;
+
             fn tag(&self) -> &'static str {
                 #tag
             }
@@ -397,9 +404,12 @@ fn generate_empty_impl(name: &syn::Ident, tag: &str) -> proc_macro2::TokenStream
                 ::wacore_binary::builder::NodeBuilder::new(#tag).build()
             }
 
-            fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::anyhow::Result<Self> {
+            fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::core::result::Result<Self, Self::Error> {
                 if node.tag != #tag {
-                    return Err(::anyhow::anyhow!("expected <{}>, got <{}>", #tag, node.tag));
+                    return Err(::wacore::protocol::ProtocolNodeError::UnexpectedTag {
+                        expected: #tag,
+                        actual: node.tag.as_ref().to_owned(),
+                    });
                 }
                 Ok(Self)
             }
@@ -955,7 +965,7 @@ fn expand_wire_enum_unit(
             }
 
             impl ::wacore::protocol::ParseStringEnum for #name {
-                fn parse_from_str(s: &str) -> ::anyhow::Result<Self> {
+                fn parse_from_str(s: &str) -> ::core::result::Result<Self, ::wacore::protocol::UnknownWireValue> {
                     ::core::result::Result::Ok(::core::convert::From::from(s))
                 }
             }
@@ -969,19 +979,19 @@ fn expand_wire_enum_unit(
         };
         conversion_impls = quote! {
             impl ::core::convert::TryFrom<&str> for #name {
-                type Error = ::anyhow::Error;
+                type Error = ::wacore::protocol::UnknownWireValue;
                 fn try_from(value: &str) -> ::core::result::Result<Self, Self::Error> {
                     match value {
                         #(#try_from_arms),*,
                         _ => ::core::result::Result::Err(
-                            ::anyhow::anyhow!("unknown {}: {}", stringify!(#name), value)
+                            ::wacore::protocol::UnknownWireValue::new(stringify!(#name), value)
                         ),
                     }
                 }
             }
 
             impl ::wacore::protocol::ParseStringEnum for #name {
-                fn parse_from_str(s: &str) -> ::anyhow::Result<Self> {
+                fn parse_from_str(s: &str) -> ::core::result::Result<Self, ::wacore::protocol::UnknownWireValue> {
                     ::core::convert::TryFrom::try_from(s)
                 }
             }

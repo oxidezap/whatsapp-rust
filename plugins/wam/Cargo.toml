@@ -8,7 +8,6 @@ publish = false
 description = "WhatsApp Metrics (WAM) telemetry plugin for whatsapp-rust"
 
 [dependencies]
-anyhow = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }

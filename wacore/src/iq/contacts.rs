@@ -35,11 +35,27 @@
 use crate::iq::spec::IqSpec;
 use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
-use anyhow::anyhow;
 use std::time::Duration;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{NodeContent, NodeRef};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProfilePictureError {
+    #[error("{0}")]
+    Rejection(#[from] crate::request::IqError),
+    #[error("Profile picture error {code}: {text}")]
+    Remote { code: String, text: String },
+    #[error("Profile picture server error: status 500")]
+    ServerError,
+    #[error("Profile picture not allowed: status 405")]
+    NotAllowed,
+    #[error("Set picture response missing 'picture' child")]
+    MissingPicture,
+    #[error("Set picture response missing 'id' attribute")]
+    MissingId,
+}
 
 /// Profile picture information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +257,7 @@ impl ProfilePictureSpec {
 
 impl IqSpec for ProfilePictureSpec {
     type Response = ProfilePictureLookup;
+    type Error = ProfilePictureError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         if self.is_community {
@@ -305,7 +322,7 @@ impl IqSpec for ProfilePictureSpec {
         }
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Support both direct <picture> (w:profile:picture) and wrapped <pictures><picture> (w:g2 community)
         let picture_node = if let Some(pictures_node) = response.get_optional_child("pictures") {
             pictures_node.get_optional_child("picture")
@@ -354,7 +371,10 @@ impl IqSpec for ProfilePictureSpec {
             }
             let text = error_node.attrs().optional_string("text");
             let text_str = text.as_deref().unwrap_or("unknown error");
-            return Err(anyhow!("Profile picture error {}: {}", code_str, text_str));
+            return Err(ProfilePictureError::Remote {
+                code: code_str.to_owned(),
+                text: text_str.to_owned(),
+            });
         }
 
         // Check status attribute on <picture> (e.g. status="304" unchanged, status="204" not found)
@@ -362,8 +382,8 @@ impl IqSpec for ProfilePictureSpec {
             match status.as_ref() {
                 "304" => return Ok(ProfilePictureLookup::Unchanged),
                 "204" => return Ok(ProfilePictureLookup::NotFound),
-                "500" => return Err(anyhow!("Profile picture server error: status 500")),
-                "405" => return Err(anyhow!("Profile picture not allowed: status 405")),
+                "500" => return Err(ProfilePictureError::ServerError),
+                "405" => return Err(ProfilePictureError::NotAllowed),
                 _ => {}
             }
         }
@@ -511,6 +531,7 @@ impl SetProfilePictureSpec {
 
 impl IqSpec for SetProfilePictureSpec {
     type Response = SetProfilePictureResponse;
+    type Error = ProfilePictureError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         // WAWebSendProfilePictureJob: emits `<picture type="image">{bytes}</picture>`
@@ -533,17 +554,17 @@ impl IqSpec for SetProfilePictureSpec {
         iq
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         if self.image_data.is_some() {
             // Set operation: server must return <picture id="..."/>
             let picture_node = response
                 .get_optional_child("picture")
-                .ok_or_else(|| anyhow!("Set picture response missing 'picture' child"))?;
+                .ok_or(ProfilePictureError::MissingPicture)?;
             let id = picture_node
                 .attrs()
                 .optional_string("id")
                 .map(|s| s.to_string())
-                .ok_or_else(|| anyhow!("Set picture response missing 'id' attribute"))?;
+                .ok_or(ProfilePictureError::MissingId)?;
             Ok(SetProfilePictureResponse { id })
         } else {
             // Remove operation: server may return an empty result
@@ -774,8 +795,8 @@ mod tests {
             .build();
         let error = spec.parse_response(&resp_429.as_node_ref()).unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<crate::request::IqError>(),
-            Some(crate::request::IqError::ServerError { code: 429, text, .. })
+            error,
+            ProfilePictureError::Rejection(crate::request::IqError::ServerError { code: 429, text, .. })
                 if text == "rate-overlimit"
         ));
     }

@@ -1,7 +1,6 @@
 //! Group stanza preparation, phash/stale-device helpers and sender-key distribution.
 
 use super::*;
-use anyhow::Context as _;
 
 /// Retain devices that may receive a sender-key distribution. Reuses the
 /// caller's allocation and centralizes the exact-sender/hosted exclusions used
@@ -52,12 +51,12 @@ pub struct PreparedGroupStanza {
 #[error("required sender-key distribution failed")]
 pub struct RequiredSenderKeyDistributionError {
     #[source]
-    source: anyhow::Error,
+    source: RequiredDistributionCause,
     stale_device_users: Vec<String>,
 }
 
 impl RequiredSenderKeyDistributionError {
-    fn new(source: anyhow::Error, stale_device_users: Vec<String>) -> Self {
+    fn new(source: RequiredDistributionCause, stale_device_users: Vec<String>) -> Self {
         Self {
             source,
             stale_device_users,
@@ -66,6 +65,53 @@ impl RequiredSenderKeyDistributionError {
 
     pub fn stale_device_users(&self) -> &[String] {
         &self.stale_device_users
+    }
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum RequiredDistributionCause {
+    #[error("{0}")]
+    Device(#[source] crate::error::BoxedErrorSource<DeviceEncryptionError>),
+    #[error("sender-key distribution encrypted {encrypted} of {required} required targets")]
+    Incomplete { encrypted: usize, required: usize },
+}
+
+debug_as_display!(RequiredDistributionCause);
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupStanzaError {
+    #[error("{0}")]
+    DeviceIdentity(#[from] DeviceIdentityError),
+    #[error("{0}")]
+    Resolver(#[source] crate::error::BoxedErrorSource<crate::client::context::SendContextError>),
+    #[error("required sender-key distribution has no targets")]
+    MissingDistributionTargets,
+    #[error("a pre-resolved group encryption address is missing")]
+    MissingResolvedAddress,
+    #[error("required sender-key session setup failed")]
+    SessionSetup(#[source] crate::error::BoxedErrorSource<SessionSetupError>),
+    #[error("{0}")]
+    RequiredDistribution(
+        #[source] crate::error::BoxedErrorSource<RequiredSenderKeyDistributionError>,
+    ),
+    #[error("{0}")]
+    SenderKeyCreation(
+        #[source] crate::error::BoxedErrorSource<crate::libsignal::protocol::SignalProtocolError>,
+    ),
+    #[error("group encrypt failed: {}", crate::diagnostics::ErrorSummary(.0.as_ref()))]
+    GroupEncrypt(
+        #[source] crate::error::BoxedErrorSource<crate::libsignal::protocol::SignalProtocolError>,
+    ),
+}
+
+impl GroupStanzaError {
+    pub fn signal_error(&self) -> Option<&crate::libsignal::protocol::SignalProtocolError> {
+        match self {
+            Self::SenderKeyCreation(error) | Self::GroupEncrypt(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -101,7 +147,7 @@ pub async fn prepare_group_stanza(
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     request: GroupStanzaRequest<'_>,
-) -> Result<PreparedGroupStanza> {
+) -> Result<PreparedGroupStanza, GroupStanzaError> {
     prepare_group_stanza_resolved(runtime, stores, resolver, request, None).await
 }
 
@@ -124,7 +170,7 @@ pub async fn prepare_group_stanza_resolved(
     resolver: &dyn SendContextResolver,
     request: GroupStanzaRequest<'_>,
     signal_addresses: Option<&std::collections::HashMap<Jid, Jid>>,
-) -> Result<PreparedGroupStanza> {
+) -> Result<PreparedGroupStanza, GroupStanzaError> {
     let sender_role = resolver.sender_identity_role();
     sender_role.validate()?;
     let GroupStanzaRequest {
@@ -250,7 +296,13 @@ pub async fn prepare_group_stanza_resolved(
             jids_to_resolve.len()
         );
 
-        let mut resolved_list = resolver.resolve_devices(&jids_to_resolve).await?;
+        let mut resolved_list =
+            resolver
+                .resolve_devices(&jids_to_resolve)
+                .await
+                .map_err(|error| {
+                    GroupStanzaError::Resolver(crate::error::BoxedErrorSource::new(error))
+                })?;
 
         // For LID groups, convert phone-based device JIDs back to LID format
         // This is necessary because WhatsApp Web expects LID addressing in SKDM <to> nodes
@@ -304,7 +356,7 @@ pub async fn prepare_group_stanza_resolved(
     if distribution_policy == SenderKeyDistributionPolicy::Required
         && distribution_list.as_ref().is_none_or(Vec::is_empty)
     {
-        bail!("required sender-key distribution has no targets");
+        return Err(GroupStanzaError::MissingDistributionTargets);
     }
 
     // Phash (groups): cover the FULL participant device set + the sending device
@@ -367,11 +419,12 @@ pub async fn prepare_group_stanza_resolved(
                 .map(|addresses| {
                     list.iter()
                         .map(|device| {
-                            addresses.get(device).cloned().ok_or_else(|| {
-                                anyhow!("a pre-resolved group encryption address is missing")
-                            })
+                            addresses
+                                .get(device)
+                                .cloned()
+                                .ok_or(GroupStanzaError::MissingResolvedAddress)
                         })
-                        .collect::<Result<Vec<_>>>()
+                        .collect::<Result<Vec<_>, GroupStanzaError>>()
                 })
                 .transpose()?;
             let setup_lock = stores
@@ -391,14 +444,18 @@ pub async fn prepare_group_stanza_resolved(
             {
                 Ok(plan) => Some(plan),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(error.context("required sender-key session setup failed"));
+                    return Err(GroupStanzaError::SessionSetup(
+                        crate::error::BoxedErrorSource::new(error),
+                    ));
                 }
                 Err(e) => {
                     log::warn!(
                         "SKDM session setup failed for group {}, continuing without distribution: {e}",
                         to_jid.observe()
                     );
-                    if is_device_unregistered_error(&e) {
+                    if e.server_error()
+                        .is_some_and(|error| error.code == UNREGISTERED_DEVICE_CODE)
+                    {
                         had_unregistered_devices = true;
                     }
                     None
@@ -440,7 +497,10 @@ pub async fn prepare_group_stanza_resolved(
             stores.sender_key_store,
             &sender_key_name,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            GroupStanzaError::SenderKeyCreation(crate::error::BoxedErrorSource::new(error))
+        })?;
 
         if let Some(plan) = session_plan {
             let skdm_plaintext_to_encrypt =
@@ -452,7 +512,11 @@ pub async fn prepare_group_stanza_resolved(
             // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
             // without a sender key never decrypt the skmsg and the revoke is silently dropped.
             let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
-            match encrypt_for_devices_with_sessions_detailed(
+            let EncryptAttempt {
+                result,
+                first_error,
+                unkeyed_at_encrypt,
+            } = encrypt_for_devices_with_sessions_detailed(
                 runtime,
                 stores,
                 distribution_list,
@@ -461,100 +525,75 @@ pub async fn prepare_group_stanza_resolved(
                 None,
                 plan,
             )
-            .await
+            .await;
+            // The SKDM fan-out is the last place a group member can be
+            // dropped, and it happens before the Required check below
+            // can turn the send into an error.
+            report_encrypt_drops(resolver, unkeyed_at_encrypt);
+            let EncryptResult {
+                participant_nodes,
+                includes_prekey_message: result_includes_prekey,
+                encrypted_devices,
+                had_unregistered_device,
+                rejected_devices,
+            } = result;
+            if distribution_policy == SenderKeyDistributionPolicy::Required
+                && (encrypted_devices.len() != distribution_list.len() || first_error.is_some())
             {
-                Ok(EncryptAttempt {
-                    result,
-                    first_error,
-                    unkeyed_at_encrypt,
-                }) => {
-                    // The SKDM fan-out is the last place a group member can be
-                    // dropped, and it happens before the Required check below
-                    // can turn the send into an error.
-                    report_encrypt_drops(resolver, unkeyed_at_encrypt);
-                    let EncryptResult {
-                        participant_nodes,
-                        includes_prekey_message: result_includes_prekey,
-                        encrypted_devices,
-                        had_unregistered_device,
-                        rejected_devices,
-                    } = result;
-                    if distribution_policy == SenderKeyDistributionPolicy::Required
-                        && (encrypted_devices.len() != distribution_list.len()
-                            || first_error.is_some())
-                    {
-                        let error = first_error.unwrap_or_else(|| {
-                            anyhow!(
-                                "sender-key distribution encrypted {} of {} required targets",
-                                encrypted_devices.len(),
-                                distribution_list.len()
-                            )
-                        });
-                        let stale_device_users = stale_users_for(
-                            had_unregistered_device,
-                            &rejected_devices,
-                            Some(distribution_list),
-                            &encrypted_devices,
-                            group_info,
-                        );
-                        return Err(RequiredSenderKeyDistributionError::new(
-                            error,
-                            stale_device_users,
-                        )
-                        .into());
-                    }
+                let error = first_error
+                    .map(|error| RequiredDistributionCause::Device(error.into()))
+                    .unwrap_or(RequiredDistributionCause::Incomplete {
+                        encrypted: encrypted_devices.len(),
+                        required: distribution_list.len(),
+                    });
+                let stale_device_users = stale_users_for(
+                    had_unregistered_device,
+                    &rejected_devices,
+                    Some(distribution_list),
+                    &encrypted_devices,
+                    group_info,
+                );
+                return Err(GroupStanzaError::RequiredDistribution(
+                    crate::error::BoxedErrorSource::new(RequiredSenderKeyDistributionError::new(
+                        error,
+                        stale_device_users,
+                    )),
+                ));
+            }
 
-                    includes_prekey_message |= result_includes_prekey;
-                    if had_unregistered_device {
-                        had_unregistered_devices = true;
-                        skdm_rejected_devices.extend(rejected_devices);
-                    }
-                    skdm_encrypted_devices = encrypted_devices;
+            includes_prekey_message |= result_includes_prekey;
+            if had_unregistered_device {
+                had_unregistered_devices = true;
+                skdm_rejected_devices.extend(rejected_devices);
+            }
+            skdm_encrypted_devices = encrypted_devices;
 
-                    if !participant_nodes.is_empty() {
-                        message_children.push(
-                            NodeBuilder::new("participants")
-                                .children_vec(participant_nodes)
-                                .build(),
-                        );
-                        let device_identity = match distribution_policy {
-                            SenderKeyDistributionPolicy::BestEffort => {
-                                needs_device_identity_for_role(
-                                    includes_prekey_message,
-                                    account,
-                                    sender_role,
-                                )
-                                .ok()
-                                .flatten()
-                            }
-                            SenderKeyDistributionPolicy::Required => {
-                                needs_device_identity_for_role(
-                                    includes_prekey_message,
-                                    account,
-                                    sender_role,
-                                )?
-                            }
-                        };
-                        if let Some(device_identity_bytes) = device_identity {
-                            message_children.push(
-                                NodeBuilder::new("device-identity")
-                                    .bytes(device_identity_bytes)
-                                    .build(),
-                            );
-                        }
-                    }
-                }
-                Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(RequiredSenderKeyDistributionError::new(error, Vec::new()).into());
-                }
-                Err(e) => {
-                    log::warn!(
-                        "SKDM distribution failed for group {}, continuing without it: {e}",
-                        to_jid.observe()
+            if !participant_nodes.is_empty() {
+                message_children.push(
+                    NodeBuilder::new("participants")
+                        .children_vec(participant_nodes)
+                        .build(),
+                );
+                let device_identity = match distribution_policy {
+                    SenderKeyDistributionPolicy::BestEffort => needs_device_identity_for_role(
+                        includes_prekey_message,
+                        account,
+                        sender_role,
+                    )
+                    .ok()
+                    .flatten(),
+                    SenderKeyDistributionPolicy::Required => needs_device_identity_for_role(
+                        includes_prekey_message,
+                        account,
+                        sender_role,
+                    )?,
+                };
+                if let Some(device_identity_bytes) = device_identity {
+                    message_children.push(
+                        NodeBuilder::new("device-identity")
+                            .bytes(device_identity_bytes)
+                            .build(),
                     );
-                    if is_device_unregistered_error(&e) {
-                        had_unregistered_devices = true;
-                    }
                 }
             }
         }
@@ -575,7 +614,9 @@ pub async fn prepare_group_stanza_resolved(
             &mut rand::make_rng::<rand::rngs::StdRng>(),
         )
         .await
-        .context("group encrypt failed")?
+        .map_err(|error| {
+            GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(error))
+        })?
     } else {
         encrypt_group_message(
             stores.sender_key_store,
@@ -583,7 +624,10 @@ pub async fn prepare_group_stanza_resolved(
             &plaintext,
             &mut rand::make_rng::<rand::rngs::StdRng>(),
         )
-        .await?
+        .await
+        .map_err(|error| {
+            GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(error))
+        })?
     };
 
     // Release before buffer cleanup and the chain-independent stanza build.
@@ -776,7 +820,7 @@ pub(crate) fn collect_stale_device_users(
 pub async fn create_sender_key_distribution_message_for_group(
     store: &mut (dyn SenderKeyStore + Send + Sync),
     sender_key_name: &SenderKeyName,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, crate::libsignal::protocol::SignalProtocolError> {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
     let skdm = crate::libsignal::protocol::create_sender_key_distribution_message(

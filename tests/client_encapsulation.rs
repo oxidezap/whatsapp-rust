@@ -14,8 +14,13 @@ use whatsapp_rust::{Client, ConnectError, RunCompletionReason, TokioRuntime};
 struct OfflineHttp;
 #[whatsapp_rust::async_trait]
 impl HttpClient for OfflineHttp {
-    async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
-        whatsapp_rust::anyhow::bail!("offline encapsulation HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
+        Err(whatsapp_rust::http::HttpError::adapter(
+            std::io::Error::other("offline encapsulation HTTP"),
+        ))
     }
 }
 struct OfflineTransport(Arc<AtomicUsize>);
@@ -23,9 +28,12 @@ struct OfflineTransport(Arc<AtomicUsize>);
 impl TransportFactory for OfflineTransport {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        whatsapp_rust::transport::TransportError,
+    > {
         self.0.fetch_add(1, Ordering::SeqCst);
-        whatsapp_rust::anyhow::bail!("offline encapsulation transport")
+        Err("offline encapsulation transport".into())
     }
 }
 struct HostHandler;
@@ -36,7 +44,7 @@ impl EncHandler for HostHandler {
         _: Arc<Client>,
         _: &wacore_binary::Node,
         _: &whatsapp_rust::types::message::MessageInfo,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 }

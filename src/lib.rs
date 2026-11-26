@@ -448,7 +448,6 @@ pub use waproto;
 // Third-party re-exports: these crates' types appear in the public API, so
 // consumers must name them; a direct dependency would have to version-match
 // this crate exactly.
-pub use anyhow;
 pub use async_channel;
 pub use async_trait::async_trait;
 pub use bytes;
@@ -471,7 +470,7 @@ pub use cache_config::{
 pub mod cache_store;
 pub(crate) mod pending_device_sync;
 pub(crate) mod sender_key_device_cache;
-pub use cache_store::CacheStore;
+pub use cache_store::{CacheError, CacheResult, CacheStore};
 pub mod http;
 pub mod types;
 
@@ -481,6 +480,7 @@ mod inbound_queue;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
+pub use client::StartupSyncError;
 pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
@@ -494,18 +494,23 @@ pub use client::{
 };
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
-pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, LifecycleError};
 pub use client::{
     ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
     DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
     SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
+pub use client::{MappingLearningError, MappingStoreError};
 pub use client::{NodeFilter, NodeWaiter};
+pub use history_sync::HistorySyncError;
+pub use pdo::PdoError;
 pub use types::connect_admission::ConnectAdmission;
 pub use types::decrypt_failure_admission::{
     DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,
 };
-pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
+pub use types::durability_hook::{
+    HistorySyncCaptureHook, HookError, HookResult, InboundDurabilityHook,
+};
 pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 #[cfg(feature = "generated-group-notifications")]
 pub use types::group_notification_facts::{
@@ -542,19 +547,21 @@ pub mod plugins;
 pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginClientInfo, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEventSubscription, PluginCoreEvents,
-    PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
-    PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
-    PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
-    PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
-    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
-    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginInterceptorRegistration,
-    PluginIq, PluginIqError, PluginIqInterceptor, PluginIqReply, PluginIqReplyError,
-    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
-    PluginStanzaInterception, PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
+    PluginError, PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope,
+    PluginEventOverflow, PluginEventPayloadEncoding, PluginEventPublishError,
+    PluginEventPublishReport, PluginEventPublisherStats, PluginEventReceiveError,
+    PluginEventRouteError, PluginEventRouter, PluginEventRouterStats, PluginEventSelector,
+    PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
+    PluginEventTryReceiveError, PluginEvents, PluginFuture, PluginHealth, PluginHostConfig,
+    PluginHostStats, PluginInterceptorRegistration, PluginIq, PluginIqError, PluginIqInterceptor,
+    PluginIqReply, PluginIqReplyError, PluginManifest, PluginMessaging, PluginMessagingError,
+    PluginPlanError, PluginResourceError, PluginResult, PluginStanzaInterception, PluginState,
+    PluginStats, PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
-pub use request::{IqError, RejectionStanza};
+pub use receipt::ReceiptError;
+pub use request::{IqEncodeError, IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 // The module is the feature's; the type inside it is the target's (`tokio::spawn` needs threads).
@@ -591,7 +598,7 @@ pub mod upload;
 pub mod voip;
 #[cfg(feature = "voip-control")]
 pub mod voip_control;
-pub use upload::UploadOptions;
+pub use upload::{ClientUploadError, UploadOptions};
 
 pub mod pdo;
 pub mod prekeys;
@@ -642,13 +649,14 @@ pub use features::{
     PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
     ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup, QuickReplies,
     ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
-    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
-    SecurityCodeVersion, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, StarredMessages, Status,
-    StatusPrivacySetting, StatusSendOptions, SubgroupFailure, SubgroupKind, SubgroupVisibility,
-    SyncActionMessageRange, TcToken, TcTokenError, TextStatusExpiry, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError,
-    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, message_range,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretDecryptError, SecretEncKind,
+    SecretEncrypted, SecurityCodeVersion, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError,
+    StarredMessages, Status, StatusPrivacySetting, StatusSendOptions, SubgroupFailure,
+    SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError,
+    TextStatusExpiry, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo,
+    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
+    VariantProperty, VerifiedName, message_range,
 };
 pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 
@@ -681,7 +689,9 @@ pub mod prelude {
     };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
-    pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+    pub use crate::client::{
+        ClientLifecycle, ConnectionScope, ConnectionScopeState, LifecycleError,
+    };
     pub use crate::client::{
         ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
         DrainOutcome, LogoutReport, ProtocolTerminalReason, RunCompletionReason, SecretFlushReport,
@@ -697,7 +707,7 @@ pub mod prelude {
         PluginInterceptorRegistration, PluginIqInterceptor, PluginIqReply, PluginManifest,
         PluginStanzaInterception, UntypedClientPlugin,
     };
-    pub use crate::request::{IqError, RejectionStanza};
+    pub use crate::request::{IqEncodeError, IqError, RejectionStanza};
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{

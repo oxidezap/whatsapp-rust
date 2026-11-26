@@ -21,9 +21,25 @@
 //! carries the new content — same shape as the legacy edit path, so callers
 //! that already handle `protocolMessage.editedMessage` can reuse their code.
 
-use anyhow::{Result, anyhow};
-
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MessageEditCryptoError {
+    #[error("Invalid secret-encrypted IV length: expected 12, got {0}")]
+    InvalidIvSize(usize),
+    #[error("{0}")]
+    Addon(#[from] crate::secret_enc_addon::AddonError),
+    #[error("Failed to decode inner secret-encrypted Message: {0}")]
+    Decode(#[source] buffa::DecodeError),
+    #[error("secret-encrypted decrypt failed: primary={primary}; fallback={fallback}")]
+    Fallback {
+        primary: Box<MessageEditCryptoError>,
+        fallback: Box<MessageEditCryptoError>,
+    },
+}
+
+type Result<T> = std::result::Result<T, MessageEditCryptoError>;
 
 const IV_SIZE: usize = 12;
 
@@ -65,7 +81,7 @@ pub fn encrypt_message_edit(
     ctx: &MessageEditContext<'_>,
 ) -> Result<(Vec<u8>, [u8; IV_SIZE])> {
     let plaintext = waproto::codec::message_to_vec(inner_message);
-    encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
+    encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx()).map_err(Into::into)
 }
 
 /// Decrypt any `secret_encrypted_message` envelope to its inner `Message`.
@@ -86,10 +102,7 @@ pub fn decrypt_secret_encrypted(
     ctx: &MessageEditContext<'_>,
 ) -> Result<waproto::whatsapp::Message> {
     if iv.len() != IV_SIZE {
-        return Err(anyhow!(
-            "Invalid secret-encrypted IV length: expected {IV_SIZE}, got {}",
-            iv.len()
-        ));
+        return Err(MessageEditCryptoError::InvalidIvSize(iv.len()));
     }
     let addon = AddonContext {
         stanza_id: ctx.original_msg_id,
@@ -98,8 +111,7 @@ pub fn decrypt_secret_encrypted(
         modification_type,
     };
     let plaintext = decrypt_addon(enc_payload, iv, message_secret, &addon)?;
-    waproto::codec::message_decode(&plaintext[..])
-        .map_err(|e| anyhow!("Failed to decode inner secret-encrypted Message: {e}"))
+    waproto::codec::message_decode(&plaintext[..]).map_err(MessageEditCryptoError::Decode)
 }
 
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.
@@ -141,16 +153,13 @@ pub fn decrypt_secret_encrypted_with_fallback(
     match decrypt_secret_encrypted(enc_payload, iv, message_secret, modification_type, primary) {
         Ok(m) => Ok(m),
         Err(primary_err) => match fallback {
-            Some(fb) => decrypt_secret_encrypted(
-                enc_payload,
-                iv,
-                message_secret,
-                modification_type,
-                fb,
-            )
-            .map_err(|fb_err| {
-                anyhow!("secret-encrypted decrypt failed: primary={primary_err}; fallback={fb_err}")
-            }),
+            Some(fb) => {
+                decrypt_secret_encrypted(enc_payload, iv, message_secret, modification_type, fb)
+                    .map_err(|fb_err| MessageEditCryptoError::Fallback {
+                        primary: Box::new(primary_err),
+                        fallback: Box::new(fb_err),
+                    })
+            }
             None => Err(primary_err),
         },
     }

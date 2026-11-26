@@ -27,9 +27,11 @@ struct CountingHttp(AtomicUsize);
 
 #[async_trait::async_trait]
 impl HttpClient for CountingHttp {
-    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+    async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        anyhow::bail!("picture mutations must not add an HTTP upload")
+        Err(crate::http::HttpError::adapter(std::io::Error::other(
+            "picture mutations must not add an HTTP upload",
+        )))
     }
 }
 

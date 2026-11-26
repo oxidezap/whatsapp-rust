@@ -17,6 +17,182 @@ use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
 use wacore::appstate_sync::{AppStateMutationPersistence, MetadataValidatedPatchList};
 
+pub(crate) struct AppStateSyncFailure(Box<AppStateSyncFailureKind>);
+
+impl AppStateSyncFailure {
+    fn new(kind: AppStateSyncFailureKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    fn kind(&self) -> &AppStateSyncFailureKind {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AppStateSyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Debug for AppStateSyncFailure {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for AppStateSyncFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum AppStateSyncFailureKind {
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    Sync(#[from] crate::appstate_sync::AppStateSyncError),
+    #[error("{0}")]
+    AppState(#[from] wacore::appstate::AppStateError),
+    #[error("{0}")]
+    Processing(#[from] wacore::appstate_sync::AppStateProcessingError),
+    #[error("{0}")]
+    Preparation(#[from] wacore::appstate_sync::AppStatePreparationError),
+    #[error("{0}: {1}")]
+    SnapshotIntegrity(
+        wacore::appstate::AppStateError,
+        #[source] wacore::appstate::validation::ValidationError,
+    ),
+    #[error("{0}")]
+    Validation(#[from] wacore::appstate::validation::ValidationError),
+    #[error("{0}")]
+    PatchDecode(#[from] wacore::appstate::patch_decode::PatchDecodeError),
+    #[error("{0}")]
+    Iq(#[from] crate::request::IqError),
+    #[error("{0}")]
+    Client(#[from] ClientError),
+    #[error("{0}")]
+    Send(#[from] crate::send::SendError),
+    #[error("{0}")]
+    SessionEnsure(#[from] SessionEnsureError),
+    #[error("{0}")]
+    DeviceSync(#[from] crate::usync::DeviceSyncError),
+    #[error("{0}")]
+    Decode(#[from] buffa::DecodeError),
+    #[cfg(feature = "mobile-core")]
+    #[error("{0}")]
+    MobilePrimary(#[from] crate::mobile_primary::PrimaryManagementError),
+    #[cfg(feature = "mobile-core")]
+    #[error("{0}")]
+    MobileSession(#[from] wacore::mobile::MobileSessionError),
+    #[error("app-state key request failed for all {peer_count} peer device(s): {failures}")]
+    KeyRequestFailedAll { peer_count: usize, failures: String },
+    #[error("no peer devices available for app-state key request")]
+    NoPeerDevicesForKeyRequest,
+    #[error("no own JID available for app-state key request")]
+    NoOwnJidForKeyRequest,
+    #[error("{0}")]
+    PolicyRequired(&'static str),
+    #[error("authoritative primary app-state cannot restore a server snapshot")]
+    AuthoritativeCannotRestoreSnapshot,
+    #[error("app-state decode key(s) for {0:?} still missing after re-request; deferring sync")]
+    DecodeKeysMissing(WAPatchName),
+    #[error("app-state sync for {name:?} refused fatally by the server ({code}): {text}")]
+    SyncRefusedFatal {
+        name: WAPatchName,
+        code: u16,
+        text: String,
+    },
+    #[error("app-state sync for {name:?} was refused by the server and advanced nothing: {error}")]
+    SyncRefusedRetryable {
+        name: WAPatchName,
+        error: wacore::appstate::patch_decode::CollectionSyncError,
+    },
+    #[error("app-state patch for {0} not attempted: its bootstrap has not completed")]
+    BootstrapIncomplete(String),
+    #[error("unreadable app-state patch response for {collection}: {source}")]
+    UnreadablePatchResponse {
+        collection: String,
+        #[source]
+        source: wacore::appstate::patch_decode::PatchDecodeError,
+    },
+    #[error("app-state patch response collection mismatch: requested {requested}, got {got}")]
+    PatchCollectionMismatch {
+        requested: String,
+        got: &'static str,
+    },
+    #[error(
+        "app-state patch for {collection} conflicted on v{version} and the collection could not be recovered: {source}"
+    )]
+    PatchConflictRecoveryFailed {
+        collection: String,
+        version: u64,
+        #[source]
+        source: AppStateSyncFailure,
+    },
+    #[error("app-state patch for {collection} rejected: {error}")]
+    PatchRejected {
+        collection: String,
+        error: wacore::appstate::patch_decode::CollectionSyncError,
+    },
+    #[error("app-state patch for {collection} still conflicting after {attempts} attempts")]
+    PatchStillConflicting { collection: String, attempts: usize },
+    #[error("{0} is not a known collection, so its conflict cannot be resolved")]
+    UnknownConflictCollection(String),
+    #[error("re-sync of {0} was deferred to a later connection")]
+    ConflictResyncDeferred(String),
+    #[error("recovering {collection} did not move it past v{version}")]
+    ConflictRecoveryDidNotAdvance { collection: String, version: u64 },
+}
+
+impl std::fmt::Debug for AppStateSyncFailureKind {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl<T: Into<AppStateSyncFailureKind>> From<T> for AppStateSyncFailure {
+    fn from(value: T) -> Self {
+        Self::new(value.into())
+    }
+}
+
+fn from_processing_error(
+    error: wacore::appstate_sync::AppStateProcessingError,
+) -> AppStateSyncFailure {
+    use wacore::appstate_sync::{
+        AppStatePreparationError, AppStatePreparationErrorKind, AppStateProcessingError,
+        AppStateProcessingErrorKind,
+    };
+    match error.into_kind() {
+        AppStateProcessingErrorKind::Preparation(error) => match error.into_kind() {
+            AppStatePreparationErrorKind::SnapshotIntegrity(error) => {
+                AppStateSyncFailure::new(AppStateSyncFailureKind::SnapshotIntegrity(
+                    wacore::appstate::AppStateError::SnapshotMACMissing,
+                    error,
+                ))
+            }
+            AppStatePreparationErrorKind::Validation(error) => error.into(),
+            other => AppStatePreparationError::new(other).into(),
+        },
+        AppStateProcessingErrorKind::Store(error) => error.into(),
+        AppStateProcessingErrorKind::Sync(error) => error.into(),
+        AppStateProcessingErrorKind::AppState(error) => error.into(),
+        other => AppStateProcessingError::new(other).into(),
+    }
+}
+
+fn app_state_error_marker(error: &AppStateSyncFailure) -> Option<&wacore::appstate::AppStateError> {
+    if let AppStateSyncFailureKind::SnapshotIntegrity(marker, _) = error.kind() {
+        return Some(marker);
+    }
+    crate::error::ErrorChainExt::sources(error)
+        .find_map(|source| source.downcast_ref::<wacore::appstate::AppStateError>())
+}
+
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
     budget: std::sync::OnceLock<crate::download::memory::MemoryBudget>,
@@ -59,7 +235,7 @@ impl<'a> PrefetchMetadata<'a> {
 }
 
 type PrefetchedBlobs =
-    HashMap<String, std::result::Result<bytes::Bytes, Arc<crate::download::ClientDownloadError>>>;
+    HashMap<String, Result<bytes::Bytes, Arc<crate::download::ClientDownloadError>>>;
 
 #[derive(Debug)]
 struct BlobDownloadFailure(Arc<crate::download::ClientDownloadError>);
@@ -80,16 +256,22 @@ impl std::error::Error for BlobDownloadFailure {
 
 fn external_blob_resolver(
     blobs: &PrefetchedBlobs,
-) -> impl Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + '_ {
+) -> impl Fn(
+    &wa::ExternalBlobReference,
+) -> Result<bytes::Bytes, wacore::appstate_sync::ExternalBlobError>
++ '_ {
+    use wacore::appstate_sync::ExternalBlobError;
     move |ext| {
         let path = ext
             .direct_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
+            .ok_or(ExternalBlobError::MissingDirectPath)?;
         match blobs.get(path) {
             Some(Ok(blob)) => Ok(blob.clone()),
-            Some(Err(error)) => Err(BlobDownloadFailure(error.clone()).into()),
-            None => Err(anyhow::anyhow!("external blob not pre-downloaded: {path}")),
+            Some(Err(error)) => Err(ExternalBlobError::download(BlobDownloadFailure(
+                error.clone(),
+            ))),
+            None => Err(ExternalBlobError::NotPrefetched(path.clone())),
         }
     }
 }
@@ -164,7 +346,7 @@ use wacore::sync_engine::app_state::{
 /// an error, a variant added later — all keep it. The alternative is to
 /// enumerate the ways to fail, and the ways to fail is exactly the list that
 /// kept turning out to be one short.
-fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
+fn sync_still_owed<E>(outcome: &Result<SyncOutcome, E>) -> bool {
     !matches!(outcome, Ok(SyncOutcome::Completed))
 }
 
@@ -417,11 +599,13 @@ fn classify_app_state_key_request_failures(
     peer_count: usize,
     failure_count: usize,
     failures: &str,
-) -> Result<AppStateKeyRequestDelivery, anyhow::Error> {
+) -> Result<AppStateKeyRequestDelivery, AppStateSyncFailure> {
     if failure_count == peer_count {
-        return Err(anyhow::anyhow!(
-            "app-state key request failed for all {peer_count} peer device(s): {failures}"
-        ));
+        return Err(AppStateSyncFailureKind::KeyRequestFailedAll {
+            peer_count,
+            failures: failures.to_owned(),
+        }
+        .into());
     }
     warn!(
         "App-state key request failed for {failure_count}/{peer_count} peer device(s): {failures}"
@@ -446,9 +630,9 @@ async fn collect_app_state_key_request_results<F, E>(
     runtime: &dyn Runtime,
     mut requests: futures::stream::FuturesUnordered<F>,
     timeout: Duration,
-) -> Result<AppStateKeyRequestDelivery, anyhow::Error>
+) -> Result<AppStateKeyRequestDelivery, AppStateSyncFailure>
 where
-    F: Future<Output = (u16, std::result::Result<(), E>)>,
+    F: Future<Output = (u16, Result<(), E>)>,
     E: std::fmt::Display,
 {
     use futures::StreamExt;
@@ -528,7 +712,7 @@ fn finalize_app_state_key_request_peers(
     mut peers: Vec<Jid>,
     current_device: u16,
     primary: Jid,
-) -> Result<Vec<Jid>, anyhow::Error> {
+) -> Result<Vec<Jid>, AppStateSyncFailure> {
     // WA Web derives every sibling address from the account's PN namespace.
     for peer in &mut peers {
         peer.user.clone_from(&primary.user);
@@ -542,9 +726,7 @@ fn finalize_app_state_key_request_peers(
         peers.push(primary);
     }
     if peers.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no peer devices available for app-state key request"
-        ));
+        return Err(AppStateSyncFailureKind::NoPeerDevicesForKeyRequest.into());
     }
     Ok(peers)
 }
@@ -558,7 +740,7 @@ fn finalize_app_state_key_request_peers(
 /// reported lost.
 enum Recovery {
     Recovered,
-    Failed(anyhow::Error),
+    Failed(AppStateSyncFailure),
 }
 
 fn unaccounted_for(
@@ -595,16 +777,17 @@ impl Client {
     // WaAppStateSyncClient.ts:598-665/744 uses authoritative local state, namespace 3
     // and ignores server snapshots. Cobalt MutationRequestBuilder and whalibmob
     // retain snapshot bootstrap, so the host must select a profile explicitly.
-    fn authoritative_app_state(&self) -> Result<bool> {
+    fn authoritative_app_state(&self) -> Result<bool, AppStateSyncFailure> {
         #[cfg(feature = "mobile-core")]
         if let Some(session) = &self.mobile_session {
             session.validate_device(&self.persistence_manager.get_device_snapshot())?;
             return match session.app_state_policy() {
                 Some(crate::MobileAppStatePolicy::AuthoritativeZapo) => Ok(true),
                 Some(crate::MobileAppStatePolicy::SnapshotCompatible) => Ok(false),
-                None => Err(anyhow::anyhow!(
-                    "primary app-state requires an explicit policy"
-                )),
+                None => Err(AppStateSyncFailureKind::PolicyRequired(
+                    "primary app-state requires an explicit policy",
+                )
+                .into()),
             };
         }
         if self
@@ -613,9 +796,10 @@ impl Client {
             .mobile_session
             .is_some()
         {
-            return Err(anyhow::anyhow!(
-                "primary app-state requires a configured mobile session"
-            ));
+            return Err(AppStateSyncFailureKind::PolicyRequired(
+                "primary app-state requires a configured mobile session",
+            )
+            .into());
         }
         Ok(false)
     }
@@ -641,7 +825,7 @@ impl Client {
         Output = (
             Option<String>,
             BlobKind,
-            std::result::Result<bytes::Bytes, crate::download::ClientDownloadError>,
+            Result<bytes::Bytes, crate::download::ClientDownloadError>,
         ),
     > + 'a {
         let prepared = self
@@ -935,7 +1119,10 @@ impl Client {
     /// batched path reserves its collections in
     /// [`sync_collections_batched`](Self::sync_collections_batched).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<SyncOutcome> {
+    async fn fetch_app_state_with_retry_inner(
+        &self,
+        name: WAPatchName,
+    ) -> Result<SyncOutcome, AppStateSyncFailure> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
@@ -962,7 +1149,10 @@ impl Client {
                     return Ok(SyncOutcome::Deferred);
                 }
                 Err(e) => {
-                    if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                    if crate::error::ErrorChainExt::sources(&e)
+                        .find_map(|source| {
+                            source.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                        })
                         .is_some_and(|ase| {
                             matches!(ase, crate::appstate_sync::AppStateSyncError::KeyNotFound(_))
                         })
@@ -983,16 +1173,20 @@ impl Client {
                         }
                         continue;
                     }
-                    let is_db_locked = e
-                        .downcast_ref::<wacore::store::error::StoreError>()
-                        .is_some_and(|se| se.is_database_busy_or_locked())
-                        || e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
-                            .is_some_and(|ase| match ase {
-                                crate::appstate_sync::AppStateSyncError::Store(se) => {
-                                    se.is_database_busy_or_locked()
-                                }
-                                _ => false,
-                            });
+                    let is_db_locked = crate::error::ErrorChainExt::sources(&e).any(|cause| {
+                        cause
+                            .downcast_ref::<wacore::store::error::StoreError>()
+                            .is_some_and(|se| se.is_database_busy_or_locked())
+                            || cause
+                                .downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                                .is_some_and(|ase| {
+                                    matches!(
+                                        ase,
+                                        crate::appstate_sync::AppStateSyncError::Store(se)
+                                            if se.is_database_busy_or_locked()
+                                    )
+                                })
+                    });
                     if is_db_locked && attempt < APP_STATE_RETRY_MAX_ATTEMPTS {
                         let backoff = Duration::from_millis(200 * attempt as u64 + 150);
                         warn!(target: "Client/AppState", "Attempt {} for {:?} failed due to locked DB; backing off {:?} and retrying", attempt, name, backoff);
@@ -1033,7 +1227,7 @@ impl Client {
         scope: SyncScope,
         settles: SyncSettles,
         requested: &[WAPatchName],
-        result: Result<BatchedSyncOutcome>,
+        result: Result<BatchedSyncOutcome, AppStateSyncFailure>,
     ) {
         self.report_background_sync_stranded(label, scope, settles, requested, false, result)
     }
@@ -1051,7 +1245,7 @@ impl Client {
         settles: SyncSettles,
         requested: &[WAPatchName],
         stranded_elsewhere: bool,
-        result: Result<BatchedSyncOutcome>,
+        result: Result<BatchedSyncOutcome, AppStateSyncFailure>,
     ) {
         if let Err(lost) = self.admits(scope) {
             debug!(target: "Client/AppState", "{label}: outcome dropped ({lost:?})");
@@ -1649,7 +1843,7 @@ impl Client {
         backend: &dyn wacore::store::traits::Backend,
         name: WAPatchName,
         scope: SyncScope,
-    ) -> Result<StandDown> {
+    ) -> Result<StandDown, AppStateSyncFailure> {
         let Some(state) = backend.get_version(name.as_str()).await? else {
             return Ok(StandDown::Done);
         };
@@ -1717,7 +1911,7 @@ impl Client {
         &self,
         collections: Vec<WAPatchName>,
         scope: SyncScope,
-    ) -> Result<BatchedSyncOutcome> {
+    ) -> Result<BatchedSyncOutcome, AppStateSyncFailure> {
         self.sync_collections_batched_with(collections, scope, BatchedSyncRequest::default())
             .await
     }
@@ -1730,12 +1924,10 @@ impl Client {
         collections: Vec<WAPatchName>,
         scope: SyncScope,
         request: BatchedSyncRequest,
-    ) -> Result<BatchedSyncOutcome> {
+    ) -> Result<BatchedSyncOutcome, AppStateSyncFailure> {
         let authoritative = self.authoritative_app_state()?;
         if authoritative && request.rebuild {
-            return Err(anyhow::anyhow!(
-                "authoritative primary app-state cannot restore a server snapshot"
-            ));
+            return Err(AppStateSyncFailureKind::AuthoritativeCannotRestoreSnapshot.into());
         }
         let mut outcome = BatchedSyncOutcome::default();
         if collections.is_empty() {
@@ -1879,7 +2071,7 @@ impl Client {
         scope: SyncScope,
         request: BatchedSyncRequest,
         outcome: &mut BatchedSyncOutcome,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateSyncFailure> {
         use wacore::appstate::patch_decode::CollectionSyncError;
         let authoritative = self.authoritative_app_state()?;
         // WA Web's own bound. Its loop reads `(l < y || (i.length > 0 && l < C))`
@@ -2373,12 +2565,10 @@ impl Client {
         &self,
         name: WAPatchName,
         full_sync: bool,
-    ) -> Result<SyncOutcome> {
+    ) -> Result<SyncOutcome, AppStateSyncFailure> {
         let authoritative = self.authoritative_app_state()?;
         if authoritative && full_sync {
-            return Err(anyhow::anyhow!(
-                "authoritative primary app-state cannot restore a server snapshot"
-            ));
+            return Err(AppStateSyncFailureKind::AuthoritativeCannotRestoreSnapshot.into());
         }
         // Two questions, where `is_shutting_down()` answered a blend of them: is
         // the client finished, and can a request reach the server at all. A
@@ -2503,9 +2693,7 @@ impl Client {
                 // Report failure (not a partial success) so the caller retries instead of
                 // treating the collection as synced; it re-syncs once the share lands.
                 // Pages already decoded this run have their version persisted.
-                return Err(anyhow::anyhow!(
-                    "app-state decode key(s) for {name:?} still missing after re-request; deferring sync"
-                ));
+                return Err(AppStateSyncFailureKind::DecodeKeysMissing(name).into());
             }
 
             let (mutations, new_state, list) =
@@ -2583,20 +2771,23 @@ impl Client {
                     // A collection the server will not serve. Retrying is what
                     // the batched path already refuses to do with these.
                     CollectionSyncError::Fatal { code, text } => {
-                        return Err(anyhow::anyhow!(
-                            "app-state sync for {name:?} refused fatally by the server \
-                             ({code}): {text}"
-                        ));
+                        return Err(AppStateSyncFailureKind::SyncRefusedFatal {
+                            name,
+                            code: *code,
+                            text: text.clone(),
+                        }
+                        .into());
                     }
                     // Retryable, or a conflict that says more is coming: the
                     // collection did not advance, so reporting this run as
                     // completed would tell the conflict recovery that the base
                     // moved when it did not.
                     _ => {
-                        return Err(anyhow::anyhow!(
-                            "app-state sync for {name:?} was refused by the server \
-                             and advanced nothing: {refused}"
-                        ));
+                        return Err(AppStateSyncFailureKind::SyncRefusedRetryable {
+                            name,
+                            error: refused.clone(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -2811,12 +3002,12 @@ impl Client {
         }
     }
 
-    async fn app_state_key_request_peers(&self) -> Result<Vec<Jid>, anyhow::Error> {
+    async fn app_state_key_request_peers(&self) -> Result<Vec<Jid>, AppStateSyncFailure> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_jid = device_snapshot
             .pn
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no own JID available for app-state key request"))?;
+            .ok_or(AppStateSyncFailureKind::NoOwnJidForKeyRequest)?;
         let current_device = own_jid.device;
         let primary = own_jid.to_non_ad();
         drop(device_snapshot);
@@ -2838,7 +3029,7 @@ impl Client {
         &self,
         raw_key_ids: &[&[u8]],
         fanout_timeout: Duration,
-    ) -> Result<AppStateKeyRequestDelivery, anyhow::Error> {
+    ) -> Result<AppStateKeyRequestDelivery, AppStateSyncFailure> {
         if raw_key_ids.is_empty() {
             return Ok(AppStateKeyRequestDelivery::AllPeers);
         }
@@ -2885,7 +3076,7 @@ impl Client {
                         },
                     )
                     .await?;
-                    Ok::<(), anyhow::Error>(())
+                    Ok::<(), crate::send::SendError>(())
                 }
                 .await;
                 (device, result)
@@ -2913,7 +3104,7 @@ impl Client {
         &self,
         collection_name: &str,
         mutations: Vec<wa::SyncdMutation>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateSyncFailure> {
         use wacore::appstate::patch_decode::CollectionSyncError;
         let authoritative = self.authoritative_app_state()?;
 
@@ -2973,10 +3164,10 @@ impl Client {
                         .await?
                         .is_some_and(|s| s.bootstrapped)
                 {
-                    return Err(anyhow::anyhow!(
-                        "app-state patch for {collection_name} not attempted: \
-                         its bootstrap has not completed"
-                    ));
+                    return Err(AppStateSyncFailureKind::BootstrapIncomplete(
+                        collection_name.to_owned(),
+                    )
+                    .into());
                 }
             }
         }
@@ -3042,16 +3233,19 @@ impl Client {
                     }
                 }
                 Err(e) => {
-                    return Err(e.context(format!(
-                        "unreadable app-state patch response for {collection_name}"
-                    )));
+                    return Err(AppStateSyncFailureKind::UnreadablePatchResponse {
+                        collection: collection_name.to_owned(),
+                        source: e,
+                    }
+                    .into());
                 }
             };
             if Some(list.name) != patch_name {
-                return Err(anyhow::anyhow!(
-                    "app-state patch response collection mismatch: requested {collection_name}, got {}",
-                    list.name.as_str()
-                ));
+                return Err(AppStateSyncFailureKind::PatchCollectionMismatch {
+                    requested: collection_name.to_owned(),
+                    got: list.name.as_str(),
+                }
+                .into());
             }
 
             match list.error {
@@ -3089,24 +3283,29 @@ impl Client {
                         )
                         .await
                     {
-                        return Err(e.context(format!(
-                            "app-state patch for {collection_name} conflicted on \
-                             v{base_version} and the collection could not be recovered"
-                        )));
+                        return Err(AppStateSyncFailureKind::PatchConflictRecoveryFailed {
+                            collection: collection_name.to_owned(),
+                            version: base_version,
+                            source: e,
+                        }
+                        .into());
                     }
                 }
                 Some(error) => {
-                    return Err(anyhow::anyhow!(
-                        "app-state patch for {collection_name} rejected: {error}"
-                    ));
+                    return Err(AppStateSyncFailureKind::PatchRejected {
+                        collection: collection_name.to_owned(),
+                        error,
+                    }
+                    .into());
                 }
             }
         }
 
-        Err(anyhow::anyhow!(
-            "app-state patch for {collection_name} still conflicting after \
-             {APP_STATE_PATCH_SEND_ATTEMPTS} attempts"
-        ))
+        Err(AppStateSyncFailureKind::PatchStillConflicting {
+            collection: collection_name.to_owned(),
+            attempts: APP_STATE_PATCH_SEND_ATTEMPTS,
+        }
+        .into())
     }
 
     /// Fold the patches a 409 response carried into local state, so the retry
@@ -3213,9 +3412,10 @@ impl Client {
             let Some(patch_name) = patch_name else {
                 // Nothing to re-sync against, and the apply did not land: the
                 // retry would rebuild on the same base.
-                return Recovery::Failed(anyhow::anyhow!(
-                    "{collection_name} is not a known collection, so its conflict cannot be resolved"
-                ));
+                return Recovery::Failed(
+                    AppStateSyncFailureKind::UnknownConflictCollection(collection_name.to_owned())
+                        .into(),
+                );
             };
             match self.fetch_app_state_with_retry_inner(patch_name).await {
                 // The base is where it was and the re-sync is the only thing that
@@ -3238,9 +3438,10 @@ impl Client {
                         "Re-sync of {collection_name} after a patch conflict was deferred; \
                          the base has not moved"
                     );
-                    return Recovery::Failed(anyhow::anyhow!(
-                        "re-sync of {collection_name} was deferred to a later connection"
-                    ));
+                    return Recovery::Failed(
+                        AppStateSyncFailureKind::ConflictResyncDeferred(collection_name.to_owned())
+                            .into(),
+                    );
                 }
                 Ok(SyncOutcome::Completed) => {}
             }
@@ -3258,10 +3459,13 @@ impl Client {
                 "Recovering {collection_name} left the base at {base_before:?}; \
                  rebuilding would send the same patch again"
             );
-            return Recovery::Failed(anyhow::anyhow!(
-                "recovering {collection_name} did not move it past v{}",
-                base_before.unwrap_or(0)
-            ));
+            return Recovery::Failed(
+                AppStateSyncFailureKind::ConflictRecoveryDidNotAdvance {
+                    collection: collection_name.to_owned(),
+                    version: base_before.unwrap_or(0),
+                }
+                .into(),
+            );
         }
         Recovery::Recovered
     }
@@ -3542,12 +3746,12 @@ impl Client {
     /// block list, and rebuilding it from a device that may itself be behind is
     /// the one collection where being wrong means talking to somebody who was
     /// blocked.
-    async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
+    async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &AppStateSyncFailure) {
         if self.is_mobile_primary() {
             warn!(target: "Client/AppState", "Not asking a primary session to recover its own snapshot");
             return;
         }
-        match RecoveryRequest::for_error(name, err.downcast_ref()) {
+        match RecoveryRequest::for_error(name, app_state_error_marker(err)) {
             RecoveryRequest::NotNeeded => return,
             RecoveryRequest::BlockList => {
                 warn!(target: "Client/AppState", "Not asking the primary to rebuild {name:?}: the block list is not recovered this way");
@@ -4282,13 +4486,20 @@ impl Client {
 
     async fn dispatch_committed_mutations_from_error(
         &self,
-        error: anyhow::Error,
+        error: wacore::appstate_sync::AppStateProcessingError,
         event_full_sync: bool,
         log_full_sync: bool,
-    ) -> anyhow::Error {
-        let committed = match error.downcast::<wacore::appstate_sync::CommittedMutationsError>() {
-            Ok(committed) => committed,
-            Err(error) => return error,
+    ) -> AppStateSyncFailure {
+        if !matches!(
+            error.kind(),
+            wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(_)
+        ) {
+            return from_processing_error(error);
+        }
+        let wacore::appstate_sync::AppStateProcessingErrorKind::CommittedMutations(committed) =
+            error.into_kind()
+        else {
+            unreachable!("checked above")
         };
         let (mutations, state, collection, source) = committed.into_parts();
         Box::pin(self.dispatch_collection_mutations(
@@ -4299,7 +4510,7 @@ impl Client {
             log_full_sync,
         ))
         .await;
-        source
+        from_processing_error(source)
     }
 
     /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].
@@ -4667,6 +4878,16 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "mobile-core")]
+    #[test]
+    fn app_state_preserves_mobile_session_error_source() {
+        let error = AppStateSyncFailure::from(wacore::mobile::MobileSessionError::InvalidDevice);
+        assert!(
+            crate::ErrorChainExt::sources(&error)
+                .any(|source| source.is::<wacore::mobile::MobileSessionError>())
+        );
+    }
 
     #[test]
     fn external_blob_resolution_preserves_bytes_and_missing_path_errors() {
@@ -5716,10 +5937,7 @@ mod tests {
 
     #[tokio::test]
     async fn passive_key_request_fanout_is_bounded() {
-        async fn peer_request(
-            device: u16,
-            completes: bool,
-        ) -> (u16, std::result::Result<(), anyhow::Error>) {
+        async fn peer_request(device: u16, completes: bool) -> (u16, Result<(), std::io::Error>) {
             if !completes {
                 std::future::pending::<()>().await;
             }
@@ -6012,14 +6230,16 @@ mod send_patch_response_tests {
 
     /// Drives one `send_app_state_patch` to completion against `reply`, and
     /// reports how many patch IQs reached the wire.
-    async fn send_against(reply: impl FnMut(usize) -> Option<&'static str>) -> (Result<()>, usize) {
+    async fn send_against(
+        reply: impl FnMut(usize) -> Option<&'static str>,
+    ) -> (Result<(), AppStateSyncFailure>, usize) {
         send_against_collection(COLLECTION, reply).await
     }
 
     async fn send_against_collection(
         response_collection: &'static str,
         reply: impl FnMut(usize) -> Option<&'static str>,
-    ) -> (Result<()>, usize) {
+    ) -> (Result<(), AppStateSyncFailure>, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         // Reachable, so the re-sync between attempts actually runs: an
         // unreachable client defers it and reports Ok, which hides whether the
@@ -6450,7 +6670,7 @@ mod send_patch_response_tests {
     /// how many IQs did.
     async fn send_after_an_empty_sync(
         version: Option<wacore::appstate::hash::HashState>,
-    ) -> (Result<()>, bool, usize) {
+    ) -> (anyhow::Result<()>, bool, usize) {
         send_named_after_an_empty_sync(COLLECTION, version).await
     }
 
@@ -6468,7 +6688,7 @@ mod send_patch_response_tests {
     async fn send_named_after_an_empty_sync(
         collection: &'static str,
         version: Option<wacore::appstate::hash::HashState>,
-    ) -> (Result<()>, bool, usize) {
+    ) -> (anyhow::Result<()>, bool, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         send_named_after_an_empty_sync_with_client(
             collection, version, client, transport, None, false,
@@ -6483,7 +6703,7 @@ mod send_patch_response_tests {
         transport: Arc<crate::transport::mock::CapturingMockTransport>,
         expected_namespace: Option<&'static str>,
         public_action: bool,
-    ) -> (Result<()>, bool, usize) {
+    ) -> (anyhow::Result<()>, bool, usize) {
         client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
@@ -6523,6 +6743,7 @@ mod send_patch_response_tests {
                     client
                         .send_app_state_patch(collection, vec![wa::SyncdMutation::default()])
                         .await
+                        .map_err(Into::into)
                 }
             })
         };
@@ -8506,9 +8727,13 @@ mod sync_owed_tests {
     /// question, which has one answer.
     #[test]
     fn everything_that_is_not_a_completed_sync_is_still_owed() {
-        assert!(!sync_still_owed(&Ok(SyncOutcome::Completed)));
-        assert!(sync_still_owed(&Ok(SyncOutcome::Deferred)));
-        assert!(sync_still_owed(&Err(anyhow::anyhow!(
+        assert!(!sync_still_owed(&Ok::<_, std::io::Error>(
+            SyncOutcome::Completed
+        )));
+        assert!(sync_still_owed(&Ok::<_, std::io::Error>(
+            SyncOutcome::Deferred
+        )));
+        assert!(sync_still_owed(&Err(std::io::Error::other(
             "the socket died under the collection IQ"
         ))));
     }

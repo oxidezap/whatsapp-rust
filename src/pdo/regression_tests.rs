@@ -320,7 +320,7 @@ async fn cancelled_caller_does_not_undo_a_transport_accepted_retry() {
     }
     #[async_trait::async_trait]
     impl crate::transport::Transport for RetainedWrite {
-        async fn send(&self, bytes: bytes::Bytes) -> anyhow::Result<()> {
+        async fn send(&self, bytes: bytes::Bytes) -> Result<(), crate::transport::TransportError> {
             crate::transport::Transport::send(self.capture.as_ref(), bytes).await?;
             self.entered.send(()).await.unwrap();
             self.release.recv().await.unwrap();

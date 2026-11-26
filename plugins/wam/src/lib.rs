@@ -71,13 +71,13 @@ mod parity;
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, Result};
 use log::warn;
+use thiserror::Error;
 use whatsapp_rust::wacore::stanza::wire_tags::StanzaTag;
 use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 use whatsapp_rust::{
     ClientPlugin, PluginCapability, PluginContext, PluginCoreEventSubscription, PluginFuture,
-    PluginIq, PluginManifest, PluginTasks,
+    PluginIq, PluginManifest, PluginResult, PluginTasks,
 };
 use whatsapp_rust_wam_catalog::events;
 
@@ -86,6 +86,26 @@ pub use runtime::{PendingEvent, TickKind, UploadFailure, WamStats, WamUploader};
 pub use store::{InMemoryWamStore, PendingBuffer, WamStore, WamStoreError};
 
 use runtime::{BUFFERING_INTERVAL, WamRuntime, WamWriter};
+
+type Result<T, E = WamPluginError> = std::result::Result<T, E>;
+
+/// Strongly typed errors for [`WamPlugin`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum WamPluginError {
+    #[error("core-events capability is missing")]
+    MissingCoreEvents,
+    #[error("tasks capability is missing")]
+    MissingTasks,
+    #[error("iq capability is missing")]
+    MissingIq,
+    #[error("client-info capability is missing")]
+    MissingClientInfo,
+    #[error("the wam plugin was installed more than once")]
+    AlreadyInstalled,
+    #[error(transparent)]
+    Resource(#[from] whatsapp_rust::PluginResourceError),
+}
 
 /// The plugin's manifest id.
 pub const WAM_PLUGIN_ID: &str = "wa.wam";
@@ -254,22 +274,22 @@ impl ClientPlugin for WamPlugin {
             .with_capability(PluginCapability::ClientInfo)
     }
 
-    fn install(&self, context: PluginContext) -> PluginFuture<'_, Result<Arc<Self::Api>>> {
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, PluginResult<Arc<Self::Api>>> {
         Box::pin(async move {
             let core_events = context
                 .core_events()
                 .cloned()
-                .context("core-events capability is missing")?;
+                .ok_or(WamPluginError::MissingCoreEvents)?;
             let tasks = context
                 .tasks()
                 .cloned()
-                .context("tasks capability is missing")?;
-            let iq = context.iq().cloned().context("iq capability is missing")?;
+                .ok_or(WamPluginError::MissingTasks)?;
+            let iq = context.iq().cloned().ok_or(WamPluginError::MissingIq)?;
 
             let client_info = context
                 .client_info()
                 .cloned()
-                .context("client-info capability is missing")?;
+                .ok_or(WamPluginError::MissingClientInfo)?;
             let runtime = Arc::new(
                 WamRuntime::new(
                     self.config.identity.clone(),
@@ -280,12 +300,12 @@ impl ClientPlugin for WamPlugin {
             );
             self.runtime
                 .set(runtime.clone())
-                .map_err(|_| anyhow::anyhow!("the wam plugin was installed more than once"))?;
+                .map_err(|_| WamPluginError::AlreadyInstalled)?;
 
             let uploader = Arc::new(IqUploader(iq));
             self.uploader
                 .set(uploader.clone())
-                .map_err(|_| anyhow::anyhow!("the wam plugin was installed more than once"))?;
+                .map_err(|_| WamPluginError::AlreadyInstalled)?;
 
             let subscription =
                 core_events.subscribe(WAM_INTEREST, Arc::new(WamEventHandler(runtime.clone())))?;
@@ -305,7 +325,7 @@ impl ClientPlugin for WamPlugin {
     /// may outlive the host's drain, so the two could be alive at once: both
     /// would read the retained set and both would pick the same next key, which
     /// is the overwrite `next_key` exists to prevent.
-    fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, PluginResult> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -320,7 +340,7 @@ fn spawn_flush_loop(
     tasks: PluginTasks,
     uploader: Arc<IqUploader>,
     runtime: Arc<WamRuntime>,
-) -> Result<()> {
+) -> Result<(), WamPluginError> {
     let worker = tasks.clone();
     // Cooperative, not the default abort mode. An aborted task's future is
     // dropped where it is suspended, which for this loop is inside `sleep`,

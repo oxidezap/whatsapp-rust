@@ -13,7 +13,6 @@ use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name_for_jid;
 use crate::types::message::PeerMessageOptions;
-use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::collections::HashSet;
@@ -78,6 +77,16 @@ pub use group::*;
 pub use peer::*;
 pub use resolved_devices::{DmSignalAddressing, ResolvedDmDevices, ResolvedGroupDevices};
 pub use status::*;
+
+debug_as_display!(
+    DeviceEncryptionError,
+    SessionSetupError,
+    SessionPreflightError,
+    PairwiseRetryError,
+    PeerStanzaError,
+    DmStanzaError,
+    GroupStanzaError,
+);
 
 #[cfg(test)]
 mod tests;

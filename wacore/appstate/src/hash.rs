@@ -164,9 +164,9 @@ impl HashState {
         &mut self,
         mutations: &[wa::SyncdMutation],
         mut get_prev_set_value_mac: F,
-    ) -> (HashUpdateResult, anyhow::Result<()>)
+    ) -> (HashUpdateResult, Result<(), AppStateError>)
     where
-        F: FnMut(&[u8], usize) -> anyhow::Result<Option<Vec<u8>>>,
+        F: FnMut(&[u8], usize) -> Result<Option<Vec<u8>>, AppStateError>,
     {
         // WA Web index-mode (WAWebSyncdAntiTampering, gate `d`): when every mutation
         // carries an index, a SET whose index is also REMOVEd in the same patch must
@@ -216,9 +216,7 @@ impl HashState {
                     let Some(op) = v.as_known() else {
                         return (
                             result,
-                            Err(anyhow::anyhow!(AppStateError::UnsupportedSyncdOperation(
-                                v.to_i32()
-                            ))),
+                            Err(AppStateError::UnsupportedSyncdOperation(v.to_i32())),
                         );
                     };
                     op
@@ -250,7 +248,7 @@ impl HashState {
                             );
                         }
                     }
-                    Err(e) => return (result, Err(anyhow::anyhow!(e))),
+                    Err(e) => return (result, Err(e)),
                 }
             }
         }

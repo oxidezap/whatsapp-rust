@@ -3,7 +3,7 @@ use super::*;
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, Result, ensure};
 use rand::{RngExt, SeedableRng};
 
 use crate::libsignal::protocol::{

@@ -13,10 +13,15 @@
 //! Withholding an ACK/receipt does not promise indefinite retention or redelivery.
 
 use crate::client::Client;
-use anyhow::Result;
 use std::sync::Arc;
 pub use wacore::types::events::InboundMessage;
 use waproto::whatsapp as wa;
+
+/// Erased error returned by durability hooks.
+pub type HookError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Result type returned by durability hooks.
+pub type HookResult<T = ()> = Result<T, HookError>;
 
 /// Hook invoked for every decrypted inbound user message before it is
 /// acknowledged to the server, turning the consumer from at-most-once into
@@ -104,7 +109,11 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// existing dispatch cache suppresses repeated events within its retention
     /// window, including reconnects of the same Client. A process restart still
     /// requires the idempotent durable consumer described above.
-    async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
+    async fn on_messages(
+        &self,
+        client: Arc<Client>,
+        batch: &[InboundMessage],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Optional capture of history-sync bytes before attempting their receipt.
@@ -158,5 +167,5 @@ pub trait HistorySyncCaptureHook: wacore::sync_marker::MaybeSendSync {
         message_id: &str,
         sync_type: Option<wa::message::HistorySyncType>,
         compressed: &[u8],
-    ) -> Result<()>;
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

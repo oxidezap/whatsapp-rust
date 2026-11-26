@@ -13,11 +13,44 @@
 use crate::WireEnum;
 use crate::iq::node::{required_attr, required_child};
 use crate::protocol::ProtocolNode;
-use anyhow::{Result, anyhow};
 use serde::Serialize;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeRef};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DeviceNotificationError {
+    #[error("{0}")]
+    Structure(#[from] crate::iq::node::IqParseError),
+    #[error("expected <{expected}>, got <{actual}>")]
+    UnexpectedTag {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("key-index-list missing required 'ts' attribute")]
+    MissingKeyIndexTimestamp,
+    #[error("key-index-list 'ts' value {0} exceeds i64::MAX")]
+    KeyIndexTimestampOverflow(u64),
+    #[error("device missing required 'jid' attribute")]
+    MissingDeviceJid,
+    #[error("device 'key-index' value {0} exceeds u32::MAX")]
+    KeyIndexOverflow(u64),
+    #[error("device id mismatch between jid ({jid}) and lid ({lid}) attributes")]
+    DeviceIdMismatch { jid: u16, lid: u16 },
+    #[error("unknown device operation: {0}")]
+    UnknownOperation(String),
+    #[error("timestamp is required to handle device remove notification")]
+    MissingRemoveTimestamp,
+    #[error("expected type='devices'")]
+    WrongType,
+    #[error("notification missing required 'from' attribute")]
+    MissingFrom,
+    #[error("notification timestamp {0} exceeds i64::MAX")]
+    TimestampOverflow(u64),
+    #[error("device notification missing required operation (add/remove/update)")]
+    MissingOperation,
+}
 
 /// Device notification operation type.
 ///
@@ -56,6 +89,8 @@ pub struct KeyIndexInfo {
 }
 
 impl ProtocolNode for KeyIndexInfo {
+    type Error = DeviceNotificationError;
+
     fn tag(&self) -> &'static str {
         "key-index-list"
     }
@@ -68,17 +103,20 @@ impl ProtocolNode for KeyIndexInfo {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         use wacore_binary::NodeContentRef;
         if node.tag != "key-index-list" {
-            return Err(anyhow!("expected <key-index-list>, got <{}>", node.tag));
+            return Err(DeviceNotificationError::UnexpectedTag {
+                expected: "key-index-list",
+                actual: node.tag.to_string(),
+            });
         }
         let ts_u64 = node
             .attrs()
             .optional_u64("ts")
-            .ok_or_else(|| anyhow!("key-index-list missing required 'ts' attribute"))?;
+            .ok_or(DeviceNotificationError::MissingKeyIndexTimestamp)?;
         let timestamp = i64::try_from(ts_u64)
-            .map_err(|_| anyhow!("key-index-list 'ts' value {} exceeds i64::MAX", ts_u64))?;
+            .map_err(|_| DeviceNotificationError::KeyIndexTimestampOverflow(ts_u64))?;
         let signed_bytes = match node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => Some(b.to_vec()),
             _ => None,
@@ -122,6 +160,8 @@ impl DeviceElement {
 }
 
 impl ProtocolNode for DeviceElement {
+    type Error = DeviceNotificationError;
+
     fn tag(&self) -> &'static str {
         "device"
     }
@@ -137,20 +177,22 @@ impl ProtocolNode for DeviceElement {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "device" {
-            return Err(anyhow!("expected <device>, got <{}>", node.tag));
+            return Err(DeviceNotificationError::UnexpectedTag {
+                expected: "device",
+                actual: node.tag.to_string(),
+            });
         }
         let mut attrs = node.attrs();
         let jid = attrs
             .optional_jid("jid")
-            .ok_or_else(|| anyhow!("device missing required 'jid' attribute"))?;
+            .ok_or(DeviceNotificationError::MissingDeviceJid)?;
 
         let key_index = match attrs.optional_u64("key-index") {
-            Some(v) => Some(
-                u32::try_from(v)
-                    .map_err(|_| anyhow!("device 'key-index' value {} exceeds u32::MAX", v))?,
-            ),
+            Some(v) => {
+                Some(u32::try_from(v).map_err(|_| DeviceNotificationError::KeyIndexOverflow(v))?)
+            }
             None => None,
         };
 
@@ -160,11 +202,10 @@ impl ProtocolNode for DeviceElement {
             let jid_device_id = jid.device;
             let lid_device_id = lid_jid.device;
             if jid_device_id != lid_device_id {
-                return Err(anyhow!(
-                    "device id mismatch between jid ({}) and lid ({}) attributes",
-                    jid_device_id,
-                    lid_device_id
-                ));
+                return Err(DeviceNotificationError::DeviceIdMismatch {
+                    jid: jid_device_id,
+                    lid: lid_device_id,
+                });
             }
         }
 
@@ -215,9 +256,9 @@ impl DeviceOperation {
     /// Per WhatsApp Web (5Yec01dI04o.js:23141-23157):
     /// - `key-index-list` is REQUIRED for add/remove operations
     /// - `ts` attribute is REQUIRED for remove operations
-    pub fn try_from_child(node: &NodeRef<'_>) -> Result<Self> {
+    pub fn try_from_child(node: &NodeRef<'_>) -> Result<Self, DeviceNotificationError> {
         let operation_type = DeviceNotificationType::try_from(node.tag.as_ref())
-            .map_err(|_| anyhow!("unknown device operation: {}", node.tag))?;
+            .map_err(|_| DeviceNotificationError::UnknownOperation(node.tag.to_string()))?;
 
         match operation_type {
             DeviceNotificationType::Add | DeviceNotificationType::Remove => {
@@ -225,9 +266,7 @@ impl DeviceOperation {
                 let key_index = KeyIndexInfo::try_from_node_ref(key_index_node)?;
 
                 if operation_type == DeviceNotificationType::Remove && key_index.timestamp == 0 {
-                    return Err(anyhow!(
-                        "timestamp is required to handle device remove notification"
-                    ));
+                    return Err(DeviceNotificationError::MissingRemoveTimestamp);
                 }
 
                 let device_node = required_child(node, "device")?;
@@ -298,21 +337,24 @@ impl DeviceNotification {
     /// Per WhatsApp Web: Only ONE operation per notification is processed.
     /// Priority order: remove > add > update
     /// Returns error if no operation is found.
-    pub fn try_parse(node: &NodeRef<'_>) -> Result<Self> {
+    pub fn try_parse(node: &NodeRef<'_>) -> Result<Self, DeviceNotificationError> {
         if node.tag != "notification" {
-            return Err(anyhow!("expected <notification>, got <{}>", node.tag));
+            return Err(DeviceNotificationError::UnexpectedTag {
+                expected: "notification",
+                actual: node.tag.to_string(),
+            });
         }
         if node
             .get_attr("type")
             .is_none_or(|v| v.as_str() != "devices")
         {
-            return Err(anyhow!("expected type='devices'"));
+            return Err(DeviceNotificationError::WrongType);
         }
 
         let mut parser = node.attrs();
         let from = parser
             .optional_jid("from")
-            .ok_or_else(|| anyhow!("notification missing required 'from' attribute"))?;
+            .ok_or(DeviceNotificationError::MissingFrom)?;
         let lid_user = parser.optional_jid("lid");
         let stanza_id = node
             .get_attr("id")
@@ -320,8 +362,9 @@ impl DeviceNotification {
             .unwrap_or_default()
             .into_owned();
         let timestamp = match parser.optional_u64("t") {
-            Some(t) => i64::try_from(t)
-                .map_err(|_| anyhow!("notification timestamp {} exceeds i64::MAX", t))?,
+            Some(t) => {
+                i64::try_from(t).map_err(|_| DeviceNotificationError::TimestampOverflow(t))?
+            }
             None => 0,
         };
 
@@ -333,9 +376,7 @@ impl DeviceNotification {
         } else if let Some(update_node) = node.get_optional_child("update") {
             DeviceOperation::try_from_child(update_node)?
         } else {
-            return Err(anyhow!(
-                "device notification missing required operation (add/remove/update)"
-            ));
+            return Err(DeviceNotificationError::MissingOperation);
         };
 
         Ok(Self {
@@ -575,6 +616,10 @@ mod tests {
 
         let result = DeviceNotification::try_parse(&node.as_node_ref());
         assert!(result.is_err());
+        assert!(matches!(
+            &result,
+            Err(DeviceNotificationError::DeviceIdMismatch { jid: 64, lid: 99 })
+        ));
         assert!(
             result
                 .unwrap_err()

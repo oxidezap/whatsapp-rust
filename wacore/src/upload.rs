@@ -2,10 +2,28 @@ use crate::download::{DownloadUtils, MediaType};
 use crate::libsignal::crypto::{CryptographicHash, CryptographicMac};
 use aes::Aes256;
 use aes::cipher::{Block, BlockModeEncrypt, KeyIvInit};
-use anyhow::Result;
 use rand::RngExt;
 use rand::rng;
 use std::io::{Read, Write};
+
+/// Errors that can occur during media encryption.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum MediaEncryptionError {
+    #[error("cryptographic MAC/hash error: {0}")]
+    Crypto(#[from] crate::libsignal::crypto::Error),
+    #[error("media key derivation error: {0}")]
+    KeyDerivation(#[from] crate::download::MediaDecryptionError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl std::fmt::Debug for MediaEncryptionError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 const BLOCK: usize = 16;
 /// Length of the truncated HMAC-SHA256 appended to the ciphertext.
@@ -103,12 +121,15 @@ pub struct MediaEncryptor {
 
 impl MediaEncryptor {
     /// Initialize with a random media key (no streaming sidecar).
-    pub fn new(media_type: MediaType) -> Result<Self> {
+    pub fn new(media_type: MediaType) -> Result<Self, MediaEncryptionError> {
         Self::new_with_sidecar(media_type, false)
     }
 
     /// Initialize with a random media key, optionally accumulating a streaming sidecar.
-    pub fn new_with_sidecar(media_type: MediaType, sidecar: bool) -> Result<Self> {
+    pub fn new_with_sidecar(
+        media_type: MediaType,
+        sidecar: bool,
+    ) -> Result<Self, MediaEncryptionError> {
         let mut media_key = [0u8; 32];
         rng().fill(&mut media_key);
         Self::with_key_and_sidecar(media_key, media_type, sidecar)
@@ -116,7 +137,10 @@ impl MediaEncryptor {
 
     /// Initialize with a caller-supplied key (no streaming sidecar). The key must
     /// be 32 cryptographically random bytes; reusing keys breaks confidentiality.
-    pub fn with_key(media_key: [u8; 32], media_type: MediaType) -> Result<Self> {
+    pub fn with_key(
+        media_key: [u8; 32],
+        media_type: MediaType,
+    ) -> Result<Self, MediaEncryptionError> {
         Self::with_key_and_sidecar(media_key, media_type, false)
     }
 
@@ -126,7 +150,7 @@ impl MediaEncryptor {
         media_key: [u8; 32],
         media_type: MediaType,
         sidecar: bool,
-    ) -> Result<Self> {
+    ) -> Result<Self, MediaEncryptionError> {
         let (iv, cipher_key, mac_key) = DownloadUtils::get_media_keys(&media_key, media_type)?;
         let mut hmac = CryptographicMac::new("HmacSha256", &mac_key)?;
         hmac.update(&iv);
@@ -170,7 +194,7 @@ impl MediaEncryptor {
     }
 
     /// PKCS7 pad + 10-byte MAC. Appends final bytes to `out`.
-    pub fn finalize(self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
+    pub fn finalize(self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
         self.finalize_buffer(out, false)
     }
 
@@ -178,7 +202,7 @@ impl MediaEncryptor {
         mut self,
         out: &mut Vec<u8>,
         single_window_sidecar: bool,
-    ) -> Result<EncryptedMediaInfo> {
+    ) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
         self.pad_and_encrypt(out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
         // For one window, the file MAC and sidecar share IV + ciphertext.
@@ -196,7 +220,10 @@ impl MediaEncryptor {
     }
 
     /// PKCS7 pad + 10-byte MAC. Writes the last of the ciphertext to `writer`.
-    pub fn finalize_to_writer<W: Write>(mut self, writer: &mut W) -> Result<EncryptedMediaInfo> {
+    pub fn finalize_to_writer<W: Write>(
+        mut self,
+        writer: &mut W,
+    ) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
         let mut scratch = std::mem::take(&mut self.scratch);
         self.pad_and_encrypt(&mut scratch, &mut |staging, _start| {
             flush_full(staging, writer)
@@ -291,14 +318,14 @@ impl MediaEncryptor {
         self.encrypt_batches(&rem, staging, deliver)
     }
 
-    fn compute_mac(&mut self) -> Result<[u8; 10]> {
+    fn compute_mac(&mut self) -> Result<[u8; 10], MediaEncryptionError> {
         let mac_full = self.hmac.finalize_sha256_array()?;
         let mut mac = [0u8; 10];
         mac.copy_from_slice(&mac_full[..10]);
         Ok(mac)
     }
 
-    fn finish_hashes(mut self, mac: &[u8; 10]) -> Result<EncryptedMediaInfo> {
+    fn finish_hashes(mut self, mac: &[u8; 10]) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
         self.sha256_enc.update(mac);
         // The sidecar covers the whole uploaded blob (ciphertext + trailing MAC),
         // so feed the MAC before sealing it.
@@ -385,7 +412,7 @@ struct SidecarAccumulator {
     /// Blob bytes hashed into the current window, excluding its 16-byte prefix.
     in_window: usize,
     /// First HMAC finalization error, surfaced by `finish`.
-    err: Option<anyhow::Error>,
+    err: Option<MediaEncryptionError>,
 }
 
 impl SidecarAccumulator {
@@ -436,14 +463,14 @@ impl SidecarAccumulator {
         match self.mac.finalize_sha256_array() {
             Ok(full) => self.result.extend_from_slice(&full[..SIDECAR_MAC_LEN]),
             Err(e) => {
-                self.err.get_or_insert(e.into());
+                self.err.get_or_insert(MediaEncryptionError::Crypto(e));
             }
         }
         self.in_window = 0;
         self.mac.update(&self.overlap);
     }
 
-    fn finish(mut self) -> Result<Vec<u8>> {
+    fn finish(mut self) -> Result<Vec<u8>, MediaEncryptionError> {
         self.flush();
         match self.err {
             Some(e) => Err(e),
@@ -553,7 +580,7 @@ pub fn encrypt_media_streaming<R: Read, W: Write>(
     reader: R,
     writer: W,
     media_type: MediaType,
-) -> Result<EncryptedMediaInfo> {
+) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
     encrypt_media_streaming_with_key(reader, writer, media_type, None, None)
 }
 
@@ -565,7 +592,7 @@ pub fn encrypt_media_streaming_with_key<R: Read, W: Write>(
     media_type: MediaType,
     media_key: Option<&[u8; 32]>,
     sidecar: Option<bool>,
-) -> Result<EncryptedMediaInfo> {
+) -> Result<EncryptedMediaInfo, MediaEncryptionError> {
     let want_sidecar = sidecar.unwrap_or_else(|| media_type_uses_sidecar(media_type));
     let mut enc = match media_key {
         Some(key) => MediaEncryptor::with_key_and_sidecar(*key, media_type, want_sidecar)?,
@@ -586,7 +613,10 @@ pub fn encrypt_media_streaming_with_key<R: Read, W: Write>(
 
 /// Encrypt media in memory. A streaming sidecar is generated automatically for
 /// audio/video.
-pub fn encrypt_media(plaintext: &[u8], media_type: MediaType) -> Result<EncryptedMedia> {
+pub fn encrypt_media(
+    plaintext: &[u8],
+    media_type: MediaType,
+) -> Result<EncryptedMedia, MediaEncryptionError> {
     encrypt_media_with_key(plaintext, media_type, None)
 }
 
@@ -595,7 +625,7 @@ pub fn encrypt_media_with_key(
     plaintext: &[u8],
     media_type: MediaType,
     media_key: Option<&[u8; 32]>,
-) -> Result<EncryptedMedia> {
+) -> Result<EncryptedMedia, MediaEncryptionError> {
     encrypt_media_with_key_and_sidecar(plaintext, media_type, media_key, None)
 }
 
@@ -606,7 +636,7 @@ pub fn encrypt_media_with_key_and_sidecar(
     media_type: MediaType,
     media_key: Option<&[u8; 32]>,
     sidecar: Option<bool>,
-) -> Result<EncryptedMedia> {
+) -> Result<EncryptedMedia, MediaEncryptionError> {
     let want_sidecar = sidecar.unwrap_or_else(|| media_type_uses_sidecar(media_type));
     let upload_len = encrypted_len(plaintext.len());
     let single_window_sidecar = want_sidecar && upload_len <= SIDECAR_CHUNK;
@@ -878,7 +908,10 @@ mod tests {
 
     /// One-shot truncated HMAC, used by the reference implementations below.
     /// The accumulator itself keeps a single running HMAC instead.
-    fn hmac_sha256_trunc10(mac_key: &[u8], data: &[u8]) -> Result<[u8; SIDECAR_MAC_LEN]> {
+    fn hmac_sha256_trunc10(
+        mac_key: &[u8],
+        data: &[u8],
+    ) -> Result<[u8; SIDECAR_MAC_LEN], MediaEncryptionError> {
         let mut hmac = CryptographicMac::new("HmacSha256", mac_key)?;
         hmac.update(data);
         let full = hmac.finalize_sha256_array()?;

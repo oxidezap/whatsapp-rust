@@ -211,6 +211,46 @@ struct GroupBatchOutcome {
     needs_device_sync: bool,
 }
 
+#[derive(thiserror::Error)]
+enum CompanionValidationError {
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    CachedAdv(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    AdvBootstrap(#[from] crate::prekeys::AdvBootstrapError),
+    #[error("{0}")]
+    Certificate(#[from] CompanionCertificateError),
+    #[error("companion account identity unavailable after locking")]
+    AccountIdentityUnavailableAfterLock,
+}
+
+impl std::fmt::Debug for CompanionValidationError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum PlaintextHandleError {
+    #[error("{0}")]
+    Padding(#[from] wacore::messages::PaddingError),
+    #[error("{0}")]
+    Decode(#[from] wacore::messages::PlaintextDecodeError),
+    #[error("{0}")]
+    InvalidEncIndex(#[from] std::num::TryFromIntError),
+    #[error("{0}")]
+    Signal(#[from] crate::features::SignalError),
+}
+
+impl std::fmt::Debug for PlaintextHandleError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Client {
     async fn preseed_sender_retry_count(&self, info: &MessageInfo, sender_count: u8) {
         if sender_count == 0 {
@@ -253,7 +293,7 @@ impl Client {
         sender: &Jid,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         self.validate_incoming_companion_identity_at_address(
             sender,
             &sender.to_protocol_address(),
@@ -270,7 +310,7 @@ impl Client {
         address: &wacore::libsignal::protocol::ProtocolAddress,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         self.validate_incoming_companion_identity_inner(
             sender,
             address,
@@ -343,7 +383,7 @@ impl Client {
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
         account_locked: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CompanionValidationError> {
         let backend = self
             .persistence_manager
             .get_device_snapshot()
@@ -371,9 +411,7 @@ impl Client {
         let primary = if account_locked {
             self.cached_adv_account_identity(sender)
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("companion account identity unavailable after locking")
-                })?
+                .ok_or(CompanionValidationError::AccountIdentityUnavailableAfterLock)?
         } else {
             self.ensure_adv_account_identity(sender).await?
         };
@@ -446,7 +484,7 @@ impl Client {
                     return Err(CompanionAccountRecheckError::StaleGeneration);
                 }
                 validation.map_err(|error| {
-                    if error.is::<CompanionCertificateError>() {
+                    if matches!(error, CompanionValidationError::Certificate(_)) {
                         CompanionAccountRecheckError::Rejected(payload.enc_index)
                     } else {
                         CompanionAccountRecheckError::Unavailable
@@ -595,7 +633,7 @@ impl Client {
                 // rejected attributes or eagerly formatting identifiers.
                 log::warn!(
                     "Failed to parse message info: {}; {}",
-                    wacore::diagnostics::ErrorSummary(error.as_ref()),
+                    wacore::diagnostics::ErrorSummary(&error),
                     crate::logging::StanzaSummary::from(nr)
                 );
                 self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
@@ -3258,7 +3296,7 @@ impl Client {
         enc_index: usize,
         annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         self.handle_decrypted_plaintext_in_scope(
             enc_type,
             padded_plaintext.into(),
@@ -3281,7 +3319,7 @@ impl Client {
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         let origin = raw_pending::DeliveryOrigin {
             stanza: slot.producer,
             position: slot.index,
@@ -3310,7 +3348,7 @@ impl Client {
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, PlaintextHandleError> {
         let PlaintextSlot {
             index: enc_index,
             annotations,
@@ -3351,6 +3389,14 @@ impl Client {
             .inbound_journal_enabled()
             .then(|| u32::try_from(enc_index).map(|index| (Some(index), source.clone())))
             .transpose()?;
+        // Recognize canonical SKDM carriers without walking every decoded field.
+        // The owned decoder still validates the complete message below.
+        const SKDM_TAG: u32 = (waproto::tags::message::SENDER_KEY_DISTRIBUTION_MESSAGE << 3) | 2;
+        let skdm_carrier = source
+            .first()
+            .is_some_and(|&byte| u32::from(byte) == SKDM_TAG)
+            && wacore::messages::has_only_sender_key_distribution_top_level_fields(&source)
+                .unwrap_or(false);
         let (original_msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)
                 .inspect_err(|_| self.finish_retained_raw(origin))?;
@@ -3392,7 +3438,7 @@ impl Client {
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
-        let skdm_only = wacore::messages::is_sender_key_distribution_only(&mut msg);
+        let skdm_only = skdm_carrier || wacore::messages::is_sender_key_distribution_only(&mut msg);
 
         if info.source.chat.is_group()
             && let Some(protocol) = msg.protocol_message.as_option()
@@ -3858,7 +3904,7 @@ impl Client {
         &self,
         lid: &Jid,
         pn: &str,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    ) -> Result<Option<[u8; 32]>, crate::prekeys::CachedAdvIdentityError> {
         if let Some(identity) = self.cached_adv_account_identity(lid).await? {
             return Ok(Some(identity));
         }
@@ -3903,10 +3949,11 @@ impl Client {
             .await;
     }
 
+    #[inline(never)]
     pub(crate) async fn parse_message_info(
         &self,
         node: &NodeRef<'_>,
-    ) -> Result<MessageInfo, anyhow::Error> {
+    ) -> Result<MessageInfo, wacore::messages::MessageInfoError> {
         // Per-message path: borrow pn/lid from the snapshot, no lock, no clones.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let default_jid = Jid::default();

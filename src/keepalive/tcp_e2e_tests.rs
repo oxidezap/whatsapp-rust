@@ -40,7 +40,7 @@ struct LoopbackTcpTransport {
 
 #[async_trait]
 impl Transport for LoopbackTcpTransport {
-    async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+    async fn send(&self, data: Bytes) -> Result<(), crate::transport::TransportError> {
         self.writer.lock().await.write_all(&data).await?;
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.write_notify.notify_one();
@@ -56,7 +56,10 @@ impl Transport for LoopbackTcpTransport {
 impl TransportFactory for LoopbackTcpFactory {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        crate::transport::TransportError,
+    > {
         let stream = TcpStream::connect(self.address).await?;
         let (mut reader, writer) = stream.into_split();
         let (events_tx, events_rx) = async_channel::unbounded();

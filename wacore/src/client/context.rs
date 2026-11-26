@@ -405,6 +405,29 @@ pub struct SessionLockGuard(
     #[allow(dead_code)] Option<Arc<dyn crate::sync_marker::MaybeSendSync>>,
 );
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SendContextError {
+    #[error("{0}")]
+    Server(#[from] crate::request::ServerErrorCode),
+    #[error("{0}")]
+    Host(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl SendContextError {
+    pub fn host(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Host(Box::new(error))
+    }
+
+    pub fn from_boxed(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Host(error)
+    }
+
+    pub fn server_error(&self) -> Option<&crate::request::ServerErrorCode> {
+        crate::request::ServerErrorCode::find(self)
+    }
+}
+
 impl SessionLockGuard {
     /// No locks held. Only use when the caller serializes pairwise session access.
     pub fn none() -> Self {
@@ -425,12 +448,12 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         crate::send::SenderIdentityRole::Companion
     }
 
-    async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error>;
+    async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, SendContextError>;
 
     async fn fetch_prekeys(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error>;
+    ) -> Result<HashMap<Jid, PreKeyBundle>, SendContextError>;
 
     /// Returns the bundles alongside the devices the server rejected by name,
     /// so a per-device rejection is not flattened into "no bundle" before the
@@ -438,7 +461,7 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<crate::prekeys::PreKeyFetchOutcome, anyhow::Error>;
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome, SendContextError>;
 
     /// Recheck a fetched bundle's certificate anchor before installation.
     /// Hosts serialize this check and installation with account-key rotation.
@@ -446,14 +469,14 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         &self,
         _jid: &Jid,
         _bundle: &PreKeyBundle,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendContextError> {
         Ok(())
     }
 
     async fn resolve_group_routing_info(
         &self,
         jid: &Jid,
-    ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error>;
+    ) -> Result<Arc<GroupRoutingInfo>, SendContextError>;
 
     /// Get the LID (Linked ID) for a phone number, if known.
     /// This is used to find existing sessions that were established under a LID address

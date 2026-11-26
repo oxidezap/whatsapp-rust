@@ -53,7 +53,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for CapturingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 let mut data = data.to_vec();
                 data.drain(..3); // strip the 3-byte frame length prefix
                 let counter = self.counter.fetch_add(1, Ordering::SeqCst);
@@ -133,13 +136,14 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for AcceptThenFailTransport {
-        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             let mut sent = self.sent.lock().expect("send mutex");
             sent.push(data);
             if sent.len() > self.fail_from {
-                return Err(anyhow::anyhow!(
-                    "injected failure after accepting the frame"
-                ));
+                return Err("injected failure after accepting the frame".into());
             }
             Ok(())
         }
@@ -171,7 +175,7 @@ mod tests {
             .encrypt_and_send(bytes::Bytes::from_static(b"first"))
             .await
             .expect_err("injected transport failure");
-        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(first.kind(), EncryptSendErrorKind::Transport));
 
         for attempt in 0..3 {
             let err = socket
@@ -179,7 +183,7 @@ mod tests {
                 .await
                 .expect_err("sends after a transport failure must be refused");
             assert!(
-                matches!(err.kind, EncryptSendErrorKind::Poisoned),
+                matches!(err.kind(), EncryptSendErrorKind::Poisoned),
                 "attempt {attempt} should be rejected as poisoned, got {err:?}"
             );
             assert!(err.is_transport_unavailable(), "must force a reconnect");
@@ -205,13 +209,13 @@ mod tests {
             .encrypt_and_send(bytes::Bytes::from_static(b"first"))
             .await
             .expect_err("transport reported failure after accepting the frame");
-        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(first.kind(), EncryptSendErrorKind::Transport));
 
         let second = socket
             .encrypt_and_send(bytes::Bytes::from_static(b"second"))
             .await
             .expect_err("sends after an ambiguous failure must be refused");
-        assert!(matches!(second.kind, EncryptSendErrorKind::Poisoned));
+        assert!(matches!(second.kind(), EncryptSendErrorKind::Poisoned));
 
         assert_eq!(
             transport.sent().len(),
@@ -409,7 +413,7 @@ mod tests {
         )
         .await
         .expect_err("an exhausted counter must not wrap");
-        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Crypto));
         assert_eq!(
             out_buf.to_vec(),
             staged,
@@ -513,8 +517,11 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl Transport for TypedFailTransport {
-            async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
-                Err(anyhow::Error::new(TypedTransportError))
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
+                Err(Box::new(TypedTransportError))
             }
             async fn disconnect(&self) {}
         }
@@ -533,11 +540,11 @@ mod tests {
             .await
             .expect_err("the transport always fails");
 
-        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Transport));
         assert!(
-            err.source.downcast_ref::<TypedTransportError>().is_some(),
+            err.cause().downcast_ref::<TypedTransportError>().is_some(),
             "a lone waiter must receive the transport's own error type, got: {:?}",
-            err.source
+            err.cause()
         );
     }
 
@@ -616,9 +623,9 @@ mod tests {
             .await
             .expect_err("the transport always fails");
 
-        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Transport));
         // `{:#}` walks the anyhow chain; the injected message must still be in it.
-        let chain = format!("{:#}", err.source);
+        let chain = format!("{:#}", err.cause());
         assert!(
             chain.contains("injected failure after accepting the frame"),
             "the transport's cause was lost on the way to the caller: {chain}"
@@ -658,7 +665,10 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for GatedTransport {
-        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+        async fn send(
+            &self,
+            data: bytes::Bytes,
+        ) -> std::result::Result<(), crate::transport::TransportError> {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
             let permit = self.gate.acquire().await.expect("gate open");
             permit.forget();
@@ -1118,7 +1128,7 @@ mod tests {
             .encrypt_and_send(oversize)
             .await
             .expect_err("frame exceeds the 24-bit length prefix");
-        assert!(matches!(err.kind, EncryptSendErrorKind::Framing));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Framing));
 
         socket
             .encrypt_and_send(bytes::Bytes::from_static(b"still usable"))
@@ -1144,7 +1154,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for RecordingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 // One write can carry several frames: the sender coalesces
                 // whatever is already queued, so each write is unpacked frame by
                 // frame before decrypting.
@@ -1226,7 +1239,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for SizeRecordingTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 self.last_size.store(data.len(), Ordering::SeqCst);
                 Ok(())
             }
@@ -1320,7 +1336,10 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for NoOpTransport {
-            async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            async fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> std::result::Result<(), crate::transport::TransportError> {
                 Ok(())
             }
             async fn disconnect(&self) {}

@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::stats::UnkeyableDevice;
-use anyhow::Context;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use wacore_binary::node::{Attrs, AttrsVec, NodeContent};
@@ -19,16 +18,13 @@ pub async fn encrypt_group_message<S, R>(
     sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
-) -> Result<SerializedCiphertext>
+) -> Result<SerializedCiphertext, crate::libsignal::protocol::SignalProtocolError>
 where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
 {
     // Delegate to the libsignal primitive so the sender-key advance, the wire
-    // gate, and the iteration lease live in exactly one place. `.context` keeps
-    // the concrete SignalProtocolError as the source, so callers can still
-    // downcast NoSenderKeyState to clear stale tracking and retry with SKDM
-    // redistribution.
+    // gate, and the iteration lease live in exactly one place.
     crate::libsignal::protocol::group_encrypt_serialized(
         sender_key_store,
         sender_key_name,
@@ -36,7 +32,6 @@ where
         csprng,
     )
     .await
-    .context("group encrypt failed")
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The
@@ -83,15 +78,25 @@ pub struct SignalStores<'a> {
     pub signed_prekey_store: &'a (dyn crate::libsignal::protocol::SignedPreKeyStore + Send + Sync),
 }
 
-/// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
-/// Uses typed downcast to `ServerErrorCode` — the shared error type that the
-/// `SendContextResolver` impl wraps server errors in.
 /// The `<error code>` the server attaches to a device it no longer knows.
 pub(crate) const UNREGISTERED_DEVICE_CODE: u16 = 406;
 
-pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
-    crate::request::ServerErrorCode::from_anyhow(err)
-        .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionSetupError {
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Resolver(#[from] crate::client::context::SendContextError),
+}
+
+impl SessionSetupError {
+    pub fn server_error(&self) -> Option<&crate::request::ServerErrorCode> {
+        match self {
+            Self::Resolver(error) => error.server_error(),
+            Self::Signal(_) => None,
+        }
+    }
 }
 
 pub struct EncryptResult {
@@ -107,7 +112,7 @@ pub struct EncryptResult {
 
 pub(crate) struct EncryptAttempt {
     pub result: EncryptResult,
-    pub first_error: Option<anyhow::Error>,
+    pub first_error: Option<Box<DeviceEncryptionError>>,
     /// Devices the encrypt fan-out itself dropped, excluding the ones already
     /// accounted for during session setup. See [`unkeyed_at_encrypt`].
     pub unkeyed_at_encrypt: u64,
@@ -143,7 +148,30 @@ pub struct EncryptForDevicesRaw {
 
 struct RawEncryptAttempt {
     result: EncryptForDevicesRaw,
-    first_error: Option<anyhow::Error>,
+    first_error: Option<Box<DeviceEncryptionError>>,
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum DeviceEncryptionError {
+    #[error("failed to encrypt for {address}: {}", crate::diagnostics::ErrorSummary(.source))]
+    Encrypt {
+        address: String,
+        #[source]
+        source: crate::libsignal::protocol::SignalProtocolError,
+    },
+    #[error("failed to process pre-key bundle for {address}: {}", crate::diagnostics::ErrorSummary(.source))]
+    SessionSetup {
+        address: String,
+        #[source]
+        source: crate::libsignal::protocol::SignalProtocolError,
+    },
+    #[error("{0}")]
+    Resolver(#[from] crate::client::context::SendContextError),
+    #[error("spawned task did not produce a result (panic or runtime shutdown)")]
+    TaskCanceled,
+    #[error("no recipient device produced a ciphertext")]
+    NoCiphertext,
 }
 
 /// Explicit primary wire profiles from the pinned reference clients. Neither profile
@@ -165,10 +193,20 @@ pub enum SenderIdentityRole {
     MobilePrimary(PrimaryDeviceIdentityPolicy),
     Unknown,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DeviceIdentityError {
+    #[error("unknown sending identity role")]
+    UnknownRole,
+    #[error("pkmsg requires <device-identity> but no ADV account is present")]
+    MissingAccount,
+}
+
 impl SenderIdentityRole {
-    pub fn validate(self) -> Result<()> {
+    pub fn validate(self) -> Result<(), DeviceIdentityError> {
         if self == Self::Unknown {
-            bail!("unknown sending identity role");
+            return Err(DeviceIdentityError::UnknownRole);
         }
         Ok(())
     }
@@ -181,7 +219,7 @@ pub fn needs_device_identity_for_role(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,
     role: SenderIdentityRole,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, DeviceIdentityError> {
     role.validate()?;
     if !includes_prekey {
         return Ok(None);
@@ -192,9 +230,7 @@ pub fn needs_device_identity_for_role(
             Ok(account.map(waproto::codec::adv_signed_device_identity_to_vec))
         }
         SenderIdentityRole::Companion => {
-            let acc = account.ok_or_else(|| {
-                anyhow!("pkmsg requires <device-identity> but no ADV account is present")
-            })?;
+            let acc = account.ok_or(DeviceIdentityError::MissingAccount)?;
             Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
         }
         SenderIdentityRole::Unknown => unreachable!("validated above"),
@@ -211,7 +247,7 @@ pub fn needs_device_identity_for_role(
 pub fn needs_device_identity(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, DeviceIdentityError> {
     needs_device_identity_for_role(includes_prekey, account, SenderIdentityRole::Companion)
 }
 
@@ -241,7 +277,7 @@ enum SessionOutcome {
     Dropped {
         jid: Jid,
         reason: Option<UnkeyableDevice>,
-        error: Option<anyhow::Error>,
+        error: Option<Box<DeviceEncryptionError>>,
     },
 }
 
@@ -270,7 +306,7 @@ struct Spawned<T> {
 }
 
 impl<T> Future for Spawned<T> {
-    type Output = std::result::Result<T, SpawnCanceled>;
+    type Output = Result<T, SpawnCanceled>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -315,7 +351,7 @@ impl<T> Drop for Spawned<T> {
 fn spawn_oneshot<F, T>(
     rt: &dyn Runtime,
     fut: F,
-) -> impl Future<Output = std::result::Result<T, SpawnCanceled>> + Send + 'static
+) -> impl Future<Output = Result<T, SpawnCanceled>> + Send + 'static
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -334,7 +370,7 @@ where
 fn spawn_oneshot<F, T>(
     rt: &dyn Runtime,
     fut: F,
-) -> impl Future<Output = std::result::Result<T, SpawnCanceled>> + 'static
+) -> impl Future<Output = Result<T, SpawnCanceled>> + 'static
 where
     F: Future<Output = T> + 'static,
     T: 'static,
@@ -360,7 +396,10 @@ async fn encrypt_one_device(
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
     crypto_provider: Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>>,
-) -> (Jid, Result<Option<EncryptOneResult>>) {
+) -> (
+    Jid,
+    Result<Option<EncryptOneResult>, Box<DeviceEncryptionError>>,
+) {
     let encrypted = if let Some(provider) = crypto_provider {
         crate::libsignal::protocol::message_encrypt_serialized_with_provider(
             &*provider,
@@ -401,7 +440,10 @@ async fn encrypt_one_device(
         }
         Err(error) => (
             device_jid,
-            Err(anyhow::Error::new(error).context(format!("failed to encrypt for {addr}"))),
+            Err(Box::new(DeviceEncryptionError::Encrypt {
+                address: addr.to_string(),
+                source: error,
+            })),
         ),
     }
 }
@@ -410,10 +452,13 @@ async fn encrypt_one_device(
 /// on success, a logged skip on failure. Node-agnostic so both the message
 /// `<to>` map and the voip offer share it.
 fn push_raw_result(
-    (device_jid, res): (Jid, Result<Option<EncryptOneResult>>),
+    (device_jid, res): (
+        Jid,
+        Result<Option<EncryptOneResult>, Box<DeviceEncryptionError>>,
+    ),
     devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
-    first_error: &mut Option<anyhow::Error>,
+    first_error: &mut Option<Box<DeviceEncryptionError>>,
     already_counted: &[Jid],
     unkeyed_at_encrypt: &mut u64,
 ) {
@@ -508,7 +553,7 @@ pub async fn encrypt_for_devices(
     plaintext_to_encrypt: &[u8],
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
-) -> Result<EncryptResult> {
+) -> Result<EncryptResult, SessionSetupError> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
     let attempt = encrypt_for_devices_with_sessions_detailed(
         runtime,
@@ -519,7 +564,7 @@ pub async fn encrypt_for_devices(
         mediatype,
         plan,
     )
-    .await?;
+    .await;
     report_encrypt_drops(resolver, attempt.unkeyed_at_encrypt);
     Ok(attempt.result)
 }
@@ -565,7 +610,7 @@ pub struct EncryptFanoutSummary {
     /// when every device produced a node. Already collected for the group
     /// path's detailed attempt, so a caller that turns "nothing encrypted"
     /// into an error can name the cause instead of reporting a bare count.
-    pub first_error: Option<anyhow::Error>,
+    pub first_error: Option<Box<DeviceEncryptionError>>,
 }
 
 /// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
@@ -589,7 +634,7 @@ pub async fn encrypt_for_devices_into(
     mediatype: Option<&str>,
     participant_nodes: &mut Vec<Node>,
     signal_addresses: Option<&[Jid]>,
-) -> Result<EncryptFanoutSummary> {
+) -> Result<EncryptFanoutSummary, SessionSetupError> {
     let plan =
         ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, signal_addresses)
             .await?;
@@ -603,7 +648,7 @@ pub async fn encrypt_for_devices_into(
         plaintext_to_encrypt,
         plan,
     )
-    .await?;
+    .await;
     report_encrypt_drops(resolver, raw.unkeyed_at_encrypt);
 
     let encrypted_devices = raw.devices.len();
@@ -678,7 +723,7 @@ pub struct SessionPlan {
     /// device that merely lacked a bundle or failed session setup, refreshing
     /// unrelated users for no reason.
     pub rejected_devices: Vec<Jid>,
-    first_error: Option<anyhow::Error>,
+    first_error: Option<Box<DeviceEncryptionError>>,
     /// Devices this plan already gave up on, and already counted. The encrypt
     /// fan-out skips them when tallying its own drops, so one dropped device is
     /// never reported as both a session-setup drop and an encrypt drop.
@@ -724,12 +769,12 @@ async fn has_session_or_report(
     addr: &ProtocolAddress,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
-) -> Result<bool> {
+) -> Result<bool, crate::libsignal::protocol::SignalProtocolError> {
     match wacore_libsignal::protocol::has_session(session_store, addr).await {
         Ok(present) => Ok(present),
         Err(error) => {
             resolver.on_unkeyable_devices(UnkeyableDevice::SessionLookup, devices.len() as u64);
-            Err(error.into())
+            Err(error)
         }
     }
 }
@@ -810,7 +855,7 @@ pub async fn ensure_sessions_for_devices(
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, None).await
 }
 
@@ -824,7 +869,7 @@ pub async fn ensure_sessions_for_devices_resolved(
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     ensure_sessions_for_devices_guarded(
         runtime,
         stores,
@@ -844,7 +889,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
     session_guard: crate::client::context::SessionLockGuard,
-) -> Result<SessionPlan> {
+) -> Result<SessionPlan, SessionSetupError> {
     // A list that is not parallel to `devices` cannot be indexed by device;
     // resolving per device is always correct, so that is the fallback in
     // every build rather than a debug-only assertion that would make a
@@ -1028,7 +1073,10 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                 server_named = outcome.rejected;
                 outcome.bundles
             }
-            Err(e) if is_device_unregistered_error(&e) => {
+            Err(e)
+                if e.server_error()
+                    .is_some_and(|server| server.code == UNREGISTERED_DEVICE_CODE) =>
+            {
                 // No server prekeys for these devices this round; the next send
                 // re-fetches. Debug, not warn — a batch 406 would otherwise flood the log.
                 log::debug!(
@@ -1048,7 +1096,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                 // Best-effort callers still skip these devices, while a required
                 // distribution can surface the typed server failure without
                 // reconstructing it or reducing the source chain to a string.
-                first_error = Some(e);
+                first_error = Some(Box::new(DeviceEncryptionError::Resolver(e)));
                 std::collections::HashMap::new()
             }
             Err(e) => {
@@ -1061,7 +1109,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                     UnkeyableDevice::FetchFailed,
                     jids_for_fetch.len() as u64,
                 );
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -1167,9 +1215,10 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                             Err(error) => SessionOutcome::Dropped {
                                 jid: lookup_jid,
                                 reason: Some(UnkeyableDevice::SessionSetup),
-                                error: Some(anyhow::Error::new(error).context(format!(
-                                    "failed to process pre-key bundle for {addr}"
-                                ))),
+                                error: Some(Box::new(DeviceEncryptionError::SessionSetup {
+                                    address: addr.to_string(),
+                                    source: error,
+                                })),
                             },
                         },
                     );
@@ -1181,7 +1230,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
         while let Some((chunk_len, spawn_result)) = in_flight.next().await {
             let outcomes = match spawn_result {
                 Ok(outcomes) => outcomes,
-                Err(error) => {
+                Err(_) => {
                     // The task took the devices' identities with it, so these
                     // drops cannot join `unkeyed_devices` — and must not be
                     // counted here either, or the encrypt fan-out (which will
@@ -1190,7 +1239,7 @@ pub(crate) async fn ensure_sessions_for_devices_guarded(
                         "Session-establishment task did not deliver a result; skipping {chunk_len} device(s)."
                     );
                     if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
+                        first_error = Some(Box::new(DeviceEncryptionError::TaskCanceled));
                     }
                     continue;
                 }
@@ -1258,8 +1307,8 @@ pub async fn encrypt_for_devices_with_sessions(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
     plan: SessionPlan,
-) -> Result<EncryptResult> {
-    Ok(encrypt_for_devices_with_sessions_detailed(
+) -> EncryptResult {
+    encrypt_for_devices_with_sessions_detailed(
         runtime,
         stores,
         devices,
@@ -1268,11 +1317,11 @@ pub async fn encrypt_for_devices_with_sessions(
         mediatype,
         plan,
     )
-    .await?
-    .result)
+    .await
+    .result
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len())))]
 pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -1281,7 +1330,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
     plan: SessionPlan,
-) -> Result<EncryptAttempt> {
+) -> EncryptAttempt {
     let RawEncryptAttempt {
         result: raw,
         first_error,
@@ -1292,7 +1341,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         plaintext_to_encrypt,
         plan,
     )
-    .await?;
+    .await;
     let unkeyed_at_encrypt = raw.unkeyed_at_encrypt;
 
     // Map each ciphertext to the message path's `<to><enc>` node, preserving the
@@ -1313,7 +1362,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         ));
     }
 
-    Ok(EncryptAttempt {
+    EncryptAttempt {
         result: EncryptResult {
             participant_nodes,
             includes_prekey_message: raw.includes_prekey_message,
@@ -1325,7 +1374,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         },
         first_error,
         unkeyed_at_encrypt,
-    })
+    }
 }
 
 /// Node-agnostic core of the encrypt fan-out: pairwise-encrypt
@@ -1341,26 +1390,26 @@ pub async fn encrypt_for_devices_with_sessions_raw(
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     plan: SessionPlan,
-) -> Result<EncryptForDevicesRaw> {
-    Ok(encrypt_for_devices_with_sessions_raw_detailed(
+) -> EncryptForDevicesRaw {
+    encrypt_for_devices_with_sessions_raw_detailed(
         runtime,
         stores,
         devices,
         plaintext_to_encrypt,
         plan,
     )
-    .await?
-    .result)
+    .await
+    .result
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout_raw", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout_raw", level = "debug", skip_all, fields(count = devices.len())))]
 async fn encrypt_for_devices_with_sessions_raw_detailed(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     plan: SessionPlan,
-) -> Result<RawEncryptAttempt> {
+) -> RawEncryptAttempt {
     debug_assert_eq!(
         plan.device_count,
         devices.len(),
@@ -1500,7 +1549,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                         );
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
@@ -1508,14 +1557,14 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     );
                     unkeyed_at_encrypt += chunk_countable;
                     if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
+                        first_error = Some(Box::new(DeviceEncryptionError::TaskCanceled));
                     }
                 }
             }
         }
     }
 
-    Ok(RawEncryptAttempt {
+    RawEncryptAttempt {
         result: EncryptForDevicesRaw {
             devices: encrypted,
             includes_prekey_message,
@@ -1524,7 +1573,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             unkeyed_at_encrypt,
         },
         first_error,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1752,15 +1801,19 @@ mod sender_identity_role_tests {
     fn explicit_primary_profiles_and_unknown_role_do_not_weaken_companions() {
         let account = wa::ADVSignedDeviceIdentity::default();
         for prekey in [false, true] {
-            assert!(
-                needs_device_identity_for_role(prekey, None, SenderIdentityRole::Unknown).is_err()
-            );
+            assert!(matches!(
+                needs_device_identity_for_role(prekey, None, SenderIdentityRole::Unknown),
+                Err(DeviceIdentityError::UnknownRole)
+            ));
             assert!(
                 needs_device_identity_for_role(prekey, Some(&account), SenderIdentityRole::Unknown)
                     .is_err()
             );
         }
-        assert!(needs_device_identity(true, None).is_err());
+        assert!(matches!(
+            needs_device_identity(true, None),
+            Err(DeviceIdentityError::MissingAccount)
+        ));
         for policy in [
             PrimaryDeviceIdentityPolicy::Omit,
             PrimaryDeviceIdentityPolicy::AttachWhenAvailable,

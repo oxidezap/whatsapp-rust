@@ -2,8 +2,7 @@
 //!
 //! Wire format: `<ib><unified_session id="..."/></ib>`
 
-use crate::protocol::ProtocolNode;
-use anyhow::Result;
+use crate::protocol::{ProtocolNode, ProtocolNodeError};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeRef};
 
@@ -75,7 +74,18 @@ impl IbStanza {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum IbParseError {
+    #[error("{0}")]
+    Node(#[from] ProtocolNodeError),
+    #[error("unknown or missing <ib> content")]
+    MissingContent,
+}
+
 impl ProtocolNode for IbStanza {
+    type Error = IbParseError;
+
     fn tag(&self) -> &'static str {
         "ib"
     }
@@ -86,9 +96,13 @@ impl ProtocolNode for IbStanza {
             .build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "ib" {
-            return Err(anyhow::anyhow!("expected <ib>, got <{}>", node.tag));
+            return Err(ProtocolNodeError::UnexpectedTag {
+                expected: "ib",
+                actual: node.tag.as_ref().to_owned(),
+            }
+            .into());
         }
 
         if let Some(children) = node.children() {
@@ -101,13 +115,29 @@ impl ProtocolNode for IbStanza {
             }
         }
 
-        Err(anyhow::anyhow!("unknown or missing <ib> content"))
+        Err(IbParseError::MissingContent)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ib_parser_reports_missing_or_invalid_content() {
+        let empty = NodeBuilder::new("ib").build();
+        assert!(matches!(
+            IbStanza::try_from_node(&empty),
+            Err(IbParseError::MissingContent)
+        ));
+        let invalid = NodeBuilder::new("ib")
+            .children([NodeBuilder::new("unified_session").build()])
+            .build();
+        assert!(matches!(
+            IbStanza::try_from_node(&invalid),
+            Err(IbParseError::Node(ProtocolNodeError::Binary(_)))
+        ));
+    }
 
     #[test]
     fn test_unified_session_into_node() {

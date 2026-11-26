@@ -47,6 +47,108 @@ use wacore::protocol::retry::{
 pub(crate) use wacore::session_engine::retry::RetransmissionRoute;
 use wacore::session_engine::retry::RetryKeyOrder;
 
+#[derive(thiserror::Error)]
+pub(crate) enum RetryPrepareError {
+    #[error("history retransmission requires its group route")]
+    HistoryRequiresGroupRoute,
+    #[error("group history retransmission is no longer authorized: {0:?}")]
+    HistoryUnauthorized(crate::GroupHistorySkipReason),
+    #[error("group history bundle no longer fits current count and time-window limits")]
+    HistoryBundleOutsideLimits,
+    #[error("history retransmission lacks audience metadata")]
+    HistoryLacksAudienceMetadata,
+    #[error("history retransmission requester is outside the authorized audience")]
+    HistoryRequesterUnauthorized,
+    #[error("history notice retransmission requires current group members")]
+    HistoryNoticeRequiresGroupMembers,
+    #[error("history retransmission policy changed: {0:?}")]
+    HistoryPolicyChanged(crate::GroupHistorySkipReason),
+    #[error("history retransmission recipient left the group")]
+    HistoryRecipientLeftGroup,
+    #[error("history bundle expired before retransmission")]
+    HistoryBundleExpired,
+    #[error("connection changed while preparing history retransmission")]
+    HistoryConnectionChanged,
+    #[error("cannot retransmit status without a device LID")]
+    StatusMissingDeviceLid,
+    #[error("cannot retransmit a status to the sending device itself")]
+    StatusTargetIsSelf,
+}
+
+impl std::fmt::Debug for RetryPrepareError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum RetryKeyBundleError {
+    #[error("<keys> child missing from retry receipt")]
+    MissingKeysChild,
+    #[error("regular retry key bundle missing one-time prekey")]
+    MissingOneTimePreKey,
+    #[error("Invalid registration ID in retry receipt")]
+    InvalidRegistrationId,
+    #[error("{0}")]
+    CachedAdvIdentity(#[from] crate::prekeys::CachedAdvIdentityError),
+    #[error("{0}")]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    #[error(
+        "Registration ID changed for peer device {address} (was {previous}, now {current}). \
+         This may indicate the device was reinstalled."
+    )]
+    PeerRegistrationIdChanged {
+        address: String,
+        previous: u32,
+        current: u32,
+    },
+    #[error("Missing identity key in retry receipt")]
+    MissingIdentityKey,
+    #[error("identity key in retry receipt is not 32 bytes")]
+    IdentityKeyNot32Bytes,
+    #[error("{0}")]
+    AdvBootstrap(#[from] crate::prekeys::AdvBootstrapError),
+    #[error("device-identity ADV validation failed for companion {0}")]
+    CompanionAdvValidationFailed(String),
+    #[error("retry companion account identity unavailable")]
+    CompanionAccountIdentityUnavailable,
+    #[error("retry companion key bundle omits device identity")]
+    CompanionOmitsDeviceIdentity,
+    #[error("{0}")]
+    Parse(#[from] wacore::iq::prekeys::PreKeyParseError),
+    #[error("Missing signed prekey in retry receipt")]
+    MissingSignedPreKey,
+    #[error("Invalid signature length")]
+    InvalidSignatureLength,
+}
+
+impl std::fmt::Debug for RetryKeyBundleError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum RetryReceiptError {
+    #[error("<retry> child missing from receipt")]
+    MissingRetryChild,
+    #[error("<retry> missing 'id' attribute")]
+    MissingRetryId,
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+    #[error("{0}")]
+    Send(#[from] SendError),
+}
+
+impl std::fmt::Debug for RetryReceiptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 #[inline]
 fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) -> bool {
     own_pn.is_some_and(|pn| jid.is_same_user_as(pn))
@@ -418,9 +520,9 @@ fn resolve_retry_chat_info(
 fn validate_retry_prekey_presence(
     keys_node: &NodeRef<'_>,
     is_fbid_bot_retry: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), RetryKeyBundleError> {
     if !is_fbid_bot_retry && keys_node.get_optional_child("key").is_none() {
-        anyhow::bail!("regular retry key bundle missing one-time prekey");
+        return Err(RetryKeyBundleError::MissingOneTimePreKey);
     }
     Ok(())
 }
@@ -455,7 +557,7 @@ impl Client {
         &self,
         route: RetransmissionRoute,
         requester: &Jid,
-    ) -> Result<Jid, anyhow::Error> {
+    ) -> Result<Jid, wacore::store::error::StoreError> {
         if matches!(route, RetransmissionRoute::Status) && requester.is_pn() {
             return match self.get_lid_pn_entry(requester).await? {
                 Some(mapping) => Ok(Jid {
@@ -514,7 +616,7 @@ impl Client {
             if !self
                 .jids_share_user_identity(&request.chat, routing_chat)
                 .await
-                .map_err(SendError::from_anyhow)?
+                .map_err(|error| SendError::Store(wacore::error::BoxedErrorSource::new(error)))?
             {
                 return Err(SendError::InvalidRequest(
                     "direct retransmission chat does not match its routing identity".into(),
@@ -534,13 +636,11 @@ impl Client {
 
         let encryption_jid = self
             .resolve_retransmission_encryption_jid(route, &request.requester)
-            .await
-            .map_err(SendError::from_anyhow)?;
+            .await?;
         if route.uses_sender_key() && request.message.message_history_bundle.is_unset() {
             let chat_key = request.chat.to_string();
             self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&encryption_jid))
-                .await
-                .map_err(SendError::from_anyhow)?;
+                .await?;
         }
 
         let MessageRetransmission {
@@ -569,7 +669,6 @@ impl Client {
             pre_encoded: Some(pre_encoded),
         })
         .await
-        .map_err(SendError::from_anyhow)
     }
 
     /// Handle an inbound `<receipt type="retry">`.
@@ -587,16 +686,16 @@ impl Client {
         self: &Arc<Self>,
         receipt: &Receipt,
         node: &Arc<OwnedNodeRef>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), RetryReceiptError> {
         let nr = node.get();
         let retry_child = nr
             .get_optional_child("retry")
-            .ok_or_else(|| anyhow::anyhow!("<retry> child missing from receipt"))?;
+            .ok_or(RetryReceiptError::MissingRetryChild)?;
 
         let message_id = retry_child
             .get_attr("id")
             .map(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("<retry> missing 'id' attribute"))?
+            .ok_or(RetryReceiptError::MissingRetryId)?
             .into_owned();
         let retry_count: u8 = retry_child
             .get_attr("count")
@@ -996,7 +1095,7 @@ impl Client {
     async fn send_retry_stanza(
         &self,
         stanza: wacore::session_engine::publication::CommittingSignal<Node>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         let confirmation = self.confirm_signal_state_pre_wire().await?;
         self.send_node(stanza.confirm(confirmation).into_payload())
             .await?;
@@ -1006,7 +1105,7 @@ impl Client {
     pub(crate) async fn retransmit_message_prepared(
         &self,
         request: PreparedRetransmission,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         let PreparedRetransmission {
             route,
             chat,
@@ -1028,18 +1127,13 @@ impl Client {
 
         if history {
             if !matches!(route, RetransmissionRoute::Group) || !chat.is_group() {
-                anyhow::bail!("history retransmission requires its group route");
+                return Err(RetryPrepareError::HistoryRequiresGroupRoute.into());
             }
             let groups = self.groups();
-            let (_, current_limits) =
-                groups
-                    .group_history_context(&chat)
-                    .await
-                    .map_err(|reason| {
-                        anyhow::anyhow!(
-                            "group history retransmission is no longer authorized: {reason:?}"
-                        )
-                    })?;
+            let (_, current_limits) = groups
+                .group_history_context(&chat)
+                .await
+                .map_err(RetryPrepareError::HistoryUnauthorized)?;
             if !message.message_history_bundle.is_unset()
                 && !crate::features::group_history_bundle_fits_current_limits(
                     &message,
@@ -1047,9 +1141,7 @@ impl Client {
                     self.runtime.wall_time_secs_u64(),
                 )
             {
-                anyhow::bail!(
-                    "group history bundle no longer fits current count and time-window limits"
-                );
+                return Err(RetryPrepareError::HistoryBundleOutsideLimits.into());
             }
             let current_group = groups
                 .routing_info_with_freshness(&chat, crate::cache::Freshness::Refresh)
@@ -1066,7 +1158,7 @@ impl Client {
                 .map(|notice| notice.message_history_metadata.as_option());
             if let Some(metadata) = bundle {
                 let Some(metadata) = metadata else {
-                    anyhow::bail!("history retransmission lacks audience metadata");
+                    return Err(RetryPrepareError::HistoryLacksAudienceMetadata.into());
                 };
                 if !history_retry_recipient_allowed(
                     metadata,
@@ -1081,9 +1173,7 @@ impl Client {
                     own.pn.as_ref(),
                     own.lid.as_ref(),
                 ) {
-                    anyhow::bail!(
-                        "history retransmission requester is outside the authorized audience"
-                    );
+                    return Err(RetryPrepareError::HistoryRequesterUnauthorized.into());
                 }
             }
             if let Some(metadata) = notice
@@ -1096,7 +1186,7 @@ impl Client {
                             })
                         }))
             {
-                anyhow::bail!("history notice retransmission requires current group members");
+                return Err(RetryPrepareError::HistoryNoticeRequiresGroupMembers.into());
             }
         }
 
@@ -1195,13 +1285,10 @@ impl Client {
         if history {
             let confirmation = self.confirm_signal_state_pre_wire().await?;
             let groups = self.groups();
-            let (metadata, current_limits) =
-                groups
-                    .group_history_context(&chat)
-                    .await
-                    .map_err(|reason| {
-                        anyhow::anyhow!("history retransmission policy changed: {reason:?}")
-                    })?;
+            let (metadata, current_limits) = groups
+                .group_history_context(&chat)
+                .await
+                .map_err(RetryPrepareError::HistoryPolicyChanged)?;
             if !history_recipients
                 .as_ref()
                 .is_some_and(|(wire, encryption)| {
@@ -1211,7 +1298,7 @@ impl Client {
                     )
                 })
             {
-                anyhow::bail!("history retransmission recipient left the group");
+                return Err(RetryPrepareError::HistoryRecipientLeftGroup.into());
             }
             if !message.message_history_bundle.is_unset()
                 && !crate::features::group_history_bundle_fits_current_limits(
@@ -1220,14 +1307,14 @@ impl Client {
                     self.runtime.wall_time_secs_u64(),
                 )
             {
-                anyhow::bail!("history bundle expired before retransmission");
+                return Err(RetryPrepareError::HistoryBundleExpired.into());
             }
             if self
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire)
                 != history_generation
             {
-                anyhow::bail!("connection changed while preparing history retransmission");
+                return Err(RetryPrepareError::HistoryConnectionChanged.into());
             }
             return self
                 .send_node(stanza.confirm(confirmation).into_payload())
@@ -1247,7 +1334,7 @@ impl Client {
         message: wa::Message,
         message_id: String,
         pre_encoded: Option<&[u8]>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = snapshot
             .pn
@@ -1256,12 +1343,12 @@ impl Client {
         let own_lid = snapshot
             .lid
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("cannot retransmit status without a device LID"))?;
+            .ok_or(RetryPrepareError::StatusMissingDeviceLid)?;
         let is_sending_device = (requester.is_same_user_as(own_pn)
             && requester.device == own_pn.device)
             || (requester.is_same_user_as(own_lid) && requester.device == own_lid.device);
         if is_sending_device {
-            anyhow::bail!("cannot retransmit a status to the sending device itself");
+            return Err(RetryPrepareError::StatusTargetIsSelf.into());
         }
 
         let chat_key = chat.to_string();
@@ -1311,14 +1398,12 @@ impl Client {
                 // I/O. The typed failure retains the original source chain and
                 // identifies only users whose pre-key lookup returned 406.
                 drop(distribution_guard);
-                if let Some(failure) =
-                    error.downcast_ref::<wacore::send::RequiredSenderKeyDistributionError>()
-                {
+                if let wacore::send::GroupStanzaError::RequiredDistribution(failure) = &error {
                     for user in failure.stale_device_users() {
                         self.invalidate_device_cache(user).await;
                     }
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         self.send_retry_stanza(
@@ -1669,10 +1754,10 @@ impl Client {
         requester_jid: &Jid,
         is_peer: bool,
         is_fbid_bot_retry: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), RetryKeyBundleError> {
         let keys_node = node
             .get_optional_child("keys")
-            .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
+            .ok_or(RetryKeyBundleError::MissingKeysChild)?;
         validate_retry_prekey_presence(keys_node, is_fbid_bot_retry)?;
 
         // Use the centralized extractor so the >4-byte rejection rule applies
@@ -1681,7 +1766,7 @@ impl Client {
             wacore::protocol::retry::extract_registration_id_from_node_ref(node).unwrap_or(0);
 
         if registration_id == 0 {
-            return Err(anyhow::anyhow!("Invalid registration ID in retry receipt"));
+            return Err(RetryKeyBundleError::InvalidRegistrationId);
         }
 
         // Use requester_jid directly — the caller already resolved the correct
@@ -1714,13 +1799,11 @@ impl Client {
                     // WhatsApp Web throws an error for peer device registration ID changes.
                     // This is a security measure - peer devices should maintain consistent identity.
                     if is_peer {
-                        return Err(anyhow::anyhow!(
-                            "Registration ID changed for peer device {} (was {}, now {}). \
-                             This may indicate the device was reinstalled.",
-                            signal_address.observe(),
-                            existing_reg_id,
-                            registration_id
-                        ));
+                        return Err(RetryKeyBundleError::PeerRegistrationIdChanged {
+                            address: signal_address.observe().to_string(),
+                            previous: existing_reg_id,
+                            current: registration_id,
+                        });
                     }
                     info!(
                         "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
@@ -1736,8 +1819,9 @@ impl Client {
         let identity_bytes = keys_node
             .get_optional_child("identity")
             .and_then(get_bytes_content_ref)
-            .ok_or_else(|| anyhow::anyhow!("Missing identity key in retry receipt"))?;
-        let identity_key = PublicKey::from_djb_public_key_bytes(identity_bytes)?;
+            .ok_or(RetryKeyBundleError::MissingIdentityKey)?;
+        let identity_key = PublicKey::from_djb_public_key_bytes(identity_bytes)
+            .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?;
 
         // A companion retry must carry a certificate anchored to the primary,
         // just like a fetched prekey bundle. Missing proof fails closed.
@@ -1749,7 +1833,7 @@ impl Client {
         {
             let fetched_identity: [u8; 32] = identity_bytes
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("identity key in retry receipt is not 32 bytes"))?;
+                .map_err(|_| RetryKeyBundleError::IdentityKeyNot32Bytes)?;
             let account_identity = Some(self.ensure_adv_account_identity(requester_jid).await?);
             match wacore::adv::validate_adv_with_identity_key(
                 device_identity,
@@ -1759,23 +1843,23 @@ impl Client {
             ) {
                 wacore::adv::AdvValidation::Valid => authenticated_account = account_identity,
                 wacore::adv::AdvValidation::Invalid => {
-                    return Err(anyhow::anyhow!(
-                        "device-identity ADV validation failed for companion {requester_jid}",
-                        requester_jid = requester_jid.observe()
+                    return Err(RetryKeyBundleError::CompanionAdvValidationFailed(
+                        requester_jid.observe().to_string(),
                     ));
                 }
                 wacore::adv::AdvValidation::NoAccountKey => {
-                    anyhow::bail!("retry companion account identity unavailable")
+                    return Err(RetryKeyBundleError::CompanionAccountIdentityUnavailable);
                 }
             }
         } else if requester_jid.device != 0 {
-            anyhow::bail!("retry companion key bundle omits device identity");
+            return Err(RetryKeyBundleError::CompanionOmitsDeviceIdentity);
         }
 
         // Extract prekey (optional in some cases).
         let prekey_data = if let Some(key_ref) = keys_node.get_optional_child("key") {
             let prekey_node = OneTimePreKeyNode::try_from_node_ref(key_ref)?;
-            let prekey_public = PublicKey::from_djb_public_key_bytes(&prekey_node.public_bytes)?;
+            let prekey_public = PublicKey::from_djb_public_key_bytes(&prekey_node.public_bytes)
+                .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?;
             Some((prekey_node.id.into(), prekey_public))
         } else {
             None
@@ -1784,15 +1868,16 @@ impl Client {
         // Extract signed prekey.
         let skey_ref = keys_node
             .get_optional_child("skey")
-            .ok_or_else(|| anyhow::anyhow!("Missing signed prekey in retry receipt"))?;
+            .ok_or(RetryKeyBundleError::MissingSignedPreKey)?;
 
         let signed_prekey = SignedPreKeyNode::try_from_node_ref(skey_ref)?;
-        let skey_public = PublicKey::from_djb_public_key_bytes(&signed_prekey.public_bytes)?;
+        let skey_public = PublicKey::from_djb_public_key_bytes(&signed_prekey.public_bytes)
+            .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?;
         let skey_signature: [u8; 64] = signed_prekey
             .signature
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
+            .map_err(|_| RetryKeyBundleError::InvalidSignatureLength)?;
 
         // Build and process the prekey bundle.
         let mut bundle = PreKeyBundle::new(
@@ -1805,8 +1890,11 @@ impl Client {
             identity_key.into(),
         )?;
         if let Some(account) = authenticated_account {
-            bundle = bundle
-                .with_account_identity(PublicKey::from_djb_public_key_bytes(&account)?.into());
+            bundle = bundle.with_account_identity(
+                PublicKey::from_djb_public_key_bytes(&account)
+                    .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?
+                    .into(),
+            );
         }
 
         let mut adapter = self.signal_adapter();
@@ -3744,7 +3832,7 @@ mod tests {
         count: &str,
         offline: bool,
         extra: impl IntoIterator<Item = Node>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), RetryReceiptError> {
         let (node_ref, receipt) = retry_receipt(chat, participant, msg_id, count, offline, extra);
         client.handle_retry_receipt(&receipt, &node_ref).await
     }
@@ -4195,11 +4283,11 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            matches!(
-                error.downcast_ref::<SignalProtocolError>(),
+            crate::error::ErrorChainExt::sources(&error).any(|source| matches!(
+                source.downcast_ref::<SignalProtocolError>(),
                 Some(SignalProtocolError::InvalidArgument(reason))
                     if reason.contains("before a newer identity was published")
-            ),
+            )),
             "{error:#}"
         );
         assert_eq!(
@@ -5564,6 +5652,28 @@ mod tests {
             .expect_err("a normal remote user cannot declare a recipient route");
         assert!(matches!(error, SendError::InvalidRequest(_)));
         assert!(error.to_string().contains("local device or bot"));
+    }
+
+    #[tokio::test]
+    async fn direct_retransmission_reports_identity_store_failure() {
+        use crate::store::release::tests::ProbeBackend;
+        let (mut probe, _) = ProbeBackend::new();
+        probe.fail_before_method = Some((
+            "get_lid_mapping",
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        let (client, _) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let request = MessageRetransmission::new(
+            Jid::pn("12025550107"),
+            Jid::lid("100000000000107"),
+            wa::Message::default(),
+            crate::MessageId::new("DIRECT-STORE-FAILURE").unwrap(),
+            1,
+        );
+        let error = client.retransmit_message(request).await.unwrap_err();
+        assert!(matches!(error, SendError::Store(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[tokio::test]

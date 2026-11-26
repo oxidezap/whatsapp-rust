@@ -11,9 +11,61 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+
+pub type RelayResult<T> = Result<T, RelayTransportError>;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RelayTransportErrorKind {
+    #[error("relay transport does not support reconnecting to {0}")]
+    ReconnectUnsupported(SocketAddr),
+    #[error("tapped transport was built without a runtime and cannot rewrap {0}")]
+    TapRuntimeUnavailable(SocketAddr),
+    #[error("relay media channel closed")]
+    Closed,
+    #[error("{0}")]
+    Adapter(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+pub struct RelayTransportError(Box<RelayTransportErrorKind>);
+
+impl RelayTransportError {
+    pub fn new(kind: RelayTransportErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+
+    pub fn adapter(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::from_boxed(Box::new(error))
+    }
+
+    pub fn from_boxed(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::new(RelayTransportErrorKind::Adapter(error))
+    }
+
+    pub fn kind(&self) -> &RelayTransportErrorKind {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RelayTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, formatter)
+    }
+}
+
+impl std::fmt::Debug for RelayTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RelayTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
 
 /// Why a relay media channel ended. The relay is a datagram pipe with no close handshake, so the
 /// set is smaller than the WebSocket `wacore::net::DisconnectReason`.
@@ -67,7 +119,7 @@ pub enum RelayTransportEvent {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
     /// Send one packet to the relay.
-    async fn send(&self, data: Bytes) -> Result<()>;
+    async fn send(&self, data: Bytes) -> RelayResult<()>;
 
     /// Close the channel.
     async fn disconnect(&self);
@@ -106,11 +158,13 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
     async fn reconnect(
         &self,
         endpoint: SocketAddr,
-    ) -> Result<(
+    ) -> RelayResult<(
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
-        bail!("relay transport does not support reconnecting to {endpoint}")
+        Err(RelayTransportError::new(
+            RelayTransportErrorKind::ReconnectUnsupported(endpoint),
+        ))
     }
 }
 
@@ -196,7 +250,10 @@ pub trait RelayTransportProvider: crate::sync_marker::MaybeSendSync {
     /// Async because a platform may have to ask for something before it can build one -- a browser
     /// creating an `RTCPeerConnection` is a call into JS. Failing here fails the call with the
     /// reason, which is the honest answer for a page whose browser has no WebRTC at all.
-    async fn factory(&self, relay: &RelayEndpointParams) -> Result<Arc<dyn RelayTransportFactory>>;
+    async fn factory(
+        &self,
+        relay: &RelayEndpointParams,
+    ) -> RelayResult<Arc<dyn RelayTransportFactory>>;
 }
 
 /// Creates a [`RelayTransport`] connected to a relay endpoint, returning it alongside a push stream
@@ -207,8 +264,25 @@ pub trait RelayTransportFactory: crate::sync_marker::MaybeSendSync {
     /// Connect to the relay and return the channel plus its event stream.
     async fn connect(
         &self,
-    ) -> Result<(
+    ) -> RelayResult<(
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn relay_error_is_one_pointer_and_preserves_adapter_cause() {
+        assert_eq!(size_of::<RelayTransportError>(), size_of::<usize>());
+        let error = RelayTransportError::adapter(std::io::Error::other("synthetic relay failure"));
+        let adapter = error.source().and_then(|source| source.source()).unwrap();
+        assert_eq!(
+            adapter.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Other
+        );
+    }
 }

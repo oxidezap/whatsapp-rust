@@ -1,4 +1,4 @@
-pub use wacore::net::{HttpClient, HttpRequest, HttpResponse};
+pub use wacore::net::{HttpClient, HttpError, HttpRequest, HttpResponse};
 
 /// An HTTP exchange that completed, carrying the status the client refused it
 /// on.
@@ -7,7 +7,7 @@ pub use wacore::net::{HttpClient, HttpRequest, HttpResponse};
 /// recovers the status by type — [`ErrorChainExt::http_status`] — instead of
 /// parsing a message. The same role
 /// [`wacore::request::ServerErrorCode`] plays for IQ rejections, and embedded
-/// the same way: `anyhow::Error::new(HttpStatusError { .. }).context(..)`.
+/// as a typed source of the operation error.
 ///
 /// Deliberately a different question from an IQ `code`. A CDN refusing a byte
 /// range and the chat server refusing a stanza are different layers with
@@ -23,14 +23,6 @@ pub use wacore::net::{HttpClient, HttpRequest, HttpResponse};
 pub struct HttpStatusError {
     /// The status the server answered with.
     pub status: u16,
-}
-
-impl HttpStatusError {
-    /// Wraps `context` around this status so the message reads as the operation
-    /// that failed while the status stays recoverable underneath it.
-    pub(crate) fn into_error(self, context: String) -> anyhow::Error {
-        anyhow::Error::new(self).context(context)
-    }
 }
 
 pub(crate) const HTTP_STATUS_OK: u16 = 200;

@@ -1,6 +1,23 @@
 use crate::client::Client;
 use wacore_binary::Jid;
 
+#[derive(thiserror::Error)]
+pub(crate) enum TcTokenStorageError {
+    #[error("client ownership unavailable during token storage")]
+    ClientOwnershipUnavailable,
+    #[error("token storage worker stopped")]
+    WorkerStopped,
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+}
+
+impl std::fmt::Debug for TcTokenStorageError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 pub(crate) struct TcTokenStorageOutcome {
     pub(crate) key: Jid,
     pub(crate) changed: bool,
@@ -18,12 +35,12 @@ impl Client {
         received: Option<(Vec<u8>, i64)>,
         sender_timestamp: Option<i64>,
         notification: bool,
-    ) -> anyhow::Result<TcTokenStorageOutcome> {
+    ) -> Result<TcTokenStorageOutcome, TcTokenStorageError> {
         let client = self
             .self_weak
             .get()
             .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during token storage"))?;
+            .ok_or(TcTokenStorageError::ClientOwnershipUnavailable)?;
         let (send, receive) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
             let observed = jid.clone();
@@ -31,12 +48,12 @@ impl Client {
                 .persist_tc_token_inner(jid, received, sender_timestamp, notification)
                 .await;
             if let Err(Err(error)) = send.send(result) {
-                log::warn!(target: "Client/TcToken", "Owned token storage for {} failed after caller cancellation: {error:#}", observed.observe());
+                log::warn!(target: "Client/TcToken", "Owned token storage for {} failed after caller cancellation: {error}", observed.observe());
             }
         }));
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("token storage worker stopped"))?
+            .map_err(|_| TcTokenStorageError::WorkerStopped)?
     }
 
     async fn persist_tc_token_inner(
@@ -45,7 +62,7 @@ impl Client {
         received: Option<(Vec<u8>, i64)>,
         sender_timestamp: Option<i64>,
         notification: bool,
-    ) -> anyhow::Result<TcTokenStorageOutcome> {
+    ) -> Result<TcTokenStorageOutcome, TcTokenStorageError> {
         let _mapping = self.lid_pn_cache.lock_mutation().await;
         if !jid.is_lid()
             && let Some(lid) = self.lid_pn_cache.get_current_lid(&jid.user).await

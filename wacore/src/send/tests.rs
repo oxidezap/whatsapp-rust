@@ -583,11 +583,17 @@ impl SendContextResolver for MockSendContextResolver {
         crate::client::context::SessionLockGuard::none()
     }
 
-    async fn resolve_devices(&self, _jids: &[Jid]) -> Result<Vec<Jid>> {
+    async fn resolve_devices(
+        &self,
+        _jids: &[Jid],
+    ) -> Result<Vec<Jid>, crate::client::context::SendContextError> {
         Ok(self.devices.clone())
     }
 
-    async fn fetch_prekeys(&self, jids: &[Jid]) -> Result<HashMap<Jid, PreKeyBundle>> {
+    async fn fetch_prekeys(
+        &self,
+        jids: &[Jid],
+    ) -> Result<HashMap<Jid, PreKeyBundle>, crate::client::context::SendContextError> {
         let mut result = HashMap::new();
         for jid in jids {
             if let Some(bundle_opt) = self.prekey_bundles.get(jid)
@@ -602,14 +608,16 @@ impl SendContextResolver for MockSendContextResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<crate::prekeys::PreKeyFetchOutcome> {
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome, crate::client::context::SendContextError> {
         if let Some(code) = self.prekey_error_code {
-            return Err(anyhow::Error::new(crate::request::ServerErrorCode {
-                code,
-                text: "injected pre-key failure".to_string(),
-                error_type: None,
-                backoff: None,
-            }));
+            return Err(crate::client::context::SendContextError::Server(
+                crate::request::ServerErrorCode {
+                    code,
+                    text: "injected pre-key failure".to_string(),
+                    error_type: None,
+                    backoff: None,
+                },
+            ));
         }
         if let Some(probe) = &self.chain_lock_probe {
             probe
@@ -645,7 +653,7 @@ impl SendContextResolver for MockSendContextResolver {
     async fn resolve_group_routing_info(
         &self,
         _jid: &Jid,
-    ) -> Result<std::sync::Arc<GroupRoutingInfo>> {
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>, crate::client::context::SendContextError> {
         unimplemented!("resolve_group_routing_info not needed for send.rs tests")
     }
 
@@ -2451,6 +2459,10 @@ mod group_retry {
             )
             .await;
             let error = result.expect_err("invalid retry must be rejected");
+            assert!(match message_id {
+                "" => matches!(error, PairwiseRetryError::MissingMessageId),
+                _ => matches!(error, PairwiseRetryError::InvalidRetryCount(_)),
+            });
             assert!(
                 error.to_string().contains(expected_error),
                 "unexpected error for {message_id:?}/{retry_count}: {error:#}"
@@ -2871,8 +2883,8 @@ mod group_retry {
         .await;
         let err = result.expect_err("must refuse before message_encrypt");
         assert!(
-            err.to_string().contains("device-identity"),
-            "error must name <device-identity>; got: {err}"
+            matches!(err, PeerStanzaError::MissingDeviceIdentity),
+            "error must identify the missing device identity; got: {err}"
         );
         assert!(
             !ss.has_session(&addr).await.unwrap(),
@@ -3649,35 +3661,76 @@ mod stanza_type {
 
 #[cfg(test)]
 mod device_unregistered_tests {
-    use super::is_device_unregistered_error;
+    use super::SessionSetupError;
+    use crate::client::context::SendContextError;
     use crate::request::ServerErrorCode;
 
     #[test]
     fn detects_406_server_error_code() {
-        let err = anyhow::Error::new(ServerErrorCode {
+        let err = SessionSetupError::Resolver(SendContextError::Server(ServerErrorCode {
+            code: 406,
+            text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
+        }));
+        assert_eq!(err.server_error().map(|server| server.code), Some(406));
+    }
+
+    #[test]
+    fn resolver_keeps_server_rejection_in_the_source_chain() {
+        let error = SendContextError::host(ServerErrorCode {
             code: 406,
             text: "not-acceptable".to_string(),
             error_type: None,
             backoff: None,
         });
-        assert!(is_device_unregistered_error(&err));
+        assert_eq!(error.server_error().map(|server| server.code), Some(406));
+        let error = SessionSetupError::Resolver(error);
+        assert_eq!(error.server_error().map(|server| server.code), Some(406));
+    }
+
+    #[test]
+    fn device_encryption_diagnostic_includes_signal_failure() {
+        let error = super::DeviceEncryptionError::Encrypt {
+            address: "synthetic-device".into(),
+            source: crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                "load_session",
+                "session store is unavailable".into(),
+            ),
+        };
+        assert!(format!("{error:#}").contains("invalid state in load_session"));
+        assert!(format!("{error:?}").contains("invalid state in load_session"));
+    }
+
+    #[test]
+    fn group_error_preserves_missing_sender_key_for_recovery() {
+        let error = super::GroupStanzaError::GroupEncrypt(crate::error::BoxedErrorSource::new(
+            crate::libsignal::protocol::SignalProtocolError::NoSenderKeyState("synthetic".into()),
+        ));
+        assert!(matches!(
+            error.signal_error(),
+            Some(crate::libsignal::protocol::SignalProtocolError::NoSenderKeyState(_))
+        ));
+        assert!(format!("{error:?}").contains("sender key state missing"));
     }
 
     #[test]
     fn rejects_non_406_server_error() {
-        let err = anyhow::Error::new(ServerErrorCode {
+        let err = SessionSetupError::Resolver(SendContextError::Server(ServerErrorCode {
             code: 404,
             text: "not-found".to_string(),
             error_type: None,
             backoff: None,
-        });
-        assert!(!is_device_unregistered_error(&err));
+        }));
+        assert_eq!(err.server_error().map(|server| server.code), Some(404));
     }
 
     #[test]
     fn rejects_unrelated_error() {
-        let err = anyhow::anyhow!("some random error");
-        assert!(!is_device_unregistered_error(&err));
+        let err = SessionSetupError::Resolver(SendContextError::host(std::io::Error::other(
+            "some random error",
+        )));
+        assert!(err.server_error().is_none());
     }
 
     #[test]
@@ -3685,15 +3738,17 @@ mod device_unregistered_tests {
         // wacore::IqError::ServerError is NOT the same as ServerErrorCode.
         // This simulates the old bug: if someone wraps wacore IqError directly
         // without the ServerErrorCode wrapper, the check should not match.
-        let err = anyhow::Error::new(crate::request::IqError::ServerError {
-            code: 406,
-            text: "not-acceptable".to_string(),
-            error_type: None,
-            backoff: None,
-        });
+        let err = SessionSetupError::Resolver(SendContextError::host(
+            crate::request::IqError::ServerError {
+                code: 406,
+                text: "not-acceptable".to_string(),
+                error_type: None,
+                backoff: None,
+            },
+        ));
         // This would only match if we also checked IqError (we don't — we use ServerErrorCode)
         // The SendContextResolver impl is responsible for wrapping in ServerErrorCode
-        assert!(!is_device_unregistered_error(&err));
+        assert!(err.server_error().is_none());
     }
 }
 
@@ -3994,6 +4049,21 @@ mod mark_full_distribution_list {
         }
     }
 
+    #[tokio::test]
+    async fn peer_preflight_preserves_session_store_failure() {
+        let mut store = FailingSessionStore;
+        let address = Jid::pn("15550001000").to_protocol_address();
+        let error = pkmsg_would_be_emitted(&mut store, &address)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SessionPreflightError::Load(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState("load_session", _)
+            )
+        ));
+    }
+
     #[derive(Clone)]
     struct MemIdentityStore {
         pair: IdentityKeyPair,
@@ -4127,10 +4197,7 @@ mod mark_full_distribution_list {
             .err()
             .expect("a missing sender key must error");
         assert!(
-            matches!(
-                err.downcast_ref::<SignalProtocolError>(),
-                Some(SignalProtocolError::NoSenderKeyState(_))
-            ),
+            matches!(err, SignalProtocolError::NoSenderKeyState(_)),
             "NoSenderKeyState must survive the delegation for the SKDM-redistribution retry, got: {err:#}"
         );
     }
@@ -4537,12 +4604,12 @@ mod mark_full_distribution_list {
             format!("{error:#}").contains("required sender-key distribution failed"),
             "unexpected error chain: {error:#}"
         );
-        let failure = error
-            .downcast_ref::<RequiredSenderKeyDistributionError>()
-            .expect("required failures must retain typed stale-target metadata");
+        let GroupStanzaError::RequiredDistribution(failure) = &error else {
+            panic!("required failures must retain typed stale-target metadata");
+        };
         assert_eq!(failure.stale_device_users(), [requester.user.as_str()]);
         assert_eq!(
-            crate::request::ServerErrorCode::from_anyhow(&error).map(|server| server.code),
+            crate::request::ServerErrorCode::find(&error).map(|server| server.code),
             Some(406),
             "the typed failure must preserve the original server error chain"
         );
@@ -5438,17 +5505,18 @@ mod mark_full_distribution_list {
         };
         let resolver = MockSendContextResolver::new();
 
-        assert!(
+        assert!(matches!(
             ensure_sessions_for_devices(
                 &TokioTestRuntime,
                 &mut stores,
                 &resolver,
                 &[first, second]
             )
-            .await
-            .is_err(),
-            "a store that cannot answer still fails the session half"
-        );
+            .await,
+            Err(SessionSetupError::Signal(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState("has_session", _)
+            ))
+        ));
 
         assert_eq!(
             resolver.captured_unkeyable(),
@@ -6010,8 +6078,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("fan-out succeeds");
+        .await;
 
         assert_eq!(raw.devices.len(), devices.len());
         assert!(raw.includes_prekey_message, "fresh sessions emit pkmsg");
@@ -6046,8 +6113,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("fan-out succeeds despite the sessionless device");
+        .await;
 
         assert_eq!(raw.devices.len(), 1);
         assert_eq!(raw.devices[0].device_jid, device_ok);
@@ -6098,8 +6164,7 @@ mod local_identity_change_on_send {
             b"payload",
             SessionPlan::assume_ready(devices.len()),
         )
-        .await
-        .expect("the send carries on without the device");
+        .await;
 
         assert!(raw.devices.is_empty());
         assert_eq!(
@@ -6137,8 +6202,7 @@ mod local_identity_change_on_send {
             b"x",
             SessionPlan::assume_ready(0),
         )
-        .await
-        .expect("empty fan-out must succeed, not panic");
+        .await;
 
         assert!(raw.devices.is_empty());
         assert!(!raw.includes_prekey_message);
@@ -6708,7 +6772,7 @@ mod local_identity_change_on_send {
             with_sessions: &[Jid],
             missing_bundles: &[Jid],
             message_id: &str,
-        ) -> Result<PreparedDmStanza, anyhow::Error> {
+        ) -> Result<PreparedDmStanza, DmStanzaError> {
             let (mut session_store, mut identity_store) = stores_with_sessions(with_sessions).await;
             let mut prekey_store = UnusedPreKeyStore;
             let signed_prekey_store = UnusedSignedPreKeyStore;
@@ -6813,9 +6877,9 @@ mod local_identity_change_on_send {
             .err()
             .expect("a DM that reached no recipient device must not report success");
 
-            let typed = err
-                .downcast_ref::<NoRecipientDeviceError>()
-                .expect("the caller must be able to match on this, not parse it");
+            let DmStanzaError::NoRecipient(typed) = &err else {
+                panic!("the caller must be able to match on this: {err}");
+            };
             assert!(
                 matches!(
                     typed,
@@ -7078,8 +7142,8 @@ mod local_identity_change_on_send {
 
             assert!(
                 matches!(
-                    err.downcast_ref::<NoRecipientDeviceError>(),
-                    Some(NoRecipientDeviceError::Unresolved)
+                    err,
+                    DmStanzaError::NoRecipient(NoRecipientDeviceError::Unresolved)
                 ),
                 "unexpected error: {err:#}"
             );
@@ -7124,7 +7188,6 @@ mod local_identity_change_on_send {
                 plan,
             )
             .await
-            .expect("encrypt fan-out")
         }
 
         /// The reused buffer must name the same device the session phase just
@@ -7314,8 +7377,7 @@ mod local_identity_change_on_send {
                 b"payload",
                 plan,
             )
-            .await
-            .expect("encrypt fan-out");
+            .await;
 
             assert_eq!(
                 raw.devices.len(),

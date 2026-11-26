@@ -272,9 +272,26 @@ impl Client {
         let task_refresh = Arc::clone(&refresh);
         // A message expiring or being revoked must not cancel another message's refresh.
         self.runtime.spawn_detached(Box::pin(async move {
+            #[derive(thiserror::Error)]
+            enum GroupRefreshError {
+                #[error("group refresh connection retired")]
+                ConnectionRetired,
+                #[error("{0}")]
+                Group(#[from] crate::features::GroupError),
+                #[error("{0}")]
+                Client(#[from] crate::client::ClientError),
+                #[error("{0}")]
+                DeviceSync(#[from] crate::usync::DeviceSyncError),
+            }
+            impl std::fmt::Debug for GroupRefreshError {
+                #[inline(never)]
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    std::fmt::Display::fmt(self, f)
+                }
+            }
             let work = async {
                 if client.connection_generation.load(Ordering::Acquire) != generation {
-                    anyhow::bail!("group refresh connection retired");
+                    return Err(GroupRefreshError::ConnectionRetired);
                 }
                 let info = client
                     .groups()
@@ -289,7 +306,7 @@ impl Client {
                 client
                     .resolve_group_devices_uncached(&info, own, Freshness::Refresh)
                     .await?;
-                anyhow::Ok(())
+                Ok(())
             };
             let cancelled = wacore::runtime::wait_for_shutdown(&shutdown);
             futures::pin_mut!(work, cancelled);
@@ -327,7 +344,7 @@ impl Client {
         message_id: &str,
         sent: GroupSendSnapshot,
         generation: u64,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::send::SendError> {
         let socket = self.get_noise_socket()?;
         if !self.refresh_group_for_repair(group, generation).await {
             return Ok(());
@@ -456,7 +473,7 @@ impl Client {
             return Ok(());
         }
         if participants.is_empty() {
-            anyhow::bail!("group repair could not encrypt for any missed device");
+            return Err(crate::send::SendInternalError::GroupRepairNoEncryptedDevices.into());
         }
         let participants =
             wacore::session_engine::publication::PreparedSignal::new(participants).begin_commit();

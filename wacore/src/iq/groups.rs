@@ -3,7 +3,117 @@ use crate::iq::node::{collect_children, required_attr, required_child};
 use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
-use anyhow::{Result, anyhow};
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum GroupNodeError {
+    #[error("unknown participant type: {0}")]
+    UnknownParticipantType(String),
+    #[error("expected <{expected}>, got <{actual}>")]
+    UnexpectedTag {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("expected <group> or <community>, got <{0}>")]
+    UnexpectedGroupTag(String),
+    #[error("expected <groups> or <communities>, got <{0}>")]
+    UnexpectedParticipatingTag(String),
+    #[error("missing <{container}> or direct <{child}> participating result")]
+    MissingParticipating {
+        container: &'static str,
+        child: &'static str,
+    },
+    #[error("missing required attribute id")]
+    MissingId,
+    #[error("missing group or community create result")]
+    MissingCreateResult,
+    #[error("missing group or community invite result")]
+    MissingInviteResult,
+    #[error("missing membership_approval_requests")]
+    MissingMembershipRequests,
+    #[error("invalid jid in membership request: {0}")]
+    InvalidMembershipJid(#[source] wacore_binary::jid::JidError),
+    #[error("invalid group jid: {0}")]
+    InvalidGroupJid(#[source] wacore_binary::jid::JidError),
+    #[error("expected <group>, <community>, or <membership_approval_request> in join response")]
+    MissingJoinResult,
+    #[error("unexpected batch group error code '{0}' (expected 403 or 404)")]
+    UnexpectedBatchError(String),
+    #[error("invalid truncated value '{0}' (expected 'true')")]
+    InvalidTruncated(String),
+    #[error("missing required attribute size on truncated group")]
+    MissingTruncatedSize,
+    #[error("reporter of {message_id} has no {attribute}")]
+    MissingReporterAttribute {
+        message_id: String,
+        attribute: &'static str,
+    },
+    #[error("group-info participant count exceeds {limit}: {0}", limit = GROUP_INFO_PARTICIPANT_LIMIT)]
+    TooManyParticipants(usize),
+    #[error("{node} missing required '{attribute}' attribute")]
+    MissingNodeAttribute {
+        node: &'static str,
+        attribute: &'static str,
+    },
+    #[error("invalid appeal status '{0}'")]
+    InvalidAppealStatus(String),
+    #[error("participant missing required 'jid' attribute")]
+    MissingParticipantJid,
+    #[error("<add_request> missing required '{0}' attribute")]
+    MissingAddRequestAttribute(&'static str),
+    #[error("<add_request> 'expiration' is not a u64: {0}")]
+    InvalidAddRequestExpiration(#[source] std::num::ParseIntError),
+    #[error("invalid '{name}' attribute '{value}': {source}")]
+    InvalidInteger {
+        name: &'static str,
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("'{name}' attribute exceeds {maximum}: {value}")]
+    AttributeOverflow {
+        name: &'static str,
+        maximum: u32,
+        value: u64,
+    },
+    #[error("{0}")]
+    Binary(#[source] crate::error::BoxedErrorSource<wacore_binary::BinaryError>),
+    #[error("{0}")]
+    Structure(#[source] crate::error::BoxedErrorSource<crate::iq::node::IqParseError>),
+    #[error("{0}")]
+    Jid(#[from] wacore_binary::jid::JidError),
+    #[error("{0}")]
+    Wire(#[from] crate::protocol::UnknownWireValue),
+    #[error("{0}")]
+    Context(#[source] crate::error::BoxedErrorSource<super::contextual::IqResponseError>),
+    #[error("{0}")]
+    Rejection(#[from] super::spec::ContextualRejection),
+}
+
+impl From<wacore_binary::BinaryError> for GroupNodeError {
+    fn from(error: wacore_binary::BinaryError) -> Self {
+        Self::Binary(crate::error::BoxedErrorSource::new(error))
+    }
+}
+
+impl From<crate::iq::node::IqParseError> for GroupNodeError {
+    fn from(error: crate::iq::node::IqParseError) -> Self {
+        Self::Structure(crate::error::BoxedErrorSource::new(error))
+    }
+}
+
+impl From<super::contextual::IqResponseError> for GroupNodeError {
+    fn from(error: super::contextual::IqResponseError) -> Self {
+        Self::Context(crate::error::BoxedErrorSource::new(error))
+    }
+}
+
+impl std::fmt::Debug for GroupNodeError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 use std::num::NonZeroU32;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Server};
@@ -183,14 +293,14 @@ impl ParticipantType {
 }
 
 impl TryFrom<Option<&str>> for ParticipantType {
-    type Error = anyhow::Error;
+    type Error = GroupNodeError;
 
-    fn try_from(value: Option<&str>) -> Result<Self> {
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
         match value {
             Some("admin") => Ok(ParticipantType::Admin),
             Some("superadmin") => Ok(ParticipantType::SuperAdmin),
             Some("member") | None => Ok(ParticipantType::Member),
-            Some(other) => Err(anyhow!("unknown participant type: {other}")),
+            Some(other) => Err(GroupNodeError::UnknownParticipantType(other.to_owned())),
         }
     }
 }
@@ -518,24 +628,42 @@ pub struct GroupQueryRequest {
     pub request: GroupQueryRequestType,
 }
 
-fn optional_u64_attr(node: &NodeRef<'_>, name: &str) -> Result<Option<u64>> {
+fn optional_u64_attr(
+    node: &NodeRef<'_>,
+    name: &'static str,
+) -> Result<Option<u64>, GroupNodeError> {
     let Some(value) = node.attrs().optional_string(name) else {
         return Ok(None);
     };
     value
         .parse()
         .map(Some)
-        .map_err(|error| anyhow!("invalid '{name}' attribute '{value}': {error}"))
+        .map_err(|source| GroupNodeError::InvalidInteger {
+            name,
+            value: value.into_owned(),
+            source,
+        })
 }
 
-fn optional_bounded_u32_attr(node: &NodeRef<'_>, name: &str, maximum: u32) -> Result<Option<u32>> {
+fn optional_bounded_u32_attr(
+    node: &NodeRef<'_>,
+    name: &'static str,
+    maximum: u32,
+) -> Result<Option<u32>, GroupNodeError> {
     let Some(value) = optional_u64_attr(node, name)? else {
         return Ok(None);
     };
-    let value = u32::try_from(value)
-        .map_err(|_| anyhow!("'{name}' attribute exceeds {maximum}: {value}"))?;
+    let value = u32::try_from(value).map_err(|_| GroupNodeError::AttributeOverflow {
+        name,
+        maximum,
+        value,
+    })?;
     if value > maximum {
-        return Err(anyhow!("'{name}' attribute exceeds {maximum}: {value}"));
+        return Err(GroupNodeError::AttributeOverflow {
+            name,
+            maximum,
+            value: value.into(),
+        });
     }
     Ok(Some(value))
 }
@@ -572,7 +700,7 @@ impl Default for GroupParticipantDetails {
 }
 
 impl GroupParticipantDetails {
-    fn from_node(node: &NodeRef<'_>) -> Result<Option<Box<Self>>> {
+    fn from_node(node: &NodeRef<'_>) -> Result<Option<Box<Self>>, GroupNodeError> {
         let mut attrs = node.attrs();
         let participant_label = attrs
             .optional_string("participant_label")
@@ -631,6 +759,8 @@ pub struct GroupParticipantResponse {
 }
 
 impl ProtocolNode for GroupParticipantResponse {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "participant"
     }
@@ -655,14 +785,18 @@ impl ProtocolNode for GroupParticipantResponse {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    #[inline(never)]
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "participant" {
-            return Err(anyhow!("expected <participant>, got <{}>", node.tag));
+            return Err(GroupNodeError::UnexpectedTag {
+                expected: "participant",
+                actual: node.tag.to_string(),
+            });
         }
         let mut attrs = node.attrs();
         let jid = attrs
             .optional_jid("jid")
-            .ok_or_else(|| anyhow!("participant missing required 'jid' attribute"))?;
+            .ok_or(GroupNodeError::MissingParticipantJid)?;
         let phone_number = attrs.optional_jid("phone_number");
         let lid = attrs.optional_jid("lid");
         let username = attrs
@@ -693,6 +827,8 @@ pub struct GroupEphemeralSettings {
 }
 
 impl ProtocolNode for GroupEphemeralSettings {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "ephemeral"
     }
@@ -708,9 +844,13 @@ impl ProtocolNode for GroupEphemeralSettings {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    #[inline(never)]
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "ephemeral" {
-            return Err(anyhow!("expected <ephemeral>, got <{}>", node.tag));
+            return Err(GroupNodeError::UnexpectedTag {
+                expected: "ephemeral",
+                actual: node.tag.to_string(),
+            });
         }
 
         Ok(Self {
@@ -841,6 +981,8 @@ pub struct GroupMetadataResponse {
 }
 
 impl ProtocolNode for GroupMetadataResponse {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "group"
     }
@@ -1078,18 +1220,16 @@ impl ProtocolNode for GroupMetadataResponse {
         builder.children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    #[inline(never)]
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "group" && node.tag != "community" {
-            return Err(anyhow!(
-                "expected <group> or <community>, got <{}>",
-                node.tag
-            ));
+            return Err(GroupNodeError::UnexpectedGroupTag(node.tag.to_string()));
         }
 
         let mut attrs = node.attrs();
         let id_str = attrs
             .optional_string("id")
-            .ok_or_else(|| anyhow!("missing required attribute id"))?;
+            .ok_or(GroupNodeError::MissingId)?;
         let id = if id_str.contains('@') {
             id_str.parse()?
         } else {
@@ -1141,10 +1281,7 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let participants = collect_children::<GroupParticipantResponse>(node, "participant")?;
         if participants.len() > GROUP_INFO_PARTICIPANT_LIMIT as usize {
-            return Err(anyhow!(
-                "group-info participant count exceeds {GROUP_INFO_PARTICIPANT_LIMIT}: {}",
-                participants.len()
-            ));
+            return Err(GroupNodeError::TooManyParticipants(participants.len()));
         }
 
         let is_locked = node.get_optional_child_by_tag(&["locked"]).is_some();
@@ -1244,21 +1381,26 @@ impl ProtocolNode for GroupMetadataResponse {
                 can_auto_file
             }
         };
-        let appeal_status =
-            node.get_optional_child_by_tag(&["appeal_status"])
-                .map(|appeal| {
-                    let value = appeal.attrs().optional_string("type").ok_or_else(|| {
-                        anyhow!("appeal_status missing required 'type' attribute")
-                    })?;
-                    GroupAppealStatus::try_from(value.as_ref())
-                        .map_err(|_| anyhow!("invalid appeal status '{value}'"))
-                })
-                .transpose()?;
+        let appeal_status = node
+            .get_optional_child_by_tag(&["appeal_status"])
+            .map(|appeal| {
+                let value = appeal.attrs().optional_string("type").ok_or(
+                    GroupNodeError::MissingNodeAttribute {
+                        node: "appeal_status",
+                        attribute: "type",
+                    },
+                )?;
+                GroupAppealStatus::try_from(value.as_ref())
+                    .map_err(|_| GroupNodeError::InvalidAppealStatus(value.into_owned()))
+            })
+            .transpose()?;
         let appeal_update_time = node
             .get_optional_child_by_tag(&["appeal_update_time"])
             .map(|appeal| {
-                optional_u64_attr(appeal, "value")?
-                    .ok_or_else(|| anyhow!("appeal_update_time missing required 'value' attribute"))
+                optional_u64_attr(appeal, "value")?.ok_or(GroupNodeError::MissingNodeAttribute {
+                    node: "appeal_update_time",
+                    attribute: "value",
+                })
             })
             .transpose()?;
         let allow_admin_reports = node
@@ -1271,13 +1413,16 @@ impl ProtocolNode for GroupMetadataResponse {
             .get_optional_child_by_tag(&["auto_add_disabled"])
             .is_some();
         let has_capi = node.get_optional_child_by_tag(&["capi"]).is_some();
-        let evolution_version = node
-            .get_optional_child_by_tag(&["evolution_version"])
-            .map(|evolution| {
-                optional_bounded_u32_attr(evolution, "value", GROUP_EVOLUTION_VERSION_MAX)?
-                    .ok_or_else(|| anyhow!("evolution_version missing required 'value' attribute"))
-            })
-            .transpose()?;
+        let evolution_version =
+            node.get_optional_child_by_tag(&["evolution_version"])
+                .map(|evolution| {
+                    optional_bounded_u32_attr(evolution, "value", GROUP_EVOLUTION_VERSION_MAX)?
+                        .ok_or(GroupNodeError::MissingNodeAttribute {
+                            node: "evolution_version",
+                            attribute: "value",
+                        })
+                })
+                .transpose()?;
         let has_group_safety_check = node
             .get_optional_child_by_tag(&["group_safety_check"])
             .is_some();
@@ -1385,6 +1530,8 @@ impl Default for GroupParticipatingRequest {
 }
 
 impl ProtocolNode for GroupParticipatingRequest {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "participating"
     }
@@ -1400,9 +1547,12 @@ impl ProtocolNode for GroupParticipatingRequest {
         NodeBuilder::new("participating").children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "participating" {
-            return Err(anyhow!("expected <participating>, got <{}>", node.tag));
+            return Err(GroupNodeError::UnexpectedTag {
+                expected: "participating",
+                actual: node.tag.to_string(),
+            });
         }
         Ok(Self {
             include_participants: node.get_optional_child("participants").is_some(),
@@ -1435,6 +1585,8 @@ pub struct GroupOverviewData {
 }
 
 impl ProtocolNode for GroupOverviewData {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "group"
     }
@@ -1467,17 +1619,15 @@ impl ProtocolNode for GroupOverviewData {
         builder.children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    #[inline(never)]
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "group" && node.tag != "community" {
-            return Err(anyhow!(
-                "expected <group> or <community>, got <{}>",
-                node.tag
-            ));
+            return Err(GroupNodeError::UnexpectedGroupTag(node.tag.to_string()));
         }
         let mut attrs = node.attrs();
         let id_str = attrs
             .optional_string("id")
-            .ok_or_else(|| anyhow!("missing required attribute id"))?;
+            .ok_or(GroupNodeError::MissingId)?;
         let id = if id_str.contains('@') {
             id_str.parse()?
         } else {
@@ -1491,7 +1641,7 @@ impl ProtocolNode for GroupOverviewData {
         let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
         let parent_group_jid = node
             .get_optional_child_by_tag(&["linked_parent"])
-            .map(|linked_parent| -> Result<Jid> {
+            .map(|linked_parent| -> Result<Jid, GroupNodeError> {
                 let mut attrs = linked_parent.attrs();
                 let jid = attrs.required_jid("jid")?;
                 attrs.finish()?;
@@ -1529,6 +1679,8 @@ pub struct GroupParticipatingOverviewResponse {
 }
 
 impl ProtocolNode for GroupParticipatingOverviewResponse {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "groups"
     }
@@ -1538,14 +1690,13 @@ impl ProtocolNode for GroupParticipatingOverviewResponse {
         NodeBuilder::new("groups").children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         let child_tag = match node.tag.as_ref() {
             "groups" => "group",
             "communities" => "community",
             _ => {
-                return Err(anyhow!(
-                    "expected <groups> or <communities>, got <{}>",
-                    node.tag
+                return Err(GroupNodeError::UnexpectedParticipatingTag(
+                    node.tag.to_string(),
                 ));
             }
         };
@@ -1555,6 +1706,8 @@ impl ProtocolNode for GroupParticipatingOverviewResponse {
 }
 
 impl ProtocolNode for GroupParticipatingResponse {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "groups"
     }
@@ -1564,14 +1717,13 @@ impl ProtocolNode for GroupParticipatingResponse {
         NodeBuilder::new("groups").children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         let child_tag = match node.tag.as_ref() {
             "groups" => "group",
             "communities" => "community",
             _ => {
-                return Err(anyhow!(
-                    "expected <groups> or <communities>, got <{}>",
-                    node.tag
+                return Err(GroupNodeError::UnexpectedParticipatingTag(
+                    node.tag.to_string(),
                 ));
             }
         };
@@ -1625,6 +1777,7 @@ impl GroupQueryIq {
 
 impl IqSpec for GroupQueryIq {
     type Response = GroupMetadataOutcome;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut query = GroupQueryRequest::default().into_node();
@@ -1638,7 +1791,8 @@ impl IqSpec for GroupQueryIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    #[inline(never)]
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         match response
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
@@ -1663,12 +1817,13 @@ impl GroupParticipatingIq {
 
 impl IqSpec for GroupParticipatingIq {
     type Response = GroupParticipatingResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         build_participating_iq()
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         if has_participating_shape(response, "groups", "group") {
             parse_participating_response(response, "groups", "group")
         } else {
@@ -1695,6 +1850,7 @@ impl GroupParticipatingOverviewIq {
 
 impl IqSpec for GroupParticipatingOverviewIq {
     type Response = GroupParticipatingOverviewResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -1706,7 +1862,7 @@ impl IqSpec for GroupParticipatingOverviewIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // A response can carry BOTH `<groups>` and `<communities>` (the
         // shape `participating_iqs_select_their_own_container` covers):
         // combine both containers instead of returning after the first, or
@@ -1744,6 +1900,7 @@ impl CommunityParticipatingOverviewIq {
 
 impl IqSpec for CommunityParticipatingOverviewIq {
     type Response = GroupParticipatingOverviewResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -1755,7 +1912,7 @@ impl IqSpec for CommunityParticipatingOverviewIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         if has_participating_shape(response, "communities", "community") {
             return parse_community_participating_overview_response(response);
         }
@@ -1777,12 +1934,13 @@ impl CommunityParticipatingIq {
 
 impl IqSpec for CommunityParticipatingIq {
     type Response = GroupParticipatingResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         build_participating_iq()
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         if has_participating_shape(response, "communities", "community") {
             return parse_community_participating_response(response);
         }
@@ -1795,7 +1953,7 @@ impl IqSpec for CommunityParticipatingIq {
 
 fn parse_community_participating_response(
     response: &NodeRef<'_>,
-) -> Result<GroupParticipatingResponse> {
+) -> Result<GroupParticipatingResponse, GroupNodeError> {
     let mut result = parse_participating_response(response, "communities", "community")?;
     for community in &mut result.groups {
         community.is_parent_group = true;
@@ -1805,7 +1963,7 @@ fn parse_community_participating_response(
 
 fn parse_community_participating_overview_response(
     response: &NodeRef<'_>,
-) -> Result<GroupParticipatingOverviewResponse> {
+) -> Result<GroupParticipatingOverviewResponse, GroupNodeError> {
     let mut result = parse_participating_overview_response(response, "communities", "community")?;
     for community in &mut result.groups {
         community.is_parent_group = true;
@@ -1817,7 +1975,7 @@ fn parse_participating_overview_response(
     response: &NodeRef<'_>,
     container_tag: &'static str,
     child_tag: &'static str,
-) -> Result<GroupParticipatingOverviewResponse> {
+) -> Result<GroupParticipatingOverviewResponse, GroupNodeError> {
     if response.tag == container_tag {
         return GroupParticipatingOverviewResponse::try_from_node_ref(response);
     }
@@ -1828,9 +1986,10 @@ fn parse_participating_overview_response(
 
     let groups = collect_children::<GroupOverviewData>(response, child_tag)?;
     if groups.is_empty() {
-        return Err(anyhow!(
-            "missing <{container_tag}> or direct <{child_tag}> participating result"
-        ));
+        return Err(GroupNodeError::MissingParticipating {
+            container: container_tag,
+            child: child_tag,
+        });
     }
     Ok(GroupParticipatingOverviewResponse { groups })
 }
@@ -1859,7 +2018,7 @@ fn parse_participating_response(
     response: &NodeRef<'_>,
     container_tag: &'static str,
     child_tag: &'static str,
-) -> Result<GroupParticipatingResponse> {
+) -> Result<GroupParticipatingResponse, GroupNodeError> {
     if response.tag == container_tag {
         return GroupParticipatingResponse::try_from_node_ref(response);
     }
@@ -1870,9 +2029,10 @@ fn parse_participating_response(
 
     let groups = collect_children::<GroupMetadataResponse>(response, child_tag)?;
     if groups.is_empty() {
-        return Err(anyhow!(
-            "missing <{container_tag}> or direct <{child_tag}> participating result"
-        ));
+        return Err(GroupNodeError::MissingParticipating {
+            container: container_tag,
+            child: child_tag,
+        });
     }
     Ok(GroupParticipatingResponse { groups })
 }
@@ -1905,6 +2065,7 @@ impl<'a> CommunityCreateIq<'a> {
 
 impl IqSpec for CommunityCreateIq<'_> {
     type Response = GroupMetadataResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         super::community_create::build_community_create(
@@ -1917,7 +2078,7 @@ impl IqSpec for CommunityCreateIq<'_> {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let mut info = parse_create_group_response(response)?;
         if info.parent_group_jid.is_none() {
             info.is_parent_group = true;
@@ -1928,11 +2089,13 @@ impl IqSpec for CommunityCreateIq<'_> {
     }
 }
 
-fn parse_create_group_response(response: &NodeRef<'_>) -> Result<GroupMetadataResponse> {
+fn parse_create_group_response(
+    response: &NodeRef<'_>,
+) -> Result<GroupMetadataResponse, GroupNodeError> {
     let group_node = response
         .get_optional_child("group")
         .or_else(|| response.get_optional_child("community"))
-        .ok_or_else(|| anyhow!("missing group or community create result"))?;
+        .ok_or(GroupNodeError::MissingCreateResult)?;
     GroupMetadataResponse::try_from_node_ref(group_node)
 }
 
@@ -1952,6 +2115,7 @@ impl IqSpec for GroupCreateIq {
     // Server's `<create>` reply carries the full `<group>` node, so callers
     // can skip a follow-up `fetch_metadata` IQ. Mirrors WA Web's CreateJob.
     type Response = GroupMetadataResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -1963,7 +2127,7 @@ impl IqSpec for GroupCreateIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let mut info = parse_create_group_response(response)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
@@ -2018,6 +2182,8 @@ impl ParticipantChangeResponse {
 }
 
 impl ProtocolNode for ParticipantChangeResponse {
+    type Error = GroupNodeError;
+
     fn tag(&self) -> &'static str {
         "participant"
     }
@@ -2046,17 +2212,17 @@ impl ProtocolNode for ParticipantChangeResponse {
         builder.build()
     }
 
-    fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::anyhow::Result<Self> {
+    fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> Result<Self, Self::Error> {
         if node.tag != "participant" {
-            return Err(::anyhow::anyhow!(
-                "expected <participant>, got <{}>",
-                node.tag
-            ));
+            return Err(GroupNodeError::UnexpectedTag {
+                expected: "participant",
+                actual: node.tag.to_string(),
+            });
         }
         let mut attrs = node.attrs();
         let jid = attrs
             .optional_jid("jid")
-            .ok_or_else(|| ::anyhow::anyhow!("participant missing required 'jid' attribute"))?;
+            .ok_or(GroupNodeError::MissingParticipantJid)?;
         let status = attrs.optional_string("type").map(|c| c.into_owned());
         let error = attrs.optional_string("error").map(|c| c.into_owned());
         let phone_number = attrs.optional_jid("phone_number");
@@ -2066,23 +2232,17 @@ impl ProtocolNode for ParticipantChangeResponse {
         // drop of the V4 invite token doesn't silently disappear.
         let add_request = node
             .get_optional_child("add_request")
-            .map(|n| -> ::anyhow::Result<AddRequestInfo> {
+            .map(|n| -> Result<AddRequestInfo, GroupNodeError> {
                 let mut a = n.attrs();
                 let code = a
                     .optional_string("code")
-                    .ok_or_else(|| {
-                        ::anyhow::anyhow!("<add_request> missing required 'code' attribute")
-                    })?
+                    .ok_or(GroupNodeError::MissingAddRequestAttribute("code"))?
                     .into_owned();
                 let expiration = a
                     .optional_string("expiration")
-                    .ok_or_else(|| {
-                        ::anyhow::anyhow!("<add_request> missing required 'expiration' attribute")
-                    })?
+                    .ok_or(GroupNodeError::MissingAddRequestAttribute("expiration"))?
                     .parse::<u64>()
-                    .map_err(|e| {
-                        ::anyhow::anyhow!("<add_request> 'expiration' is not a u64: {e}")
-                    })?;
+                    .map_err(GroupNodeError::InvalidAddRequestExpiration)?;
                 Ok(AddRequestInfo { code, expiration })
             })
             .transpose()?;
@@ -2123,6 +2283,7 @@ impl SetGroupSubjectIq {
 
 impl IqSpec for SetGroupSubjectIq {
     type Response = ();
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         super::pilots::build_set_subject(super::pilots::SetSubjectRequest {
@@ -2131,7 +2292,7 @@ impl IqSpec for SetGroupSubjectIq {
         })
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         match super::pilots::parse_set_subject_payload(response) {
             super::pilots::SetSubjectSuccess::Success => Ok(()),
         }
@@ -2149,11 +2310,11 @@ impl IqSpec for SetGroupSubjectIq {
         &self,
         response: &NodeRef<'_>,
         request: &NodeRef<'_>,
-    ) -> Result<Self::Response> {
+    ) -> Result<Self::Response, Self::Error> {
         use super::contextual::w_g2::{MakeSetSubjectRequestResponse, MakeSetSubjectRequestSpec};
         match MakeSetSubjectRequestSpec::parse_sent_response(response, request)? {
             MakeSetSubjectRequestResponse::Success(_) => Ok(()),
-            _ => Err(super::spec::contextual_rejection(response)),
+            _ => Err(super::spec::contextual_rejection(response).into()),
         }
     }
 }
@@ -2195,6 +2356,7 @@ impl SetGroupDescriptionIq {
 
 impl IqSpec for SetGroupDescriptionIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let desc_node = if let Some(ref desc) = self.description {
@@ -2224,7 +2386,7 @@ impl IqSpec for SetGroupDescriptionIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2252,6 +2414,7 @@ impl LeaveGroupIq {
 
 impl IqSpec for LeaveGroupIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let group_node = NodeBuilder::new("group")
@@ -2266,7 +2429,7 @@ impl IqSpec for LeaveGroupIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2322,12 +2485,13 @@ macro_rules! define_group_participant_iq {
 
         impl IqSpec for $name {
             type Response = Vec<ParticipantChangeResponse>;
+            type Error = GroupNodeError;
 
             fn build_iq(&self) -> InfoQuery<'static> {
                 build_participant_action_iq(&self.group_jid, $action, &self.participants, false)
             }
 
-            fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+            fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
                 let action_node = required_child(response, $action)?;
                 collect_children::<ParticipantChangeResponse>(action_node, "participant")
             }
@@ -2355,12 +2519,13 @@ macro_rules! define_group_participant_iq {
 
         impl IqSpec for $name {
             type Response = ();
+            type Error = std::convert::Infallible;
 
             fn build_iq(&self) -> InfoQuery<'static> {
                 build_participant_action_iq(&self.group_jid, $action, &self.participants, false)
             }
 
-            fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+            fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
                 Ok(())
             }
         }
@@ -2398,6 +2563,7 @@ impl AddParticipantsIq {
 
 impl IqSpec for AddParticipantsIq {
     type Response = Vec<ParticipantChangeResponse>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -2433,7 +2599,7 @@ impl IqSpec for AddParticipantsIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let action_node = required_child(response, "add")?;
         collect_children::<ParticipantChangeResponse>(action_node, "participant")
     }
@@ -2470,12 +2636,13 @@ impl RemoveParticipantsIncludingLinkedGroupsIq {
 
 impl IqSpec for RemoveParticipantsIncludingLinkedGroupsIq {
     type Response = Vec<ParticipantChangeResponse>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         build_participant_action_iq(&self.group_jid, "remove", &self.participants, true)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let action_node = required_child(response, "remove")?;
         collect_children::<ParticipantChangeResponse>(action_node, "participant")
     }
@@ -2528,6 +2695,7 @@ impl GetGroupInviteLinkIq {
 
 impl IqSpec for GetGroupInviteLinkIq {
     type Response = String;
+    type Error = crate::iq::node::IqParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let content = Some(NodeContent::Nodes(vec![NodeBuilder::new("invite").build()]));
@@ -2538,7 +2706,7 @@ impl IqSpec for GetGroupInviteLinkIq {
         }
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let invite_node = required_child(response, "invite")?;
         let code = required_attr(invite_node, "code")?;
         Ok(format!("https://chat.whatsapp.com/{code}"))
@@ -2588,6 +2756,7 @@ impl SetGroupLockedIq {
 
 impl IqSpec for SetGroupLockedIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         build_property_toggle_iq(
@@ -2596,7 +2765,7 @@ impl IqSpec for SetGroupLockedIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2635,6 +2804,7 @@ impl SetGroupAnnouncementIq {
 
 impl IqSpec for SetGroupAnnouncementIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         build_property_toggle_iq(
@@ -2647,7 +2817,7 @@ impl IqSpec for SetGroupAnnouncementIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2717,6 +2887,7 @@ impl SetGroupEphemeralIq {
 
 impl IqSpec for SetGroupEphemeralIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = match self.expiration {
@@ -2741,7 +2912,7 @@ impl IqSpec for SetGroupEphemeralIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2775,6 +2946,7 @@ impl SetGroupMembershipApprovalIq {
 
 impl IqSpec for SetGroupMembershipApprovalIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("membership_approval_mode")
@@ -2789,7 +2961,7 @@ impl IqSpec for SetGroupMembershipApprovalIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -2828,12 +3000,13 @@ macro_rules! define_group_property_toggle_iq {
 
         impl IqSpec for $name {
             type Response = ();
+            type Error = std::convert::Infallible;
 
             fn build_iq(&self) -> InfoQuery<'static> {
                 build_property_toggle_iq(&self.group_jid, if self.enabled { $on } else { $off })
             }
 
-            fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+            fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
                 Ok(())
             }
         }
@@ -2953,6 +3126,7 @@ impl LinkSubgroupsIq {
 
 impl IqSpec for LinkSubgroupsIq {
     type Response = LinkSubgroupsResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let group_nodes: Vec<Node> = self
@@ -2981,7 +3155,7 @@ impl IqSpec for LinkSubgroupsIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let links_node = required_child(response, "links")?;
         let link_node = required_child(links_node, "link")?;
 
@@ -3029,6 +3203,7 @@ impl UnlinkSubgroupsIq {
 
 impl IqSpec for UnlinkSubgroupsIq {
     type Response = UnlinkSubgroupsResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let group_nodes: Vec<Node> = self
@@ -3055,7 +3230,7 @@ impl IqSpec for UnlinkSubgroupsIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let unlink_node = required_child(response, "unlink")?;
 
         let mut groups = Vec::new();
@@ -3096,6 +3271,7 @@ impl DeleteCommunityIq {
 
 impl IqSpec for DeleteCommunityIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set_ref(
@@ -3107,7 +3283,7 @@ impl IqSpec for DeleteCommunityIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -3137,6 +3313,7 @@ impl QueryLinkedGroupIq {
 
 impl IqSpec for QueryLinkedGroupIq {
     type Response = GroupMetadataResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let query_node = NodeBuilder::new("query_linked")
@@ -3151,7 +3328,7 @@ impl IqSpec for QueryLinkedGroupIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let linked_node = required_child(response, "linked_group")?;
         let group_node = required_child(linked_node, "group")?;
         GroupMetadataResponse::try_from_node_ref(group_node)
@@ -3183,6 +3360,7 @@ impl JoinLinkedGroupIq {
 
 impl IqSpec for JoinLinkedGroupIq {
     type Response = JoinGroupResult;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("join_linked_group")
@@ -3196,7 +3374,7 @@ impl IqSpec for JoinLinkedGroupIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Bare joins the request's own subgroup (same shape pair as the V4
         // accept — see the generated shapes).
         if response.content.is_none() {
@@ -3238,7 +3416,7 @@ impl IqSpec for JoinLinkedGroupIq {
         &self,
         response: &NodeRef<'_>,
         request: &NodeRef<'_>,
-    ) -> Result<Self::Response> {
+    ) -> Result<Self::Response, Self::Error> {
         use super::contextual::w_g2::{
             MakeJoinLinkedGroupRequestResponse, MakeJoinLinkedGroupRequestSpec,
         };
@@ -3247,7 +3425,7 @@ impl IqSpec for JoinLinkedGroupIq {
                 Ok(JoinGroupResult::PendingApproval(self.subgroup_jid.clone()))
             }
             MakeJoinLinkedGroupRequestResponse::Success(_) => self.parse_response(response),
-            _ => Err(super::spec::contextual_rejection(response)),
+            _ => Err(super::spec::contextual_rejection(response).into()),
         }
     }
 }
@@ -3275,6 +3453,7 @@ impl GetLinkedGroupsParticipantsIq {
 
 impl IqSpec for GetLinkedGroupsParticipantsIq {
     type Response = Vec<GroupParticipantResponse>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get_ref(
@@ -3286,7 +3465,7 @@ impl IqSpec for GetLinkedGroupsParticipantsIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let container = required_child(response, "linked_groups_participants")?;
 
         // Participants may be direct children or nested inside <group> nodes.
@@ -3325,9 +3504,9 @@ impl JoinGroupResult {
     }
 }
 
-fn parse_group_id(id_str: &str) -> Result<Jid> {
+fn parse_group_id(id_str: &str) -> Result<Jid, wacore_binary::jid::JidError> {
     if id_str.contains('@') {
-        id_str.parse().map_err(Into::into)
+        id_str.parse()
     } else {
         Ok(Jid::group(id_str))
     }
@@ -3340,29 +3519,23 @@ const JOIN_COMMUNITY_CHILD: &str = "community";
 const JOIN_APPROVAL_CHILD: &str = "membership_approval_request";
 
 /// Shared response parser for group join IQs (both code-based and V4 invite).
-fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
+fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult, GroupNodeError> {
     if let Some(group_node) = response
         .get_optional_child(JOIN_GROUP_CHILD)
         .or_else(|| response.get_optional_child(JOIN_COMMUNITY_CHILD))
     {
         let jid_str = required_attr(group_node, "jid")?;
-        let jid: Jid = jid_str
-            .parse()
-            .map_err(|e| anyhow!("invalid group jid: {e}"))?;
+        let jid: Jid = jid_str.parse().map_err(GroupNodeError::InvalidGroupJid)?;
         return Ok(JoinGroupResult::Joined(jid));
     }
     if let Some(approval_node) = response.get_optional_child(JOIN_APPROVAL_CHILD) {
         let jid_str = required_attr(approval_node, "jid")?;
-        let jid: Jid = jid_str
-            .parse()
-            .map_err(|e| anyhow!("invalid group jid: {e}"))?;
+        let jid: Jid = jid_str.parse().map_err(GroupNodeError::InvalidGroupJid)?;
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
     // NOTE: this message is matched downstream (bridge/baileyrs surfaces it);
     // keep it byte-identical when touching the tags above.
-    Err(anyhow!(
-        "expected <group>, <community>, or <membership_approval_request> in join response"
-    ))
+    Err(GroupNodeError::MissingJoinResult)
 }
 
 /// ```xml
@@ -3383,6 +3556,7 @@ impl AcceptGroupInviteIq {
 
 impl IqSpec for AcceptGroupInviteIq {
     type Response = JoinGroupResult;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let to = Jid::new("", Server::Group);
@@ -3395,7 +3569,7 @@ impl IqSpec for AcceptGroupInviteIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         parse_join_group_response(response)
     }
 }
@@ -3426,6 +3600,7 @@ impl AcceptGroupInviteV4Iq {
 
 impl IqSpec for AcceptGroupInviteV4Iq {
     type Response = JoinGroupResult;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         super::pilots::build_accept_group_add(super::pilots::AcceptGroupAddRequest {
@@ -3436,7 +3611,7 @@ impl IqSpec for AcceptGroupInviteV4Iq {
         })
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Retain the SDK's explicit group/community result extension and its
         // errors. The official V4 contract has no group payload in either
         // success outcome; its approval child is only a presence gate.
@@ -3467,7 +3642,7 @@ impl IqSpec for AcceptGroupInviteV4Iq {
         &self,
         response: &NodeRef<'_>,
         request: &NodeRef<'_>,
-    ) -> Result<Self::Response> {
+    ) -> Result<Self::Response, Self::Error> {
         use super::contextual::w_g2::{
             MakeAcceptGroupAddRequestResponse, MakeAcceptGroupAddRequestSpec,
         };
@@ -3478,7 +3653,7 @@ impl IqSpec for AcceptGroupInviteV4Iq {
                 Ok(JoinGroupResult::PendingApproval(self.group_jid.clone()))
             }
             MakeAcceptGroupAddRequestResponse::Success(_) => self.parse_response(response),
-            _ => Err(super::spec::contextual_rejection(response)),
+            _ => Err(super::spec::contextual_rejection(response).into()),
         }
     }
 }
@@ -3507,6 +3682,7 @@ impl GetGroupInviteInfoIq {
 
 impl IqSpec for GetGroupInviteInfoIq {
     type Response = GroupMetadataResponse;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let to = Jid::new("", Server::Group);
@@ -3519,11 +3695,11 @@ impl IqSpec for GetGroupInviteInfoIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let group_node = response
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
-            .ok_or_else(|| anyhow!("missing group or community invite result"))?;
+            .ok_or(GroupNodeError::MissingInviteResult)?;
         GroupMetadataResponse::try_from_node_ref(group_node)
     }
 }
@@ -3561,6 +3737,7 @@ pub struct MembershipRequest {
 
 impl IqSpec for GetMembershipRequestsIq {
     type Response = Vec<MembershipRequest>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get_ref(
@@ -3572,17 +3749,17 @@ impl IqSpec for GetMembershipRequestsIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let requests_node = response
             .get_optional_child("membership_approval_requests")
-            .ok_or_else(|| anyhow!("missing membership_approval_requests"))?;
+            .ok_or(GroupNodeError::MissingMembershipRequests)?;
 
         let mut requests = Vec::new();
         for child in requests_node.get_children_by_tag("membership_approval_request") {
             let jid_str = required_attr(child, "jid")?;
             let jid: Jid = jid_str
                 .parse()
-                .map_err(|e| anyhow!("invalid jid in membership request: {e}"))?;
+                .map_err(GroupNodeError::InvalidMembershipJid)?;
             let request_time = child
                 .attrs()
                 .optional_string("request_time")
@@ -3631,6 +3808,7 @@ impl MembershipRequestActionIq {
 
 impl IqSpec for MembershipRequestActionIq {
     type Response = Vec<ParticipantChangeResponse>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let action_tag = if self.approve { "approve" } else { "reject" };
@@ -3655,7 +3833,7 @@ impl IqSpec for MembershipRequestActionIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let action_node = required_child(response, "membership_requests_action")?;
         let action_tag = if self.approve { "approve" } else { "reject" };
         let inner = required_child(action_node, action_tag)?;
@@ -3691,6 +3869,7 @@ impl SetMemberAddModeIq {
 
 impl IqSpec for SetMemberAddModeIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set_ref(
@@ -3704,7 +3883,7 @@ impl IqSpec for SetMemberAddModeIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -3771,6 +3950,7 @@ impl AcknowledgeGroupIq {
 
 impl IqSpec for AcknowledgeGroupIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set_ref(
@@ -3780,7 +3960,7 @@ impl IqSpec for AcknowledgeGroupIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -3807,15 +3987,16 @@ enum BatchGroupRefusal {
 /// An unrecognized `error` code is an error rather than a `NotFound`: mapping
 /// it to `NotFound` would report a group as nonexistent when the server said
 /// something else entirely.
-fn parse_batch_group_refusal(group_node: &NodeRef<'_>, code: &str) -> Result<BatchGroupRefusal> {
+fn parse_batch_group_refusal(
+    group_node: &NodeRef<'_>,
+    code: &str,
+) -> Result<BatchGroupRefusal, GroupNodeError> {
     let id_str = required_attr(group_node, "id")?;
     let id = parse_group_id(&id_str)?;
     match code {
         "403" => Ok(BatchGroupRefusal::Forbidden(id)),
         "404" => Ok(BatchGroupRefusal::NotFound(id)),
-        other => Err(anyhow!(
-            "unexpected batch group error code '{other}' (expected 403 or 404)"
-        )),
+        other => Err(GroupNodeError::UnexpectedBatchError(other.to_owned())),
     }
 }
 
@@ -3872,6 +4053,7 @@ impl BatchGetGroupInfoIq {
 
 impl IqSpec for BatchGetGroupInfoIq {
     type Response = Vec<BatchGroupMetadataResult>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -3889,7 +4071,7 @@ impl IqSpec for BatchGetGroupInfoIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let groups_node = required_child(response, "groups")?;
         let mut results = Vec::new();
 
@@ -3913,10 +4095,7 @@ impl IqSpec for BatchGetGroupInfoIq {
             let is_truncated = match attrs.optional_string("truncated") {
                 Some(value) if value.as_ref() == "true" => true,
                 Some(value) => {
-                    return Err(anyhow!(
-                        "invalid truncated value '{}' (expected 'true')",
-                        value
-                    ));
+                    return Err(GroupNodeError::InvalidTruncated(value.into_owned()));
                 }
                 None => false,
             };
@@ -3927,9 +4106,7 @@ impl IqSpec for BatchGetGroupInfoIq {
                 let id = parse_group_id(&id_str)?;
                 let size =
                     optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
-                        .ok_or_else(|| {
-                            anyhow!("missing required attribute size on truncated group")
-                        })?;
+                        .ok_or(GroupNodeError::MissingTruncatedSize)?;
                 results.push(BatchGroupMetadataResult::Truncated { id, size });
             } else {
                 let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
@@ -3962,12 +4139,13 @@ impl BatchGetGroupOverviewIq {
 
 impl IqSpec for BatchGetGroupOverviewIq {
     type Response = Vec<BatchGroupOverviewResult>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         BatchGetGroupInfoIq::new(&self.group_jids).build_iq()
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let groups_node = required_child(response, "groups")?;
         let mut results = Vec::new();
 
@@ -3991,10 +4169,7 @@ impl IqSpec for BatchGetGroupOverviewIq {
             let is_truncated = match attrs.optional_string("truncated") {
                 Some(value) if value.as_ref() == "true" => true,
                 Some(value) => {
-                    return Err(anyhow!(
-                        "invalid truncated value '{}' (expected 'true')",
-                        value
-                    ));
+                    return Err(GroupNodeError::InvalidTruncated(value.into_owned()));
                 }
                 None => false,
             };
@@ -4005,9 +4180,7 @@ impl IqSpec for BatchGetGroupOverviewIq {
                 let id = parse_group_id(&id_str)?;
                 let size =
                     optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
-                        .ok_or_else(|| {
-                            anyhow!("missing required attribute size on truncated group")
-                        })?;
+                        .ok_or(GroupNodeError::MissingTruncatedSize)?;
                 results.push(BatchGroupOverviewResult::Truncated { id, size });
             } else {
                 let info = GroupOverviewData::try_from_node_ref(group_node)?;
@@ -4194,6 +4367,7 @@ impl GetGroupProfilePicturesIq {
 
 impl IqSpec for GetGroupProfilePicturesIq {
     type Response = Vec<GroupProfilePicture>;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -4239,7 +4413,7 @@ impl IqSpec for GetGroupProfilePicturesIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let pictures_node = required_child(response, "pictures")?;
         let mut results = Vec::new();
 
@@ -4351,6 +4525,7 @@ impl ReportGroupMessagesIq {
 
 impl IqSpec for ReportGroupMessagesIq {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let reports = NodeBuilder::new("reports")
@@ -4368,7 +4543,7 @@ impl IqSpec for ReportGroupMessagesIq {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -4393,6 +4568,7 @@ impl GetReportedGroupMessagesIq {
 
 impl IqSpec for GetReportedGroupMessagesIq {
     type Response = ReportedGroupMessages;
+    type Error = GroupNodeError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get_ref(
@@ -4404,7 +4580,7 @@ impl IqSpec for GetReportedGroupMessagesIq {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         let addressing_mode = response
             .attrs()
             .optional_string("addressing_mode")
@@ -4417,12 +4593,18 @@ impl IqSpec for GetReportedGroupMessagesIq {
             let mut reporters = Vec::new();
             for reporter in report.get_children_by_tag("reporter") {
                 let mut attrs = reporter.attrs();
-                let jid = attrs
-                    .optional_jid("jid")
-                    .ok_or_else(|| anyhow!("reporter of {message_id} has no jid"))?;
-                let timestamp = attrs
-                    .optional_u64("timestamp")
-                    .ok_or_else(|| anyhow!("reporter of {message_id} has no timestamp"))?;
+                let jid = attrs.optional_jid("jid").ok_or_else(|| {
+                    GroupNodeError::MissingReporterAttribute {
+                        message_id: message_id.clone(),
+                        attribute: "jid",
+                    }
+                })?;
+                let timestamp = attrs.optional_u64("timestamp").ok_or_else(|| {
+                    GroupNodeError::MissingReporterAttribute {
+                        message_id: message_id.clone(),
+                        attribute: "timestamp",
+                    }
+                })?;
                 reporters.push(GroupMessageReporter {
                     jid,
                     timestamp,
@@ -4879,6 +5061,16 @@ mod tests {
 
         let over_limit = "a".repeat(GROUP_SUBJECT_MAX_LENGTH + 1);
         assert!(GroupSubject::new(&over_limit).is_err());
+
+        let unicode = "é".repeat(GROUP_SUBJECT_MAX_LENGTH);
+        assert!(GroupSubject::new(&unicode).is_ok());
+        let error = GroupSubject::new(format!("{unicode}é")).unwrap_err();
+        assert_eq!(error.max, GROUP_SUBJECT_MAX_LENGTH);
+        assert_eq!(error.actual, GROUP_SUBJECT_MAX_LENGTH + 1);
+        assert_eq!(
+            error.to_string(),
+            format!("Group subject exceeds {GROUP_SUBJECT_MAX_LENGTH} characters")
+        );
     }
 
     #[test]
@@ -5899,6 +6091,35 @@ mod tests {
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].jid, sub);
         assert!(result.groups[0].error.is_none());
+    }
+
+    #[test]
+    fn link_subgroups_missing_links_preserves_parser_cause() {
+        let parent = Jid::new("120363000000000001", Server::Group);
+        let response = NodeBuilder::new("iq").build();
+        let error = LinkSubgroupsIq::new(&parent, &[])
+            .parse_response(&response.as_node_ref())
+            .unwrap_err();
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(matches!(
+            source.downcast_ref::<crate::iq::node::IqParseError>(),
+            Some(crate::iq::node::IqParseError::MissingChild { tag }) if tag == "links"
+        ));
+        let binary = GroupNodeError::from(wacore_binary::BinaryError::MissingAttr("id".into()));
+        assert!(
+            std::error::Error::source(&binary)
+                .unwrap()
+                .is::<wacore_binary::BinaryError>()
+        );
+        let context =
+            GroupNodeError::from(super::super::contextual::IqResponseError::MissingChild {
+                tag: "group",
+            });
+        assert!(
+            std::error::Error::source(&context)
+                .unwrap()
+                .is::<super::super::contextual::IqResponseError>()
+        );
     }
 
     #[test]

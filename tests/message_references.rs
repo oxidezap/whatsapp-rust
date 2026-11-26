@@ -7,7 +7,7 @@ use whatsapp_rust::wacore::types::events::InboundMessage;
 use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::{
     Client, EditRequest, MessageId, MessageRef, MessageRefError, NewsletterMessageRef, PinDuration,
-    SendResult, ServerMessageId, StanzaId, anyhow, async_trait, waproto::whatsapp as wa,
+    SendResult, ServerMessageId, StanzaId, async_trait, waproto::whatsapp as wa,
 };
 
 #[async_trait]

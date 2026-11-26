@@ -1740,7 +1740,6 @@ version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
- "anyhow",
  "async-channel",
  "async-lock",
  "async-trait",
@@ -1787,7 +1786,6 @@ dependencies = [
 name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "hex",
  "hkdf",
@@ -1864,7 +1862,6 @@ dependencies = [
 name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "buffa",
  "bytes",
  "hkdf",
@@ -2018,7 +2015,6 @@ dependencies = [
 name = "whatsapp-rust"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-channel",
  "async-lock",
  "async-trait",
@@ -2083,7 +2079,6 @@ dependencies = [
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-channel",
  "async-trait",
  "bytes",
@@ -2091,6 +2086,7 @@ dependencies = [
  "http",
  "log",
  "rustls",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-websockets",
@@ -2102,8 +2098,8 @@ dependencies = [
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-trait",
+ "thiserror",
  "tokio",
  "ureq",
  "wacore",

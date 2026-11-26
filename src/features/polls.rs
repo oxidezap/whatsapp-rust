@@ -15,7 +15,7 @@ pub use wacore::poll::PollVoteCiphertext;
 super::creation::creation_types!(CreatedPoll, PollRef, poll_ref);
 
 /// Errors from poll operations (creation, voting, and vote decryption).
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum PollError {
     /// Sending the poll/vote stanza failed (embeds the send path error).
@@ -34,7 +34,14 @@ pub enum PollError {
     NotLoggedIn,
     /// Vote decryption/encryption (HKDF/GCM) failed.
     #[error("poll vote crypto failed: {0}")]
-    Crypto(#[source] anyhow::Error),
+    Crypto(#[source] poll::PollVoteError),
+}
+
+impl std::fmt::Debug for PollError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +65,7 @@ impl<'a> Polls<'a> {
     ///
     /// ```no_run
     /// # use whatsapp_rust::{Client, Jid};
-    /// # async fn example(client: &Client, chat: &Jid) -> whatsapp_rust::anyhow::Result<()> {
+    /// # async fn example(client: &Client, chat: &Jid) -> Result<(), Box<dyn std::error::Error>> {
     /// let options = ["Yes".to_owned(), "No".to_owned()];
     /// let created = client.polls().create(chat, "Question", &options, 1).await?;
     /// let target = created.poll_ref()?;
@@ -333,7 +340,7 @@ impl<'a> Polls<'a> {
         primary: poll::PollVoteAddressing<'_>,
         creator_alt: Option<&str>,
         voter_alt: Option<&str>,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Vec<u8>>, poll::PollVoteError> {
         let creators = [
             Some(primary.poll_creator_jid),
             creator_alt.filter(|jid| *jid != primary.poll_creator_jid),
@@ -342,9 +349,21 @@ impl<'a> Polls<'a> {
             Some(primary.voter_jid),
             voter_alt.filter(|jid| *jid != primary.voter_jid),
         ];
-        let mut last_error = None;
+        let mut last_error = match poll::decrypt_poll_vote_with_secret(
+            ciphertext,
+            message_secret,
+            poll_msg_id,
+            primary.poll_creator_jid,
+            primary.voter_jid,
+        ) {
+            Ok(hashes) => return Ok(hashes),
+            Err(error) => error,
+        };
         for creator in creators.into_iter().flatten() {
             for voter in voters.into_iter().flatten() {
+                if creator == primary.poll_creator_jid && voter == primary.voter_jid {
+                    continue;
+                }
                 match poll::decrypt_poll_vote_with_secret(
                     ciphertext,
                     message_secret,
@@ -353,12 +372,11 @@ impl<'a> Polls<'a> {
                     voter,
                 ) {
                     Ok(hashes) => return Ok(hashes),
-                    Err(error) => last_error = Some(error),
+                    Err(error) => last_error = error,
                 }
             }
         }
-        // The original pair is always present, so at least one attempt ran.
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no poll vote addressing available")))
+        Err(last_error)
     }
 
     /// Decrypts each vote and tallies per-option results.

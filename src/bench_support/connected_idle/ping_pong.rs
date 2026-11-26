@@ -1,6 +1,6 @@
+use super::util::{ContextExt, Result};
 use super::{BackendFixture, DEADLINE, Session};
 use crate::{Client, MessageId, SendOptions, SendRequest};
-use anyhow::{Context, Result, ensure};
 use rand::{SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
@@ -73,7 +73,7 @@ impl PingPong {
                 let peer = super::super::establish_acknowledged_session(client, &peer_jid).await;
                 let (events_tx, events) = async_channel::bounded(2);
                 let subscription = client.subscribe_handler(Arc::new(Events(events_tx)));
-                Ok::<_, anyhow::Error>((
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                     session,
                     peer,
                     peer_jid,
@@ -115,7 +115,7 @@ impl PingPong {
                 for index in rounds {
                     self.exchange(index, &mut rng, |id| id.as_str()).await?;
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             })
             .await
             .context("ping/pong did not reach its matching ACK")??;
@@ -166,10 +166,10 @@ impl PingPong {
             .await
             .with_context(|| format!("waiting for ping {index}"))??;
         let Event::Messages(batch) = &*event else {
-            anyhow::bail!("expected the ping message event");
+            bail!("expected the ping message event");
         };
         let [ping] = &*batch.messages else {
-            anyhow::bail!("expected one ping message");
+            bail!("expected one ping message");
         };
         ensure!(ping.info.id == ping_id && ping.info.source.sender == self.peer_jid);
         ensure!(ping.message.text_content() == Some(PING));
@@ -247,7 +247,7 @@ impl PingPong {
             .await
             .with_context(|| format!("waiting for ACK {index}"))??;
         let Event::ServerAck(ack) = &*event else {
-            anyhow::bail!("expected the pong ACK event");
+            bail!("expected the pong ACK event");
         };
         ensure!(
             ack.id == pong_id.as_str()

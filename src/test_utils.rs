@@ -363,7 +363,7 @@ pub struct MockHttpClient;
 
 #[async_trait::async_trait]
 impl HttpClient for MockHttpClient {
-    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
         Ok(HttpResponse::new(200, Vec::new()))
     }
 }
@@ -373,8 +373,10 @@ pub struct FailingMockHttpClient;
 
 #[async_trait::async_trait]
 impl HttpClient for FailingMockHttpClient {
-    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
-        Err(anyhow::anyhow!("Not implemented"))
+    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, crate::http::HttpError> {
+        Err(crate::http::HttpError::adapter(std::io::Error::other(
+            "Not implemented",
+        )))
     }
 }
 

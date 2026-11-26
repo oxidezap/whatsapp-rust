@@ -13,7 +13,9 @@ pub struct Attributes {
 #[protocol(tag = "synthetic-empty")]
 pub struct Empty;
 
-pub fn parse_attributes(node: &wacore_binary::Node) -> anyhow::Result<Attributes> {
+pub fn parse_attributes(
+    node: &wacore_binary::Node,
+) -> Result<Attributes, wacore::protocol::ProtocolNodeError> {
     Attributes::try_from_node(node)
 }
 

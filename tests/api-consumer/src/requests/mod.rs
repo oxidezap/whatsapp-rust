@@ -1,10 +1,34 @@
 //! A genuinely separate downstream crate; operations compile but do not send.
 use std::{future::Future, pin::Pin};
+use wacore::iq::{IqResponseError, groups::GroupNodeError, passive::PassiveModeError};
 use whatsapp_rust::prelude::MessageBuilderExt;
 use whatsapp_rust::{
     Client, EditOptions, EditRequest, Jid, MessageId, MessageRef, MessageSecret, SendError,
     SendOptions, SendRequest, SendResult, StanzaId, async_trait, waproto::whatsapp::Message,
 };
+
+#[test]
+fn contextual_iq_errors_expose_typed_causes() {
+    let cause = IqResponseError::MissingAttribute { name: "from" };
+    let passive = PassiveModeError::from(cause.clone());
+    let group = GroupNodeError::from(cause);
+
+    let PassiveModeError::Context(cause) = passive else {
+        panic!("expected a contextual passive-mode error");
+    };
+    assert!(matches!(
+        cause,
+        IqResponseError::MissingAttribute { name: "from" }
+    ));
+
+    let GroupNodeError::Context(cause) = group else {
+        panic!("expected a contextual group error");
+    };
+    assert!(matches!(
+        cause.as_ref(),
+        IqResponseError::MissingAttribute { name: "from" }
+    ));
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]

@@ -16,7 +16,7 @@ tcp = ["tokio/net", "tokio/io-util"]
 danger-skip-tls-verify = []
 
 [dependencies]
-anyhow = { workspace = true }
+thiserror = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

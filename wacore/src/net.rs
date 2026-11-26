@@ -1,4 +1,3 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -164,13 +163,16 @@ pub enum TransportEvent {
     Disconnected(DisconnectReason),
 }
 
+/// Error reported by a transport implementation.
+pub type TransportError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Represents an active network connection.
 /// The transport is a dumb pipe for bytes with no knowledge of WhatsApp framing.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Transport: crate::sync_marker::MaybeSendSync {
     /// Sends raw data to the server.
-    async fn send(&self, data: Bytes) -> Result<(), anyhow::Error>;
+    async fn send(&self, data: Bytes) -> Result<(), TransportError>;
 
     /// Closes the connection.
     async fn disconnect(&self);
@@ -197,7 +199,7 @@ pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
     /// half-open dial must leave no socket behind when dropped.
     async fn create_transport(
         &self,
-    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
+    ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError>;
 }
 
 /// Dials two endpoints concurrently and keeps the first success, mirroring WA
@@ -251,7 +253,7 @@ impl RacingTransportFactory {
 }
 
 type TransportDial =
-    Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
+    Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError>;
 
 /// Bound for the loser's background close.
 ///
@@ -376,8 +378,8 @@ impl HttpResponse {
         Self { status_code, body }
     }
 
-    pub fn body_string(&self) -> Result<String> {
-        Ok(String::from_utf8(self.body.clone())?)
+    pub fn body_string(&self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.body.clone())
     }
 }
 
@@ -426,12 +428,60 @@ impl AsyncStreamingHttpResponse {
 /// transfer-encoding on upload).
 pub type UploadBody = Box<dyn std::io::Read + Send>;
 
+/// Failure reported by an HTTP adapter.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HttpError {
+    #[error("Streaming not supported by this HTTP client")]
+    StreamingUnsupported,
+    #[error("Upload streaming not supported by this HTTP client")]
+    UploadStreamingUnsupported,
+    #[error("HTTP request timed out: {0}")]
+    Timeout(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Adapter(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl HttpError {
+    /// Reports an adapter timeout while retaining its original cause.
+    pub fn timeout(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Timeout(error.into())
+    }
+
+    /// Whether the adapter reported a timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+
+    /// Retains an adapter's concrete error as the source.
+    pub fn adapter(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Adapter(Box::new(error))
+    }
+
+    /// Retains an already boxed adapter error as the source.
+    pub fn from_boxed(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Adapter(error)
+    }
+}
+
+impl From<std::io::Error> for HttpError {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            Self::timeout(error)
+        } else {
+            Self::adapter(error)
+        }
+    }
+}
+
 /// Trait for executing HTTP requests in a runtime-agnostic way.
 ///
 /// A received HTTP response returns `Ok` with its status, including 4xx/5xx.
 /// Implementations must not turn an HTTP status into an opaque error. The SDK
 /// decides whether to retry according to the operation being performed.
 /// DNS, connect, TLS and request timeout failures return `Err`.
+/// Use [`HttpError::timeout`] for a backend-specific timeout so callers can
+/// classify it without depending on that backend.
 ///
 /// Successful buffered responses must contain the complete body; body read
 /// failures or exceeded body limits return `Err`. For non-success responses,
@@ -466,7 +516,7 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// Executes a given HTTP request and returns the response, non-2xx included.
     /// Do not follow redirects: the core validates the initial media origin and
     /// cannot authorize an unseen redirect target. Return the 3xx response or an error.
-    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse>;
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError>;
 
     /// Whether this client supports synchronous streaming downloads.
     fn supports_streaming(&self) -> bool {
@@ -479,16 +529,14 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// response body is released, including on cancellation.
     fn streaming_admission(
         &self,
-    ) -> Option<crate::runtime::BoxFuture<'_, Result<StreamingRequestPermit>>> {
+    ) -> Option<crate::runtime::BoxFuture<'_, Result<StreamingRequestPermit, HttpError>>> {
         None
     }
 
     /// Synchronous streaming variant — returns a reader over the response body.
     /// Must be called from a blocking context.
-    fn execute_streaming(&self, _request: HttpRequest) -> Result<StreamingHttpResponse> {
-        Err(anyhow::anyhow!(
-            "Streaming not supported by this HTTP client"
-        ))
+    fn execute_streaming(&self, _request: HttpRequest) -> Result<StreamingHttpResponse, HttpError> {
+        Err(HttpError::StreamingUnsupported)
     }
 
     /// Whether this client provides a pull-based asynchronous response body.
@@ -502,7 +550,7 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     fn execute_async_streaming(
         &self,
         _request: HttpRequest,
-    ) -> Option<crate::runtime::BoxFuture<'_, Result<AsyncStreamingHttpResponse>>> {
+    ) -> Option<crate::runtime::BoxFuture<'_, Result<AsyncStreamingHttpResponse, HttpError>>> {
         None
     }
 
@@ -520,10 +568,8 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
         _request: HttpRequest,
         _body: UploadBody,
         _content_length: u64,
-    ) -> Result<HttpResponse> {
-        Err(anyhow::anyhow!(
-            "Upload streaming not supported by this HTTP client"
-        ))
+    ) -> Result<HttpResponse, HttpError> {
+        Err(HttpError::UploadStreamingUnsupported)
     }
 
     /// Best-effort per-session footprint of this client: idle connection-pool
@@ -539,6 +585,12 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
 #[cfg(test)]
 mod tests {
     use super::DisconnectReason;
+
+    #[test]
+    fn response_body_string_reports_invalid_utf8() {
+        let response = super::HttpResponse::new(200, vec![0xff]);
+        assert!(response.body_string().is_err());
+    }
 
     // Happy paths: benign server-initiated recycles must classify as clean so
     // their reconnect is logged quietly.
@@ -692,7 +744,7 @@ mod racing_tests {
 
     #[async_trait::async_trait]
     impl Transport for MockDialTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -722,7 +774,7 @@ mod racing_tests {
     impl TransportFactory for ScriptedDialFactory {
         async fn create_transport(
             &self,
-        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), TransportError>
         {
             self.counters.started.fetch_add(1, Ordering::AcqRel);
             self.counters.live.fetch_add(1, Ordering::AcqRel);
@@ -734,7 +786,7 @@ mod racing_tests {
                 tokio::time::sleep(delay).await;
             }
             if let Some(msg) = self.fail_with {
-                return Err(anyhow::anyhow!("{msg}"));
+                return Err(std::io::Error::other(msg).into());
             }
             self.counters.opened.fetch_add(1, Ordering::AcqRel);
             self.counters.transports_live.fetch_add(1, Ordering::AcqRel);
@@ -936,7 +988,7 @@ mod racing_tests {
         impl TransportFactory for GatedFailure {
             async fn create_transport(&self) -> TransportDial {
                 self.started.send(()).await.unwrap();
-                Err(anyhow::anyhow!(self.release.recv().await.unwrap()))
+                Err(std::io::Error::other(self.release.recv().await.unwrap()).into())
             }
         }
         // Observe the first failure before releasing the second. Wall-clock

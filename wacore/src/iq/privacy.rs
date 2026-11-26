@@ -185,8 +185,20 @@ impl PrivacySettingsSpec {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PrivacySettingsParseError {
+    #[error("{0}")]
+    Node(#[from] crate::iq::node::IqParseError),
+    #[error("missing name in category")]
+    MissingCategoryName,
+    #[error("missing value in category")]
+    MissingCategoryValue,
+}
+
 impl IqSpec for PrivacySettingsSpec {
     type Response = PrivacySettingsResponse;
+    type Error = PrivacySettingsParseError;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(
@@ -198,7 +210,7 @@ impl IqSpec for PrivacySettingsSpec {
         )
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         use crate::iq::node::{optional_attr, required_child};
 
         let privacy_node = required_child(response, "privacy")?;
@@ -206,9 +218,9 @@ impl IqSpec for PrivacySettingsSpec {
         let mut settings = Vec::new();
         for child in privacy_node.get_children_by_tag("category") {
             let name = optional_attr(child, "name")
-                .ok_or_else(|| anyhow::anyhow!("missing name in category"))?;
+                .ok_or(PrivacySettingsParseError::MissingCategoryName)?;
             let value = optional_attr(child, "value")
-                .ok_or_else(|| anyhow::anyhow!("missing value in category"))?;
+                .ok_or(PrivacySettingsParseError::MissingCategoryValue)?;
 
             settings.push(PrivacySetting {
                 category: PrivacyCategory::from(name.as_ref()),
@@ -285,6 +297,7 @@ impl SetPrivacySettingSpec {
 
 impl IqSpec for SetPrivacySettingSpec {
     type Response = SetPrivacySettingResponse;
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut category_node = NodeBuilder::new("category")
@@ -325,7 +338,7 @@ impl IqSpec for SetPrivacySettingSpec {
 
     /// Parse the SET response. WA Web's `setPrivacyParser` extracts `{name, value, dhash}`
     /// per category; we only need the dhash for disallowed-list conflict resolution.
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         use crate::iq::node::optional_attr;
 
         let dhash = response.get_optional_child("privacy").and_then(|privacy| {
@@ -359,6 +372,7 @@ impl SetDefaultDisappearingModeSpec {
 
 impl IqSpec for SetDefaultDisappearingModeSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -372,7 +386,7 @@ impl IqSpec for SetDefaultDisappearingModeSpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }
@@ -528,6 +542,10 @@ mod tests {
             .parse_response(&response.as_node_ref())
             .expect_err("a response without <privacy> must be a hard error");
         assert!(err.to_string().contains("<privacy> child not found"));
+        assert!(matches!(
+            err,
+            PrivacySettingsParseError::Node(crate::iq::node::IqParseError::MissingChild { .. })
+        ));
     }
 
     #[test]
@@ -544,6 +562,10 @@ mod tests {
             .parse_response(&response.as_node_ref())
             .expect_err("a nameless category cannot be mapped to a setting");
         assert!(err.to_string().contains("missing name in category"));
+        assert!(matches!(
+            err,
+            PrivacySettingsParseError::MissingCategoryName
+        ));
     }
 
     #[test]
@@ -560,6 +582,10 @@ mod tests {
             .parse_response(&response.as_node_ref())
             .expect_err("a valueless category cannot be mapped to a setting");
         assert!(err.to_string().contains("missing value in category"));
+        assert!(matches!(
+            err,
+            PrivacySettingsParseError::MissingCategoryValue
+        ));
     }
 
     #[test]

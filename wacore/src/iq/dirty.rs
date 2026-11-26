@@ -95,6 +95,7 @@ impl CleanDirtyBitsSpec {
 
 impl IqSpec for CleanDirtyBitsSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -116,7 +117,7 @@ impl IqSpec for CleanDirtyBitsSpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Clean dirty bits just needs a successful response
         Ok(())
     }

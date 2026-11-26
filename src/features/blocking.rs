@@ -12,7 +12,7 @@ use wacore::iq::blocklist::{GetBlocklistSpec, UpdateBlocklistSpec};
 use wacore_binary::Jid;
 
 /// Error returned by blocklist operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum BlockingError {
     /// The IQ to the server failed (transport, timeout, server rejection).
@@ -22,9 +22,16 @@ pub enum BlockingError {
     /// (modern WA requires both sides for a block).
     #[error("invalid blocklist target: {0}")]
     InvalidJid(String),
-    /// Catch-all for internal failures (e.g. LID/PN store lookup).
+    /// The LID/PN store lookup failed.
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Store(#[from] wacore::store::error::StoreError),
+}
+
+impl std::fmt::Debug for BlockingError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Feature handle for blocklist operations.
@@ -178,14 +185,9 @@ mod tests {
             .await
             .expect("lookup failure must return without waiting for an IQ")
             .unwrap_err();
-            let BlockingError::Internal(cause) = error else {
+            let BlockingError::Store(_cause) = error else {
                 panic!("expected the mapping backend error, got {error:?}");
             };
-            assert!(
-                cause
-                    .downcast_ref::<wacore::store::error::StoreError>()
-                    .is_some()
-            );
         }
         assert!(transport.sent().is_empty());
     }

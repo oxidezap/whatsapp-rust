@@ -1036,7 +1036,7 @@ impl Client {
 
 /// Errors from call-control operations. `#[non_exhaustive]` so new variants stay
 /// non-breaking after 1.0.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum CallError {
     #[error("{0}")]
@@ -1113,6 +1113,13 @@ pub enum CallError {
     #[cfg(feature = "voip-control")]
     #[error("call service request timed out")]
     ResponseTimeout,
+}
+
+impl std::fmt::Debug for CallError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl Voip<'_> {
@@ -1728,12 +1735,18 @@ impl Voip<'_> {
             WaitingRoomUserAction::Admit => (
                 build_waiting_room_admit(call_id, call_creator, user, &request_id),
                 parse_waiting_room_admit_ack
-                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+                    as fn(
+                        &wacore_binary::NodeRef<'_>,
+                    )
+                        -> Result<(), wacore::stanza::group_call::GroupCallParseError>,
             ),
             WaitingRoomUserAction::Deny => (
                 build_waiting_room_deny(call_id, call_creator, user, &request_id),
                 parse_waiting_room_deny_ack
-                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+                    as fn(
+                        &wacore_binary::NodeRef<'_>,
+                    )
+                        -> Result<(), wacore::stanza::group_call::GroupCallParseError>,
             ),
         };
         execute_call_service_request(
@@ -2192,7 +2205,9 @@ async fn execute_call_service_request<T>(
     client: &Client,
     request_id: &str,
     request: Node,
-    parse: impl FnOnce(&wacore_binary::NodeRef<'_>) -> anyhow::Result<T>,
+    parse: impl FnOnce(
+        &wacore_binary::NodeRef<'_>,
+    ) -> Result<T, wacore::stanza::group_call::GroupCallParseError>,
 ) -> Result<T, CallError> {
     let (tx, response) = futures::channel::oneshot::channel();
     let cleanup_generation = client
@@ -2338,7 +2353,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for CountingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -2370,8 +2385,8 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for FailingTransport {
-        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("transport down"))
+        async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
+            Err("transport down".into())
         }
         async fn disconnect(&self) {}
     }
@@ -3922,7 +3937,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 if self.gate_next_send.swap(false, Ordering::AcqRel) {
                     self.started
                         .send(())
@@ -5037,7 +5052,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 self.release.recv().await?;
                 Ok(())
@@ -5176,7 +5191,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for BlockingTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 let _ = self.started.try_send(());
                 futures::future::pending().await
             }
@@ -5309,7 +5324,7 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            async fn send(&self, _data: Bytes) -> Result<(), crate::transport::TransportError> {
                 self.started
                     .send(())
                     .await

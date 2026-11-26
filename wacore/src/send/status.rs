@@ -94,6 +94,11 @@ pub fn status_revoke_target_id(message: &wa::Message) -> Option<&str> {
     protocol_message.key.as_option()?.id.as_deref()
 }
 
+/// No status recipient resolved to an address.
+#[derive(Debug, thiserror::Error)]
+#[error("No valid status recipients after LID resolution")]
+pub struct StatusRecipientsError;
+
 /// Dedup a pre-resolved status recipient list by user, then anchor the sender's
 /// own LID. Errors when no recipient was resolvable (matches WA Web's
 /// `WAWebLidMigrationUtils.toUserLid` + `compactMap` dropping unresolvable
@@ -101,7 +106,10 @@ pub fn status_revoke_target_id(message: &wa::Message) -> Option<&str> {
 ///
 /// Small audiences use a linear scan. Large audiences index the emitted users
 /// so de-duplication preserves the first recipient without quadratic scans.
-pub fn assemble_status_participants<I>(resolved: I, own_lid: &Jid) -> Result<Vec<Jid>>
+pub fn assemble_status_participants<I>(
+    resolved: I,
+    own_lid: &Jid,
+) -> Result<Vec<Jid>, StatusRecipientsError>
 where
     I: IntoIterator<Item = Option<Jid>>,
 {
@@ -138,7 +146,7 @@ where
         }
     }
     if out.is_empty() {
-        anyhow::bail!("No valid status recipients after LID resolution");
+        return Err(StatusRecipientsError);
     }
     if !out.iter().any(|r| r.user == own_lid.user) {
         out.push(own_lid.to_non_ad());

@@ -305,7 +305,19 @@ fn main() -> std::io::Result<()> {
 
     let mut api = emission::finish(&out_path, "whatsapp", |suffix, file| {
         if suffix.is_empty() {
-            pin_clone::apply(file, &["Message", "ContextInfo"]).map_err(std::io::Error::other)?;
+            pin_clone::apply(
+                file,
+                &[
+                    "Message",
+                    "ContextInfo",
+                    "BotMetadata",
+                    "message::VideoMessage",
+                    "message::ImageMessage",
+                    "message::InteractiveMessage",
+                    "message::ExtendedTextMessage",
+                ],
+            )
+            .map_err(std::io::Error::other)?;
         }
         Ok(())
     })?;

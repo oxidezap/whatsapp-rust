@@ -29,6 +29,48 @@ pub struct PreKeyFetchOutcome {
 
 pub struct PreKeyUtils;
 
+#[derive(Debug, thiserror::Error)]
+#[error("<list> not found in pre-key response")]
+pub struct MissingPreKeyList;
+
+#[derive(thiserror::Error)]
+enum PreKeyBundleError {
+    #[error("Expected bytes in node content")]
+    ExpectedBytes,
+    #[error("Error getting prekeys: {0}")]
+    Server(String),
+    #[error("Invalid registration ID length")]
+    InvalidRegistrationLength,
+    #[error("Invalid identity key length: got {0}, expected 32")]
+    InvalidIdentityLength(usize),
+    #[error("Missing signed prekey")]
+    MissingSignedPreKey,
+    #[error("companion ADV account identity unavailable")]
+    MissingAccountIdentity,
+    #[error("device-identity ADV validation failed for companion {0}")]
+    InvalidDeviceIdentity(Jid),
+    #[error("companion prekey bundle omits device identity")]
+    MissingDeviceIdentity,
+    #[error("Missing pre-key value")]
+    MissingPreKeyValue,
+    #[error("Invalid pre-key value length")]
+    InvalidPreKeyLength,
+    #[error("Signed pre-key is missing ID or value")]
+    MissingSignedPreKeyFields,
+    #[error("Missing signed pre-key signature")]
+    MissingSignature,
+    #[error("Invalid signature length")]
+    InvalidSignatureLength,
+    #[error("{0}")]
+    Signal(#[from] crate::libsignal::protocol::SignalProtocolError),
+    #[error("{0}")]
+    Curve(#[from] crate::libsignal::core::CurveError),
+    #[error("{0}")]
+    Decode(#[from] buffa::DecodeError),
+}
+
+debug_as_display!(PreKeyBundleError);
+
 /// Compute SHA-1 digest of a key bundle for validation against server.
 ///
 /// Matches WA Web's `validateLocalKeyBundle` hash computation:
@@ -219,10 +261,10 @@ impl PreKeyUtils {
     pub fn parse_prekeys_response(
         resp_node: &NodeRef<'_>,
         account_identities: &HashMap<Jid, [u8; 32]>,
-    ) -> Result<PreKeyFetchOutcome, anyhow::Error> {
+    ) -> Result<PreKeyFetchOutcome, MissingPreKeyList> {
         let list_node = resp_node
             .get_optional_child("list")
-            .ok_or_else(|| anyhow::anyhow!("<list> not found in pre-key response"))?;
+            .ok_or(MissingPreKeyList)?;
 
         let children = list_node.children().unwrap_or_default();
         // A normal fanout fetch includes the primary and companions together.
@@ -332,7 +374,7 @@ impl PreKeyUtils {
         jid: &Jid,
         node: &NodeRef<'_>,
         account_identity: Option<&[u8; 32]>,
-    ) -> Result<PreKeyBundle, anyhow::Error> {
+    ) -> Result<PreKeyBundle, PreKeyBundleError> {
         use crate::xml::DisplayableNodeRef;
         use wacore_binary::NodeContentRef;
 
@@ -342,35 +384,33 @@ impl PreKeyUtils {
         // and dropped. With the `<value>` and `<signature>` reads below that is
         // five allocations per device, on a path that runs for every device of
         // every user in a fetch.
-        fn extract_bytes_ref<'a>(node: Option<&'a NodeRef<'_>>) -> Result<&'a [u8], anyhow::Error> {
+        fn extract_bytes_ref<'a>(
+            node: Option<&'a NodeRef<'_>>,
+        ) -> Result<&'a [u8], PreKeyBundleError> {
             match node.and_then(|n| n.content.as_ref()) {
                 Some(NodeContentRef::Bytes(b)) => Ok(b.as_ref()),
-                _ => Err(anyhow::anyhow!("Expected bytes in node content")),
+                _ => Err(PreKeyBundleError::ExpectedBytes),
             }
         }
 
         if let Some(error_node) = node.get_optional_child("error") {
-            return Err(anyhow::anyhow!(
-                "Error getting prekeys: {}",
-                DisplayableNodeRef(error_node)
+            return Err(PreKeyBundleError::Server(
+                DisplayableNodeRef(error_node).to_string(),
             ));
         }
 
         let reg_id_bytes = extract_bytes_ref(node.get_optional_child("registration"))?;
         let registration_id = u32::from_be_bytes(
             <[u8; 4]>::try_from(reg_id_bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid registration ID length"))?,
+                .map_err(|_| PreKeyBundleError::InvalidRegistrationLength)?,
         );
 
         let keys_node = node.get_optional_child("keys").unwrap_or(node);
 
         let identity_key_bytes = extract_bytes_ref(keys_node.get_optional_child("identity"))?;
-        let identity_key_array: [u8; 32] = identity_key_bytes.try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "Invalid identity key length: got {}, expected 32",
-                identity_key_bytes.len()
-            )
-        })?;
+        let identity_key_array: [u8; 32] = identity_key_bytes
+            .try_into()
+            .map_err(|_| PreKeyBundleError::InvalidIdentityLength(identity_key_bytes.len()))?;
         let identity_key =
             IdentityKey::new(PublicKey::from_djb_public_key_bytes(&identity_key_array)?);
 
@@ -385,7 +425,7 @@ impl PreKeyUtils {
 
         let signed_pre_key_node = keys_node
             .get_optional_child("skey")
-            .ok_or(anyhow::anyhow!("Missing signed prekey"))?;
+            .ok_or(PreKeyBundleError::MissingSignedPreKey)?;
         let (signed_pre_key_id_u32, signed_pre_key_public_bytes, signed_pre_key_signature) =
             Self::node_to_signed_pre_key_ref(signed_pre_key_node)?;
 
@@ -431,29 +471,27 @@ impl PreKeyUtils {
                         let key = account_identity
                             .map(|key| key.as_slice())
                             .or(signed.account_signature_key.filter(|key| !key.is_empty()))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("companion ADV account identity unavailable")
-                            })?;
+                            .ok_or(PreKeyBundleError::MissingAccountIdentity)?;
                         let parent = IdentityKey::new(PublicKey::from_djb_public_key_bytes(key)?);
                         bundle = bundle.with_account_identity(parent);
                     }
                     crate::adv::AdvValidation::Invalid => {
-                        return Err(anyhow::anyhow!(
-                            "device-identity ADV validation failed for companion {jid}"
-                        ));
+                        return Err(PreKeyBundleError::InvalidDeviceIdentity(jid.clone()));
                     }
                     crate::adv::AdvValidation::NoAccountKey => {
-                        anyhow::bail!("companion ADV account identity unavailable");
+                        return Err(PreKeyBundleError::MissingAccountIdentity);
                     }
                 },
-                None => anyhow::bail!("companion prekey bundle omits device identity"),
+                None => return Err(PreKeyBundleError::MissingDeviceIdentity),
             }
         }
 
         Ok(bundle)
     }
 
-    fn node_to_pre_key_ref(node: &NodeRef<'_>) -> Result<Option<(u32, [u8; 32])>, anyhow::Error> {
+    fn node_to_pre_key_ref(
+        node: &NodeRef<'_>,
+    ) -> Result<Option<(u32, [u8; 32])>, PreKeyBundleError> {
         use wacore_binary::NodeContentRef;
 
         let id_content = node
@@ -463,24 +501,24 @@ impl PreKeyUtils {
         let id = match id_content {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => {
                 if b.len() == 3 {
-                    Ok(u32::from_be_bytes([0, b[0], b[1], b[2]]))
+                    Some(u32::from_be_bytes([0, b[0], b[1], b[2]]))
                 } else if let Ok(s) = std::str::from_utf8(b.as_ref()) {
                     let trimmed_s = s.trim();
                     if trimmed_s.is_empty() {
-                        Err(anyhow::anyhow!("ID content is only whitespace"))
+                        None
                     } else {
-                        u32::from_str_radix(trimmed_s, 16).map_err(|e| e.into())
+                        u32::from_str_radix(trimmed_s, 16).ok()
                     }
                 } else {
-                    Err(anyhow::anyhow!("ID is not valid UTF-8 hex or 3-byte int"))
+                    None
                 }
             }
-            _ => Err(anyhow::anyhow!("Missing or empty pre-key ID content")),
+            _ => None,
         };
 
         let id = match id {
-            Ok(val) => val,
-            Err(_e) => return Ok(None),
+            Some(val) => val,
+            None => return Ok(None),
         };
 
         let value_bytes = node
@@ -493,20 +531,20 @@ impl PreKeyUtils {
                     None
                 }
             })
-            .ok_or(anyhow::anyhow!("Missing pre-key value"))?;
+            .ok_or(PreKeyBundleError::MissingPreKeyValue)?;
         let value_arr = <[u8; 32]>::try_from(value_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid pre-key value length"))?;
+            .map_err(|_| PreKeyBundleError::InvalidPreKeyLength)?;
         Ok(Some((id, value_arr)))
     }
 
     fn node_to_signed_pre_key_ref(
         node: &NodeRef<'_>,
-    ) -> Result<(u32, [u8; 32], [u8; 64]), anyhow::Error> {
+    ) -> Result<(u32, [u8; 32], [u8; 64]), PreKeyBundleError> {
         use wacore_binary::NodeContentRef;
 
         let (id, public_key_bytes) = match Self::node_to_pre_key_ref(node)? {
             Some((id, key)) => (id, key),
-            None => return Err(anyhow::anyhow!("Signed pre-key is missing ID or value")),
+            None => return Err(PreKeyBundleError::MissingSignedPreKeyFields),
         };
         let signature_bytes = node
             .get_optional_child("signature")
@@ -518,9 +556,9 @@ impl PreKeyUtils {
                     None
                 }
             })
-            .ok_or(anyhow::anyhow!("Missing signed pre-key signature"))?;
+            .ok_or(PreKeyBundleError::MissingSignature)?;
         let sig_arr = <[u8; 64]>::try_from(signature_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
+            .map_err(|_| PreKeyBundleError::InvalidSignatureLength)?;
         Ok((id, public_key_bytes, sig_arr))
     }
 }
@@ -534,6 +572,15 @@ mod tests {
     use crate::protocol::ProtocolNode;
 
     use wacore_binary::NodeValue;
+
+    #[test]
+    fn prekey_response_requires_list() {
+        let response = NodeBuilder::new("iq").build();
+        assert!(matches!(
+            PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new()),
+            Err(MissingPreKeyList)
+        ));
+    }
 
     #[test]
     fn extract_prekey_public_key_matches_full_decode_validation() {

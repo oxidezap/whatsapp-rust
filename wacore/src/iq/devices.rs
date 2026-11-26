@@ -24,6 +24,7 @@ impl RemoveCompanionDeviceSpec {
 
 impl IqSpec for RemoveCompanionDeviceSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let child = NodeBuilder::new("remove-companion-device")
@@ -39,7 +40,7 @@ impl IqSpec for RemoveCompanionDeviceSpec {
         .with_timeout(LOGOUT_TIMEOUT)
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }

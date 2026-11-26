@@ -54,7 +54,7 @@ fn adv_bootstrap_memory_reports_retained_capacity_after_cancelled_flights() {
 fn request(
     client: &Arc<Client>,
     companion: Jid,
-) -> tokio::task::JoinHandle<anyhow::Result<[u8; 32]>> {
+) -> tokio::task::JoinHandle<Result<[u8; 32], AdvBootstrapError>> {
     let client = client.clone();
     tokio::spawn(async move { client.ensure_adv_account_identity(&companion).await })
 }
@@ -250,25 +250,27 @@ async fn wait_for_joiner(client: &Client) {
 /// Trust conflicts stay downcastable through sharing; storage errors retain their original source chain.
 #[test]
 fn shared_adv_bootstrap_preserves_typed_conflicts_and_other_error_sources() {
+    use crate::error::ErrorChainExt;
     use crate::usync::DeviceListIdentityConflict as Conflict;
     for conflict in [Conflict::Alias, Conflict::Primary, Conflict::Bootstrap] {
         let message = conflict.to_string();
-        let shared = Arc::new(anyhow::Error::new(conflict).context("bootstrap transaction"));
+        let shared = Arc::new(AdvBootstrapError::Conflict(conflict));
         for _ in 0..2 {
             let error = shared_adv_bootstrap_error(shared.clone());
-            assert!(error.is::<Conflict>());
-            assert_eq!(
-                error.downcast_ref::<Conflict>().unwrap().to_string(),
-                message
-            );
+            assert!(matches!(error, AdvBootstrapError::Conflict(c) if c == conflict));
+            assert_eq!(error.to_string(), message);
         }
     }
-    let shared = Arc::new(anyhow::Error::new(std::io::Error::other(
-        "storage unavailable",
-    )));
+    let shared = Arc::new(AdvBootstrapError::Cached(
+        CachedAdvIdentityError::InvalidStored,
+    ));
     let error = shared_adv_bootstrap_error(shared);
-    assert!(!error.is::<Conflict>());
-    assert!(error.chain().any(|source| source.is::<std::io::Error>()));
+    assert!(!matches!(error, AdvBootstrapError::Conflict(_)));
+    assert!(
+        error
+            .sources()
+            .any(|source| source.is::<CachedAdvIdentityError>())
+    );
 }
 
 /// An alias losing reciprocity during an IQ must produce the same typed rejection for both callers.
@@ -296,8 +298,8 @@ async fn adv_bootstrap_alias_conflict_remains_typed_for_leader_and_joiner() {
     for caller in [leader, joiner] {
         let error = caller.await.unwrap().unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<crate::usync::DeviceListIdentityConflict>(),
-            Some(crate::usync::DeviceListIdentityConflict::Alias)
+            error,
+            AdvBootstrapError::Conflict(crate::usync::DeviceListIdentityConflict::Alias)
         ));
     }
     assert_eq!(transport.sent_count(), 1);

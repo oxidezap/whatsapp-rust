@@ -47,7 +47,7 @@ pub struct RegistrationAttestationValue {
     pub authorization: Option<Zeroizing<String>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MobileRegistrationError {
     #[error("{0}")]
@@ -74,6 +74,13 @@ pub enum MobileRegistrationError {
     MissingIdentity,
     #[error("registration attestation provider failed")]
     Attestation,
+}
+
+impl std::fmt::Debug for MobileRegistrationError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A response is exposed only after its resulting state is durable. It may carry
@@ -191,7 +198,7 @@ struct PendingAttempt {
     endpoint: RegistrationEndpointPath,
     method: Option<VerificationMethod>,
     deadline_ms: u64,
-    exchange: Option<BoxFuture<'static, anyhow::Result<HttpResponse>>>,
+    exchange: Option<BoxFuture<'static, Result<HttpResponse, crate::http::HttpError>>>,
     response: Option<RegistrationResponse>,
     // Retain a completed HTTP status across cancellation/recovery. An error
     // status is not a qualified registration outcome and never permits resend.

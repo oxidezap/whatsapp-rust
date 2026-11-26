@@ -27,7 +27,7 @@ use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 use waproto::whatsapp as wa;
 
 /// Error returned by newsletter (channel) operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum NewsletterError {
     /// The poll definition failed validation.
@@ -58,25 +58,12 @@ pub enum NewsletterError {
     /// No newsletter exists behind this JID.
     #[error("newsletter not found: {0}")]
     NotFound(Jid),
-    /// Catch-all for internal failures with no dedicated variant.
-    #[error("{0}")]
-    Internal(#[from] anyhow::Error),
 }
 
-impl NewsletterError {
-    /// Recover the concrete typed error from an `anyhow` bubbled up by a helper
-    /// that still threads `anyhow` (e.g. `send_server_reaction`), so transport
-    /// failures stay matchable as `Client`/`Iq` instead of collapsing into the
-    /// `Internal` catch-all via the blanket `#[from] anyhow::Error`.
-    pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
-        match err.downcast::<ClientError>() {
-            Ok(ClientError::Iq(iq)) => NewsletterError::Iq(iq),
-            Ok(client) => NewsletterError::Client(client),
-            Err(other) => match other.downcast::<IqError>() {
-                Ok(iq) => NewsletterError::Iq(iq),
-                Err(other) => NewsletterError::Internal(other),
-            },
-        }
+impl std::fmt::Debug for NewsletterError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
@@ -953,7 +940,10 @@ impl<'a> Newsletter<'a> {
             .client
             .send_server_reaction(jid, server_id, reaction)
             .await
-            .map_err(NewsletterError::from_anyhow)?;
+            .map_err(|error| match error {
+                ClientError::Iq(error) => NewsletterError::Iq(error),
+                error => NewsletterError::Client(error),
+            })?;
         Ok(crate::StanzaId::new(id)?)
     }
 

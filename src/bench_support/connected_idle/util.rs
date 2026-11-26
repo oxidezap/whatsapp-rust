@@ -1,7 +1,60 @@
 //! Fixture-only bounded polling and owned SQLite-file cleanup.
 
-use anyhow::{Context, Result};
 use std::time::Duration;
+
+pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+pub trait ContextExt<T> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T>;
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, f: F) -> Result<T>;
+}
+
+impl<T> ContextExt<T> for Option<T> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T> {
+        self.ok_or_else(|| msg.to_string().into())
+    }
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, f: F) -> Result<T> {
+        self.ok_or_else(|| f().to_string().into())
+    }
+}
+
+impl<T, E: std::fmt::Display> ContextExt<T> for std::result::Result<T, E> {
+    fn context<C: std::fmt::Display>(self, msg: C) -> Result<T> {
+        self.map_err(|e| format!("{msg}: {e}").into())
+    }
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, f: F) -> Result<T> {
+        self.map_err(|e| format!("{}: {e}", f()).into())
+    }
+}
+
+#[allow(unused_macros)]
+macro_rules! ensure {
+    ($cond:expr $(,)?) => {
+        if !$cond {
+            return Err(concat!("condition failed: ", stringify!($cond)).into())
+        }
+    };
+    ($cond:expr, $msg:literal $(,)?) => {
+        if !$cond {
+            return Err($msg.into())
+        }
+    };
+    ($cond:expr, $fmt:expr, $($arg:tt)*) => {
+        if !$cond {
+            return Err(format!($fmt, $($arg)*).into())
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! bail {
+    ($msg:literal $(,)?) => {
+        return Err($msg.into())
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        return Err(format!($fmt, $($arg)*).into())
+    };
+}
 
 pub(crate) async fn wait_until(timeout: Duration, ready: impl Fn() -> bool) -> Result<()> {
     tokio::time::timeout(timeout, async {

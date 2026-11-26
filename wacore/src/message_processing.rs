@@ -261,7 +261,7 @@ pub fn process_decrypted_plaintext(
     padded_plaintext: &[u8],
     padding_version: u8,
     is_from_me: bool,
-) -> Result<DecryptedMessageResult, anyhow::Error> {
+) -> Result<DecryptedMessageResult, crate::messages::PlaintextDecodeError> {
     let original_msg = crate::messages::decode_plaintext(padded_plaintext, padding_version)?;
 
     // Validate DSM presence against sender identity

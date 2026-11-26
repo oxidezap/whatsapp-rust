@@ -8,8 +8,8 @@ use crate::iq::node::optional_child;
 use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
-use anyhow::Result;
 use log::warn;
+use std::convert::Infallible;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
@@ -82,6 +82,8 @@ pub struct BlocklistResponse {
 }
 
 impl ProtocolNode for BlocklistResponse {
+    type Error = Infallible;
+
     fn tag(&self) -> &'static str {
         "list"
     }
@@ -91,7 +93,7 @@ impl ProtocolNode for BlocklistResponse {
         NodeBuilder::new("list").children(children).build()
     }
 
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self, Self::Error> {
         // Response can be either:
         // 1. <list><item .../></list>
         // 2. Direct <item .../> children in the response node
@@ -118,12 +120,13 @@ pub struct GetBlocklistSpec;
 
 impl IqSpec for GetBlocklistSpec {
     type Response = Vec<BlocklistEntry>;
+    type Error = Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::get(BLOCKLIST_IQ_NAMESPACE, Jid::new("", Server::Pn), None)
     }
 
-    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // BlocklistResponse checks for a <list> child or direct <item> children
         let entries = if let Some(list) = response.get_optional_child("list") {
             list.get_children_by_tag("item")
@@ -177,6 +180,7 @@ impl UpdateBlocklistSpec {
 
 impl IqSpec for UpdateBlocklistSpec {
     type Response = ();
+    type Error = Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -186,7 +190,7 @@ impl IqSpec for UpdateBlocklistSpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 }

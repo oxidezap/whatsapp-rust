@@ -17,8 +17,13 @@ use whatsapp_rust::{
 struct OfflineHttp;
 #[async_trait::async_trait]
 impl HttpClient for OfflineHttp {
-    async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
-        anyhow::bail!("offline lifecycle HTTP")
+    async fn execute(
+        &self,
+        _: HttpRequest,
+    ) -> Result<HttpResponse, whatsapp_rust::http::HttpError> {
+        Err(whatsapp_rust::http::HttpError::adapter(
+            std::io::Error::other("offline lifecycle HTTP"),
+        ))
     }
 }
 struct OfflineTransport;
@@ -26,8 +31,11 @@ struct OfflineTransport;
 impl TransportFactory for OfflineTransport {
     async fn create_transport(
         &self,
-    ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
-        anyhow::bail!("offline lifecycle transport")
+    ) -> Result<
+        (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>),
+        whatsapp_rust::transport::TransportError,
+    > {
+        Err("offline lifecycle transport".into())
     }
 }
 async fn bot() -> Bot {

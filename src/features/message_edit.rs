@@ -22,7 +22,6 @@
 //!
 //! Mirrors the existing flow for poll vote decryption (`Polls::decrypt_vote`).
 
-use anyhow::{Result, anyhow};
 use buffa::MessageField;
 use log::warn;
 use wacore::message_edit::{self, MessageEditContext};
@@ -36,7 +35,7 @@ use waproto::whatsapp as wa;
 ///
 /// Both variants mean the peer sent a target message key we cannot attribute,
 /// so retrying the same envelope yields the same result.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MessageEditError {
     /// A JID carried by the target message key did not parse.
@@ -51,6 +50,36 @@ pub enum MessageEditError {
     /// `from_me` was not `Some(true)`, so no author can be derived from it.
     #[error("target message key missing participant and remote_jid")]
     MissingTargetSender,
+}
+
+impl std::fmt::Debug for MessageEditError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum SecretDecryptError {
+    #[error("{0}")]
+    Edit(#[from] message_edit::MessageEditCryptoError),
+    #[error("{0}")]
+    Reaction(#[from] wacore::reaction::ReactionError),
+    #[error("{0}")]
+    Comment(#[from] wacore::secret_enc_addon::AddonError),
+    #[error("{prior}; fallback: {fallback}")]
+    Attempts {
+        prior: Box<SecretDecryptError>,
+        fallback: Box<SecretDecryptError>,
+    },
+}
+
+impl std::fmt::Debug for SecretDecryptError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.
@@ -77,7 +106,7 @@ pub fn decrypt(
     original_msg_id: &str,
     original_sender_jid: &Jid,
     editor_jid: &Jid,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     let primary_orig = original_sender_jid.to_non_ad_string();
     let primary_editor = editor_jid.to_non_ad_string();
     let primary = MessageEditContext {
@@ -85,7 +114,12 @@ pub fn decrypt(
         original_sender_jid: &primary_orig,
         editor_jid: &primary_editor,
     };
-    message_edit::decrypt_message_edit(enc_payload, enc_iv, message_secret, &primary)
+    Ok(message_edit::decrypt_message_edit(
+        enc_payload,
+        enc_iv,
+        message_secret,
+        &primary,
+    )?)
 }
 
 /// Same as [`decrypt`] but tries a fallback addressing combination if
@@ -105,7 +139,7 @@ pub fn decrypt_with_fallback(
     editor_jid: &Jid,
     fallback_original_sender: Option<&Jid>,
     fallback_editor: Option<&Jid>,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     decrypt_secret_encrypted_with_fallback(
         enc_payload,
         enc_iv,
@@ -434,7 +468,7 @@ pub fn decrypt_secret_encrypted(
     original_msg_id: &str,
     original_sender_jid: &Jid,
     modification_sender_jid: &Jid,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     let orig = original_sender_jid.to_non_ad_string();
     let sender = modification_sender_jid.to_non_ad_string();
     match kind {
@@ -456,27 +490,27 @@ pub fn decrypt_secret_encrypted(
                 proto
             })
         }
-        SecretEncKind::EncComment => wacore::comment::decrypt_comment_with_secret(
+        SecretEncKind::EncComment => Ok(wacore::comment::decrypt_comment_with_secret(
             enc_payload,
             enc_iv,
             message_secret,
             original_msg_id,
             &orig,
             &sender,
-        ),
+        )?),
         _ => {
             let ctx = MessageEditContext {
                 original_msg_id,
                 original_sender_jid: &orig,
                 editor_jid: &sender,
             };
-            message_edit::decrypt_secret_encrypted(
+            Ok(message_edit::decrypt_secret_encrypted(
                 enc_payload,
                 enc_iv,
                 message_secret,
                 kind.modification_type(),
                 &ctx,
-            )
+            )?)
         }
     }
 }
@@ -494,7 +528,7 @@ pub fn decrypt_secret_encrypted_with_fallback(
     modification_sender_jid: &Jid,
     fallback_original_sender: Option<&Jid>,
     fallback_modification_sender: Option<&Jid>,
-) -> Result<wa::Message> {
+) -> Result<wa::Message, SecretDecryptError> {
     // The reaction/comment kinds decode a different inner proto, so they go
     // through the per-kind dispatch instead of the wacore Message-only helper.
     // Like the receive path, every distinct LID/PN combination is attempted:
@@ -540,7 +574,12 @@ pub fn decrypt_secret_encrypted_with_fallback(
                 sender,
             ) {
                 Ok(inner) => return Ok(inner),
-                Err(e) => last_err = anyhow!("{last_err}; fallback: {e}"),
+                Err(e) => {
+                    last_err = SecretDecryptError::Attempts {
+                        prior: Box::new(last_err),
+                        fallback: Box::new(e),
+                    }
+                }
             }
             tried.push(pair);
         }
@@ -571,14 +610,14 @@ pub fn decrypt_secret_encrypted_with_fallback(
         })
     };
 
-    message_edit::decrypt_secret_encrypted_with_fallback(
+    Ok(message_edit::decrypt_secret_encrypted_with_fallback(
         enc_payload,
         enc_iv,
         message_secret,
         kind.modification_type(),
         &primary,
         fallback_ctx.as_ref(),
-    )
+    )?)
 }
 
 #[cfg(test)]

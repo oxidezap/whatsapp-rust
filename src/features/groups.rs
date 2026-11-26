@@ -49,7 +49,7 @@ pub use wacore::iq::groups::{
 
 /// Error returned by group operations (metadata queries, participant and
 /// settings mutations, invites, profile pictures).
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum GroupError {
     /// A `w:g2` IQ to the server failed (transport, timeout, server rejection).
@@ -74,7 +74,58 @@ pub enum GroupError {
     /// Catch-all for internal failures (LID/PN resolution, the protocol-message
     /// send path behind `update_member_label`, cache plumbing).
     #[error("{0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[derive(thiserror::Error)]
+#[error("group query failed on a shared attempt: {0}")]
+struct SharedGroupQueryFailed(String);
+
+impl std::fmt::Debug for SharedGroupQueryFailed {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(thiserror::Error)]
+pub(crate) enum GroupMetadataStoreError {
+    #[error("notification scope is no longer current")]
+    StaleScope,
+    #[error("corrupt group metadata for {jid}: {source}")]
+    Corrupt {
+        jid: Jid,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Failed to serialize group metadata for {jid}: {source}")]
+    Serialize {
+        jid: Jid,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Failed to persist group metadata for {jid}: {source}")]
+    Persist {
+        jid: Jid,
+        #[source]
+        source: wacore::store::error::StoreError,
+    },
+    #[error("{0}")]
+    Store(#[from] wacore::store::error::StoreError),
+}
+
+impl std::fmt::Debug for GroupMetadataStoreError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::fmt::Debug for GroupError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Outcome of adding group members and optionally sharing consumer-provided
@@ -797,7 +848,7 @@ impl GroupMetadata {
     ///     },
     ///     _ => {}, // The hierarchy is extensible.
     /// }
-    /// # Ok::<(), whatsapp_rust::anyhow::Error>(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn hierarchy(&self) -> GroupHierarchy {
         GroupHierarchy::from_metadata(self)
@@ -1012,9 +1063,9 @@ impl FailureKind {
         match self {
             Self::TimedOut => GroupError::Iq(IqError::Timeout),
             Self::TransportUnavailable => GroupError::Iq(IqError::NotConnected),
-            Self::Other => GroupError::Internal(anyhow::anyhow!(
-                "group query failed on a shared attempt: {message}"
-            )),
+            Self::Other => {
+                GroupError::Internal(Box::new(SharedGroupQueryFailed(message.to_owned())))
+            }
         }
     }
 }
@@ -1233,7 +1284,7 @@ impl GroupMetadataGuard<'_> {
 
     pub(crate) async fn current_or_persisted(
         &self,
-    ) -> anyhow::Result<Option<Arc<GroupRoutingInfo>>> {
+    ) -> Result<Option<Arc<GroupRoutingInfo>>, GroupMetadataStoreError> {
         if let Some(info) = self.client.get_group_cache().get(self.jid).await {
             return Ok(Some(info));
         }
@@ -1241,8 +1292,12 @@ impl GroupMetadataGuard<'_> {
         let backend = self.client.persistence_manager.backend();
         match backend.get_group_metadata(&jid_str).await {
             Ok(Some(blob)) => {
-                let mut info: GroupRoutingInfo = serde_json::from_slice(&blob)
-                    .map_err(|e| anyhow::anyhow!("corrupt group metadata for {}: {e}", self.jid))?;
+                let mut info: GroupRoutingInfo = serde_json::from_slice(&blob).map_err(|e| {
+                    GroupMetadataStoreError::Corrupt {
+                        jid: self.jid.clone(),
+                        source: e,
+                    }
+                })?;
                 Groups::new(self.client)
                     .fill_group_info_pns(&mut info)
                     .await;
@@ -1263,13 +1318,15 @@ impl GroupMetadataGuard<'_> {
     pub(crate) async fn rotate_sender_key_on_participant_remove(
         &self,
         users: &[&str],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::client::SenderKeyResetError> {
         self.client
             .rotate_sender_key_on_participant_remove_locked(self.jid, users)
             .await
     }
 
-    pub(crate) async fn force_rotate_own_sender_key(&self) -> anyhow::Result<()> {
+    pub(crate) async fn force_rotate_own_sender_key(
+        &self,
+    ) -> Result<(), crate::client::SenderKeyResetError> {
         self.client
             .force_rotate_own_sender_key_locked(self.jid)
             .await
@@ -1285,16 +1342,16 @@ impl GroupMetadataGuard<'_> {
         &self,
         info: Arc<GroupRoutingInfo>,
         scope: Option<crate::client::NotificationScope<'_>>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), GroupMetadataStoreError> {
         if scope.is_some_and(|scope| !scope.is_current(self.client)) {
-            anyhow::bail!("notification scope is no longer current");
+            return Err(GroupMetadataStoreError::StaleScope);
         }
         let jid = self.jid.to_string();
         let blob = serde_json::to_vec(info.as_ref()).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to serialize group metadata for {}: {error}",
-                self.jid
-            )
+            GroupMetadataStoreError::Serialize {
+                jid: self.jid.clone(),
+                source: error,
+            }
         })?;
 
         let res = self
@@ -1308,8 +1365,9 @@ impl GroupMetadataGuard<'_> {
         // Retirement cannot undo a storage commit.
         self.cache(info).await;
 
-        res.map_err(|error| {
-            anyhow::anyhow!("Failed to persist group metadata for {}: {error}", self.jid)
+        res.map_err(|error| GroupMetadataStoreError::Persist {
+            jid: self.jid.clone(),
+            source: error,
         })
     }
 
@@ -1817,7 +1875,8 @@ impl<'a> Groups<'a> {
                 let entry = self
                     .client
                     .get_lid_pn_entry(&participant.jid)
-                    .await?
+                    .await
+                    .map_err(|e| GroupError::Internal(Box::new(e)))?
                     .ok_or_else(|| {
                         GroupError::InvalidRequest(format!(
                             "missing phone number mapping for LID {}",
@@ -3251,7 +3310,8 @@ impl<'a> Groups<'a> {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            .map_err(|e| GroupError::Internal(Box::new(e)))?;
         Ok(message_id)
     }
 

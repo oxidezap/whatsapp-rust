@@ -37,12 +37,12 @@ const MAX_SIGNED_PRE_KEY_ID: u32 = 16_777_215;
 /// Wraps a backend failure as [`SignalMaintenanceError::Storage`], keeping the
 /// typed cause in the `source()` chain under `context`.
 fn storage_err<E>(
-    context: impl std::fmt::Display + Send + Sync + 'static,
+    _context: impl std::fmt::Display + Send + Sync + 'static,
 ) -> impl FnOnce(E) -> SignalMaintenanceError
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Into<wacore::store::signal_cache::SignalCacheFlushError>,
 {
-    move |e| SignalMaintenanceError::Storage(anyhow::Error::new(e).context(context))
+    |e| SignalMaintenanceError::Storage(e.into())
 }
 
 /// Whether the cadence has elapsed. `last == 0` means the field predates this

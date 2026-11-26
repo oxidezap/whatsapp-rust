@@ -37,6 +37,7 @@ impl KeepaliveSpec {
 
 impl IqSpec for KeepaliveSpec {
     type Response = ();
+    type Error = std::convert::Infallible;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut iq = InfoQuery::get("w:p", Jid::new("", Server::Pn), None);
@@ -46,7 +47,7 @@ impl IqSpec for KeepaliveSpec {
         iq
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, Self::Error> {
         // Keepalive just needs a successful response, no parsing needed
         Ok(())
     }

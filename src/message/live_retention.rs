@@ -1,9 +1,38 @@
 //! Live writes own plaintext independently of the offline batch and reconnect reset.
 
-use super::raw_pending::{MAX_PENDING_BYTES, PendingDelivery, StanzaOrigin};
+use super::raw_pending::{MAX_PENDING_BYTES, PendingDelivery, RawPendingError, StanzaOrigin};
 use crate::types::message::MessageInfo;
 use std::sync::{Arc, Mutex};
 use wacore::stats::HeapSize;
+
+#[derive(thiserror::Error)]
+pub(super) enum LiveRetentionError {
+    #[error("{0}")]
+    Pending(#[from] RawPendingError),
+    #[error("invalid comment target key: {0}")]
+    CommentTargetDecode(#[from] buffa::DecodeError),
+    #[error("pending receipt capacity exhausted")]
+    ReceiptCapacityExhausted,
+    #[error("live reservation overflow")]
+    ReservationOverflow,
+    #[error("live pending capacity exhausted")]
+    PendingCapacityExhausted,
+    #[error("live retention overflow")]
+    RetentionOverflow,
+    #[error("live delivery has a different reservation owner")]
+    DifferentReservationOwner,
+    #[error("live metadata overflow")]
+    MetadataOverflow,
+    #[error("live projection exceeds admission")]
+    ProjectionExceedsAdmission,
+}
+
+impl std::fmt::Debug for LiveRetentionError {
+    #[inline(never)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 
 // Vector growth and the fixed Arc allocation kept alive by a weak message
 // reference are resident bookkeeping, even after its decoded fields drop.
@@ -131,7 +160,7 @@ impl RetainedDelivery {
     }
 
     #[inline(never)]
-    fn materialize(&self) -> anyhow::Result<PendingDelivery> {
+    fn materialize(&self) -> Result<PendingDelivery, LiveRetentionError> {
         let mut item = PendingDelivery::from_occurrence(
             super::raw_pending::Occurrence {
                 producer: self.origin.map(|origin| origin.stanza),
@@ -341,15 +370,17 @@ impl LiveRetention {
             "durability-disabled processing must not access live retention"
         );
     }
-    pub fn begin_receipts(&self, info: &Arc<MessageInfo>) -> anyhow::Result<ReceiptProducer> {
+    pub fn begin_receipts(
+        &self,
+        info: &Arc<MessageInfo>,
+    ) -> Result<ReceiptProducer, LiveRetentionError> {
         let mut state = lock(&self.state);
         state
             .receipts
             .retain(|entry| entry.scope.strong_count() != 0);
-        anyhow::ensure!(
-            state.receipts.len() < 400,
-            "pending receipt capacity exhausted"
-        );
+        if state.receipts.len() >= 400 {
+            return Err(LiveRetentionError::ReceiptCapacityExhausted);
+        }
         let original = state
             .reservations
             .iter()
@@ -393,7 +424,7 @@ impl LiveRetention {
         origin: StanzaOrigin,
         wire_bytes: usize,
         slots: usize,
-    ) -> anyhow::Result<Admission> {
+    ) -> Result<Admission, LiveRetentionError> {
         self.reserve_sized(origin, wire_bytes, slots, 0)
     }
 
@@ -404,7 +435,7 @@ impl LiveRetention {
         wire_bytes: usize,
         slots: usize,
         info: &MessageInfo,
-    ) -> anyhow::Result<Admission> {
+    ) -> Result<Admission, LiveRetentionError> {
         self.reserve_sized(origin, wire_bytes, slots, info_bytes(info))
     }
 
@@ -414,7 +445,7 @@ impl LiveRetention {
         wire_bytes: usize,
         slots: usize,
         metadata: usize,
-    ) -> anyhow::Result<Admission> {
+    ) -> Result<Admission, LiveRetentionError> {
         // Canonical encoding may expand packed scalar fields to unpacked tags.
         // Message's repeated scalar tags occupy at most two bytes, so a one-byte
         // value can expand to three bytes. Reserve carrier + that projection
@@ -428,7 +459,7 @@ impl LiveRetention {
             })
             .and_then(|bytes| bytes.checked_add(size_of::<Reservation>()))
             .and_then(|bytes| bytes.checked_add(metadata))
-            .ok_or_else(|| anyhow::anyhow!("live reservation overflow"))?;
+            .ok_or(LiveRetentionError::ReservationOverflow)?;
         let charge = self.charge(bytes)?;
         let mut state = lock(&self.state);
         state.reservations.push(Reservation {
@@ -444,16 +475,16 @@ impl LiveRetention {
             origin,
         })
     }
-    fn charge(&self, bytes: usize) -> anyhow::Result<Arc<Charge>> {
+    fn charge(&self, bytes: usize) -> Result<Arc<Charge>, LiveRetentionError> {
         let mut budget = lock(&self.budget);
-        anyhow::ensure!(
-            budget
-                .bytes
-                .checked_add(bytes)
-                .is_some_and(|total| total <= MAX_PENDING_BYTES)
-                && budget.admissions < 400,
-            "live pending capacity exhausted"
-        );
+        if !budget
+            .bytes
+            .checked_add(bytes)
+            .is_some_and(|total| total <= MAX_PENDING_BYTES)
+            || budget.admissions >= 400
+        {
+            return Err(LiveRetentionError::PendingCapacityExhausted);
+        }
         budget.bytes += bytes;
         budget.admissions += 1;
         Ok(Arc::new(Charge {
@@ -468,7 +499,7 @@ impl LiveRetention {
         &self,
         item: &mut PendingDelivery,
         draining: bool,
-    ) -> anyhow::Result<Option<usize>> {
+    ) -> Result<Option<usize>, LiveRetentionError> {
         if item.receipt.is_none() {
             item.receipt = self.receipt_for(&item.info);
         }
@@ -484,7 +515,7 @@ impl LiveRetention {
         Ok(None)
     }
 
-    pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<usize> {
+    pub fn retain(&self, item: &mut PendingDelivery) -> Result<usize, LiveRetentionError> {
         let mut cache = buffa::SizeCache::new();
         let message_size = waproto::codec::message_compute_size(&item.message, &mut cache);
         buffa::checked_encode_size(message_size as u32)
@@ -496,7 +527,7 @@ impl LiveRetention {
                     .as_ref()
                     .map_or(0, |key| waproto::codec::message_key_encoded_len(key)),
             )
-            .ok_or_else(|| anyhow::anyhow!("live retention overflow"))?;
+            .ok_or(LiveRetentionError::RetentionOverflow)?;
         let mut state = lock(&self.state);
         // Legacy replay has no producer origin. Reuse its existing charge
         // instead of adding another reservation on each failed alias retry.
@@ -508,12 +539,13 @@ impl LiveRetention {
                     .iter()
                     .any(|entry| same_entry(entry, item))
         }) {
-            anyhow::ensure!(
-                item.retention
-                    .as_ref()
-                    .is_none_or(|charge| Arc::ptr_eq(charge, &reservation.charge)),
-                "live delivery has a different reservation owner"
-            );
+            if !item
+                .retention
+                .as_ref()
+                .is_none_or(|charge| Arc::ptr_eq(charge, &reservation.charge))
+            {
+                return Err(LiveRetentionError::DifferentReservationOwner);
+            }
             item.retention = Some(Arc::clone(&reservation.charge));
             return Ok(wire_bytes);
         }
@@ -532,7 +564,7 @@ impl LiveRetention {
                 let bytes = retained_bytes
                     .checked_add(info_bytes(&item.info))
                     .and_then(|bytes| bytes.checked_add(SLOT_BYTES + size_of::<Reservation>()))
-                    .ok_or_else(|| anyhow::anyhow!("live retention overflow"))?;
+                    .ok_or(LiveRetentionError::RetentionOverflow)?;
                 let charge = match item.retention.as_ref() {
                     Some(charge) => Arc::clone(charge),
                     None => self.charge(bytes)?,
@@ -551,11 +583,10 @@ impl LiveRetention {
             }
         };
         let reservation = &mut state.reservations[index];
-        if let Some(charge) = &item.retention {
-            anyhow::ensure!(
-                Arc::ptr_eq(charge, &reservation.charge),
-                "live delivery has a different reservation owner"
-            );
+        if let Some(charge) = &item.retention
+            && !Arc::ptr_eq(charge, &reservation.charge)
+        {
+            return Err(LiveRetentionError::DifferentReservationOwner);
         }
         // Storage workers and replay clones keep the reservation charged until
         // their final owner drops, even after the in-memory entry is removed.
@@ -594,22 +625,25 @@ impl LiveRetention {
             {
                 metadata = metadata
                     .checked_add(info_bytes(info))
-                    .ok_or_else(|| anyhow::anyhow!("live metadata overflow"))?;
+                    .ok_or(LiveRetentionError::MetadataOverflow)?;
                 seen.push(info);
             }
         }
         drop(seen);
-        anyhow::ensure!(
-            used.checked_add(retained_bytes)
-                .and_then(|bytes| bytes.checked_add(raw_bytes))
-                .and_then(|bytes| bytes.checked_add(metadata))
-                .and_then(|bytes| slots
+        if !used
+            .checked_add(retained_bytes)
+            .and_then(|bytes| bytes.checked_add(raw_bytes))
+            .and_then(|bytes| bytes.checked_add(metadata))
+            .and_then(|bytes| {
+                slots
                     .checked_mul(SLOT_BYTES)
-                    .and_then(|slots| bytes.checked_add(slots)))
-                .and_then(|bytes| bytes.checked_add(size_of::<Reservation>()))
-                .is_some_and(|bytes| bytes <= reservation.charge.bytes),
-            "live projection exceeds admission"
-        );
+                    .and_then(|slots| bytes.checked_add(slots))
+            })
+            .and_then(|bytes| bytes.checked_add(size_of::<Reservation>()))
+            .is_some_and(|bytes| bytes <= reservation.charge.bytes)
+        {
+            return Err(LiveRetentionError::ProjectionExceedsAdmission);
+        }
         reservation
             .raw
             .retain(|raw| Some(raw.origin) != item.origin);
@@ -738,7 +772,10 @@ impl LiveRetention {
             .collect()
     }
     #[inline(never)]
-    pub fn for_message(&self, info: &MessageInfo) -> anyhow::Result<Vec<PendingDelivery>> {
+    pub fn for_message(
+        &self,
+        info: &MessageInfo,
+    ) -> Result<Vec<PendingDelivery>, LiveRetentionError> {
         #[cfg(test)]
         self.assert_access_allowed();
         let mut entries = Vec::new();
