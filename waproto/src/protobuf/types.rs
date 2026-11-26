@@ -44,6 +44,28 @@ pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
     Ok(output)
 }
 
+#[inline]
+pub fn merge_bytes(output: &mut Vec<u8>, input: &mut impl Buf) -> Result<(), DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    output.clear();
+    output.reserve(length);
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(input.chunk().len());
+        if count == 0 {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        output.extend_from_slice(&input.chunk()[..count]);
+        input.advance(count);
+        remaining -= count;
+    }
+    Ok(())
+}
+
 pub fn decode_shared_bytes(input: &mut impl Buf) -> Result<bytes::Bytes, DecodeError> {
     let length = usize::try_from(encoding::decode_varint(input)?)
         .map_err(|_| DecodeError::MessageTooLarge)?;

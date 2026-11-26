@@ -681,7 +681,13 @@ impl Emitter<'_> {
         for field in &fields {
             out.push_str(&self.encode_field(field, true));
         }
-        out.push_str(&format!("}}\nfn merge_field(&mut self,tag:{RT}::encoding::Tag,input:&mut impl ::bytes::Buf,context:{RT}::DecodeContext<'_>)->Result<(),{RT}::DecodeError>{{let _=&context;use ::bytes::Buf as _;"));
+        // Keeping this wide dispatch separate avoids a large stack frame on each decode.
+        let inline = if message.full_name == ".whatsapp.SyncActionValue" {
+            "#[inline(never)]"
+        } else {
+            ""
+        };
+        out.push_str(&format!("}}\n{inline} fn merge_field(&mut self,tag:{RT}::encoding::Tag,input:&mut impl ::bytes::Buf,context:{RT}::DecodeContext<'_>)->Result<(),{RT}::DecodeError>{{let _=&context;use ::bytes::Buf as _;"));
         if !fields.is_empty() {
             out.push_str("match(tag.field_number(),tag.wire_type()){");
         }
@@ -883,6 +889,21 @@ impl Emitter<'_> {
         out.push_str(&format!(
             "({number},{RT}::encoding::WireType::{wire_name})=>{{"
         ));
+        // These app-state buffers are frequently decoded and may be merged repeatedly.
+        if self.schema.message(field.owner).full_name == ".whatsapp.SyncActionData"
+            && matches!(
+                field.shape,
+                FieldShape::Singular {
+                    presence: Presence::Explicit,
+                    ..
+                }
+            )
+            && matches!(value, ValueType::Scalar(Scalar::Bytes))
+            && field.bytes_storage == BytesStorage::Vector
+        {
+            out.push_str(&format!("{RT}::types::merge_bytes(self.{slot}.get_or_insert_with(::core::default::Default::default),input)?;Ok(())}},"));
+            return out;
+        }
         if let ValueType::Message(id, encoding) = value {
             let merge = if encoding == MessageEncoding::Group {
                 format!("merge_group(input,context,{number})?")

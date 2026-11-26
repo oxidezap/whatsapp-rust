@@ -6,6 +6,38 @@ use waproto::whatsapp::{
 };
 
 #[test]
+#[allow(clippy::disallowed_methods)]
+fn sync_action_data_bytes_merge_reuses_buffer() {
+    use bytes::Buf as _;
+    use std::cell::Cell;
+    use waproto::protobuf::{DecodeContext, RECURSION_LIMIT};
+
+    let mut action = waproto::whatsapp::SyncActionData::default();
+    let mut index = Vec::with_capacity(64);
+    index.extend_from_slice(b"old");
+    let pointer = index.as_ptr();
+    action.index = Some(index);
+    let budget = Cell::new(10);
+    let mut input = (&[0x0a, 3, b'n'][..]).chain(&b"ew"[..]);
+    action
+        .merge(&mut input, DecodeContext::new(RECURSION_LIMIT, &budget))
+        .unwrap();
+    assert_eq!(action.index.as_deref(), Some(&b"new"[..]));
+    assert_eq!(action.index.as_ref().unwrap().as_ptr(), pointer);
+    assert_eq!(
+        action.merge_from_slice(&[0x0a, 2, 1]),
+        Err(DecodeError::UnexpectedEof)
+    );
+    assert_eq!(action.index.as_deref(), Some(&b"new"[..]));
+    let mut empty = waproto::whatsapp::SyncActionData::default();
+    assert_eq!(
+        empty.merge_from_slice(&[0x0a, 2, 1]),
+        Err(DecodeError::UnexpectedEof)
+    );
+    assert_eq!(empty.index.as_deref(), Some(&[][..]));
+}
+
+#[test]
 fn repeated_numeric_fields_respect_element_memory_limit() {
     let options = DecodeOptions::new().with_element_memory_limit(0);
     for input in [&[0x22, 1, 0][..], &[0x20, 0][..]] {
