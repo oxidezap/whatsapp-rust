@@ -69,6 +69,12 @@ impl Tag {
     }
     #[inline]
     pub fn decode(input: &mut impl bytes::Buf) -> Result<Self, DecodeError> {
+        if let Some(&byte) = input.chunk().first()
+            && byte < 128
+        {
+            input.advance(1);
+            return Self::from_raw(u64::from(byte));
+        }
         Self::from_raw(decode_varint(input)?)
     }
     #[inline]
@@ -440,6 +446,15 @@ mod tests {
                 );
                 assert_eq!(candidate, reference);
                 let mut reference = input.as_slice();
+                let mut candidate = input.as_slice();
+                let actual = Tag::decode(&mut candidate)
+                    .map(|tag| (tag.field_number(), tag.wire_type() as u8));
+                let expected = buffa::encoding::Tag::decode(&mut reference)
+                    .map(|tag| (tag.field_number(), tag.wire_type() as u8))
+                    .map_err(reference_error);
+                assert_eq!(actual, expected);
+                assert_eq!(candidate, reference);
+                let mut reference = input.as_slice();
                 let mut candidate = Reader::new(&input).unwrap();
                 let actual = candidate
                     .tag()
@@ -449,6 +464,32 @@ mod tests {
                     .map_err(reference_error);
                 assert_eq!(actual, expected);
                 assert_eq!(candidate.remaining(), reference);
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_tags_match_the_reference() {
+        use bytes::Buf as _;
+
+        for (first, second) in [
+            (&[0x08][..], &[0x2a][..]),
+            (&[0x80][..], &[0x01, 0x2a][..]),
+            (&[0x80][..], &[][..]),
+            (&[0x00][..], &[0x2a][..]),
+            (&[0x0f][..], &[0x2a][..]),
+        ] {
+            let mut candidate = first.chain(second);
+            let mut reference = first.chain(second);
+            let actual =
+                Tag::decode(&mut candidate).map(|tag| (tag.field_number(), tag.wire_type() as u8));
+            let expected = buffa::encoding::Tag::decode(&mut reference)
+                .map(|tag| (tag.field_number(), tag.wire_type() as u8))
+                .map_err(reference_error);
+            assert_eq!(actual, expected);
+            assert_eq!(candidate.remaining(), reference.remaining());
+            while candidate.has_remaining() {
+                assert_eq!(candidate.get_u8(), reference.get_u8());
             }
         }
     }
