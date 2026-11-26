@@ -98,6 +98,31 @@ fn proto_macro_update_evaluates_fields_before_base() {
 }
 
 #[test]
+fn proto_macro_update_accepts_borrowed_temporaries() {
+    use waproto::prelude::*;
+
+    let name = "World";
+    let image = wa::message::ImageMessage::default();
+    let result = proto!(wa::message::ImageMessage {
+        caption: format!("Hello {name}").as_str(),
+        ..image
+    });
+    assert_eq!(result.caption.as_deref(), Some("Hello World"));
+}
+
+#[test]
+fn proto_macro_update_accepts_a_borrow_from_the_base() {
+    use waproto::prelude::*;
+
+    let image = wa::message::ImageMessage::default().with_caption("Hello");
+    let image = proto!(wa::message::ImageMessage {
+        caption: image.caption.as_deref().unwrap_or_default(),
+        ..image
+    });
+    assert_eq!(image.caption.as_deref(), Some("Hello"));
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn ordinary_singular_fields_reuse_buffers() {
     use bytes::Buf as _;

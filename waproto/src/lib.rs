@@ -36,11 +36,13 @@ macro_rules! proto {
         message
     }};
     ($message:path { $($field:ident : $value:expr,)+ .. $base:expr $(,)? }) => {{
-        let values = ($($value,)+);
-        let mut message: $message = $base;
-        let ($($field,)+) = values;
-        $($crate::__proto_private::assign(&mut message.$field, $field);)+
-        message
+        match ($($crate::__proto_private::prepare($value, |message: &$message| &message.$field),)+) {
+            ($($field,)+) => {
+                let mut message: $message = $base;
+                $(message.$field = $field;)+
+                message
+            }
+        }
     }};
     ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{
         let mut message = <$message>::default();
@@ -82,6 +84,11 @@ pub mod __proto_private {
     #[inline(always)]
     pub fn assign<T, V: IntoField<T, Mode>, Mode>(field: &mut T, value: V) {
         *field = value.into_field();
+    }
+
+    #[inline(always)]
+    pub fn prepare<M, T, V: IntoField<T, Mode>, Mode>(value: V, _: fn(&M) -> &T) -> T {
+        value.into_field()
     }
 }
 
