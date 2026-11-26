@@ -42,7 +42,7 @@ fn absent_bundle_families_keep_their_public_types() {
 
 #[test]
 fn reclaimed_labyrinth_inputs_keep_their_distinct_wire_contracts() {
-    use buffa::{MessageView as _, ViewEncode as _};
+    use waproto::protobuf::{MessageView as _, ViewEncode as _};
     let historical = [0x0a, 1, 1, 0x12, 1, 2, 0x1a, 1, b'x', 0x20, 1, 0x2a, 1, 3];
     let current = [0x0a, 1, 1, 0x10, 2, 0x1a, 1, b'x', 0x20, 1, 0x2a, 1, 3];
     let old = wa::DecryptMessageInput::decode_from_slice(&historical).unwrap();

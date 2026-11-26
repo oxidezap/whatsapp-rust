@@ -124,7 +124,7 @@ fn proto_codecs(root: &Path, check: bool) -> Result<()> {
         (
             "waproto/src/whatsapp.desc",
             "crate::protobuf::generated::whatsapp",
-            "waproto/src/generated/whatsapp.rs",
+            "-",
         ),
         (
             "wacore/src/voip/mlow/tables.desc",

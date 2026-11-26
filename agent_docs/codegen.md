@@ -71,12 +71,17 @@ shape, and both owned and view decoders dispatch on number and wire type. Keep
 the frozen API snapshot unchanged; do not generalize this exception to unrelated
 field collisions.
 
-`waproto`, MLow and SQLite compile committed static codecs. Normal builds only
-verify schema, descriptor and Rust hashes. The `protobuf-codegen` binary in
-`whatspec-codegen` owns generation; no runtime crate depends on that tool.
-Use `cargo xt proto-desc`, `tables-desc` and `wire-desc` for descriptors, codecs
-and hash sidecars. `cargo xt proto-codecs --check` verifies all three domains
-without updating files. MLow and SQLite omit borrowed views and Serde because
+`waproto` generates its model and codecs in `OUT_DIR` from the committed
+descriptor. MLow and SQLite compile committed static codecs. The
+`protobuf-codegen` binary in `whatspec-codegen` shares the WhatsApp generator
+with `waproto` and generates the private codecs. Use `cargo xt proto-desc`,
+`tables-desc` and `wire-desc` for descriptors and private codecs.
+`cargo xt proto-codecs --check` checks the generated WhatsApp declarations and
+wire identities against `waproto/generated-api.snapshot` and verifies the
+private codecs without updating files. Review any intentional
+breaking change before regenerating that snapshot with
+`cargo run --locked -p whatspec-codegen --bin protobuf-codegen -- waproto/src/whatsapp.desc crate::protobuf::generated::whatsapp crate::protobuf - --whatsapp --update-api`.
+MLow and SQLite omit borrowed views and Serde because
 their private callers do not use them. The temporary `protobuf-experiment`
 feature still enables the locked differential reference. `cargo xt --help`
 lists tooling.

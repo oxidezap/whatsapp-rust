@@ -4762,8 +4762,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::disallowed_methods)]
     async fn dm_alt_chat_rewrite_hosted_lid_preserves_hosted_server() {
-        use waproto::protobuf::Message;
         use wacore::adv::test_util;
+        use waproto::protobuf::Message;
 
         let client = retry_repair_client("retry_repair_dm_alt_chat_hosted").await;
         let pn: Jid = "12025550124@s.whatsapp.net".parse().unwrap();

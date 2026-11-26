@@ -499,7 +499,10 @@ impl Emitter<'_> {
     }
     fn message_source(&self, message: &Message) -> String {
         let name = ident(&message.name);
-        let pinned_clone = message.full_name == ".whatsapp.Message";
+        let pinned_clone = matches!(
+            message.full_name.as_str(),
+            ".whatsapp.Message" | ".whatsapp.ContextInfo"
+        );
         let clone = if pinned_clone { "" } else { "Clone," };
         let mut out = format!(
             "#[derive({clone}Debug,PartialEq,::serde::Serialize)] #[cfg_attr(feature=\"serde-deserialize\",derive(::serde::Deserialize),serde(default))] #[non_exhaustive] pub struct {name}{{\n"

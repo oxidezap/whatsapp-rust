@@ -1,14 +1,39 @@
-//! Verify committed schemas and generated Rust without compiling a generator.
+//! Generate the protobuf model from the committed descriptor.
 
 use sha2::{Digest as _, Sha256};
 use std::io::{self, Read as _};
 
+#[path = "codegen/descriptor.rs"]
+mod descriptor;
+#[path = "codegen/emit_owned.rs"]
+#[allow(dead_code)]
+mod emit_owned;
+#[path = "codegen/features.rs"]
+mod features;
+#[path = "codegen/names.rs"]
+#[allow(dead_code)]
+mod names;
+#[path = "codegen/policy.rs"]
+#[allow(dead_code)]
+mod policy;
+#[path = "codegen/project.rs"]
+#[allow(dead_code)]
+mod project;
 #[cfg(feature = "protobuf-experiment")]
 #[path = "build/reference.rs"]
 #[allow(dead_code)]
 mod reference;
-#[cfg(feature = "protobuf-experiment")]
-pub use reference::policy;
+#[path = "codegen/retained.rs"]
+mod retained;
+#[path = "codegen/schema.rs"]
+#[allow(dead_code)]
+mod schema;
+#[path = "build_support/signal_storage.rs"]
+mod signal_storage;
+#[path = "codegen/wallpaper.rs"]
+mod wallpaper;
+#[path = "codegen/whatsapp.rs"]
+mod whatsapp;
 
 fn hash(path: &str) -> io::Result<String> {
     let mut input = std::fs::File::open(path)?;
@@ -40,7 +65,7 @@ fn verify(manifest: &str, entries: &[(&str, &str)]) -> io::Result<()> {
             .collect::<Vec<_>>();
         if matches.len() != 1 || matches[0].1.trim() != hash(path)? {
             return Err(io::Error::other(format!(
-                "{path} does not match {manifest}. Run `cargo xt proto-desc` or `cargo xt proto-codecs` and commit the generated files."
+                "{path} does not match {manifest}. Run `cargo xt proto-desc` to regenerate the descriptor."
             )));
         }
     }
@@ -55,14 +80,16 @@ fn main() -> io::Result<()> {
             ("desc", "src/whatsapp.desc"),
         ],
     )?;
-    verify(
-        "src/generated/whatsapp.rs.sha256",
-        &[
-            ("descriptor", "src/whatsapp.desc"),
-            ("rust", "src/generated/whatsapp.rs"),
-            ("tags", "src/generated/tags.rs"),
-        ],
-    )?;
+    println!("cargo:rerun-if-changed=codegen");
+    println!("cargo:rerun-if-changed=build_support/signal_storage.rs");
+    println!("cargo:rerun-if-changed=signal-storage.snapshot");
+    let descriptor = std::fs::read("src/whatsapp.desc")?;
+    let (_, source, tags) = whatsapp::generate(&descriptor)?;
+    let out = std::path::PathBuf::from(
+        std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is not set"))?,
+    );
+    std::fs::write(out.join("generated-whatsapp.rs"), source)?;
+    std::fs::write(out.join("generated-tags.rs"), tags)?;
     #[cfg(feature = "protobuf-experiment")]
     reference::generate_reference()?;
     Ok(())

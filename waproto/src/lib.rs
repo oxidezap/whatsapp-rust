@@ -74,7 +74,7 @@ mod reference_enum_serde;
 /// (or compile-time assert against them) instead of magic numbers, so schema
 /// changes surface as compile errors rather than silent wire-format drift.
 pub mod tags {
-    include!("generated/tags.rs");
+    include!(concat!(env!("OUT_DIR"), "/generated-tags.rs"));
 }
 
 /// Pinned, non-generic codec entry points for the hottest protobuf roots.

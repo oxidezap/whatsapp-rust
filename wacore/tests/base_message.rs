@@ -56,13 +56,15 @@ fn device_sent_and_edits_keep_their_distinct_precedence() {
     let mut image = wa::Message::default();
     image.image_message.get_or_insert_default().caption = Some("photo".into());
     let mut edit = wa::Message::default();
-    edit.edited_message.get_or_insert_default().message = waproto::protobuf::MessageField::some(image.clone());
+    edit.edited_message.get_or_insert_default().message =
+        waproto::protobuf::MessageField::some(image.clone());
     assert_eq!(stanza_type_from_message(&edit), "text");
     assert_eq!(edit.get_caption(), Some("photo"));
     assert_eq!(edit.clone().into_base_message(), image);
 
     let mut outer = wa::Message::default();
-    outer.device_sent_message.get_or_insert_default().message = waproto::protobuf::MessageField::some(edit);
+    outer.device_sent_message.get_or_insert_default().message =
+        waproto::protobuf::MessageField::some(edit);
     outer.ephemeral_message.get_or_insert_default();
     let mut poll = wa::Message::default();
     poll.poll_creation_message.get_or_insert_default();

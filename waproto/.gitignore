@@ -1,4 +1,4 @@
-# Legacy loose generator output. Static codecs in src/generated are tracked.
+# Legacy loose generator output.
 /whatsapp.rs
 src/whatsapp.rs
 /tags.rs

@@ -43,6 +43,6 @@ pub use view::{
 )]
 pub mod generated {
     pub mod whatsapp {
-        include!("../generated/whatsapp.rs");
+        include!(concat!(env!("OUT_DIR"), "/generated-whatsapp.rs"));
     }
 }

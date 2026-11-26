@@ -8,8 +8,7 @@ license = "MIT AND Apache-2.0"
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
 
-# `build.rs` injects serde_repr derives into generated enums under
-# `serde-enum-repr`; static dependency scanners do not see those uses.
+# Generated enums use serde_repr under `serde-enum-repr`.
 [package.metadata.cargo-machete]
 ignored = ["serde_repr"]
 
@@ -20,7 +19,7 @@ serde-snake-case = ["serde-deserialize"]
 # Enums (de)serialize as their numeric repr instead of the variant name — what
 # the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
-protobuf-experiment = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor", "dep:heck", "dep:syn", "dep:quote", "dep:prettyplease"]
+protobuf-experiment = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor"]
 protobuf-experiment-oracle = ["protobuf-experiment"]
 
 [[example]]
@@ -50,18 +49,15 @@ serde = { workspace = true }
 serde_repr = { version = "0.1", optional = true }
 
 [build-dependencies]
-# buffa-build does the codegen; buffa-descriptor decodes+re-encodes the committed
-# camelCase descriptor so build.rs can snake_case field names for the Rust API
-# (the proto file stays in upstream/whatspec camelCase form); heck does the case
-# conversion; sha2 powers the descriptor-freshness guard.
+# Buffa is used only to generate the differential reference.
 buffa = { workspace = true, optional = true }
 buffa-build = { workspace = true, optional = true }
 buffa-descriptor = { workspace = true, optional = true }
-heck = { workspace = true, optional = true }
+heck = { workspace = true }
 sha2 = { workspace = true }
-syn = { version = "3.0", features = ["full", "visit-mut"], optional = true }
-quote = { version = "1", optional = true }
-prettyplease = { version = "0.3", optional = true }
+syn = { version = "3.0", features = ["full", "visit-mut"] }
+quote = { version = "1" }
+prettyplease = { version = "0.3" }
 
 [dev-dependencies]
 buffa = { workspace = true }
