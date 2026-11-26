@@ -7,6 +7,61 @@ use waproto::whatsapp::{
 
 #[test]
 #[allow(clippy::disallowed_methods)]
+fn ordinary_singular_fields_reuse_buffers() {
+    use bytes::Buf as _;
+    use std::cell::Cell;
+    use waproto::protobuf::{DecodeContext, RECURSION_LIMIT};
+
+    let budget = Cell::new(10);
+    let context = DecodeContext::new(RECURSION_LIMIT, &budget);
+    let mut notification = waproto::whatsapp::message::HistorySyncNotification::default();
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"old");
+    let pointer = bytes.as_ptr();
+    notification.file_sha256 = Some(bytes);
+    let mut input = (&[0x0a, 3, b'n'][..]).chain(&b"ew"[..]);
+    notification.merge(&mut input, context).unwrap();
+    assert_eq!(notification.file_sha256.as_deref(), Some(&b"new"[..]));
+    assert_eq!(notification.file_sha256.as_ref().unwrap().as_ptr(), pointer);
+
+    let mut contact = waproto::whatsapp::sync_action_value::ContactAction::default();
+    let mut name = String::with_capacity(64);
+    name.push_str("old");
+    let pointer = name.as_ptr();
+    contact.full_name = Some(name);
+    let mut input = (&[0x0a, 3, b'a'][..]).chain(&[0xc3, 0xa9][..]);
+    contact.merge(&mut input, context).unwrap();
+    assert_eq!(contact.full_name.as_deref(), Some("aé"));
+    assert_eq!(contact.full_name.as_ref().unwrap().as_ptr(), pointer);
+    let mut input = (&[0x0a, 2, 0xc3][..]).chain(&[0xff][..]);
+    assert_eq!(
+        contact.merge(&mut input, context),
+        Err(DecodeError::InvalidUtf8)
+    );
+    assert_eq!(contact.full_name.as_deref(), Some(""));
+    assert_eq!(contact.full_name.as_ref().unwrap().as_ptr(), pointer);
+}
+
+#[test]
+#[cfg(feature = "protobuf-reference")]
+#[allow(clippy::disallowed_methods)]
+fn invalid_singular_fields_match_reference_presence() {
+    use buffa::Message as _;
+    let mut actual = waproto::whatsapp::sync_action_value::ContactAction::default();
+    let mut expected = waproto::reference::sync_action_value::ContactAction::default();
+    assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 1, 0xff]).is_err());
+    assert!(expected.merge_from_slice(&[0x0a, 1, 0xff]).is_err());
+    assert_eq!(actual.full_name, expected.full_name);
+
+    let mut actual = waproto::whatsapp::message::HistorySyncNotification::default();
+    let mut expected = waproto::reference::message::HistorySyncNotification::default();
+    assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 2, 0x01]).is_err());
+    assert!(expected.merge_from_slice(&[0x0a, 2, 0x01]).is_err());
+    assert_eq!(actual.file_sha256, expected.file_sha256);
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
 fn sync_action_data_bytes_merge_reuses_buffer() {
     use bytes::Buf as _;
     use std::cell::Cell;

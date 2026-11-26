@@ -312,8 +312,7 @@ impl ::waproto::protobuf::Message for Region {
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.data = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.data, input)?;
                 Ok(())
             }
             (1, _) => {
@@ -917,33 +916,33 @@ impl ::waproto::protobuf::Message for LsfSeed {
         use ::bytes::Buf as _;
         match (tag.field_number(), tag.wire_type()) {
             (1, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.rot_8 = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.rot_8, input)?;
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.rot_cond_8 = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.rot_cond_8, input)?;
                 Ok(())
             }
             (3, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.st2_all_qlvls_8 = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.st2_all_qlvls_8,
+                    input,
+                )?;
                 Ok(())
             }
             (4, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.st2_all_qlvl_dcmfs = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.st2_all_qlvl_dcmfs,
+                    input,
+                )?;
                 Ok(())
             }
             (5, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.st2_min_qi = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.st2_min_qi, input)?;
                 Ok(())
             }
             (6, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.st2_max_qi = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.st2_max_qi, input)?;
                 Ok(())
             }
             (7, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
@@ -1505,38 +1504,46 @@ impl ::waproto::protobuf::Message for PitchSeed {
         use ::bytes::Buf as _;
         match (tag.field_number(), tag.wire_type()) {
             (1, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.blocksegs_bitstream = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.blocksegs_bitstream,
+                    input,
+                )?;
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.blocksegs2idx = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.blocksegs2idx, input)?;
                 Ok(())
             }
             (3, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.blocksegs_ix = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.blocksegs_ix, input)?;
                 Ok(())
             }
             (4, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.firstblock_range = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.firstblock_range,
+                    input,
+                )?;
                 Ok(())
             }
             (5, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.blockseg_idx_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.blockseg_idx_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (6, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.delta_lag_dcmfs = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.delta_lag_dcmfs,
+                    input,
+                )?;
                 Ok(())
             }
             (7, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.block_transition_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.block_transition_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (1, _) => {
@@ -1903,33 +1910,45 @@ impl ::waproto::protobuf::Message for CcSeed {
         use ::bytes::Buf as _;
         match (tag.field_number(), tag.wire_type()) {
             (1, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.nrgres_gain4_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.nrgres_gain4_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.nrgres_shape4_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.nrgres_shape4_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (3, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.fcbg_offset_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.fcbg_offset_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (4, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.acbgains_hr_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.acbgains_hr_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (5, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.fcbgains_v_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.fcbgains_v_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (6, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.fcbgains_v_delta_dcmf = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.fcbgains_v_delta_dcmf,
+                    input,
+                )?;
                 Ok(())
             }
             (7, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
@@ -1967,23 +1986,28 @@ impl ::waproto::protobuf::Message for CcSeed {
                 Ok(())
             }
             (9, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.gain_recon = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.gain_recon, input)?;
                 Ok(())
             }
             (10, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.n_pulses_dcmf_bgn = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.n_pulses_dcmf_bgn,
+                    input,
+                )?;
                 Ok(())
             }
             (11, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.n_pulses_dcmf_uv = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.n_pulses_dcmf_uv,
+                    input,
+                )?;
                 Ok(())
             }
             (12, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.n_pulses_dcmf_v = value;
+                ::waproto::protobuf::types::merge_bytes(
+                    &mut self.n_pulses_dcmf_v,
+                    input,
+                )?;
                 Ok(())
             }
             (1, _) => {

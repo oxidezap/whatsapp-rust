@@ -104,8 +104,7 @@ impl ::waproto::protobuf::Message for NoiseCert {
         use ::bytes::Buf as _;
         match (tag.field_number(), tag.wire_type()) {
             (1, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.key = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.key, input)?;
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::Varint) => {
@@ -420,13 +419,11 @@ impl ::waproto::protobuf::Message for AppStateSyncKeyWire {
         use ::bytes::Buf as _;
         match (tag.field_number(), tag.wire_type()) {
             (1, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.key_data = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.key_data, input)?;
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.fingerprint = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.fingerprint, input)?;
                 Ok(())
             }
             (3, ::waproto::protobuf::encoding::WireType::Varint) => {
@@ -618,8 +615,7 @@ impl ::waproto::protobuf::Message for HashStateWire {
                 Ok(())
             }
             (2, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {
-                let value = ::waproto::protobuf::types::decode_bytes(input)?;
-                self.hash = value;
+                ::waproto::protobuf::types::merge_bytes(&mut self.hash, input)?;
                 Ok(())
             }
             (3, ::waproto::protobuf::encoding::WireType::LengthDelimited) => {

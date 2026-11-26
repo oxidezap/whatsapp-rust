@@ -66,6 +66,19 @@ pub fn merge_bytes(output: &mut Vec<u8>, input: &mut impl Buf) -> Result<(), Dec
     Ok(())
 }
 
+pub fn merge_optional_bytes(
+    output: &mut Option<Vec<u8>>,
+    input: &mut impl Buf,
+) -> Result<(), DecodeError> {
+    let value = output.get_or_insert_with(Vec::new);
+    if value.capacity() == 0 {
+        *value = decode_bytes(input)?;
+        Ok(())
+    } else {
+        merge_bytes(value, input)
+    }
+}
+
 pub fn decode_shared_bytes(input: &mut impl Buf) -> Result<bytes::Bytes, DecodeError> {
     let length = usize::try_from(encoding::decode_varint(input)?)
         .map_err(|_| DecodeError::MessageTooLarge)?;
@@ -100,6 +113,63 @@ pub fn decode_string(input: &mut impl Buf) -> Result<String, DecodeError> {
         remaining -= count;
     }
     String::from_utf8(output).map_err(|_| DecodeError::InvalidUtf8)
+}
+
+pub fn merge_optional_string(
+    output: &mut Option<String>,
+    input: &mut impl Buf,
+) -> Result<(), DecodeError> {
+    merge_string(output.get_or_insert_with(String::new), input)
+}
+
+pub fn merge_string(output: &mut String, input: &mut impl Buf) -> Result<(), DecodeError> {
+    if output.capacity() == 0 {
+        *output = decode_string(input)?;
+        return Ok(());
+    }
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    if input.chunk().len() >= length {
+        let result = std::str::from_utf8(&input.chunk()[..length])
+            .map(|value| {
+                output.clear();
+                output.push_str(value);
+            })
+            .map_err(|_| {
+                output.clear();
+                DecodeError::InvalidUtf8
+            });
+        input.advance(length);
+        return result;
+    }
+    let mut bytes = std::mem::take(output).into_bytes();
+    bytes.clear();
+    bytes.reserve(length);
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(input.chunk().len());
+        if count == 0 {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        bytes.extend_from_slice(&input.chunk()[..count]);
+        input.advance(count);
+        remaining -= count;
+    }
+    match String::from_utf8(bytes) {
+        Ok(value) => {
+            *output = value;
+            Ok(())
+        }
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.clear();
+            *output = String::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8)?;
+            Err(DecodeError::InvalidUtf8)
+        }
+    }
 }
 
 pub fn decode_fixed32(input: &mut impl Buf) -> Result<u32, DecodeError> {

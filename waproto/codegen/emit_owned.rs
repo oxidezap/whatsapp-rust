@@ -904,6 +904,54 @@ impl Emitter<'_> {
             out.push_str(&format!("{RT}::types::merge_bytes(self.{slot}.get_or_insert_with(::core::default::Default::default),input)?;Ok(())}},"));
             return out;
         }
+        if matches!(
+            field.shape,
+            FieldShape::Singular {
+                presence: Presence::Explicit,
+                ..
+            }
+        ) && matches!(value, ValueType::Scalar(Scalar::Bytes))
+            && field.bytes_storage == BytesStorage::Vector
+        {
+            out.push_str(&format!(
+                "{RT}::types::merge_optional_bytes(&mut self.{slot},input)?;Ok(())}},"
+            ));
+            return out;
+        }
+        if matches!(
+            field.shape,
+            FieldShape::Singular {
+                presence: Presence::Explicit,
+                ..
+            }
+        ) && matches!(value, ValueType::Scalar(Scalar::String))
+        {
+            out.push_str(&format!(
+                "{RT}::types::merge_optional_string(&mut self.{slot},input)?;Ok(())}},"
+            ));
+            return out;
+        }
+        if matches!(
+            field.shape,
+            FieldShape::Singular {
+                presence: Presence::Implicit,
+                ..
+            }
+        ) {
+            let merge = match value {
+                ValueType::Scalar(Scalar::String) => Some("merge_string"),
+                ValueType::Scalar(Scalar::Bytes) if field.bytes_storage == BytesStorage::Vector => {
+                    Some("merge_bytes")
+                }
+                _ => None,
+            };
+            if let Some(merge) = merge {
+                out.push_str(&format!(
+                    "{RT}::types::{merge}(&mut self.{slot},input)?;Ok(())}},"
+                ));
+                return out;
+            }
+        }
         if let ValueType::Message(id, encoding) = value {
             let merge = if encoding == MessageEncoding::Group {
                 format!("merge_group(input,context,{number})?")
