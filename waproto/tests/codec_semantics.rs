@@ -92,6 +92,7 @@ fn closed_enum_budget_counts_only_recognized_values() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
 fn malformed_new_message_variant_preserves_previous_oneof() {
     let mut header = Header::default();
     header.media = Some(Media::JpegThumbnail(vec![1, 2, 3]));
@@ -102,6 +103,7 @@ fn malformed_new_message_variant_preserves_previous_oneof() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
 fn repeated_message_variant_merges_into_existing_oneof() {
     let mut image = waproto::whatsapp::message::ImageMessage::default();
     image.caption = Some("caption".into());

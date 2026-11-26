@@ -553,7 +553,7 @@ impl Emitter<'_> {
         }
         out.push_str("}\n");
         if pinned_clone {
-            out.push_str(&format!("impl ::core::clone::Clone for {name}{{#[inline(never)]fn clone(&self)->Self{{Self{{"));
+            out.push_str(&format!("impl ::core::clone::Clone for {name}{{#[inline(never)]#[allow(clippy::clone_on_copy)]fn clone(&self)->Self{{Self{{"));
             for id in &message.fields {
                 let field = self.schema.field(*id);
                 if !matches!(field.shape, FieldShape::Oneof { .. }) {
