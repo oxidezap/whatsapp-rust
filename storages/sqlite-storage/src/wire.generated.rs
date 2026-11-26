@@ -490,7 +490,7 @@ impl ::waproto::protobuf::Message for AppStateSyncKeyWire {
 pub struct HashStateWire {
     pub version: u64,
     pub hash: ::std::vec::Vec<u8>,
-    pub index_value_map: ::std::collections::HashMap<
+    pub index_value_map: ::waproto::protobuf::Map<
         ::std::string::String,
         ::std::vec::Vec<u8>,
     >,
@@ -502,7 +502,7 @@ impl ::core::default::Default for HashStateWire {
         Self {
             version: 0,
             hash: ::std::vec::Vec::new(),
-            index_value_map: ::std::collections::HashMap::new(),
+            index_value_map: ::waproto::protobuf::Map::new(),
             mac_mismatch_fatal: false,
             bootstrapped: false,
         }

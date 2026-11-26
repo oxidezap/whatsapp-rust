@@ -967,16 +967,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.cb_16
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.cb_16.push(v);
                 }
                 Ok(())
             }
             (7, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.cb_16.push(value);
                 Ok(())
             }
@@ -989,16 +989,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.cinv_16
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.cinv_16.push(v);
                 }
                 Ok(())
             }
             (8, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.cinv_16.push(value);
                 Ok(())
             }
@@ -1011,16 +1011,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.cmf
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.cmf.push(v);
                 }
                 Ok(())
             }
             (9, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.cmf.push(value);
                 Ok(())
             }
@@ -1033,16 +1033,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.cmf_cond
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.cmf_cond.push(v);
                 }
                 Ok(())
             }
             (10, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.cmf_cond.push(value);
                 Ok(())
             }
@@ -1055,16 +1055,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.lsf_sel
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.lsf_sel.push(v);
                 }
                 Ok(())
             }
             (11, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.lsf_sel.push(value);
                 Ok(())
             }
@@ -1077,16 +1077,16 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.lsf_extra
-                        .push(
-                            ::waproto::protobuf::encoding::decode_varint(&mut packed)?
-                                as u32,
-                        );
+                    let v = ::waproto::protobuf::encoding::decode_varint(&mut packed)?
+                        as u32;
+                    context.register_element_memory(::std::mem::size_of::<u32>())?;
+                    self.lsf_extra.push(v);
                 }
                 Ok(())
             }
             (12, ::waproto::protobuf::encoding::WireType::Varint) => {
                 let value = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
+                context.register_element_memory(::std::mem::size_of::<u32>())?;
                 self.lsf_extra.push(value);
                 Ok(())
             }
@@ -1099,12 +1099,11 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.mean
-                        .push(
-                            f32::from_bits(
-                                ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
-                            ),
-                        );
+                    let v = f32::from_bits(
+                        ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
+                    );
+                    context.register_element_memory(::std::mem::size_of::<f32>())?;
+                    self.mean.push(v);
                 }
                 Ok(())
             }
@@ -1112,6 +1111,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 let value = f32::from_bits(
                     ::waproto::protobuf::types::decode_fixed32(input)?,
                 );
+                context.register_element_memory(::std::mem::size_of::<f32>())?;
                 self.mean.push(value);
                 Ok(())
             }
@@ -1124,12 +1124,11 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.min_dist
-                        .push(
-                            f32::from_bits(
-                                ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
-                            ),
-                        );
+                    let v = f32::from_bits(
+                        ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
+                    );
+                    context.register_element_memory(::std::mem::size_of::<f32>())?;
+                    self.min_dist.push(v);
                 }
                 Ok(())
             }
@@ -1137,6 +1136,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 let value = f32::from_bits(
                     ::waproto::protobuf::types::decode_fixed32(input)?,
                 );
+                context.register_element_memory(::std::mem::size_of::<f32>())?;
                 self.min_dist.push(value);
                 Ok(())
             }
@@ -1149,12 +1149,11 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.reg_cond
-                        .push(
-                            f32::from_bits(
-                                ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
-                            ),
-                        );
+                    let v = f32::from_bits(
+                        ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
+                    );
+                    context.register_element_memory(::std::mem::size_of::<f32>())?;
+                    self.reg_cond.push(v);
                 }
                 Ok(())
             }
@@ -1162,6 +1161,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 let value = f32::from_bits(
                     ::waproto::protobuf::types::decode_fixed32(input)?,
                 );
+                context.register_element_memory(::std::mem::size_of::<f32>())?;
                 self.reg_cond.push(value);
                 Ok(())
             }
@@ -1174,12 +1174,11 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.qstep
-                        .push(
-                            f32::from_bits(
-                                ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
-                            ),
-                        );
+                    let v = f32::from_bits(
+                        ::waproto::protobuf::types::decode_fixed32(&mut packed)?,
+                    );
+                    context.register_element_memory(::std::mem::size_of::<f32>())?;
+                    self.qstep.push(v);
                 }
                 Ok(())
             }
@@ -1187,6 +1186,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
                 let value = f32::from_bits(
                     ::waproto::protobuf::types::decode_fixed32(input)?,
                 );
+                context.register_element_memory(::std::mem::size_of::<f32>())?;
                 self.qstep.push(value);
                 Ok(())
             }
@@ -1965,13 +1965,14 @@ impl ::waproto::protobuf::Message for CcSeed {
                 }
                 let mut packed = input.take(n);
                 while packed.has_remaining() {
-                    self.acbgains_cb_hr_q14
-                        .push({
-                            let n = ::waproto::protobuf::encoding::decode_varint(
-                                &mut packed,
-                            )? as u32;
-                            (n >> 1) as i32 ^ -((n & 1) as i32)
-                        });
+                    let v = {
+                        let n = ::waproto::protobuf::encoding::decode_varint(
+                            &mut packed,
+                        )? as u32;
+                        (n >> 1) as i32 ^ -((n & 1) as i32)
+                    };
+                    context.register_element_memory(::std::mem::size_of::<i32>())?;
+                    self.acbgains_cb_hr_q14.push(v);
                 }
                 Ok(())
             }
@@ -1980,6 +1981,7 @@ impl ::waproto::protobuf::Message for CcSeed {
                     let n = ::waproto::protobuf::encoding::decode_varint(input)? as u32;
                     (n >> 1) as i32 ^ -((n & 1) as i32)
                 };
+                context.register_element_memory(::std::mem::size_of::<i32>())?;
                 self.acbgains_cb_hr_q14.push(value);
                 Ok(())
             }
