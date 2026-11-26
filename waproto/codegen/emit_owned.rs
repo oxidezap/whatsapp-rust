@@ -160,7 +160,7 @@ impl Emitter<'_> {
                 )
             }
             FieldShape::Map { key, value, .. } => format!(
-                "::std::collections::HashMap<{}, {}>",
+                "{RT}::Map<{}, {}>",
                 Self::scalar_type(key, BytesStorage::Vector),
                 self.value_type(value, field.bytes_storage)
             ),
@@ -195,7 +195,7 @@ impl Emitter<'_> {
                 ..
             } => "None".into(),
             FieldShape::Repeated { .. } => "::std::vec::Vec::new()".into(),
-            FieldShape::Map { .. } => "::std::collections::HashMap::new()".into(),
+            FieldShape::Map { .. } => format!("{RT}::Map::new()"),
             FieldShape::Oneof { .. } => "None".into(),
             FieldShape::Singular {
                 value: ValueType::Enumeration(id),

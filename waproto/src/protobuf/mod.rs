@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub use bytes;
+pub use hashbrown::HashMap as Map;
 
 mod decode;
 pub mod encoding;

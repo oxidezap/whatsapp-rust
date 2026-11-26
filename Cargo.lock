@@ -5787,6 +5787,7 @@ dependencies = [
  "buffa-build",
  "buffa-descriptor",
  "bytes",
+ "hashbrown 0.15.5",
  "heck",
  "prettyplease 0.3.0",
  "quote",

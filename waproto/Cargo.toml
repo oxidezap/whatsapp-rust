@@ -45,6 +45,7 @@ required-features = ["protobuf-experiment"]
 [dependencies]
 buffa = { workspace = true, optional = true }
 bytes = { workspace = true }
+hashbrown = { version = "0.15.5", default-features = false, features = ["default-hasher", "serde"] }
 serde = { workspace = true }
 serde_repr = { version = "0.1", optional = true }
 

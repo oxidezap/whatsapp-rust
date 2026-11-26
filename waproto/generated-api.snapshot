@@ -21567,7 +21567,7 @@ field whatsapp::ComputeClientSealTokenOutput::result :: core :: option :: Option
 field whatsapp::ComputeClientSealTokenOutputView::result :: core :: option :: Option < crate :: protobuf :: generated :: whatsapp :: compute_client_seal_token_output :: ResultView < 'a , > , >
 field whatsapp::ComputeClientSealTokenSuccess::client_seal_token :: std :: vec :: Vec < u8 >
 field whatsapp::ComputeClientSealTokenSuccessView::client_seal_token & 'a [u8]
-field whatsapp::Config::field :: std :: collections :: HashMap < u32 , crate :: protobuf :: generated :: whatsapp :: Field , >
+field whatsapp::Config::field crate :: protobuf :: Map < u32 , crate :: protobuf :: generated :: whatsapp :: Field >
 field whatsapp::Config::version :: core :: option :: Option < u32 >
 field whatsapp::ConfigView::field crate :: protobuf :: MapView < 'a , u32 , crate :: protobuf :: generated :: whatsapp :: FieldView < 'a > , >
 field whatsapp::ConfigView::version :: core :: option :: Option < u32 >
@@ -22399,7 +22399,7 @@ field whatsapp::Field::is_message :: core :: option :: Option < bool >
 field whatsapp::Field::max_version :: core :: option :: Option < u32 >
 field whatsapp::Field::min_version :: core :: option :: Option < u32 >
 field whatsapp::Field::not_reportable_min_version :: core :: option :: Option < u32 >
-field whatsapp::Field::subfield :: std :: collections :: HashMap < u32 , crate :: protobuf :: generated :: whatsapp :: Field , >
+field whatsapp::Field::subfield crate :: protobuf :: Map < u32 , crate :: protobuf :: generated :: whatsapp :: Field >
 field whatsapp::FieldView::is_message :: core :: option :: Option < bool >
 field whatsapp::FieldView::max_version :: core :: option :: Option < u32 >
 field whatsapp::FieldView::min_version :: core :: option :: Option < u32 >
@@ -28092,7 +28092,7 @@ field whatsapp::sync_action_value::MerchantPaymentPartnerActionView::credential_
 field whatsapp::sync_action_value::MerchantPaymentPartnerActionView::gateway_name :: core :: option :: Option < & 'a str >
 field whatsapp::sync_action_value::MerchantPaymentPartnerActionView::status crate :: protobuf :: generated :: whatsapp :: sync_action_value :: merchant_payment_partner_action :: Status
 field whatsapp::sync_action_value::MusicUserIdAction::music_user_id :: core :: option :: Option < :: std :: string :: String >
-field whatsapp::sync_action_value::MusicUserIdAction::music_user_id_map :: std :: collections :: HashMap < :: std :: string :: String , :: std :: string :: String , >
+field whatsapp::sync_action_value::MusicUserIdAction::music_user_id_map crate :: protobuf :: Map < :: std :: string :: String , :: std :: string :: String , >
 field whatsapp::sync_action_value::MusicUserIdActionView::music_user_id :: core :: option :: Option < & 'a str >
 field whatsapp::sync_action_value::MusicUserIdActionView::music_user_id_map crate :: protobuf :: MapView < 'a , & 'a str , & 'a str >
 field whatsapp::sync_action_value::MuteAction::auto_muted :: core :: option :: Option < bool >
