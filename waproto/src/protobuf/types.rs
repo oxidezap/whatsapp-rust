@@ -24,14 +24,12 @@ pub fn encode_bytes(value: &[u8], output: &mut impl EncodeSink) {
     output.put_slice(value);
 }
 
-pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
-    let length = usize::try_from(encoding::decode_varint(input)?)
-        .map_err(|_| DecodeError::MessageTooLarge)?;
-    if input.remaining() < length {
-        return Err(DecodeError::UnexpectedEof);
-    }
-    let mut output = Vec::with_capacity(length);
-    let mut remaining = length;
+#[inline(always)]
+fn copy_chunks(
+    input: &mut impl Buf,
+    output: &mut Vec<u8>,
+    mut remaining: usize,
+) -> Result<(), DecodeError> {
     while remaining != 0 {
         let count = remaining.min(input.chunk().len());
         if count == 0 {
@@ -41,6 +39,17 @@ pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
         input.advance(count);
         remaining -= count;
     }
+    Ok(())
+}
+
+pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.remaining() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let mut output = Vec::with_capacity(length);
+    copy_chunks(input, &mut output, length)?;
     Ok(output)
 }
 
@@ -53,17 +62,7 @@ pub fn merge_bytes(output: &mut Vec<u8>, input: &mut impl Buf) -> Result<(), Dec
     }
     output.clear();
     output.reserve(length);
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = remaining.min(input.chunk().len());
-        if count == 0 {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        output.extend_from_slice(&input.chunk()[..count]);
-        input.advance(count);
-        remaining -= count;
-    }
-    Ok(())
+    copy_chunks(input, output, length)
 }
 
 pub fn merge_optional_bytes(
@@ -102,16 +101,7 @@ pub fn decode_string(input: &mut impl Buf) -> Result<String, DecodeError> {
         return result;
     }
     let mut output = Vec::with_capacity(length);
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = remaining.min(input.chunk().len());
-        if count == 0 {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        output.extend_from_slice(&input.chunk()[..count]);
-        input.advance(count);
-        remaining -= count;
-    }
+    copy_chunks(input, &mut output, length)?;
     String::from_utf8(output).map_err(|_| DecodeError::InvalidUtf8)
 }
 
@@ -148,16 +138,7 @@ pub fn merge_string(output: &mut String, input: &mut impl Buf) -> Result<(), Dec
     let mut bytes = std::mem::take(output).into_bytes();
     bytes.clear();
     bytes.reserve(length);
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = remaining.min(input.chunk().len());
-        if count == 0 {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        bytes.extend_from_slice(&input.chunk()[..count]);
-        input.advance(count);
-        remaining -= count;
-    }
+    copy_chunks(input, &mut bytes, length)?;
     match String::from_utf8(bytes) {
         Ok(value) => {
             *output = value;
