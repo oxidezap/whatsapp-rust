@@ -3389,35 +3389,14 @@ impl Client {
             .inbound_journal_enabled()
             .then(|| u32::try_from(enc_index).map(|index| (Some(index), source.clone())))
             .transpose()?;
-        // A canonical SKDM starts with its distribution field. Mixed, reordered,
-        // or malformed carriers still take the full decoder path below.
+        // Recognize canonical SKDM carriers without walking every decoded field.
+        // The owned decoder still validates the complete message below.
         const SKDM_TAG: u32 = (waproto::tags::message::SENDER_KEY_DISTRIBUTION_MESSAGE << 3) | 2;
-        if source
+        let skdm_carrier = source
             .first()
             .is_some_and(|&byte| u32::from(byte) == SKDM_TAG)
-            && let Ok(Some(distribution)) =
-                wacore::messages::sender_key_distribution_only_unpadded(&source)
-        {
-            if let Some(axolotl_bytes) = distribution.axolotl_sender_key_distribution_message
-                && let Err(error) = self
-                    .handle_sender_key_distribution_message(
-                        &info.source.chat,
-                        &info.source.sender,
-                        &info.id,
-                        axolotl_bytes,
-                    )
-                    .await
-            {
-                if matches!(error, crate::features::SignalError::InvalidInput(_)) {
-                    self.finish_retained_raw(origin);
-                }
-                return Err(error.into());
-            }
-            return Ok(PlaintextHandleOutcome {
-                skdm_only: true,
-                ..Default::default()
-            });
-        }
+            && wacore::messages::has_only_sender_key_distribution_top_level_fields(&source)
+                .unwrap_or(false);
         let (original_msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)
                 .inspect_err(|_| self.finish_retained_raw(origin))?;
@@ -3459,7 +3438,7 @@ impl Client {
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
-        let skdm_only = wacore::messages::is_sender_key_distribution_only(&mut msg);
+        let skdm_only = skdm_carrier || wacore::messages::is_sender_key_distribution_only(&mut msg);
 
         if info.source.chat.is_group()
             && let Some(protocol) = msg.protocol_message.as_option()
