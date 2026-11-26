@@ -149,9 +149,12 @@ pub trait ErrorChainExt {
     /// Whether the operation ran out of time waiting for the server.
     ///
     /// Covers a request that got no answer and a connect or handshake step
-    /// that never completed.
+    /// that never completed, and timeouts reported by HTTP adapters.
     fn is_timeout(&self) -> bool {
         self.sources().any(|cause| {
+            if let Some(http) = cause.downcast_ref::<crate::http::HttpError>() {
+                return http.is_timeout();
+            }
             if let Some(iq) = cause.downcast_ref::<ClientIqError>() {
                 return iq.is_timeout();
             }
@@ -261,6 +264,21 @@ mod boxed_source_tests {
 
     fn storage_error() -> StoreError {
         StoreError::Io(std::io::Error::other("synthetic storage failure"))
+    }
+
+    #[test]
+    fn http_timeout_is_classified_through_a_media_error() {
+        use std::io::{Error, ErrorKind};
+
+        let cause = crate::download::DownloadCause::from(crate::http::HttpError::from(
+            Error::from(ErrorKind::TimedOut),
+        ));
+        assert!(cause.is_timeout());
+
+        let cause = crate::download::DownloadCause::from(crate::http::HttpError::from(
+            Error::from(ErrorKind::ConnectionRefused),
+        ));
+        assert!(!cause.is_timeout());
     }
 
     #[test]

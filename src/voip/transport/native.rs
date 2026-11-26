@@ -61,13 +61,13 @@ type Result<T, E = NativeRelayError> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum NativeRelayError {
     #[error("dtls connect: {0}")]
-    DtlsConnect(String),
+    DtlsConnect(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("dtls crypto provider: {0}")]
-    DtlsProvider(String),
+    DtlsProvider(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("dtls self-signed cert: {0}")]
-    DtlsCertificate(String),
+    DtlsCertificate(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("dtls config: {0}")]
-    DtlsConfig(String),
+    DtlsConfig(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("bind udp: {0}")]
     BindUdp(#[source] io::Error),
     #[error("connect udp to relay: {0}")]
@@ -190,7 +190,7 @@ impl RelayStack {
         let config = dtls_config(true, Some(remote))?;
         let mut dtls = DtlsEndpoint::new(local, TransportProtocol::UDP, None);
         dtls.connect(now, remote, Arc::new(config), None)
-            .map_err(|error| NativeRelayError::DtlsConnect(error.to_string()))?;
+            .map_err(|error| NativeRelayError::DtlsConnect(Box::new(error)))?;
         // The dialling end initiates the association too, so its SCTP endpoint needs no server
         // config: nothing will ever arrive on it that this side did not ask for.
         let sctp = SctpEndpoint::new(
@@ -527,9 +527,9 @@ fn dtls_config(
     remote: Option<SocketAddr>,
 ) -> Result<rtc_dtls::config::HandshakeConfig> {
     let provider = rtc_dtls::crypto_provider::default_provider()
-        .map_err(|error| NativeRelayError::DtlsProvider(error.to_string()))?;
+        .map_err(|error| NativeRelayError::DtlsProvider(Box::new(error)))?;
     let cert = Certificate::generate_self_signed(vec!["wa-voip".to_owned()], provider.crypto())
-        .map_err(|error| NativeRelayError::DtlsCertificate(error.to_string()))?;
+        .map_err(|error| NativeRelayError::DtlsCertificate(Box::new(error)))?;
     DtlsConfigBuilder::default()
         .with_crypto_provider(provider)
         .with_certificates(vec![cert])
@@ -538,7 +538,7 @@ fn dtls_config(
         // library's empty-server-name warn.
         .with_server_name("localhost".to_owned())
         .build(is_client, remote)
-        .map_err(|error| NativeRelayError::DtlsConfig(error.to_string()))
+        .map_err(|error| NativeRelayError::DtlsConfig(Box::new(error)))
 }
 
 /// The SCTP parameters of a relay association. Everything else is the crate's default, which is

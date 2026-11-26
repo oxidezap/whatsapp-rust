@@ -9,6 +9,15 @@ pub trait IqSpec {
     type Response;
 
     /// Error produced by this specification's response parser.
+    ///
+    /// If your parser already returns boxed errors, use a concrete wrapper
+    /// as this associated type. The wrapper can expose the original cause.
+    ///
+    /// ```
+    /// #[derive(Debug, thiserror::Error)]
+    /// #[error("custom IQ response parser failed")]
+    /// struct ParserError(#[source] Box<dyn std::error::Error + Send + Sync>);
+    /// ```
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Build the IQ stanza for this spec.

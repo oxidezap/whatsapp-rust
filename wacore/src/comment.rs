@@ -74,8 +74,7 @@ pub fn decrypt_comment_with_secret(
         message_secret,
         &comment_addon_ctx(parent_msg_id, parent_sender_jid, commenter_jid),
     )?;
-    waproto::codec::message_decode(&plaintext[..])
-        .map_err(|e| AddonError::ProtobufDecode(e.to_string()))
+    waproto::codec::message_decode(&plaintext[..]).map_err(AddonError::ProtobufDecode)
 }
 
 #[cfg(test)]

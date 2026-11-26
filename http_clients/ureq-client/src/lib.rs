@@ -31,7 +31,15 @@ pub enum UreqHttpError {
 
 impl From<UreqHttpError> for HttpError {
     fn from(error: UreqHttpError) -> Self {
-        Self::adapter(error)
+        match &error {
+            UreqHttpError::Ureq(ureq::Error::Timeout(_)) => Self::timeout(error),
+            UreqHttpError::Ureq(ureq::Error::Io(cause)) | UreqHttpError::Io(cause)
+                if cause.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Self::timeout(error)
+            }
+            _ => Self::adapter(error),
+        }
     }
 }
 
@@ -430,6 +438,17 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn maps_ureq_timeouts_to_the_portable_http_error() {
+        let error = HttpError::from(UreqHttpError::Ureq(ureq::Error::Timeout(
+            ureq::Timeout::Connect,
+        )));
+        assert!(error.is_timeout());
+        assert!(
+            std::error::Error::source(&error).is_some_and(|source| source.is::<UreqHttpError>())
+        );
+    }
 
     #[test]
     fn adapter_error_retains_the_concrete_io_source() {

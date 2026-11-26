@@ -63,17 +63,20 @@ pub struct EncryptSendError {
     inner: Box<EncryptSendErrorDetails>,
 }
 
-#[doc(hidden)]
-pub struct EncryptSendErrorDetails {
-    pub kind: EncryptSendErrorKind,
-    pub source: Box<dyn std::error::Error + Send + Sync>,
+struct EncryptSendErrorDetails {
+    kind: EncryptSendErrorKind,
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-impl std::ops::Deref for EncryptSendError {
-    type Target = EncryptSendErrorDetails;
+impl EncryptSendError {
+    /// The layer or sender state that prevented sending.
+    pub fn kind(&self) -> &EncryptSendErrorKind {
+        &self.inner.kind
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+    /// The original cause, including any transport adapter error.
+    pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.source.as_ref()
     }
 }
 
@@ -82,26 +85,23 @@ impl std::fmt::Display for EncryptSendError {
         write!(
             f,
             "{}: {}",
-            self.kind,
-            crate::diagnostics::ErrorSummary(self.source.as_ref())
+            self.kind(),
+            crate::diagnostics::ErrorSummary(self.cause())
         )
     }
 }
 
 impl std::error::Error for EncryptSendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
+        Some(self.cause())
     }
 }
 
 impl std::fmt::Debug for EncryptSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncryptSendError")
-            .field("kind", &self.kind)
-            .field(
-                "source",
-                &crate::diagnostics::ErrorSummary(self.source.as_ref()),
-            )
+            .field("kind", self.kind())
+            .field("source", &crate::diagnostics::ErrorSummary(self.cause()))
             .finish()
     }
 }
@@ -163,7 +163,7 @@ impl EncryptSendError {
     /// the same way: stop retrying on this connection and reconnect.
     pub fn is_transport_unavailable(&self) -> bool {
         matches!(
-            self.kind,
+            self.kind(),
             EncryptSendErrorKind::Transport
                 | EncryptSendErrorKind::ChannelClosed
                 | EncryptSendErrorKind::Poisoned
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn crypto_preserves_the_noise_error_type() {
         let err = EncryptSendError::crypto(NoiseError::Encrypt(CryptoProviderError::BackendFailed));
-        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Crypto));
         let src = std::error::Error::source(&err).expect("source preserved");
         let ne = src
             .downcast_ref::<NoiseError>()

@@ -436,11 +436,23 @@ pub enum HttpError {
     StreamingUnsupported,
     #[error("Upload streaming not supported by this HTTP client")]
     UploadStreamingUnsupported,
+    #[error("HTTP request timed out: {0}")]
+    Timeout(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("{0}")]
     Adapter(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl HttpError {
+    /// Reports an adapter timeout while retaining its original cause.
+    pub fn timeout(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Timeout(error.into())
+    }
+
+    /// Whether the adapter reported a timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+
     /// Retains an adapter's concrete error as the source.
     pub fn adapter(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Adapter(Box::new(error))
@@ -454,7 +466,11 @@ impl HttpError {
 
 impl From<std::io::Error> for HttpError {
     fn from(error: std::io::Error) -> Self {
-        Self::adapter(error)
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            Self::timeout(error)
+        } else {
+            Self::adapter(error)
+        }
     }
 }
 
@@ -464,6 +480,8 @@ impl From<std::io::Error> for HttpError {
 /// Implementations must not turn an HTTP status into an opaque error. The SDK
 /// decides whether to retry according to the operation being performed.
 /// DNS, connect, TLS and request timeout failures return `Err`.
+/// Use [`HttpError::timeout`] for a backend-specific timeout so callers can
+/// classify it without depending on that backend.
 ///
 /// Successful buffered responses must contain the complete body; body read
 /// failures or exceeded body limits return `Err`. For non-success responses,

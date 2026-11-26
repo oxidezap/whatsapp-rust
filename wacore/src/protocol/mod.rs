@@ -9,6 +9,8 @@ use wacore_binary::{Node, NodeRef};
 /// Represents a type that maps to a WhatsApp Protocol node.
 pub trait ProtocolNode: Sized {
     /// Error produced when parsing this node.
+    /// A concrete parser error. To retain an already boxed cause, put it in a
+    /// wrapper that implements `std::error::Error`.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// The XML tag name (e.g., "create", "iq", "participant").

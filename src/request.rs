@@ -633,9 +633,7 @@ impl Client {
                     let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
                     // A spec can report a typed rejection embedded in a result IQ.
                     // Attach its original response without changing ordinary parse errors.
-                    match crate::ErrorChainExt::sources(error.as_ref())
-                        .find_map(|cause| cause.downcast_ref::<wacore::request::IqError>())
-                    {
+                    match iq_parser_rejection(error.as_ref()) {
                         Some(wacore::request::IqError::ServerError {
                             code,
                             text,
@@ -945,6 +943,15 @@ impl Client {
 #[path = "request_context_tests.rs"]
 mod context_tests;
 
+fn iq_parser_rejection<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a wacore::request::IqError> {
+    // A caller-provided error can contain a cyclic source chain.
+    crate::ErrorChainExt::sources(error)
+        .take(32)
+        .find_map(|cause| cause.downcast_ref::<wacore::request::IqError>())
+}
+
 /// Run `spec` over a stream positioned inside the `<iq type="result">` root
 /// and close the stream out: the trailer is what says every inflated byte was
 /// the one the peer sent, and a tree decode validates it too.
@@ -978,6 +985,44 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn iq_parser_rejection_handles_wrapped_and_cyclic_sources() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapper")]
+        struct Wrapped(#[source] wacore::request::IqError);
+
+        let rejection = Wrapped(wacore::request::IqError::ServerError {
+            code: 403,
+            text: String::new(),
+            error_type: None,
+            backoff: None,
+        });
+        assert!(matches!(
+            super::iq_parser_rejection(&rejection),
+            Some(wacore::request::IqError::ServerError { code: 403, .. })
+        ));
+
+        #[derive(Debug)]
+        struct Cyclic(std::cell::Cell<usize>);
+
+        impl std::fmt::Display for Cyclic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cyclic source")
+            }
+        }
+
+        impl std::error::Error for Cyclic {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                let calls = self.0.get();
+                assert!(calls < 32, "IQ parser search exceeded its source budget");
+                self.0.set(calls + 1);
+                Some(self)
+            }
+        }
+
+        assert!(super::iq_parser_rejection(&Cyclic(0.into())).is_none());
+    }
 
     #[tokio::test]
     async fn typed_catalog_iq_sends_smax_id_on_the_root() {

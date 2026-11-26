@@ -40,13 +40,13 @@ pub enum AddonError {
     #[error("encrypted payload too short: need at least {need} bytes for tag, got {got}")]
     PayloadTooShort { need: usize, got: usize },
     #[error("HKDF expand failed: {0}")]
-    KeyDerivation(String),
+    KeyDerivation(#[source] crate::crypto::CryptoError),
     #[error("AES-GCM encrypt failed: {0}")]
-    EncryptionFailed(String),
+    EncryptionFailed(#[source] crate::libsignal::crypto::CryptoProviderError),
     #[error("addon GCM tag verification failed")]
     AuthenticationFailed,
     #[error("protobuf decode failed: {0}")]
-    ProtobufDecode(String),
+    ProtobufDecode(#[source] buffa::DecodeError),
 }
 
 debug_as_display!(AddonError);
@@ -153,7 +153,7 @@ pub fn derive_use_case_secret(
 
     let mut key = [0u8; MESSAGE_SECRET_SIZE];
     crate::crypto::hkdf_sha256_into(message_secret, None, &info, &mut key)
-        .map_err(|e| AddonError::KeyDerivation(e.to_string()))?;
+        .map_err(AddonError::KeyDerivation)?;
     Ok(key)
 }
 
@@ -190,7 +190,7 @@ pub fn encrypt_addon(
 
     let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
     aes_256_gcm_encrypt(&key, &iv, &aad, plaintext, &mut payload)
-        .map_err(|e| AddonError::EncryptionFailed(e.to_string()))?;
+        .map_err(AddonError::EncryptionFailed)?;
 
     Ok((payload, iv))
 }

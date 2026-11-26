@@ -4722,7 +4722,7 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
         .expect("one result")
         .expect_err("the transport is configured to fail");
     assert!(matches!(
-        transport_error.kind,
+        transport_error.kind(),
         EncryptSendErrorKind::Transport
     ));
     assert!(transport_error.is_transport_unavailable());
@@ -4739,7 +4739,7 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
         .expect("one result")
         .expect_err("the sender must reject work after an ambiguous write");
     assert!(matches!(
-        poisoned_error.kind,
+        poisoned_error.kind(),
         EncryptSendErrorKind::Poisoned
     ));
     assert!(poisoned_error.is_transport_unavailable());
@@ -4833,7 +4833,7 @@ async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
         .pop()
         .expect("one result")
         .expect_err("the sender receiver was dropped at construction");
-    assert!(matches!(error.kind, EncryptSendErrorKind::ChannelClosed));
+    assert!(matches!(error.kind(), EncryptSendErrorKind::ChannelClosed));
     assert!(error.is_transport_unavailable());
     assert!(frames.is_empty());
     assert_eq!(frames.capacity(), retained_capacity);

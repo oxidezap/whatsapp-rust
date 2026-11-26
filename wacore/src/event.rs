@@ -67,8 +67,7 @@ pub fn decrypt_event_response_with_secret(
         event_creator_jid,
         responder_jid,
     )?;
-    waproto::codec::event_response_message_decode(&plaintext)
-        .map_err(|error| AddonError::ProtobufDecode(error.to_string()))
+    waproto::codec::event_response_message_decode(&plaintext).map_err(AddonError::ProtobufDecode)
 }
 
 /// Decrypt an event response and return its encoded protobuf payload.

@@ -175,7 +175,7 @@ mod tests {
             .encrypt_and_send(bytes::Bytes::from_static(b"first"))
             .await
             .expect_err("injected transport failure");
-        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(first.kind(), EncryptSendErrorKind::Transport));
 
         for attempt in 0..3 {
             let err = socket
@@ -183,7 +183,7 @@ mod tests {
                 .await
                 .expect_err("sends after a transport failure must be refused");
             assert!(
-                matches!(err.kind, EncryptSendErrorKind::Poisoned),
+                matches!(err.kind(), EncryptSendErrorKind::Poisoned),
                 "attempt {attempt} should be rejected as poisoned, got {err:?}"
             );
             assert!(err.is_transport_unavailable(), "must force a reconnect");
@@ -209,13 +209,13 @@ mod tests {
             .encrypt_and_send(bytes::Bytes::from_static(b"first"))
             .await
             .expect_err("transport reported failure after accepting the frame");
-        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(first.kind(), EncryptSendErrorKind::Transport));
 
         let second = socket
             .encrypt_and_send(bytes::Bytes::from_static(b"second"))
             .await
             .expect_err("sends after an ambiguous failure must be refused");
-        assert!(matches!(second.kind, EncryptSendErrorKind::Poisoned));
+        assert!(matches!(second.kind(), EncryptSendErrorKind::Poisoned));
 
         assert_eq!(
             transport.sent().len(),
@@ -413,7 +413,7 @@ mod tests {
         )
         .await
         .expect_err("an exhausted counter must not wrap");
-        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Crypto));
         assert_eq!(
             out_buf.to_vec(),
             staged,
@@ -540,11 +540,11 @@ mod tests {
             .await
             .expect_err("the transport always fails");
 
-        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Transport));
         assert!(
-            err.source.downcast_ref::<TypedTransportError>().is_some(),
+            err.cause().downcast_ref::<TypedTransportError>().is_some(),
             "a lone waiter must receive the transport's own error type, got: {:?}",
-            err.source
+            err.cause()
         );
     }
 
@@ -623,9 +623,9 @@ mod tests {
             .await
             .expect_err("the transport always fails");
 
-        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Transport));
         // `{:#}` walks the anyhow chain; the injected message must still be in it.
-        let chain = format!("{:#}", err.source);
+        let chain = format!("{:#}", err.cause());
         assert!(
             chain.contains("injected failure after accepting the frame"),
             "the transport's cause was lost on the way to the caller: {chain}"
@@ -1128,7 +1128,7 @@ mod tests {
             .encrypt_and_send(oversize)
             .await
             .expect_err("frame exceeds the 24-bit length prefix");
-        assert!(matches!(err.kind, EncryptSendErrorKind::Framing));
+        assert!(matches!(err.kind(), EncryptSendErrorKind::Framing));
 
         socket
             .encrypt_and_send(bytes::Bytes::from_static(b"still usable"))

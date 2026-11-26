@@ -100,7 +100,7 @@ async fn a_provider_that_breaks_the_tag_size_contract_cannot_write_a_frame() {
 
         assert!(
             matches!(
-                err.kind,
+                err.kind(),
                 whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
             ),
             "the mismatch is a crypto-layer fault, got {err:?}"
@@ -132,7 +132,7 @@ async fn offloaded_frame_rejects_bad_sealed_length_without_advancing_or_appendin
         .await
         .expect_err("malformed provider output must be refused before framing");
         assert!(matches!(
-            error.kind,
+            error.kind(),
             whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
         ));
         assert_eq!(counter, 7);
