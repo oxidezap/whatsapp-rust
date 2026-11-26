@@ -319,6 +319,11 @@ pub fn decode_varint(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
         input.advance(length);
         return Ok(value);
     }
+    decode_varint_slow(input)
+}
+
+#[cold]
+fn decode_varint_slow(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
     let mut value = 0;
     for shift in (0..70).step_by(7) {
         if !input.has_remaining() {
