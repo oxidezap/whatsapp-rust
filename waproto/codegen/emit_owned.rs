@@ -701,9 +701,11 @@ impl Emitter<'_> {
             }
         }
         if fields.is_empty() {
-            out.push_str(&format!("{RT}::encoding::skip_field_depth(tag,input,context.depth())}}\nfn clear(&mut self){{"));
+            out.push_str(&format!(
+                "{RT}::encoding::skip_unknown_field(tag,input,context)}}\nfn clear(&mut self){{"
+            ));
         } else {
-            out.push_str(&format!("_=>{RT}::encoding::skip_field_depth(tag,input,context.depth()),}}}}\nfn clear(&mut self){{"));
+            out.push_str(&format!("_=>{RT}::encoding::skip_unknown_field(tag,input,context),}}}}\nfn clear(&mut self){{"));
         }
         for id in &message.fields {
             let field = self.schema.field(*id);
@@ -833,7 +835,7 @@ impl Emitter<'_> {
                 && !self.schema.enumeration(id).open
             {
                 out.push_str(&format!(
-                    "if let Some(v)={}{{value=v;}}",
+                    "if let Some(v)={}{{value=v;}}else{{context.register_unknown_field()?;}}",
                     self.read_value(value, field.bytes_storage, "input")
                 ));
             } else {
@@ -842,7 +844,7 @@ impl Emitter<'_> {
                     self.read_value(value, field.bytes_storage, "input")
                 ));
             }
-            out.push_str(&format!("}},_=>{RT}::encoding::skip_field_depth(item,input,context.depth())?,}}}}if input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
+            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,input,context)?,}}}}if input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
             return out;
         }
         let value = match field.shape {
@@ -870,7 +872,9 @@ impl Emitter<'_> {
             let push = if let ValueType::Enumeration(id) = value
                 && !self.schema.enumeration(id).open
             {
-                format!("if let Some(v)={expression}{{{charge}self.{slot}.push(v);}} ")
+                format!(
+                    "if let Some(v)={expression}{{{charge}self.{slot}.push(v);}}else{{context.register_unknown_field()?;}} "
+                )
             } else {
                 format!("let v={expression};{charge}self.{slot}.push(v);")
             };
@@ -944,7 +948,7 @@ impl Emitter<'_> {
                 _ => unreachable!(),
             }
             if closed {
-                out.push('}');
+                out.push_str("}else{context.register_unknown_field()?;}");
             }
         }
         out.push_str("Ok(())},");
@@ -1175,7 +1179,7 @@ impl Emitter<'_> {
         }
         out
     }
-    fn view_decode_field(&self, field: &Field) -> String {
+    fn view_decode_field(&self, field: &Field, required_bit: Option<usize>) -> String {
         let number = field.number.get();
         let slot = self.slot(field);
         if let FieldShape::Map { key, value, .. } = field.shape {
@@ -1207,13 +1211,13 @@ impl Emitter<'_> {
             } else if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
                 out.push_str(&format!(
-                    "if let Some(v)={}{{value=v;}}",
+                    "if let Some(v)={}{{value=v;}}else{{context.register_unknown_field()?;}}",
                     self.view_read(value, "&mut entry")
                 ));
             } else {
                 out.push_str(&format!("value={};", self.view_read(value, "&mut entry")));
             }
-            out.push_str(&format!("}},_=>{RT}::encoding::skip_field_depth(item,&mut entry,context.depth())?,}}}}self.{slot}.push(key,value);Ok(())}},"));
+            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,&mut entry,context)?,}}}}self.{slot}.push(key,value);Ok(())}},"));
             return out;
         }
         let value = match field.shape {
@@ -1240,7 +1244,9 @@ impl Emitter<'_> {
             );
             let push = if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
-                format!("if let Some(v)={expr}{{{charge}self.{slot}.push(v);}} ")
+                format!(
+                    "if let Some(v)={expr}{{{charge}self.{slot}.push(v);}}else{{context.register_unknown_field()?;}} "
+                )
             } else {
                 format!("let v={expr};{charge}self.{slot}.push(v);")
             };
@@ -1304,8 +1310,15 @@ impl Emitter<'_> {
                 )),
                 _ => unreachable!(),
             }
+            if let Some(bit) = required_bit {
+                out.push_str(&format!(
+                    "self.__required_seen_{}|={}u64;",
+                    bit / 64,
+                    1u64 << (bit % 64)
+                ));
+            }
             if closed {
-                out.push('}');
+                out.push_str("}else{context.register_unknown_field()?;}");
             }
         }
         out.push_str("Ok(())},");
@@ -1314,6 +1327,19 @@ impl Emitter<'_> {
     fn view_source(&self, message: &Message, id: MessageId) -> String {
         let name = ident(&format!("{}View", message.name));
         let owned = self.message_path(id);
+        let mut required_bits = BTreeMap::new();
+        for field_id in &message.fields {
+            if matches!(
+                self.schema.field(*field_id).shape,
+                FieldShape::Singular {
+                    value: ValueType::Scalar(_) | ValueType::Enumeration(_),
+                    presence: Presence::Required,
+                }
+            ) {
+                required_bits.insert(*field_id, required_bits.len());
+            }
+        }
+        let seen_words = required_bits.len().div_ceil(64);
         let mut out = format!("#[derive(Clone,PartialEq)]#[non_exhaustive]pub struct {name}<'a>{{");
         for field in &message.fields {
             let field = self.schema.field(*field);
@@ -1338,6 +1364,9 @@ impl Emitter<'_> {
                 }
             ));
         }
+        for word in 0..seen_words {
+            out.push_str(&format!("__required_seen_{word}:u64,"));
+        }
         out.push_str("_lifetime: ::core::marker::PhantomData<&'a()>,}\n");
         let mut initial = String::new();
         for field in &message.fields {
@@ -1356,8 +1385,38 @@ impl Emitter<'_> {
                 member(&self.schema.oneof(*group).name)
             ));
         }
+        for word in 0..seen_words {
+            initial.push_str(&format!("__required_seen_{word}:0,"));
+        }
         initial.push_str("_lifetime: ::core::marker::PhantomData,");
         out.push_str(&format!("impl<'a>::core::default::Default for {name}<'a>{{fn default()->Self{{Self{{{initial}}}}}}}impl<'v>{RT}::DefaultViewInstance for {name}<'v>{{fn default_view_instance<'b>()->&'b Self where Self:'b{{static INSTANCE:{name}<'static>={name}{{{initial}}};&INSTANCE}}}}\n"));
+        let mut presence_methods = String::new();
+        for field_id in &message.fields {
+            let field = self.schema.field(*field_id);
+            if let FieldShape::Singular {
+                value,
+                presence: Presence::Required,
+            } = field.shape
+            {
+                let accessor = ident(&format!("has_{}", field.name.to_snake_case()));
+                let present = if matches!(value, ValueType::Message(..)) {
+                    format!("self.{}.is_set()", member(&field.name))
+                } else {
+                    let bit = required_bits[field_id];
+                    format!(
+                        "self.__required_seen_{}&{}u64!=0",
+                        bit / 64,
+                        1u64 << (bit % 64)
+                    )
+                };
+                presence_methods.push_str(&format!(
+                    "#[must_use]#[inline]pub const fn {accessor}(&self)->bool{{{present}}}"
+                ));
+            }
+        }
+        if !presence_methods.is_empty() {
+            out.push_str(&format!("impl<'a>{name}<'a>{{{presence_methods}}}\n"));
+        }
         out.push_str(&format!("impl<'a>::core::fmt::Debug for {name}<'a>{{fn fmt(&self,f:&mut ::core::fmt::Formatter<'_>)->::core::fmt::Result{{let mut d=f.debug_struct({name:?});"));
         for field in &message.fields {
             let field = self.schema.field(*field);
@@ -1379,7 +1438,12 @@ impl Emitter<'_> {
         };
         out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view(input:&'a[u8])->Result<Self,{RT}::DecodeError>{{{RT}::DecodeOptions::new().with_context(|context|Self::decode_view_ctx(input,context))}}fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
         for field in &message.fields {
-            out.push_str(&self.view_decode_field(self.schema.field(*field)));
+            out.push_str(
+                &self.view_decode_field(
+                    self.schema.field(*field),
+                    required_bits.get(field).copied(),
+                ),
+            );
         }
         let mut known = BTreeSet::new();
         for field in &message.fields {
@@ -1399,7 +1463,7 @@ impl Emitter<'_> {
         } else {
             ("_=>", ",}")
         };
-        out.push_str(&format!("{fallback}{RT}::encoding::skip_field_depth(tag,input,context.depth()){end};result?;Ok(cur)}}fn to_owned_message(&self)->Result<Self::Owned,{RT}::DecodeError>{{self.to_owned_from_source(None)}}fn to_owned_from_source(&self,source: ::core::option::Option<&::bytes::Bytes>)->Result<Self::Owned,{RT}::DecodeError>{{let _=&source;Ok({owned}{{"));
+        out.push_str(&format!("{fallback}{RT}::encoding::skip_unknown_field(tag,input,context){end};result?;Ok(cur)}}fn to_owned_message(&self)->Result<Self::Owned,{RT}::DecodeError>{{self.to_owned_from_source(None)}}fn to_owned_from_source(&self,source: ::core::option::Option<&::bytes::Bytes>)->Result<Self::Owned,{RT}::DecodeError>{{let _=&source;Ok({owned}{{"));
         for field in &message.fields {
             let field = self.schema.field(*field);
             let slot = member(&field.name);
@@ -1786,6 +1850,16 @@ fn generate_view_oracle(schema: &Schema) -> String {
         for fid in &message.fields {
             let field = schema.field(*fid);
             let slot = member(&field.name);
+            if matches!(
+                field.shape,
+                FieldShape::Singular {
+                    presence: Presence::Required,
+                    ..
+                }
+            ) {
+                let accessor = ident(&format!("has_{}", field.name.to_snake_case()));
+                out.push_str(&format!("assert_eq!(a.{accessor}(),b.{accessor}());"));
+            }
             match field.shape{
             FieldShape::Singular{value:ValueType::Message(child,_),..}=>out.push_str(&format!("assert_eq!(a.{slot}.is_set(),b.{slot}.is_set());if let(Some(a),Some(b))=(a.{slot}.as_option(),b.{slot}.as_option()){{assert_v{}(a,b);}}",child.0)),
             FieldShape::Singular{value,presence:Presence::Explicit}=>out.push_str(&format!("match(&a.{slot},&b.{slot}){{(Some(a),Some(b))=>{{{}}},(None,None)=>{{}},_=>panic!(\"borrowed presence mismatch\"),}}",value_assert(value,"a","b"))),

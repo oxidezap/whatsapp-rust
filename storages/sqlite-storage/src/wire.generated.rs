@@ -142,13 +142,7 @@ impl ::waproto::protobuf::Message for NoiseCert {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -314,13 +308,7 @@ impl ::waproto::protobuf::Message for ServerCertChain {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -470,13 +458,7 @@ impl ::waproto::protobuf::Message for AppStateSyncKeyWire {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -676,10 +658,10 @@ impl ::waproto::protobuf::Message for HashStateWire {
                             value = ::waproto::protobuf::types::decode_bytes(input)?;
                         }
                         _ => {
-                            ::waproto::protobuf::encoding::skip_field_depth(
+                            ::waproto::protobuf::encoding::skip_unknown_field(
                                 item,
                                 input,
-                                context.depth(),
+                                context,
                             )?
                         }
                     }
@@ -740,13 +722,7 @@ impl ::waproto::protobuf::Message for HashStateWire {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {

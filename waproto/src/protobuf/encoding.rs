@@ -358,6 +358,29 @@ pub fn skip_field_depth(
     Ok(())
 }
 
+pub fn skip_unknown_field(
+    tag: Tag,
+    input: &mut impl bytes::Buf,
+    context: super::DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    context.register_unknown_field()?;
+    if tag.kind != WireType::StartGroup {
+        return skip_field_depth(tag, input, context.depth());
+    }
+    let child_context = context.descend()?;
+    loop {
+        let child = Tag::decode(input)?;
+        if child.kind == WireType::EndGroup {
+            return if child.number == tag.number {
+                Ok(())
+            } else {
+                Err(DecodeError::InvalidEndGroup(child.number))
+            };
+        }
+        skip_unknown_field(child, input, child_context)?;
+    }
+}
+
 pub fn skip_field(tag: Tag, input: &mut impl bytes::Buf) -> Result<(), DecodeError> {
     skip_field_depth(tag, input, super::RECURSION_LIMIT)
 }

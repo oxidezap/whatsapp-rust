@@ -211,13 +211,7 @@ impl ::waproto::protobuf::Message for HeapWindow {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -338,13 +332,7 @@ impl ::waproto::protobuf::Message for Region {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -1318,13 +1306,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -1613,13 +1595,7 @@ impl ::waproto::protobuf::Message for PitchSeed {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {
@@ -2106,13 +2082,7 @@ impl ::waproto::protobuf::Message for CcSeed {
                     ),
                 )
             }
-            _ => {
-                ::waproto::protobuf::encoding::skip_field_depth(
-                    tag,
-                    input,
-                    context.depth(),
-                )
-            }
+            _ => ::waproto::protobuf::encoding::skip_unknown_field(tag, input, context),
         }
     }
     fn clear(&mut self) {

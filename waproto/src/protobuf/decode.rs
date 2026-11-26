@@ -100,6 +100,7 @@ impl DecodeOptions {
         self.max_message_size = bytes.min(MAX_MESSAGE_BYTES as usize);
         self
     }
+    /// Set the maximum number of unknown fields skipped across the decode tree.
     pub fn with_unknown_field_limit(mut self, count: usize) -> Self {
         self.unknown_field_limit = count;
         self

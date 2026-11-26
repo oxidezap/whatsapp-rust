@@ -22,9 +22,7 @@
 mod emission;
 #[path = "../build_support/names.rs"]
 mod names;
-#[path = "../build_support/signal_storage.rs"]
-mod signal_storage;
-
+use crate::{descriptor, emit_owned, policy, project, signal_storage};
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
@@ -33,23 +31,8 @@ use buffa_descriptor::generated::descriptor::{
 #[path = "descriptor.rs"]
 mod descriptor_file;
 
-#[path = "../codegen/descriptor.rs"]
-pub mod descriptor;
-#[path = "../codegen/features.rs"]
-pub mod features;
-
 #[path = "pin_clone.rs"]
 mod pin_clone;
-
-#[path = "../codegen/policy.rs"]
-pub mod policy;
-
-#[path = "../codegen/emit_owned.rs"]
-pub mod emit_owned;
-#[path = "../codegen/project.rs"]
-pub mod project;
-#[path = "../codegen/schema.rs"]
-pub mod schema;
 
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
