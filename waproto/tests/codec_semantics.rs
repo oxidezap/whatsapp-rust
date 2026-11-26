@@ -123,6 +123,18 @@ fn proto_macro_update_accepts_a_borrow_from_the_base() {
 }
 
 #[test]
+fn proto_macro_update_does_not_shadow_the_base() {
+    use waproto::prelude::*;
+
+    let caption = wa::message::ImageMessage::default();
+    let image = proto!(wa::message::ImageMessage {
+        caption: "New",
+        ..caption
+    });
+    assert_eq!(image.caption.as_deref(), Some("New"));
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn ordinary_singular_fields_reuse_buffers() {
     use bytes::Buf as _;

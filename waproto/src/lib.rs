@@ -36,13 +36,11 @@ macro_rules! proto {
         message
     }};
     ($message:path { $($field:ident : $value:expr,)+ .. $base:expr $(,)? }) => {{
-        match ($($crate::__proto_private::prepare($value, |message: &$message| &message.$field),)+) {
-            ($($field,)+) => {
-                let mut message: $message = $base;
-                $(message.$field = $field;)+
-                message
-            }
-        }
+        let values = ($($crate::__proto_private::prepare($value, |message: &$message| &message.$field),)+);
+        let mut message: $message = $base;
+        let ($($field,)+) = values;
+        $(message.$field = $field;)+
+        message
     }};
     ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{
         let mut message = <$message>::default();
