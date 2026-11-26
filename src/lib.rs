@@ -732,8 +732,10 @@ pub mod prelude {
         MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
     };
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
-    /// Optional sub-message wrapper in `wa::Message` literals.
-    pub use waproto::protobuf::MessageField;
+    pub use waproto::codec as protobuf_codec;
+    pub use waproto::protobuf::{
+        Message as ProtoMessage, MessageField, MessageView as ProtoMessageView,
+    };
     /// The protobuf namespace (`wa::Message`, `wa::message::*`).
     pub use waproto::whatsapp as wa;
 }
