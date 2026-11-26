@@ -31,6 +31,15 @@ macro_rules! proto {
     ($message:path {}) => {
         <$message>::default()
     };
+    ($message:path { .. $base:expr $(,)? }) => {{
+        let message: $message = $base;
+        message
+    }};
+    ($message:path { $($field:ident : $value:expr,)+ .. $base:expr $(,)? }) => {{
+        let mut message: $message = $base;
+        $(message.$field = ::core::convert::Into::into($value);)+
+        message
+    }};
     ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{
         let mut message = <$message>::default();
         $(message.$field = ::core::convert::Into::into($value);)+

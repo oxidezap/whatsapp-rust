@@ -22,6 +22,16 @@ fn proto_macro_constructs_messages_without_extra_copies() {
     assert_eq!(image.caption.as_deref(), Some("Hello"));
     assert_eq!(image.caption.as_ref().unwrap().as_ptr(), image_pointer);
     assert_eq!(proto!(wa::Message {}), wa::Message::default());
+    let changed = proto!(wa::message::ImageMessage {
+        caption: Some("Changed".into()),
+        ..image.clone()
+    });
+    assert_eq!(changed.caption.as_deref(), Some("Changed"));
+    assert_eq!(image.caption.as_deref(), Some("Hello"));
+    assert_eq!(
+        proto!(wa::message::ImageMessage { ..changed.clone() }),
+        changed
+    );
 }
 
 #[test]
