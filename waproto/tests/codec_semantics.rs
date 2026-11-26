@@ -6,6 +6,25 @@ use waproto::whatsapp::{
 };
 
 #[test]
+fn proto_macro_constructs_messages_without_extra_copies() {
+    use waproto::prelude::*;
+
+    let image = proto!(wa::message::ImageMessage {
+        caption: Some("Hello".into()),
+    });
+    let image_pointer = image.caption.as_ref().unwrap().as_ptr();
+    let message = proto!(wa::Message {
+        conversation: Some("Test".to_owned()),
+        image_message: image,
+    });
+    assert_eq!(message.conversation.as_deref(), Some("Test"));
+    let image = message.image_message.as_option().unwrap();
+    assert_eq!(image.caption.as_deref(), Some("Hello"));
+    assert_eq!(image.caption.as_ref().unwrap().as_ptr(), image_pointer);
+    assert_eq!(proto!(wa::Message {}), wa::Message::default());
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn ordinary_singular_fields_reuse_buffers() {
     use bytes::Buf as _;

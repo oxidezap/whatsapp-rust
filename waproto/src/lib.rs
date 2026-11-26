@@ -25,9 +25,23 @@ pub mod whatsapp {
     pub use crate::protobuf::generated::whatsapp::*;
 }
 
+/// Construct a generated message using its default values for omitted fields.
+#[macro_export]
+macro_rules! proto {
+    ($message:path {}) => {
+        <$message>::default()
+    };
+    ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{
+        let mut message = <$message>::default();
+        $(message.$field = ::core::convert::Into::into($value);)+
+        message
+    }};
+}
+
 /// Common protobuf types, traits, and codecs.
 pub mod prelude {
     pub use crate::codec as protobuf_codec;
+    pub use crate::proto;
     pub use crate::protobuf::{
         DecodeOptions as ProtoDecodeOptions, Message as ProtoMessage, MessageField,
         MessageView as ProtoMessageView, OwnedView,
