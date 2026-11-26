@@ -879,7 +879,27 @@ impl Emitter<'_> {
             } else {
                 "merge_length_delimited(input,context)?".into()
             };
-            match field.shape{FieldShape::Singular{..}=>out.push_str(&format!("self.{slot}.get_or_insert_default().{merge};")),FieldShape::Repeated{..}=>out.push_str(&format!("context.register_element_memory(::std::mem::size_of::<{}>())?;let mut value={}::default();value.{merge};self.{slot}.push(value);",self.message_path(id),self.message_path(id))),FieldShape::Oneof{owner,..}=>{let path=self.oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if !matches!(&self.{slot},Some({path}::{variant}(_))){{self.{slot}=Some({path}::{variant}(::std::boxed::Box::default()));}}if let Some({path}::{variant}(value))=&mut self.{slot}{{value.{merge};}}"));},_=>unreachable!()}
+            match field.shape {
+                FieldShape::Singular { .. } => {
+                    out.push_str(&format!("self.{slot}.get_or_insert_default().{merge};"));
+                }
+                FieldShape::Repeated { .. } => {
+                    out.push_str(&format!(
+                        "context.register_element_memory(::std::mem::size_of::<{}>())?;let mut value={}::default();value.{merge};self.{slot}.push(value);",
+                        self.message_path(id),
+                        self.message_path(id)
+                    ));
+                }
+                FieldShape::Oneof { owner, .. } => {
+                    let path = self.oneof_path(owner);
+                    let variant = ident(&field.name.to_upper_camel_case());
+                    out.push_str(&format!(
+                        "if let Some({path}::{variant}(value))=&mut self.{slot}{{value.{merge};}}else{{let mut value={}::default();value.{merge};self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(value)));}}",
+                        self.message_path(id)
+                    ));
+                }
+                _ => unreachable!(),
+            }
         } else {
             if matches!(field.shape, FieldShape::Repeated { .. })
                 && matches!(value, ValueType::Scalar(Scalar::String | Scalar::Bytes))

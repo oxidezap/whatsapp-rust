@@ -1,4 +1,5 @@
-use waproto::protobuf::{DecodeError, DecodeOptions};
+use waproto::protobuf::{DecodeError, DecodeOptions, Message as _};
+use waproto::whatsapp::message::interactive_message::{Header, header::Media};
 use waproto::whatsapp::{
     ADVKeyIndexList, ADVKeyIndexListView, BotCapabilityMetadata, BotCapabilityMetadataView,
 };
@@ -88,4 +89,29 @@ fn closed_enum_budget_counts_only_recognized_values() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn malformed_new_message_variant_preserves_previous_oneof() {
+    let mut header = Header::default();
+    header.media = Some(Media::JpegThumbnail(vec![1, 2, 3]));
+    let original = header.clone();
+
+    assert!(header.merge_from_slice(&[0x1a, 1, 0x80]).is_err());
+    assert_eq!(header, original);
+}
+
+#[test]
+fn repeated_message_variant_merges_into_existing_oneof() {
+    let mut image = waproto::whatsapp::message::ImageMessage::default();
+    image.caption = Some("caption".into());
+    let mut header = Header::default();
+    header.media = Some(Media::ImageMessage(Box::new(image)));
+
+    header.merge_from_slice(&[0x22, 3, 0x0a, 1, b'x']).unwrap();
+    let Some(Media::ImageMessage(image)) = header.media else {
+        panic!("expected image");
+    };
+    assert_eq!(image.url.as_deref(), Some("x"));
+    assert_eq!(image.caption.as_deref(), Some("caption"));
 }
