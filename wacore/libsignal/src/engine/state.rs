@@ -469,12 +469,27 @@ pub struct PendingPreKey {
     pub kyber_pre_key_id: Option<u32>,
     pub kyber_ciphertext: Option<Vec<u8>>,
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct SessionState {
     pub metadata: Arc<SessionMetadata>,
     pub sender: Option<Chain>,
     pub receivers: Vec<Chain>,
     pub pending_pre_key: Option<Arc<PendingPreKey>>,
+}
+impl Clone for SessionState {
+    fn clone(&self) -> Self {
+        // Clone a single receiver without the slice clone loop.
+        let receivers = match self.receivers.as_slice() {
+            [receiver] => vec![receiver.clone()],
+            receivers => receivers.to_vec(),
+        };
+        Self {
+            metadata: Arc::clone(&self.metadata),
+            sender: self.sender.clone(),
+            receivers,
+            pending_pre_key: self.pending_pre_key.clone(),
+        }
+    }
 }
 /// Session identity and ratchet metadata change at setup or a DH transition,
 /// while message-counter updates keep sharing the same immutable snapshot.
