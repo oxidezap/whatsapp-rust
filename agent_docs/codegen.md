@@ -78,7 +78,10 @@ with `waproto` and generates the private codecs. Use `cargo xt proto-desc`,
 `tables-desc` and `wire-desc` for descriptors and private codecs.
 `cargo xt proto-codecs --check` checks the generated WhatsApp declarations and
 wire identities against `waproto/generated-api.snapshot` and verifies the
-private codecs without updating files. Review any intentional
+private codecs without updating files. The snapshot combines inherent-member
+signatures with their impl bounds and omits impl entries already represented by
+associated items; the check still compares the full generated inventory.
+Review any intentional
 breaking change before regenerating that snapshot with
 `cargo run --locked -p whatspec-codegen --bin protobuf-codegen -- waproto/src/whatsapp.desc crate::protobuf::generated::whatsapp crate::protobuf - --whatsapp --update-api`.
 MLow and SQLite omit borrowed views and Serde because

@@ -42,8 +42,8 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
         .filter_map(|line| {
             line.strip_prefix("struct ")
                 .or_else(|| line.strip_prefix("enum "))?
-                .split_once(' ')
-                .map(|(owner, _)| owner)
+                .split_whitespace()
+                .next()
         })
         .collect();
     let expected_entries: BTreeSet<_> = expected.lines().map(str::trim_end).collect();

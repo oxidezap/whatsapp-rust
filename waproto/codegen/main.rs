@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (descriptors, source, _) = whatsapp::generate(&descriptor)?;
         let parsed = syn::parse_file(&source)?;
         let mut api = std::collections::BTreeSet::new();
-        inventory::inventory(&parsed.items, "whatsapp", &mut api);
+        inventory::inventory_compact(&parsed.items, "whatsapp", &mut api);
         let mut api: std::collections::BTreeSet<_> = api
             .into_iter()
             .map(|entry| entry.trim_end().to_owned())
@@ -95,7 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         api.extend(names::wire_api(&descriptors));
         let snapshot = Path::new("waproto/generated-api.snapshot");
         if update_api {
-            let contents = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
+            let contents = inventory::compact_snapshot(&api)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
             update(snapshot, contents.as_bytes(), false)?;
         } else {
             api_guard::check_api(&std::fs::read_to_string(snapshot)?, &api)?;

@@ -2,7 +2,34 @@ use std::collections::BTreeSet;
 
 use quote::ToTokens;
 
+#[allow(dead_code)]
 pub fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
+    inventory_inner(items, scope, api, false);
+}
+
+#[allow(dead_code)]
+pub fn inventory_compact(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
+    inventory_inner(items, scope, api, true);
+}
+
+#[allow(dead_code)]
+pub fn compact_snapshot(api: &BTreeSet<String>) -> BTreeSet<String> {
+    api.iter()
+        .filter(|entry| {
+            if !entry.starts_with("impl ") {
+                return true;
+            }
+            // Every associated item carries the complete impl identity.
+            let prefix = format!("associated {entry} ");
+            !api.range(prefix.clone()..)
+                .next()
+                .is_some_and(|associated| associated.starts_with(&prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+fn inventory_inner(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>, compact: bool) {
     let tokens = |value: &dyn ToTokens| normalize(&value.to_token_stream().to_string(), scope);
     let public_scope = canonical(scope.split("::").map(str::to_owned).collect(), false);
     let availability = |attrs: &[syn::Attribute]| {
@@ -29,7 +56,7 @@ pub fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     availability(&m.attrs)
                 ));
                 if let Some((_, items)) = &m.content {
-                    inventory(items, &format!("{scope}::{}", m.ident), api);
+                    inventory_inner(items, &format!("{scope}::{}", m.ident), api, compact);
                 }
             }
             syn::Item::Struct(s) if matches!(s.vis, syn::Visibility::Public(_)) => {
@@ -118,43 +145,58 @@ pub fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                 }
             }
             syn::Item::Impl(i) if i.trait_.is_none() => {
+                let generics = tokens(&i.generics);
+                let where_clause = tokens(&i.generics.where_clause);
+                let bounds = if compact && (!generics.is_empty() || !where_clause.is_empty()) {
+                    format!(" impl-generics={generics} impl-where={where_clause}")
+                } else {
+                    String::new()
+                };
+                let impl_availability = availability(&i.attrs);
                 for item in &i.items {
                     match item {
                         syn::ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Public(_)) => {
+                            if !compact {
+                                api.insert(format!(
+                                    "inherent-method-bound {public_scope}::{}::{} {} {}{}{}",
+                                    tokens(&i.self_ty),
+                                    f.sig.ident,
+                                    generics,
+                                    where_clause,
+                                    impl_availability,
+                                    availability(&f.attrs)
+                                ));
+                            }
                             api.insert(format!(
-                                "inherent-method-bound {public_scope}::{}::{} {} {}{}{}",
-                                tokens(&i.self_ty),
-                                f.sig.ident,
-                                tokens(&i.generics),
-                                tokens(&i.generics.where_clause),
-                                availability(&i.attrs),
-                                availability(&f.attrs)
-                            ));
-                            api.insert(format!(
-                                "method {public_scope}::{} {}{}{}",
+                                "method {public_scope}::{} {}{}{}{}",
                                 tokens(&i.self_ty),
                                 tokens(&f.sig),
-                                availability(&i.attrs),
+                                bounds,
+                                impl_availability,
                                 availability(&f.attrs)
                             ));
                         }
                         syn::ImplItem::Const(c) if matches!(c.vis, syn::Visibility::Public(_)) => {
+                            if !compact {
+                                api.insert(format!(
+                                    "inherent-const-bound {public_scope}::{}::{} {} {}{}{}",
+                                    tokens(&i.self_ty),
+                                    c.ident,
+                                    generics,
+                                    where_clause,
+                                    impl_availability,
+                                    availability(&c.attrs)
+                                ));
+                            }
+                            let kind = if compact { "inherent-const" } else { "const" };
                             api.insert(format!(
-                                "inherent-const-bound {public_scope}::{}::{} {} {}{}{}",
-                                tokens(&i.self_ty),
-                                c.ident,
-                                tokens(&i.generics),
-                                tokens(&i.generics.where_clause),
-                                availability(&i.attrs),
-                                availability(&c.attrs)
-                            ));
-                            api.insert(format!(
-                                "const {public_scope}::{}::{} {} = {}{}{}",
+                                "{kind} {public_scope}::{}::{} {} = {}{}{}{}",
                                 tokens(&i.self_ty),
                                 c.ident,
                                 tokens(&c.ty),
                                 tokens(&c.expr),
-                                availability(&i.attrs),
+                                bounds,
+                                impl_availability,
                                 availability(&c.attrs)
                             ));
                         }

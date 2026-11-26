@@ -131,6 +131,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trimmed_snapshot_rejects_serialization_changes_on_plain_types() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory::inventory_compact(&file.items, "whatsapp", &mut api);
+            api.into_iter()
+                .map(|line| line.trim_end().to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        for declaration in [
+            "pub struct Record { pub value: String }",
+            "pub enum Kind { First }",
+        ] {
+            let baseline = collect(declaration)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let changed = collect(&format!(
+                "#[serde(rename_all = \"camelCase\")] {declaration}"
+            ));
+            check_api(&baseline, &changed).expect_err("serialization of a retained type changed");
+        }
+    }
+
+    #[test]
+    fn compact_inventory_preserves_inherent_and_trait_contracts() {
+        let collect = |source: &str, compact: bool| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            if compact {
+                inventory::inventory_compact(&file.items, "whatsapp", &mut api);
+            } else {
+                inventory(&file.items, "whatsapp", &mut api);
+            }
+            api.into_iter()
+                .map(|line| line.trim_end().to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let cases = [
+            (
+                "pub struct Record<T>(T); impl<T> Record<T> { pub fn value(&self) -> u32 { 1 } pub const VALUE: u32 = 1; }",
+                "pub struct Record<T>(T); impl<T: Clone> Record<T> { pub fn value(&self) -> u32 { 1 } pub const VALUE: u32 = 1; }",
+                false,
+            ),
+            (
+                "pub struct Record<T>(T); impl<T> Record<T> { pub fn value(&self) -> u32 { 1 } }",
+                "pub struct Record<T>(T); impl<T> Record<T> where T: Clone { pub fn value(&self) -> u32 { 1 } }",
+                false,
+            ),
+            (
+                "pub struct Record; impl Record { pub fn value(&self) -> u32 { 1 } }",
+                "pub struct Record; impl Record { #[cfg(feature = \"optional\")] pub fn value(&self) -> u32 { 1 } }",
+                false,
+            ),
+            (
+                "pub struct Record; impl Record { pub const VALUE: u32 = 1; }",
+                "pub struct Record; impl Record { pub const VALUE: u32 = 2; }",
+                false,
+            ),
+            (
+                "pub struct Record; impl Record { pub fn value(&self) -> u32 { 1 } }",
+                "pub struct Record; impl Record { pub fn value(&self) -> u64 { 1 } }",
+                false,
+            ),
+            (
+                "pub struct Record; impl Record { pub fn value(&self) -> u32 { 1 } }",
+                "pub struct Record; impl Record { pub fn value(&self) -> u32 { 1 } pub fn added(&self) {} }",
+                true,
+            ),
+            (
+                "pub struct Record; impl Trait for Record { type View = u32; }",
+                "pub struct Record; impl Trait for Record { type View = u64; }",
+                false,
+            ),
+            (
+                "pub struct Record; impl Trait for Record { type View = u32; }",
+                "pub struct Record; impl Trait for Record {}",
+                false,
+            ),
+            (
+                "pub struct Record; impl Trait for Record {}",
+                "pub struct Record; impl Trait for Record { type Added = u32; }",
+                true,
+            ),
+            (
+                "pub struct Record { pub value: String }",
+                "pub struct Record { #[serde(rename = \"changed\")] pub value: String }",
+                false,
+            ),
+            (
+                "pub struct Record { pub value: String }",
+                "pub struct Record { pub value: String, pub added: u32 }",
+                true,
+            ),
+            (
+                "pub enum Kind { First }",
+                "pub enum Kind { #[serde(rename = \"changed\")] First }",
+                false,
+            ),
+        ];
+        for (before, after, allowed) in cases {
+            for compact in [false, true] {
+                let original = collect(before, compact);
+                let frozen = if compact {
+                    inventory::compact_snapshot(&original)
+                } else {
+                    original
+                };
+                let expected = frozen.into_iter().collect::<Vec<_>>().join("\n");
+                assert_eq!(
+                    check_api(&expected, &collect(after, compact)).is_ok(),
+                    allowed,
+                    "compact={compact} before={before} after={after}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn inherent_impl_bounds_cannot_restrict_existing_members() {
         let collect = |source: &str| {
             let file = syn::parse_file(source).unwrap();
