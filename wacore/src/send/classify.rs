@@ -211,48 +211,40 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
 /// presence of a future-proof wrapper does not create a media record.
 pub fn message_meta_from_message(msg: &wa::Message) -> Option<Node> {
     let (msg, media, wrapped_view_once) = metadata_content(msg)?;
-    let mut meta = NodeBuilder::new("meta");
-    let mut has_attr = false;
-
-    if msg.poll_creation_message.is_set()
+    let mut tag_reason = None;
+    let primary = if msg.poll_creation_message.is_set()
         || msg.poll_creation_message_v2.is_set()
         || msg.poll_creation_message_v3.is_set()
     {
-        meta = meta.attr("polltype", "creation");
-        has_attr = true;
+        Some(("polltype", "creation"))
     } else if let Some(poll_update) = msg.poll_update_message.as_option()
         && poll_update.vote.is_set()
     {
-        meta = meta.attr("polltype", "vote");
-        has_attr = true;
+        Some(("polltype", "vote"))
         // Result snapshots require an envelope gate, not just a protobuf field.
     } else if msg.event_message.is_set() {
-        meta = meta.attr("event_type", "creation");
-        has_attr = true;
+        Some(("event_type", "creation"))
     } else if msg.enc_event_response_message.is_set() {
-        meta = meta.attr("event_type", "response");
-        has_attr = true;
+        Some(("event_type", "response"))
     } else if let Some(sec) = msg.secret_encrypted_message.as_option()
         && sec.secret_enc_type
             == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit)
     {
-        meta = meta.attr("event_type", "edit");
-        has_attr = true;
+        Some(("event_type", "edit"))
     } else if let Some(label) = msg
         .protocol_message
         .as_option()
         .and_then(|pm| pm.member_label.as_option())
     {
-        let tag_reason = if label.label.as_deref().unwrap_or("").is_empty() {
+        tag_reason = Some(if label.label.as_deref().unwrap_or("").is_empty() {
             "user_delete"
         } else {
             "user_update"
-        };
-        meta = meta
-            .attr("appdata", "member_tag")
-            .attr("tag_reason", tag_reason);
-        has_attr = true;
-    }
+        });
+        Some(("appdata", "member_tag"))
+    } else {
+        None
+    };
 
     // WA Web 2.3000.1047483476: genMetaNode reads mediaData.isViewOnce.
     // Image/video/audio/PTV parsers populate that record from the inline flag;
@@ -273,11 +265,21 @@ pub fn message_meta_from_message(msg: &wa::Message) -> Option<Node> {
         || media.video_message.is_set()
         || media.audio_message.is_set()
         || media.ptv_message.is_set();
-    if has_media && (wrapped_view_once || inline_view_once == Some(true)) {
-        meta = meta.attr("view_once", "true");
-        has_attr = true;
+    let view_once = has_media && (wrapped_view_once || inline_view_once == Some(true));
+    if primary.is_none() && !view_once {
+        return None;
     }
-    has_attr.then(|| meta.build())
+    let mut meta = NodeBuilder::new("meta");
+    if let Some((key, value)) = primary {
+        meta = meta.attr(key, value);
+    }
+    if let Some(reason) = tag_reason {
+        meta = meta.attr("tag_reason", reason);
+    }
+    if view_once {
+        meta = meta.attr("view_once", "true");
+    }
+    Some(meta.build())
 }
 
 /// Follow the same classification wrappers without losing the view-once marker.

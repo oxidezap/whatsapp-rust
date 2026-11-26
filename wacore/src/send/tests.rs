@@ -1613,6 +1613,31 @@ mod metadata {
     }
 
     #[test]
+    fn metadata_combines_primary_attributes_and_view_once_in_order() {
+        let mut msg = build_member_label_message("synthetic".into(), 1_700_000_000);
+        let mut image = wa::message::ImageMessage::default();
+        image.view_once = Some(true);
+        msg.image_message = Some(image).into();
+
+        let node = message_meta_from_message(&msg).unwrap();
+        let keys: Vec<_> = node.attrs.iter().map(|(key, _)| key.as_ref()).collect();
+        assert_eq!(keys, ["appdata", "tag_reason", "view_once"]);
+        assert_eq!(
+            node.attrs().optional_string("tag_reason").unwrap(),
+            "user_update"
+        );
+
+        msg.event_message = Some(Default::default()).into();
+        let node = message_meta_from_message(&msg).unwrap();
+        let keys: Vec<_> = node.attrs.iter().map(|(key, _)| key.as_ref()).collect();
+        assert_eq!(keys, ["event_type", "view_once"]);
+        assert_eq!(
+            node.attrs().optional_string("event_type").unwrap(),
+            "creation"
+        );
+    }
+
+    #[test]
     fn metadata_traversal_is_bounded_without_changing_general_view_once_detection() {
         use crate::proto_helpers::MessageExt;
         let text = {
