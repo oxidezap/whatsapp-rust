@@ -1022,13 +1022,19 @@ pub fn sender_key_distribution_only_plaintext(
     padded_plaintext: &[u8],
     padding_version: u8,
 ) -> Result<Option<SenderKeyDistributionOnlyPlaintext<'_>>, PlaintextDecodeError> {
-    let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
-    if !has_only_sender_key_distribution_top_level_fields(plaintext_slice)? {
+    let plaintext = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
+    sender_key_distribution_only_unpadded(plaintext)
+}
+
+/// Identify a distribution-only message in an already unpadded plaintext.
+pub fn sender_key_distribution_only_unpadded(
+    plaintext: &[u8],
+) -> Result<Option<SenderKeyDistributionOnlyPlaintext<'_>>, PlaintextDecodeError> {
+    if !has_only_sender_key_distribution_top_level_fields(plaintext)? {
         return Ok(None);
     }
 
-    let view =
-        wa::MessageView::decode_view(plaintext_slice).map_err(PlaintextDecodeError::Decode)?;
+    let view = wa::MessageView::decode_view(plaintext).map_err(PlaintextDecodeError::Decode)?;
     let axolotl_sender_key_distribution_message = view
         .sender_key_distribution_message
         .as_option()
