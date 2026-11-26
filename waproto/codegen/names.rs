@@ -7,8 +7,7 @@ use crate::{features, features::ResolvedFeatures};
 use std::io;
 
 #[cfg(test)]
-#[path = "../build_support/api_guard.rs"]
-mod guard;
+use crate::api_guard as guard;
 
 pub struct TypeName<'a> {
     pub upstream: &'a str,

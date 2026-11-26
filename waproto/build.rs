@@ -3,6 +3,9 @@
 use sha2::{Digest as _, Sha256};
 use std::io::{self, Read as _};
 
+#[cfg(test)]
+#[path = "build_support/api_guard.rs"]
+mod api_guard;
 #[path = "codegen/descriptor.rs"]
 mod descriptor;
 #[path = "codegen/emit_owned.rs"]

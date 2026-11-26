@@ -5,8 +5,7 @@
 mod emission;
 #[path = "../build_support/evolution.rs"]
 mod evolution;
-#[path = "../build_support/inventory.rs"]
-mod inventory;
+use emission::inventory;
 #[allow(dead_code)]
 #[path = "../build_support/names.rs"]
 mod names;

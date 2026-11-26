@@ -14,7 +14,7 @@ mod api_guard;
 pub use api_guard::check_api;
 
 #[path = "inventory.rs"]
-mod inventory;
+pub(crate) mod inventory;
 use inventory::inventory;
 
 #[path = "wallpaper.rs"]

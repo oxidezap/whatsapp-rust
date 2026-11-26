@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::disallowed_methods)]
 
+#[path = "../build_support/api_guard.rs"]
+mod api_guard;
 #[path = "../codegen/descriptor.rs"]
 pub mod descriptor;
 #[path = "../codegen/features.rs"]
