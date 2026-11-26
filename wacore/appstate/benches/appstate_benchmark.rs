@@ -16,6 +16,19 @@ fn main() {
     divan::main();
 }
 
+#[divan::bench]
+fn bench_sync_action_decode_isolated(bencher: divan::Bencher) {
+    let index =
+        b"[\"star\",\"5511000000000@s.whatsapp.net\",\"3EB0123456789ABCDEF01234\",\"1\",\"0\"]";
+    let mut wire = vec![0x0a, index.len() as u8];
+    wire.extend_from_slice(index);
+    wire.extend_from_slice(&[
+        0x12, 0x0a, 0x08, 0x80, 0xe2, 0xcf, 0xaa, 0x06, 0x12, 0x02, 0x08, 0x01, 0x1a, 0x00, 0x20,
+        0x01,
+    ]);
+    bencher.bench(|| black_box(waproto::codec::sync_action_data_decode(black_box(&wire)).unwrap()));
+}
+
 /// 812 MACs = one prekey-upload-sized batch; also the order of magnitude of a
 /// large app-state patch apply.
 #[divan::bench]
