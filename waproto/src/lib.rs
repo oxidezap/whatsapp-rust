@@ -37,14 +37,50 @@ macro_rules! proto {
     }};
     ($message:path { $($field:ident : $value:expr,)+ .. $base:expr $(,)? }) => {{
         let mut message: $message = $base;
-        $(message.$field = ::core::convert::Into::into($value);)+
+        $($crate::__proto_private::assign(&mut message.$field, $value);)+
         message
     }};
     ($message:path { $($field:ident : $value:expr),+ $(,)? }) => {{
         let mut message = <$message>::default();
-        $(message.$field = ::core::convert::Into::into($value);)+
+        $($crate::__proto_private::assign(&mut message.$field, $value);)+
         message
     }};
+}
+
+#[doc(hidden)]
+pub mod __proto_private {
+    pub struct Direct;
+    pub struct OptionalText;
+
+    pub trait IntoField<T, Mode> {
+        fn into_field(self) -> T;
+    }
+
+    impl<T, V: Into<T>> IntoField<T, Direct> for V {
+        #[inline(always)]
+        fn into_field(self) -> T {
+            self.into()
+        }
+    }
+
+    impl IntoField<Option<String>, OptionalText> for &str {
+        #[inline(always)]
+        fn into_field(self) -> Option<String> {
+            Some(self.to_owned())
+        }
+    }
+
+    impl IntoField<Option<String>, OptionalText> for &String {
+        #[inline(always)]
+        fn into_field(self) -> Option<String> {
+            Some(self.clone())
+        }
+    }
+
+    #[inline(always)]
+    pub fn assign<T, V: IntoField<T, Mode>, Mode>(field: &mut T, value: V) {
+        *field = value.into_field();
+    }
 }
 
 /// Common protobuf types, traits, and codecs.

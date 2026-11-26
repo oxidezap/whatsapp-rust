@@ -35,6 +35,50 @@ fn proto_macro_constructs_messages_without_extra_copies() {
 }
 
 #[test]
+fn proto_macro_accepts_text_and_existing_field_conversions() {
+    use waproto::prelude::*;
+
+    let image = proto!(wa::message::ImageMessage { caption: "Hello" });
+    let message = proto!(wa::Message {
+        conversation: Some("Old".into()),
+        image_message: image,
+    });
+    assert_eq!(message.conversation.as_deref(), Some("Old"));
+    let changed = proto!(wa::Message {
+        conversation: "New",
+        ..message
+    });
+    assert_eq!(changed.conversation.as_deref(), Some("New"));
+    assert_eq!(
+        changed
+            .image_message
+            .as_option()
+            .unwrap()
+            .caption
+            .as_deref(),
+        Some("Hello")
+    );
+    let cleared = proto!(wa::Message {
+        conversation: None,
+        ..changed
+    });
+    assert_eq!(cleared.conversation, None);
+    let owned = String::from("Owned");
+    let pointer = owned.as_ptr();
+    let moved = proto!(wa::Message {
+        conversation: owned
+    });
+    assert_eq!(moved.conversation.as_ref().unwrap().as_ptr(), pointer);
+    let text = String::from("Borrowed");
+    let borrowed = proto!(wa::Message {
+        conversation: &text
+    });
+    assert_eq!(borrowed.conversation.as_deref(), Some(text.as_str()));
+    let key = proto!(wa::MessageKey { from_me: true });
+    assert_eq!(key.from_me, Some(true));
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn ordinary_singular_fields_reuse_buffers() {
     use bytes::Buf as _;
