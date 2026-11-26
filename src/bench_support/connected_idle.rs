@@ -502,26 +502,29 @@ impl Session {
                         .step_by(LANES)
                         .map(|i| {
                             let mut proto_value = wa::HistorySyncMsg::default();
-                            proto_value.message = waproto::protobuf::MessageField::some({
+                            proto_value.message = {
                                 let mut proto_value = wa::WebMessageInfo::default();
-                                proto_value.key = waproto::protobuf::MessageField::some({
+                                proto_value.key = {
                                     let mut proto_value = wa::MessageKey::default();
                                     proto_value.remote_jid = Some(group.to_string());
                                     proto_value.from_me = Some(false);
                                     proto_value.id = Some(format!("HISTORY-{i}"));
                                     proto_value.participant = Some(peer_jid.to_string());
                                     proto_value
-                                });
-                                proto_value.message = waproto::protobuf::MessageField::some({
+                                }
+                                .into();
+                                proto_value.message = {
                                     let mut proto_value = wa::Message::default();
                                     proto_value.conversation = Some(text.clone());
                                     proto_value
-                                });
+                                }
+                                .into();
                                 proto_value.message_secret = Some(vec![0x44; 32]);
                                 proto_value.message_timestamp =
                                     Some(wacore::time::now_secs() as u64);
                                 proto_value
-                            });
+                            }
+                            .into();
                             proto_value.msg_order_id = Some(i as u64);
                             proto_value
                         })
@@ -1226,13 +1229,14 @@ impl Wire {
                 ))?;
                 let response = waproto::codec::handshake_message_to_vec(&{
                     let mut proto_value = wa::HandshakeMessage::default();
-                    proto_value.server_hello = waproto::protobuf::MessageField::some({
+                    proto_value.server_hello = {
                         let mut proto_addition = wa::handshake_message::ServerHello::default();
                         proto_addition.ephemeral = Some(ephemeral_pub.to_vec());
                         proto_addition.r#static = Some(encrypted_static);
                         proto_addition.payload = Some(payload);
                         proto_addition
-                    });
+                    }
+                    .into();
                     proto_value
                 });
                 *state = State::Finish {
