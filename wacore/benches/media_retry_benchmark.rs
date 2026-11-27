@@ -15,6 +15,7 @@ const CASES: [&str; 8] = [
     "error_result",
     "invalid_utf8",
 ];
+const PROJECTION_CASES: [&str; 4] = ["short", "path_127", "unknown_short", "invalid_utf8"];
 
 struct Fixture {
     plaintext: Vec<u8>,
@@ -100,7 +101,7 @@ fn notification(bencher: divan::Bencher, case: &str) {
     });
 }
 
-#[divan::bench(args = CASES)]
+#[divan::bench(args = PROJECTION_CASES)]
 fn projection(bencher: divan::Bencher, case: &str) {
     let fixture = fixture(case);
     bencher.bench(|| {

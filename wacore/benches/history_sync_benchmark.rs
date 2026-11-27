@@ -17,7 +17,6 @@
 //! and message* is the number that moves. It costs some absolute throughput on
 //! every row, which is fine as long as before/after are both measured with it.
 
-// Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
 use bytes::Bytes;

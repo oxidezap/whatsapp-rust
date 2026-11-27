@@ -197,6 +197,10 @@ name = "media_retry_benchmark"
 harness = false
 
 [[bench]]
+name = "protobuf_benchmark"
+harness = false
+
+[[bench]]
 name = "retained_memory_benchmark"
 harness = false
 

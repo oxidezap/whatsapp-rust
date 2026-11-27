@@ -1,4 +1,3 @@
-// Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
 use divan::black_box;
