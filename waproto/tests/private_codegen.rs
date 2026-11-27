@@ -16,8 +16,8 @@ pub mod wallpaper;
 
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;
-#[path = "../codegen/indexed_schema.rs"]
-pub mod indexed_schema;
+#[path = "../codegen/media_retry_schema.rs"]
+pub mod media_retry_schema;
 #[path = "../codegen/policy.rs"]
 pub mod policy;
 #[path = "../codegen/project.rs"]
@@ -28,7 +28,9 @@ pub mod schema;
 use descriptor::FileDescriptorSet;
 
 #[test]
-fn indexed_schema_generation_is_deterministic_and_valid_rust() {
+fn media_retry_projection_rejects_schema_shape_changes() {
+    use schema::{FieldNumber, FieldShape, OneofId, Presence, Scalar, ValueType};
+
     let descriptor =
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/whatsapp.desc")).unwrap();
     let mut descriptor = FileDescriptorSet::decode_from_slice(&descriptor).unwrap();
@@ -43,120 +45,54 @@ fn indexed_schema_generation_is_deterministic_and_valid_rust() {
     retained::apply_local_fields(&mut descriptor).unwrap();
     wallpaper::retain_fields(&mut descriptor).unwrap();
     let schema = project::project(&descriptor).unwrap();
-    let first = indexed_schema::generate(&schema).unwrap();
-    assert_eq!(first, indexed_schema::generate(&schema).unwrap());
-    syn::parse_file(&first).unwrap();
-    assert_eq!(
-        first.matches("Schema{identity:").count(),
-        schema.messages.len()
-    );
-}
+    media_retry_schema::validate(&schema).unwrap();
+    let message = schema
+        .messages
+        .iter()
+        .position(|message| message.full_name == ".whatsapp.MediaRetryNotification")
+        .unwrap();
+    let first = schema.messages[message]
+        .fields
+        .iter()
+        .find(|&&id| schema.field(id).number.get() == 1)
+        .unwrap()
+        .0;
 
-#[test]
-fn indexed_schema_preserves_field_shapes() {
-    use schema::*;
-    let enumeration = Enumeration {
-        full_name: ".test.Code".into(),
-        name: "Code".into(),
-        parent: None,
-        open: true,
-        values: vec![
-            EnumValue {
-                name: "NEGATIVE".into(),
-                number: -1,
-            },
-            EnumValue {
-                name: "TWO".into(),
-                number: 2,
-            },
-        ],
+    let mut missing = schema.clone();
+    missing.messages[message].fields.pop();
+    assert!(media_retry_schema::validate(&missing).is_err());
+
+    let mut duplicate = schema.clone();
+    let second = duplicate.messages[message]
+        .fields
+        .iter()
+        .find(|&&id| duplicate.field(id).number.get() == 2)
+        .unwrap()
+        .0;
+    duplicate.fields[second].number = FieldNumber::new(1).unwrap();
+    assert!(media_retry_schema::validate(&duplicate).is_err());
+
+    let mut wrong_type = schema.clone();
+    wrong_type.fields[first].shape = FieldShape::Singular {
+        value: ValueType::Scalar(Scalar::Bytes),
+        presence: Presence::Explicit,
     };
-    let message = Message {
-        full_name: ".test.Record".into(),
-        name: "Record".into(),
-        parent: None,
-        fields: vec![FieldId(0), FieldId(1), FieldId(2)],
-        oneofs: vec![OneofId(0)],
-        map_entry: false,
+    assert!(media_retry_schema::validate(&wrong_type).is_err());
+
+    let mut wrong_presence = schema.clone();
+    wrong_presence.fields[first].shape = FieldShape::Singular {
+        value: ValueType::Scalar(Scalar::String),
+        presence: Presence::Required,
     };
-    let entry = Message {
-        full_name: ".test.Entry".into(),
-        name: "Entry".into(),
-        parent: None,
-        fields: vec![FieldId(3), FieldId(4)],
-        oneofs: vec![],
-        map_entry: true,
-    };
-    let make_field = |owner, name: &str, number, shape| Field {
-        owner,
-        name: name.into(),
-        number: FieldNumber::new(number).unwrap(),
-        shape,
-        default_literal: None,
-        bytes_storage: BytesStorage::Vector,
-    };
-    let schema = Schema {
-        messages: vec![message, entry],
-        enumerations: vec![enumeration],
-        fields: vec![
-            make_field(
-                MessageId(0),
-                "required_text",
-                1,
-                FieldShape::Singular {
-                    value: ValueType::Scalar(Scalar::String),
-                    presence: Presence::Required,
-                },
-            ),
-            make_field(
-                MessageId(0),
-                "codes",
-                2,
-                FieldShape::Repeated {
-                    value: ValueType::Enumeration(EnumId(0)),
-                    packed: true,
-                },
-            ),
-            make_field(
-                MessageId(0),
-                "selected",
-                3,
-                FieldShape::Oneof {
-                    value: ValueType::Scalar(Scalar::Bytes),
-                    owner: OneofId(0),
-                },
-            ),
-            make_field(
-                MessageId(1),
-                "key",
-                1,
-                FieldShape::Singular {
-                    value: ValueType::Scalar(Scalar::String),
-                    presence: Presence::Implicit,
-                },
-            ),
-            make_field(
-                MessageId(1),
-                "value",
-                2,
-                FieldShape::Singular {
-                    value: ValueType::Enumeration(EnumId(0)),
-                    presence: Presence::Implicit,
-                },
-            ),
-        ],
-        oneofs: vec![Oneof {
-            owner: MessageId(0),
-            name: "choice".into(),
-            fields: vec![FieldId(2)],
-        }],
-    };
-    let generated = indexed_schema::generate(&schema).unwrap();
-    assert!(generated.contains("required_prefix:1,fields:&["));
-    assert!(generated.contains("Spec::new(2,Kind::Enum,FieldOptions{repeated:true,packed:true,required:false,open:true},None,&[-1,2])"));
-    assert!(generated.contains("Spec::new(3,Kind::Bytes,FieldOptions{repeated:false,packed:false,required:false,open:false},Some(0),&[])"));
-    assert!(generated.contains("Spec::new(1,Kind::String,FieldOptions{repeated:false,packed:false,required:false,open:false},None,&[])"));
-    assert!(generated.contains("Spec::new(2,Kind::Enum,FieldOptions{repeated:false,packed:false,required:false,open:true},None,&[-1,2])"));
+    assert!(media_retry_schema::validate(&wrong_presence).is_err());
+
+    let mut oneof = schema.clone();
+    oneof.messages[message].oneofs.push(OneofId(0));
+    assert!(media_retry_schema::validate(&oneof).is_err());
+
+    let mut absent = schema;
+    absent.messages[message].full_name.clear();
+    assert!(media_retry_schema::validate(&absent).is_err());
 }
 
 #[test]

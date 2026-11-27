@@ -193,6 +193,10 @@ name = "media_benchmark"
 harness = false
 
 [[bench]]
+name = "media_retry_benchmark"
+harness = false
+
+[[bench]]
 name = "retained_memory_benchmark"
 harness = false
 

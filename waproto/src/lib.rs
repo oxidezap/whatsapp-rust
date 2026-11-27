@@ -145,10 +145,7 @@ pub mod codec {
 
     #[doc(hidden)]
     pub fn media_retry_success(input: &[u8]) -> Option<(&str, &str)> {
-        crate::protobuf::indexed::media_retry_success(
-            input,
-            crate::protobuf::indexed::Limits::default(),
-        )
+        crate::protobuf::projection::media_retry_success(input)
     }
 
     /// Protobuf packs the field number above the 3-bit wire type in the tag.

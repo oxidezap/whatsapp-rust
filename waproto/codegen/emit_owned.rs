@@ -1369,7 +1369,7 @@ impl Emitter<'_> {
                 } else {
                     format!("{RT}::types::borrow_bytes(&mut entry)?")
                 };
-                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::indexed::merge_generated_view(&mut value,payload,child_context)?;"));
+                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::view::merge_generated_view(&mut value,payload,child_context)?;"));
             } else if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
                 out.push_str(&format!(
@@ -1431,9 +1431,9 @@ impl Emitter<'_> {
                 "let child_context=context.descend()?;let payload={payload};"
             ));
             match field.shape{
-                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::indexed::merge_generated_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);}}",self.view_path(id))),
+                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::view::merge_generated_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);}}",self.view_path(id))),
                 FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);",self.view_path(id))),
-                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::indexed::merge_generated_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
+                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::view::merge_generated_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
             }
         } else {
             if matches!(field.shape, FieldShape::Repeated { .. })
@@ -1598,7 +1598,7 @@ impl Emitter<'_> {
         } else {
             "match(tag.field_number(),tag.wire_type()){ "
         };
-        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{let mut value=Self::default();{RT}::indexed::merge_generated_view(&mut value,input,context)?;Ok(value)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
+        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{let mut value=Self::default();{RT}::view::merge_generated_view(&mut value,input,context)?;Ok(value)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
         for field in &message.fields {
             out.push_str(
                 &self.view_decode_field(

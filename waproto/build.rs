@@ -13,8 +13,8 @@ mod descriptor;
 mod emit_owned;
 #[path = "codegen/features.rs"]
 mod features;
-#[path = "codegen/indexed_schema.rs"]
-mod indexed_schema;
+#[path = "codegen/media_retry_schema.rs"]
+mod media_retry_schema;
 #[path = "codegen/names.rs"]
 #[allow(dead_code)]
 mod names;
@@ -89,15 +89,12 @@ fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed=build_support/signal_storage.rs");
     println!("cargo:rerun-if-changed=signal-storage.snapshot");
     let descriptor = std::fs::read("src/whatsapp.desc")?;
-    let (descriptor, source, tags) = whatsapp::generate(&descriptor)?;
-    let schema = project::project(&descriptor).map_err(io::Error::other)?;
-    let indexed = indexed_schema::generate(&schema).map_err(io::Error::other)?;
+    let (_, source, tags) = whatsapp::generate(&descriptor)?;
     let out = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is not set"))?,
     );
     std::fs::write(out.join("generated-whatsapp.rs"), source)?;
     std::fs::write(out.join("generated-tags.rs"), tags)?;
-    std::fs::write(out.join("generated-indexed-schema.rs"), indexed)?;
     #[cfg(feature = "protobuf-reference")]
     reference::generate_reference()?;
     Ok(())

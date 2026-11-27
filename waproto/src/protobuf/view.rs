@@ -57,6 +57,23 @@ pub trait MessageView<'a>: Sized {
     }
 }
 
+pub(crate) fn merge_generated_view<'a, V: MessageView<'a>>(
+    view: &mut V,
+    mut input: &'a [u8],
+    context: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    while !input.is_empty() {
+        let Some((tag, tag_len)) = super::encoding::probe_tag(input) else {
+            return view.merge_into_view(input, context);
+        };
+        let Some(payload) = input.get(tag_len..) else {
+            return view.merge_into_view(input, context);
+        };
+        input = view.merge_view_field(tag, payload, input, context)?;
+    }
+    Ok(())
+}
+
 pub trait HasMessageView: Message + Sized {
     type View<'a>: MessageView<'a, Owned = Self> + super::OwnedViewSource + Send + Sync;
     type ViewHandle: From<super::OwnedView<Self::View<'static>>>
