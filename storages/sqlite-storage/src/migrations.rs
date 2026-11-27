@@ -6,7 +6,6 @@ use diesel::sql_types::VarChar;
 use diesel::sqlite::SqliteConnection;
 use std::collections::HashSet;
 use std::error::Error;
-use std::fmt;
 use wacore::store::error::{Result, StoreError};
 
 diesel::table! {
@@ -132,26 +131,11 @@ struct AppliedMigration {
     version: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to run {name} with: {source}")]
 struct MigrationSqlError {
     name: &'static str,
     source: diesel::result::Error,
-}
-
-impl fmt::Display for MigrationSqlError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Failed to run {} with: {}",
-            self.name, self.source
-        )
-    }
-}
-
-impl Error for MigrationSqlError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 pub(crate) fn run_pending(connection: &mut SqliteConnection) -> Result<()> {
