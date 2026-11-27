@@ -776,6 +776,36 @@ fn repeated_numeric_fields_respect_element_memory_limit() {
 }
 
 #[test]
+fn packed_decode_preserves_limit_and_wire_error_precedence() {
+    let unknown_then_malformed = [0x98, 0x06, 1, 0x22, 1, 0x80];
+    assert_eq!(
+        DecodeOptions::new()
+            .with_unknown_field_limit(0)
+            .decode_from_slice::<ADVKeyIndexList>(&unknown_then_malformed),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    );
+
+    let malformed = [0x22, 3, 1, 2, 0x80];
+    for (limit, expected) in [
+        (size_of::<u32>(), DecodeError::ElementMemoryLimitExceeded),
+        (2 * size_of::<u32>(), DecodeError::UnexpectedEof),
+    ] {
+        assert_eq!(
+            DecodeOptions::new()
+                .with_element_memory_limit(limit)
+                .decode_from_slice::<ADVKeyIndexList>(&malformed),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        DecodeOptions::new()
+            .with_max_message_size(malformed.len() - 1)
+            .decode_from_slice::<ADVKeyIndexList>(&malformed),
+        Err(DecodeError::MessageTooLarge)
+    );
+}
+
+#[test]
 fn numeric_element_budget_is_shared_across_packed_and_unpacked_values() {
     let input = [0x22, 1, 1, 0x20, 2];
     let one_element = DecodeOptions::new().with_element_memory_limit(size_of::<u32>());
@@ -903,6 +933,33 @@ fn packed_view_preserves_values_across_block_boundaries_and_errors() {
             }
         }
     }
+}
+
+#[test]
+fn packed_view_returns_following_fields_after_ascii_blocks() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+    let mut wire = vec![64];
+    wire.extend_from_slice(&[1; 64]);
+    wire.extend_from_slice(&[0x08, 7]);
+    let unknown = Cell::new(10);
+    let budget = Cell::new(64 * size_of::<u32>());
+    let context = DecodeContext::new(10, &unknown).with_element_memory(&budget);
+    let mut view = ADVKeyIndexListView::default();
+    let rest = view
+        .merge_view_field(
+            Tag::new(4, WireType::LengthDelimited),
+            &wire,
+            &wire,
+            context,
+        )
+        .unwrap();
+    assert_eq!(rest, &[0x08, 7]);
+    assert_eq!(&*view.valid_indexes, &[1; 64]);
+    assert_eq!(budget.get(), 0);
 }
 
 #[test]

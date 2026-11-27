@@ -53,7 +53,7 @@ fn indexed_schema_generation_is_deterministic_and_valid_rust() {
 }
 
 #[test]
-fn indexed_schema_preserves_field_shape_and_map_defaults() {
+fn indexed_schema_preserves_field_shapes() {
     use schema::*;
     let enumeration = Enumeration {
         full_name: ".test.Code".into(),
@@ -152,14 +152,11 @@ fn indexed_schema_preserves_field_shape_and_map_defaults() {
         }],
     };
     let generated = indexed_schema::generate(&schema).unwrap();
-    assert!(generated.contains("required_prefix:1,map_defaults:&[]"));
+    assert!(generated.contains("required_prefix:1,fields:&["));
     assert!(generated.contains("Spec::new(2,Kind::Enum,FieldOptions{repeated:true,packed:true,required:false,open:true},None,&[-1,2])"));
     assert!(generated.contains("Spec::new(3,Kind::Bytes,FieldOptions{repeated:false,packed:false,required:false,open:false},Some(0),&[])"));
-    assert!(
-        generated.contains(
-            "map_defaults:&[(0,Value::Bytes(&[])),(1,Value::Varint(18446744073709551615))]"
-        )
-    );
+    assert!(generated.contains("Spec::new(1,Kind::String,FieldOptions{repeated:false,packed:false,required:false,open:false},None,&[])"));
+    assert!(generated.contains("Spec::new(2,Kind::Enum,FieldOptions{repeated:false,packed:false,required:false,open:true},None,&[-1,2])"));
 }
 
 #[test]

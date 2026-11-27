@@ -2915,6 +2915,23 @@ mod tests {
                 .user,
             "999000099990000"
         );
+
+        let mut mapping = wa::LIDMigrationMapping::default();
+        mapping.pn = 15550000002;
+        mapping.assigned_lid = 100000000000002;
+        mapping.latest_lid = Some(0);
+        let mut payload = wa::LIDMigrationMappingSyncPayload::default();
+        payload.pn_to_lid_mappings.push(mapping);
+        let mut sync = wa::LIDMigrationMappingSyncMessage::default();
+        sync.encoded_mapping_payload = Some(payload.encode_to_vec());
+        client.handle_lid_migration_mapping_sync(&sync).await;
+        assert_eq!(
+            client
+                .resolve_encryption_jid(&Jid::pn("15550000002"))
+                .await
+                .user,
+            "100000000000002"
+        );
     }
 
     #[tokio::test]

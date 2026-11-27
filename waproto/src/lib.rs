@@ -116,7 +116,7 @@ pub mod prelude {
 pub use protobuf::open_enum_serde;
 
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside
-/// the buffa code. Hand-written partial decoders must reference these consts
+/// the protobuf code. Hand-written partial decoders must reference these consts
 /// (or compile-time assert against them) instead of magic numbers, so schema
 /// changes surface as compile errors rather than silent wire-format drift.
 pub mod tags {
@@ -125,7 +125,7 @@ pub mod tags {
 
 /// Pinned, non-generic codec entry points for the hottest protobuf roots.
 ///
-/// buffa's `Message` encode/decode methods are generic over the buffer type, so
+/// The `Message` encode/decode methods are generic over the buffer type, so
 /// rustc instantiates them in every crate that calls them; the per-crate copies
 /// carry distinct instantiating-crate symbol hashes that LTO cannot merge, and
 /// each calling crate ends up shipping its own copy of the full encode/decode
@@ -349,7 +349,7 @@ pub mod codec {
         whatsapp::Conversation::decode_from_slice(bytes)
     }
 
-    /// [`conversation_decode`] into an existing struct. buffa's `clear()`
+    /// [`conversation_decode`] into an existing struct. The generated `clear()`
     /// retains `Vec` capacity, so a caller draining thousands of conversations
     /// through one reused struct skips the per-entry message-spine reallocs.
     /// On error the struct is left cleared-then-partially-merged; callers must
@@ -410,12 +410,8 @@ pub mod codec {
         mci.merge_from_slice(bytes)
     }
 
-    /// App state sync roots. wacore-appstate and wacore each instantiated
-    /// these decode/encode trees themselves (SyncActionData drags in the very
-    /// wide SyncActionValue subtree), and buffa 0.9's larger per-instantiation
-    /// decode codegen made those per-crate copies the dominant .text cost of
-    /// the upgrade; pinning them here keeps one copy, shared across the
-    /// snapshot/patch/mutations paths.
+    /// App state sync roots share one copy of their encode/decode trees across
+    /// the snapshot, patch and mutation paths.
     #[inline(never)]
     pub fn syncd_snapshot_decode(
         bytes: &[u8],

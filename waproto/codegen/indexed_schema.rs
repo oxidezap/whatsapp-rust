@@ -73,33 +73,6 @@ fn field_spec(schema: &Schema, message: &Message, field: &Field) -> Result<Strin
     ))
 }
 
-fn map_default(schema: &Schema, field: &Field) -> Result<String, String> {
-    let FieldShape::Singular { value, .. } = field.shape else {
-        return Err(format!("invalid map entry field {}", field.name));
-    };
-    Ok(match value {
-        ValueType::Message(..) | ValueType::Scalar(Scalar::String | Scalar::Bytes) => {
-            "Value::Bytes(&[])".to_owned()
-        }
-        ValueType::Scalar(Scalar::Double | Scalar::Fixed64 | Scalar::Sfixed64) => {
-            "Value::Fixed64(0)".to_owned()
-        }
-        ValueType::Scalar(Scalar::Float | Scalar::Fixed32 | Scalar::Sfixed32) => {
-            "Value::Fixed32(0)".to_owned()
-        }
-        ValueType::Enumeration(id) => {
-            let number = schema
-                .enumeration(id)
-                .values
-                .first()
-                .ok_or_else(|| format!("empty enum for {}", field.name))?
-                .number;
-            format!("Value::Varint({})", number as i64 as u64)
-        }
-        _ => "Value::Varint(0)".to_owned(),
-    })
-}
-
 pub fn generate(schema: &Schema) -> Result<String, String> {
     let mut output = String::new();
     let mut entries = String::new();
@@ -123,18 +96,8 @@ pub fn generate(schema: &Schema) -> Result<String, String> {
         if message.oneofs.len() > usize::from(u16::MAX) + 1 {
             return Err(format!("too many oneofs in {}", message.full_name));
         }
-        let defaults = if message.map_entry {
-            fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| Ok(format!("({index},{})", map_default(schema, field)?)))
-                .collect::<Result<Vec<_>, String>>()?
-                .join(",")
-        } else {
-            String::new()
-        };
         let mut declaration = String::new();
-        write!(declaration, "Schema{{identity:SchemaIdentity({identity}),oneofs:{},required_prefix:{required_prefix},map_defaults:&[{defaults}],fields:&[", message.oneofs.len()).map_err(|error| error.to_string())?;
+        write!(declaration, "Schema{{identity:SchemaIdentity({identity}),oneofs:{},required_prefix:{required_prefix},fields:&[", message.oneofs.len()).map_err(|error| error.to_string())?;
         for field in &fields {
             declaration.push_str(&field_spec(schema, message, field)?);
             declaration.push(',');

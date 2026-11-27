@@ -35,37 +35,6 @@ fn message_wire(shape: &str) -> Vec<u8> {
             message.interactive_message = Some(interactive).into();
             message
         }
-        "dense" => {
-            let mut message = wa::Message::default().with_conversation("synthetic text");
-            macro_rules! set_fields {
-                ($($field:ident),+ $(,)?) => { $(message.$field = Some(Default::default()).into();)+ };
-            }
-            set_fields!(
-                view_once_message,
-                ephemeral_message,
-                document_with_caption_message,
-                view_once_message_v2,
-                edited_message,
-                view_once_message_v2_extension,
-                group_mentioned_message,
-                bot_invoke_message,
-                lottie_sticker_message,
-                event_cover_image,
-                status_mention_message,
-                poll_creation_option_image_message,
-                associated_child_message,
-                group_status_mention_message,
-                poll_creation_message_v4,
-                status_add_yours,
-                group_status_message,
-                limit_sharing_message,
-                bot_task_message,
-                question_message,
-                group_status_message_v2,
-                bot_forwarded_message
-            );
-            message
-        }
         "media" => {
             let mut message = wa::Message::default();
             message.image_message = Some(
@@ -106,153 +75,6 @@ fn packed_wire() -> Vec<u8> {
     value.raw_id = Some(7);
     value.valid_indexes = (0..256).collect();
     value.encode_to_vec()
-}
-
-mod packed_sizes {
-    use super::*;
-
-    fn wire(case: &str) -> Vec<u8> {
-        let (count, pattern) = case
-            .split_once('-')
-            .expect("benchmark case must contain a count and pattern");
-        let count: u32 = count.parse().expect("benchmark count must be numeric");
-        let mut value = wa::ADVKeyIndexList::default();
-        value.valid_indexes = (0..count)
-            .map(|index| match pattern {
-                "small" => index % 128,
-                "mixed" => index,
-                "large" => u32::MAX - index,
-                "three" => 16_384 + index,
-                "first3" => {
-                    if index == 0 {
-                        16_384
-                    } else {
-                        1
-                    }
-                }
-                "middle3" => {
-                    if index == count / 2 {
-                        16_384
-                    } else {
-                        1
-                    }
-                }
-                "last3" => {
-                    if index + 1 == count {
-                        16_384
-                    } else {
-                        1
-                    }
-                }
-                "alternate3" => {
-                    if index % 2 == 0 {
-                        16_384
-                    } else {
-                        1
-                    }
-                }
-                "first5" => {
-                    if index == 0 {
-                        u32::MAX
-                    } else {
-                        1
-                    }
-                }
-                "firstshort" => {
-                    if index == 0 {
-                        1
-                    } else {
-                        u32::MAX
-                    }
-                }
-                "ten" | "firstten" => {
-                    if pattern == "ten" || index == 0 {
-                        u32::MAX
-                    } else {
-                        1
-                    }
-                }
-                "first" => {
-                    if index == 0 {
-                        128
-                    } else {
-                        1
-                    }
-                }
-                "middle" => {
-                    if index == count / 2 {
-                        128
-                    } else {
-                        1
-                    }
-                }
-                "last" => {
-                    if index + 1 == count {
-                        128
-                    } else {
-                        1
-                    }
-                }
-                _ => unreachable!(),
-            })
-            .collect();
-        let wire = if matches!(pattern, "ten" | "firstten") {
-            let mut payload = Vec::new();
-            for index in 0..count {
-                let n = if pattern == "ten" || index == 0 {
-                    u64::MAX
-                } else {
-                    1
-                };
-                waproto::protobuf::encoding::encode_varint(n, &mut payload);
-            }
-            let mut wire = vec![0x22];
-            waproto::protobuf::encoding::encode_varint(payload.len() as u64, &mut wire);
-            wire.extend_from_slice(&payload);
-            wire
-        } else {
-            value.encode_to_vec()
-        };
-        let reference = <reference::ADVKeyIndexList as buffa::Message>::decode_from_slice(&wire)
-            .expect("synthetic protobuf benchmark fixture must be valid");
-        assert_eq!(value.valid_indexes, reference.valid_indexes);
-        wire
-    }
-
-    macro_rules! bench {
-        ($name:ident, $ty:ty, $trait:path, $decode:ident) => {
-            #[divan::bench(args = ["0-small", "1-small", "4-small", "8-small", "16-small", "32-small", "256-small", "256-mixed", "256-large", "256-first", "256-middle", "256-last", "256-three", "256-first3", "256-middle3", "256-last3", "256-alternate3", "256-first5", "256-firstshort", "256-ten", "256-firstten", "4096-mixed", "4096-first", "4096-middle", "4096-last"])]
-            fn $name(bencher: divan::Bencher, case: &str) {
-                let wire = wire(case);
-                bencher.bench(|| black_box(<$ty as $trait>::$decode(black_box(&wire)).expect("synthetic protobuf benchmark fixture must be valid")));
-            }
-        };
-    }
-
-    bench!(
-        owned_sdk,
-        wa::ADVKeyIndexList,
-        waproto::protobuf::Message,
-        decode_from_slice
-    );
-    bench!(
-        owned_buffa,
-        reference::ADVKeyIndexList,
-        buffa::Message,
-        decode_from_slice
-    );
-    bench!(
-        view_sdk,
-        wa::ADVKeyIndexListView<'_>,
-        waproto::protobuf::MessageView,
-        decode_view
-    );
-    bench!(
-        view_buffa,
-        reference::ADVKeyIndexListView<'_>,
-        buffa::MessageView,
-        decode_view
-    );
 }
 
 fn map_wire() -> Vec<u8> {
@@ -475,7 +297,7 @@ mod fragmented {
     }
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_owned_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -486,7 +308,7 @@ fn message_owned_zero(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -497,7 +319,7 @@ fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_view_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -508,7 +330,7 @@ fn message_view_zero(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -519,7 +341,7 @@ fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_encode_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     let message = wa::Message::decode_from_slice(&wire)
@@ -527,7 +349,7 @@ fn message_encode_zero(bencher: divan::Bencher, shape: &str) {
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
-#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof"])]
 fn message_encode_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     let message = <reference::Message as buffa::Message>::decode_from_slice(&wire)
