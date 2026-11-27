@@ -43,6 +43,7 @@ prettyplease = { version = "0.3" }
 
 [dev-dependencies]
 buffa = { workspace = true }
+divan = { workspace = true }
 sha2 = { workspace = true }
 buffa-build = { workspace = true }
 buffa-descriptor = { workspace = true }
@@ -51,6 +52,11 @@ serde_json = { workspace = true, features = ["std"] }
 syn = { version = "3.0", features = ["full", "visit-mut"] }
 quote = "1"
 prettyplease = "0.3"
+
+[[bench]]
+name = "codec_comparison"
+harness = false
+required-features = ["protobuf-reference"]
 
 [lints]
 workspace = true

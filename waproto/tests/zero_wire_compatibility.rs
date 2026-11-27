@@ -122,12 +122,13 @@ fn zero_reader_retains_original_tag_width() {
         (&[0x88, 0, 1][..], 2),
         (&[0x82, 0xb5, 0x18, 0][..], 3),
     ] {
+        let (_, _, actual_width) = zero_wire::tag_prefix(input).unwrap();
         let field = zero_wire::Reader::new(input, zero_wire::Limits::default())
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(field.tag_len, width);
+        assert_eq!(actual_width, width);
         assert_eq!(field.raw, input);
     }
 }

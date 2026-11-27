@@ -83,21 +83,9 @@ impl Tag {
 }
 
 pub(crate) fn probe_tag(input: &[u8]) -> Option<(Tag, usize)> {
-    use super::indexed_wire::{Limits, Reader, Value};
-    let limits = Limits {
-        max_message_bytes: MAX_MESSAGE_BYTES as usize,
-        max_fields: 1,
-        max_group_depth: 0,
-    };
-    let field = Reader::new(input, limits).ok()?.next()?.ok()?;
-    let kind = match field.value {
-        Value::Varint(_) => WireType::Varint,
-        Value::Fixed64(_) => WireType::Fixed64,
-        Value::Bytes(_) => WireType::LengthDelimited,
-        Value::Fixed32(_) => WireType::Fixed32,
-        Value::Group(_) => return None,
-    };
-    Some((Tag::new(field.number.get(), kind), field.tag_len))
+    let (number, wire, length) = super::indexed_wire::tag_prefix(input).ok()?;
+    let kind = WireType::from_u32(u32::from(wire)).ok()?;
+    Some((Tag::new(number.get(), kind), length))
 }
 
 #[inline]
@@ -349,12 +337,6 @@ pub fn skip_field_depth(
     input: &mut impl bytes::Buf,
     depth: u32,
 ) -> Result<(), DecodeError> {
-    if let Some(length) =
-        super::indexed_wire::probe_value(input.chunk(), tag.number, tag.kind as u8)
-    {
-        input.advance(length);
-        return Ok(());
-    }
     let count = match tag.kind {
         WireType::Varint => {
             decode_varint(input)?;
@@ -404,6 +386,9 @@ pub fn skip_unknown_field(
     context: super::DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     context.register_unknown_field()?;
+    if tag.kind == WireType::LengthDelimited {
+        return skip_length_delimited(input);
+    }
     if tag.kind != WireType::StartGroup {
         return skip_field_depth(tag, input, context.depth());
     }
@@ -428,6 +413,37 @@ pub fn skip_field(tag: Tag, input: &mut impl bytes::Buf) -> Result<(), DecodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingBuf<'a> {
+        input: &'a [u8],
+        advances: Vec<usize>,
+    }
+
+    impl bytes::Buf for RecordingBuf<'_> {
+        fn remaining(&self) -> usize {
+            self.input.len()
+        }
+        fn chunk(&self) -> &[u8] {
+            self.input
+        }
+        fn advance(&mut self, count: usize) {
+            self.advances.push(count);
+            self.input = &self.input[count..];
+        }
+    }
+
+    #[test]
+    fn tag_probe_accepts_incomplete_payloads_without_consuming_them() {
+        for (input, number, kind, width) in [
+            (&[0x08][..], 1, WireType::Varint, 1),
+            (&[0x8a, 0, 2, 1][..], 1, WireType::LengthDelimited, 2),
+            (&[0x0b][..], 1, WireType::StartGroup, 1),
+        ] {
+            assert_eq!(probe_tag(input), Some((Tag::new(number, kind), width)));
+        }
+        assert_eq!(probe_tag(&[0x80]), None);
+        assert_eq!(probe_tag(&[0x06]), None);
+    }
 
     #[test]
     fn varint_boundaries_and_cursor_match_reference() {
@@ -612,6 +628,43 @@ mod tests {
             skip_field_depth(Tag::new(7, kind), &mut input, 100).unwrap();
             assert_eq!(input, &bytes[consumed..]);
         }
+    }
+
+    #[test]
+    fn length_delimited_skip_preserves_advance_boundaries() {
+        let mut input = RecordingBuf {
+            input: &[2, 7, 8, 42],
+            advances: Vec::new(),
+        };
+        skip_field_depth(Tag::new(7, WireType::LengthDelimited), &mut input, 100).unwrap();
+        assert_eq!(input.input, &[42]);
+        assert_eq!(input.advances, [1, 2]);
+    }
+
+    #[test]
+    fn owned_decoder_preserves_multibyte_tag_advance_boundaries() {
+        let bytes = &[0xc5, 0x0c, 1, 2, 3, 0xff];
+        let mut reference = RecordingBuf {
+            input: bytes,
+            advances: Vec::new(),
+        };
+        let tag = Tag::decode(&mut reference).unwrap();
+        let unknown = std::cell::Cell::new(1);
+        skip_unknown_field(
+            tag,
+            &mut reference,
+            super::super::DecodeContext::new(100, &unknown),
+        )
+        .unwrap();
+        let mut actual = RecordingBuf {
+            input: bytes,
+            advances: Vec::new(),
+        };
+        super::super::DecodeOptions::new()
+            .decode::<crate::whatsapp::Message>(&mut actual)
+            .unwrap();
+        assert_eq!(actual.input, reference.input);
+        assert_eq!(actual.advances, reference.advances);
     }
 
     #[test]

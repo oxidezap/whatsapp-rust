@@ -5782,6 +5782,7 @@ dependencies = [
  "buffa-build",
  "buffa-descriptor",
  "bytes",
+ "codspeed-divan-compat",
  "hashbrown 0.15.5",
  "heck",
  "prettyplease 0.3.0",

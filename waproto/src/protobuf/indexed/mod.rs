@@ -5556,6 +5556,68 @@ mod migration_tests {
     use super::*;
     use crate::protobuf::MessageView as _;
 
+    fn schema_named(name: &str) -> &'static Schema {
+        let index = SCHEMA_NAMES.iter().position(|item| *item == name).unwrap();
+        SCHEMAS[index]
+    }
+
+    #[test]
+    fn builder_edits_text_without_discarding_unknown_fields() {
+        let schema = schema_named(".whatsapp.Message");
+        let text = *schema
+            .fields
+            .iter()
+            .find(|field| field.number() == 1)
+            .unwrap();
+        let input = b"\x0a\x03old\x80\xb5\x18\x07";
+        let view = View::parse(input, schema, Limits::default()).unwrap();
+        let mut builder = Builder::from_view(&view);
+        builder.scalar(text, "new", false).unwrap();
+        let output = builder.finish().unwrap();
+        let edited = View::parse(&output, schema, Limits::default()).unwrap();
+        assert_eq!(edited.scalar::<&str>(text).unwrap(), Some("new"));
+        let unknown = edited
+            .unknown_fields()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].raw(), Some(&b"\x80\xb5\x18\x07"[..]));
+        let public = crate::whatsapp::MessageView::decode_view(&output).unwrap();
+        assert_eq!(public.conversation, Some("new"));
+    }
+
+    #[test]
+    fn builder_encodes_packed_values_and_respects_oneof_selection() {
+        let schema = schema_named(".whatsapp.ADVKeyIndexList");
+        let indexes = *schema
+            .fields
+            .iter()
+            .find(|field| field.number() == 4)
+            .unwrap();
+        let mut builder = Builder::new(schema, Limits::default());
+        builder.scalar(indexes, 1u32, true).unwrap();
+        builder.scalar(indexes, 300u32, true).unwrap();
+        let output = builder.finish().unwrap();
+        assert_eq!(output, b"\x22\x03\x01\xac\x02");
+        let public = crate::whatsapp::ADVKeyIndexListView::decode_view(&output).unwrap();
+        assert_eq!(
+            public.valid_indexes.iter().copied().collect::<Vec<_>>(),
+            [1, 300]
+        );
+
+        let schema = schema_named(".whatsapp.HydratedTemplateButton");
+        let quick_reply = *schema
+            .fields
+            .iter()
+            .find(|field| field.number() == 1)
+            .unwrap();
+        let input = b"\x12\x00";
+        let view = View::parse(input, schema, Limits::default()).unwrap();
+        let mut builder = Builder::from_view(&view);
+        builder.clear(quick_reply).unwrap();
+        assert_eq!(builder.finish().unwrap(), input);
+    }
+
     #[test]
     fn indexed_errors_keep_their_messages() {
         for (error, expected) in [

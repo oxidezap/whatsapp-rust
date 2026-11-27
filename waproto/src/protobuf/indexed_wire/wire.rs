@@ -35,7 +35,6 @@ pub struct Field<'a> {
     pub number: FieldNumber,
     pub value: Value<'a>,
     pub raw: &'a [u8],
-    pub(crate) tag_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -317,24 +316,12 @@ impl<'a> Iterator for Reader<'a> {
             return None;
         }
         let start = self.remaining;
-        let result = (|| {
-            let (number, wire) = tag(&mut self.remaining)?;
-            let tag_len = start.len() - self.remaining.len();
-            let value = read_value(
-                &mut self.remaining,
-                number,
-                wire,
-                &mut self.fields_left,
-                self.group_depth,
-            )?;
-            Ok::<_, DecodeError>((number, value, tag_len))
-        })();
+        let result = read_field(&mut self.remaining, &mut self.fields_left, self.group_depth);
         Some(match result {
-            Ok((number, value, tag_len)) => Ok(Field {
+            Ok((number, value)) => Ok(Field {
                 number,
                 value,
                 raw: &start[..start.len() - self.remaining.len()],
-                tag_len,
             }),
             Err(error) => {
                 self.remaining = &[];
@@ -358,14 +345,29 @@ fn varint(input: &mut &[u8]) -> Result<u64, DecodeError> {
     Ok(value)
 }
 
-fn tag(input: &mut &[u8]) -> Result<(FieldNumber, u8), DecodeError> {
-    let value = u32::try_from(varint(input)?).map_err(|_| DecodeError::InvalidTag)?;
+fn tag_parts(value: u64) -> Result<(FieldNumber, u8), DecodeError> {
+    let value = u32::try_from(value).map_err(|_| DecodeError::InvalidTag)?;
     let number = FieldNumber::new(value >> 3)?;
     let wire = (value & 7) as u8;
     if wire > 5 {
         return Err(DecodeError::InvalidWireType);
     }
     Ok((number, wire))
+}
+
+fn tag(input: &mut &[u8]) -> Result<(FieldNumber, u8), DecodeError> {
+    tag_parts(varint(input)?)
+}
+
+pub(crate) fn tag_prefix(input: &[u8]) -> Result<(FieldNumber, u8, usize), DecodeError> {
+    let first = *input.first().ok_or(DecodeError::Truncated)?;
+    let (value, length) = if first < 0x80 {
+        (u64::from(first), 1)
+    } else {
+        decode_varint(input)?
+    };
+    let (number, wire) = tag_parts(value)?;
+    Ok((number, wire, length))
 }
 
 fn read_field<'a>(
@@ -546,14 +548,6 @@ fn read_value<'a>(
         }
         _ => return Err(DecodeError::InvalidWireType),
     })
-}
-
-pub(crate) fn probe_value(input: &[u8], number: u32, wire: u8) -> Option<usize> {
-    let number = FieldNumber::new(number).ok()?;
-    let mut remaining = input;
-    let mut fields_left = 1;
-    read_value(&mut remaining, number, wire, &mut fields_left, 0).ok()?;
-    Some(input.len() - remaining.len())
 }
 
 pub trait WriteSink {

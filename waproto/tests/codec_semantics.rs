@@ -129,6 +129,91 @@ fn generated_views_preserve_overlong_tag_boundaries() {
     assert_eq!(owned.conversation.as_deref(), Some("b"));
 }
 
+#[test]
+fn generated_and_default_view_decoders_preserve_results_and_budgets() {
+    use std::cell::Cell;
+    use std::fmt::Debug;
+    use waproto::protobuf::DecodeContext;
+
+    fn compare<'a, V: waproto::protobuf::MessageView<'a> + Default + Debug + PartialEq>(
+        input: &'a [u8],
+        depth: u32,
+        unknown_limit: usize,
+        element_limit: usize,
+    ) {
+        let raw_unknown = Cell::new(unknown_limit);
+        let raw_elements = Cell::new(element_limit);
+        let indexed_unknown = Cell::new(unknown_limit);
+        let indexed_elements = Cell::new(element_limit);
+        let raw_context =
+            DecodeContext::new(depth, &raw_unknown).with_element_memory(&raw_elements);
+        let indexed_context =
+            DecodeContext::new(depth, &indexed_unknown).with_element_memory(&indexed_elements);
+        let raw = V::decode_view_ctx(input, raw_context);
+        let indexed = V::decode_view_with_ctx(input, indexed_context);
+        assert_eq!(
+            indexed, raw,
+            "input={input:02x?}, depth={depth}, unknown={unknown_limit}, elements={element_limit}"
+        );
+        assert_eq!(indexed_unknown.get(), raw_unknown.get());
+        assert_eq!(indexed_elements.get(), raw_elements.get());
+    }
+
+    for input in [
+        &[][..],
+        &[0x08, 0x96, 1, 0x22, 3, 1, 0xac, 2][..],
+        &[0x08, 0x80][..],
+        &[0x0a, 2, 0xff][..],
+        &[0x28, 99][..],
+        &[0x82, 0xb5, 0x18, 2, 1][..],
+        &[0x88, 0, 1][..],
+        &[0xab, 0x06, 0x08, 1, 0xac, 0x06][..],
+    ] {
+        for unknown in [0, 1, 10] {
+            for elements in [0, 4, 128] {
+                compare::<ADVKeyIndexListView<'_>>(input, 2, unknown, elements);
+            }
+        }
+    }
+    for input in [
+        &[0x0a, 5, 0x0a, 3, b'a', b'b', b'c'][..],
+        &[0x0a, 2, 0x0a][..],
+    ] {
+        for depth in [0, 1, 2] {
+            compare::<waproto::whatsapp::AIQueryFanoutView<'_>>(input, depth, 1, 128);
+        }
+    }
+    for input in [
+        &[0x0a, 4, 0x08, 1, 0x12, 0][..],
+        &[0x0a, 4, 0x08, 1, 0x12][..],
+        &[0x0a, 2, 0x18, 0][..],
+    ] {
+        for depth in [0, 1, 2] {
+            for unknown in [0, 1] {
+                for elements in [0, 128] {
+                    compare::<waproto::whatsapp::ConfigView<'_>>(input, depth, unknown, elements);
+                }
+            }
+        }
+    }
+    let mut state = 0x96a3_5f27_31dc_b40eu64;
+    for length in 0..=24 {
+        for _ in 0..256 {
+            let input: Vec<u8> = (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            compare::<ADVKeyIndexListView<'_>>(&input, 2, 1, 64);
+            compare::<waproto::whatsapp::MessageView<'_>>(&input, 2, 1, 64);
+            compare::<waproto::whatsapp::ConfigView<'_>>(&input, 2, 1, 64);
+        }
+    }
+}
+
 struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
 
 impl<'a> waproto::protobuf::MessageView<'a> for CustomIndexView<'a> {
@@ -513,6 +598,51 @@ fn numeric_element_budget_is_shared_across_packed_and_unpacked_values() {
             .unwrap()
             .valid_indexes,
         &[1, 2]
+    );
+}
+
+#[test]
+fn packed_long_payload_preserves_error_order_and_limits() {
+    let mut input = vec![0x22, 33];
+    input.extend_from_slice(&[1; 32]);
+    input.push(0x80);
+    for budget in [0, 4, 64, 128, 132] {
+        let options = DecodeOptions::new().with_element_memory_limit(budget);
+        let expected = if budget < 128 {
+            DecodeError::ElementMemoryLimitExceeded
+        } else {
+            DecodeError::UnexpectedEof
+        };
+        assert_eq!(
+            options
+                .decode_from_slice::<ADVKeyIndexList>(&input)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            options
+                .decode_view::<ADVKeyIndexListView<'_>>(&input)
+                .unwrap_err(),
+            expected
+        );
+    }
+    *input.last_mut().unwrap() = 1;
+    let options = DecodeOptions::new().with_element_memory_limit(132);
+    assert_eq!(
+        options
+            .decode_from_slice::<ADVKeyIndexList>(&input)
+            .unwrap()
+            .valid_indexes
+            .len(),
+        33
+    );
+    assert_eq!(
+        options
+            .decode_view::<ADVKeyIndexListView<'_>>(&input)
+            .unwrap()
+            .valid_indexes
+            .len(),
+        33
     );
 }
 
