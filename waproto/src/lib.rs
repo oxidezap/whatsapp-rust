@@ -16,9 +16,6 @@
 //!
 #![allow(clippy::large_enum_variant)]
 extern crate alloc;
-/// Compatibility path for the protobuf traits and containers used by this crate.
-pub use protobuf as buffa;
-
 /// Protobuf messages, views, containers, and encoding APIs owned by this crate.
 pub mod protobuf;
 

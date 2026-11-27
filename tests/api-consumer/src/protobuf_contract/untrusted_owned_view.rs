@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use whatsapp_rust::buffa::{
+use whatsapp_rust::waproto::protobuf::{
     DecodeContext, DecodeError, MessageView, OwnedView, bytes::Bytes, encoding::Tag,
 };
 
