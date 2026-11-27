@@ -16,6 +16,8 @@ pub mod wallpaper;
 
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;
+#[path = "../codegen/media_retry_schema.rs"]
+pub mod media_retry_schema;
 #[path = "../codegen/policy.rs"]
 pub mod policy;
 #[path = "../codegen/project.rs"]
@@ -24,6 +26,74 @@ pub mod project;
 pub mod schema;
 
 use descriptor::FileDescriptorSet;
+
+#[test]
+fn media_retry_projection_rejects_schema_shape_changes() {
+    use schema::{FieldNumber, FieldShape, OneofId, Presence, Scalar, ValueType};
+
+    let descriptor =
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/whatsapp.desc")).unwrap();
+    let mut descriptor = FileDescriptorSet::decode_from_slice(&descriptor).unwrap();
+    names::apply(
+        &mut descriptor,
+        names::TYPES,
+        names::FIELDS,
+        names::ENUM_VALUES,
+        names::ONEOFS,
+    )
+    .unwrap();
+    retained::apply_local_fields(&mut descriptor).unwrap();
+    wallpaper::retain_fields(&mut descriptor).unwrap();
+    let schema = project::project(&descriptor).unwrap();
+    media_retry_schema::validate(&schema).unwrap();
+    let message = schema
+        .messages
+        .iter()
+        .position(|message| message.full_name == ".whatsapp.MediaRetryNotification")
+        .unwrap();
+    let first = schema.messages[message]
+        .fields
+        .iter()
+        .find(|&&id| schema.field(id).number.get() == 1)
+        .unwrap()
+        .0;
+
+    let mut missing = schema.clone();
+    missing.messages[message].fields.pop();
+    assert!(media_retry_schema::validate(&missing).is_err());
+
+    let mut duplicate = schema.clone();
+    let second = duplicate.messages[message]
+        .fields
+        .iter()
+        .find(|&&id| duplicate.field(id).number.get() == 2)
+        .unwrap()
+        .0;
+    duplicate.fields[second].number = FieldNumber::new(1).unwrap();
+    assert!(media_retry_schema::validate(&duplicate).is_err());
+
+    let mut wrong_type = schema.clone();
+    wrong_type.fields[first].shape = FieldShape::Singular {
+        value: ValueType::Scalar(Scalar::Bytes),
+        presence: Presence::Explicit,
+    };
+    assert!(media_retry_schema::validate(&wrong_type).is_err());
+
+    let mut wrong_presence = schema.clone();
+    wrong_presence.fields[first].shape = FieldShape::Singular {
+        value: ValueType::Scalar(Scalar::String),
+        presence: Presence::Required,
+    };
+    assert!(media_retry_schema::validate(&wrong_presence).is_err());
+
+    let mut oneof = schema.clone();
+    oneof.messages[message].oneofs.push(OneofId(0));
+    assert!(media_retry_schema::validate(&oneof).is_err());
+
+    let mut absent = schema;
+    absent.messages[message].full_name.clear();
+    assert!(media_retry_schema::validate(&absent).is_err());
+}
 
 #[test]
 fn private_codecs_are_current_and_deterministic() {

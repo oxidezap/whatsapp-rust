@@ -6,6 +6,7 @@ use whatsapp_rust::download::{
     DownloadParams, Downloadable, MediaDownloader, MediaRoute, MediaType,
 };
 use whatsapp_rust::upload::UploadResponse;
+use whatsapp_rust::waproto::protobuf::MessageField as ProtoMessageField;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -36,7 +37,7 @@ fn build_image_message(upload: &UploadResponse, caption: Option<&str>) -> wa::Me
     let upload = UploadedMediaParts::from(upload);
     {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.image_message = whatsapp_rust::buffa::MessageField::some({
+        proto_contract_fixture.image_message = ProtoMessageField::some({
             let mut proto_contract_fixture = wa::message::ImageMessage::default();
             proto_contract_fixture.url = Some(upload.url);
             proto_contract_fixture.direct_path = Some(upload.direct_path);
@@ -61,7 +62,7 @@ fn build_video_message(
     let upload = UploadedMediaParts::from(upload);
     {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.video_message = whatsapp_rust::buffa::MessageField::some({
+        proto_contract_fixture.video_message = ProtoMessageField::some({
             let mut proto_contract_fixture = wa::message::VideoMessage::default();
             proto_contract_fixture.url = Some(upload.url);
             proto_contract_fixture.direct_path = Some(upload.direct_path);
@@ -83,7 +84,7 @@ fn build_document_message(upload: &UploadResponse, filename: &str, mimetype: &st
     let upload = UploadedMediaParts::from(upload);
     {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.document_message = whatsapp_rust::buffa::MessageField::some({
+        proto_contract_fixture.document_message = ProtoMessageField::some({
             let mut proto_contract_fixture = wa::message::DocumentMessage::default();
             proto_contract_fixture.url = Some(upload.url);
             proto_contract_fixture.direct_path = Some(upload.direct_path);
@@ -104,7 +105,7 @@ fn build_audio_message(upload: &UploadResponse, ptt: bool, seconds: u32) -> wa::
     let upload = UploadedMediaParts::from(upload);
     {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.audio_message = whatsapp_rust::buffa::MessageField::some({
+        proto_contract_fixture.audio_message = ProtoMessageField::some({
             let mut proto_contract_fixture = wa::message::AudioMessage::default();
             proto_contract_fixture.url = Some(upload.url);
             proto_contract_fixture.direct_path = Some(upload.direct_path);

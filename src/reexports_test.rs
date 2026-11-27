@@ -1,8 +1,8 @@
 //! Compile-shaped proof that a downstream crate can build message literals and
 //! implement the async traits using only this crate's re-exports (no direct
-//! buffa/bytes/async-trait dependency of its own).
+//! bytes/async-trait dependency of its own).
 #![cfg(test)]
-// Tests/benches exercise the raw buffa API.
+// Test fixtures compare against the optional Buffa reference codec.
 #![allow(clippy::disallowed_methods)]
 // The `whatsapp_rust::` prefixes ARE the assertion here — spelling a path the way
 // a downstream consumer would is the only thing this file checks. Shortening them
@@ -17,7 +17,7 @@ fn message_literals_build_from_reexports_only() {
     // Explicit MessageField path, as a consumer would write it.
     let explicit = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = whatsapp_rust::buffa::MessageField::some({
+        proto.extended_text_message = whatsapp_rust::waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("hi".into());
             proto
@@ -38,7 +38,7 @@ fn message_literals_build_from_reexports_only() {
     assert_eq!(explicit, via_into);
 
     // Encode/decode through the re-exported Message trait.
-    use whatsapp_rust::buffa::Message as _;
+    use whatsapp_rust::waproto::protobuf::Message as _;
     let bytes = explicit.encode_to_vec();
     let back = wa::Message::decode_from_slice(&bytes).unwrap();
     assert_eq!(back, via_into);

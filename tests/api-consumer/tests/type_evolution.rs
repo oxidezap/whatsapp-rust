@@ -1,8 +1,8 @@
 //! Downstream contracts across the SDK's public dependency reexports.
 #![cfg(feature = "sdk")]
 
-use buffa::{Message as _, MessageView as _};
-use whatsapp_rust::{buffa, waproto::whatsapp as wa};
+use whatsapp_rust::waproto::protobuf::{Message as _, MessageView as _};
+use whatsapp_rust::{protobuf, waproto::whatsapp as wa};
 
 #[test]
 fn open_envelope_enums_support_named_values_unknown_payloads_and_future_variants() {
@@ -40,8 +40,8 @@ fn dependency_reexports_accept_the_same_public_types() {
 
     let mut message = wa::Message::default();
     message.conversation = Some("synthetic".into());
-    let field: whatsapp_rust::buffa::MessageField<wa::Message> = message.into();
-    let _: whatsapp_rust::waproto::buffa::MessageField<wa::Message> = field;
+    let field: protobuf::MessageField<wa::Message> = message.into();
+    let _: whatsapp_rust::waproto::protobuf::MessageField<wa::Message> = field;
 }
 
 #[test]

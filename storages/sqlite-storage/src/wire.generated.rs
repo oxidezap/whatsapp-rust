@@ -79,19 +79,15 @@ impl ::waproto::protobuf::Message for NoiseCert {
         let _ = &output;
         if !self.key.is_empty() {
             let v = &self.key;
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, v, output);
         }
         if self.not_before != 0 {
             let v = &self.not_before;
-            ::waproto::protobuf::encoding::put_varint(16, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(2, *v as u64, output);
         }
         if self.not_after != 0 {
             let v = &self.not_after;
-            ::waproto::protobuf::encoding::put_varint(24, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(3, *v as u64, output);
         }
     }
     fn merge_field(
@@ -253,8 +249,7 @@ impl ::waproto::protobuf::Message for ServerCertChain {
         }
         if self.signature_verified {
             let v = &self.signature_verified;
-            ::waproto::protobuf::encoding::put_varint(24, output);
-            ::waproto::protobuf::encoding::put_varint(u64::from(*v), output);
+            ::waproto::protobuf::encoding::put_varint_field(3, u64::from(*v), output);
         }
     }
     fn merge_field(
@@ -393,20 +388,15 @@ impl ::waproto::protobuf::Message for AppStateSyncKeyWire {
         let _ = &output;
         if !self.key_data.is_empty() {
             let v = &self.key_data;
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, v, output);
         }
         if !self.fingerprint.is_empty() {
             let v = &self.fingerprint;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         if self.timestamp != 0 {
             let v = &self.timestamp;
-            ::waproto::protobuf::encoding::put_varint(24, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(3, *v as u64, output);
         }
     }
     fn merge_field(
@@ -565,14 +555,11 @@ impl ::waproto::protobuf::Message for HashStateWire {
         let _ = &output;
         if self.version != 0 {
             let v = &self.version;
-            ::waproto::protobuf::encoding::put_varint(8, output);
-            ::waproto::protobuf::encoding::put_varint(*v, output);
+            ::waproto::protobuf::encoding::put_varint_field(1, *v, output);
         }
         if !self.hash.is_empty() {
             let v = &self.hash;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         for (k, v) in &self.index_value_map {
             let entry = 1u64
@@ -582,22 +569,16 @@ impl ::waproto::protobuf::Message for HashStateWire {
                 + v.len() as u64;
             ::waproto::protobuf::encoding::put_varint(26, output);
             ::waproto::protobuf::encoding::put_varint(entry, output);
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(k.len() as u64, output);
-            output.put_slice(k.as_bytes());
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, k.as_bytes(), output);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         if self.mac_mismatch_fatal {
             let v = &self.mac_mismatch_fatal;
-            ::waproto::protobuf::encoding::put_varint(32, output);
-            ::waproto::protobuf::encoding::put_varint(u64::from(*v), output);
+            ::waproto::protobuf::encoding::put_varint_field(4, u64::from(*v), output);
         }
         if self.bootstrapped {
             let v = &self.bootstrapped;
-            ::waproto::protobuf::encoding::put_varint(40, output);
-            ::waproto::protobuf::encoding::put_varint(u64::from(*v), output);
+            ::waproto::protobuf::encoding::put_varint_field(5, u64::from(*v), output);
         }
     }
     fn merge_field(

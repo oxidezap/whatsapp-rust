@@ -434,20 +434,78 @@ impl Emitter<'_> {
     fn write_value(&self, kind: ValueType, field: u32, value: &str) -> String {
         let wire = Self::wire(kind);
         let tag = (u64::from(field) << 3) | u64::from(wire);
-        let mut out = format!("{RT}::encoding::put_varint({tag},output);");
         match kind {
-            ValueType::Message(_, encoding) => { if encoding==MessageEncoding::LengthPrefixed { out.push_str(&format!("{RT}::encoding::put_varint(u64::from(cache.consume_next()),output);")); } out.push_str(&format!("{RT}::Message::write_to({value},cache,output);")); if encoding==MessageEncoding::Group { out.push_str(&format!("{RT}::encoding::put_varint({},output);",(u64::from(field)<<3)|4)); } }
-            ValueType::Scalar(Scalar::String) => out.push_str(&format!("{RT}::encoding::put_varint({value}.len()as u64,output);output.put_slice({value}.as_bytes());")),
-            ValueType::Scalar(Scalar::Bytes) => out.push_str(&format!("{RT}::encoding::put_varint({value}.len()as u64,output);output.put_slice({value});")),
-            ValueType::Scalar(Scalar::Float) => out.push_str(&format!("output.put_u32_le({value}.to_bits());")),
-            ValueType::Scalar(Scalar::Double) => out.push_str(&format!("output.put_u64_le({value}.to_bits());")),
-            ValueType::Scalar(Scalar::Fixed32) => out.push_str(&format!("output.put_u32_le(*{value});")),
-            ValueType::Scalar(Scalar::Fixed64) => out.push_str(&format!("output.put_u64_le(*{value});")),
-            _ if wire==5 => out.push_str(&format!("output.put_u32_le(*{value} as u32);")),
-            _ if wire==1 => out.push_str(&format!("output.put_u64_le(*{value} as u64);")),
-            _=>out.push_str(&format!("{RT}::encoding::put_varint({},output);",self.numeric(kind,value))),
+            ValueType::Message(_, encoding) => {
+                let mut out = format!("{RT}::encoding::put_varint({tag},output);");
+                if encoding == MessageEncoding::LengthPrefixed {
+                    out.push_str(&format!(
+                        "{RT}::encoding::put_varint(u64::from(cache.consume_next()),output);"
+                    ));
+                }
+                out.push_str(&format!("{RT}::Message::write_to({value},cache,output);"));
+                if encoding == MessageEncoding::Group {
+                    out.push_str(&format!(
+                        "{RT}::encoding::put_varint({},output);",
+                        (u64::from(field) << 3) | 4
+                    ));
+                }
+                out
+            }
+            ValueType::Scalar(Scalar::String) => {
+                format!("{RT}::encoding::put_bytes_field({field},{value}.as_bytes(),output);")
+            }
+            ValueType::Scalar(Scalar::Bytes) => {
+                format!("{RT}::encoding::put_bytes_field({field},{value},output);")
+            }
+            ValueType::Scalar(Scalar::Float) => {
+                format!("{RT}::encoding::put_fixed32_field({field},{value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Double) => {
+                format!("{RT}::encoding::put_fixed64_field({field},{value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Fixed32) => {
+                format!("{RT}::encoding::put_fixed32_field({field},*{value},output);")
+            }
+            ValueType::Scalar(Scalar::Fixed64) => {
+                format!("{RT}::encoding::put_fixed64_field({field},*{value},output);")
+            }
+            _ if wire == 5 => {
+                format!("{RT}::encoding::put_fixed32_field({field},*{value} as u32,output);")
+            }
+            _ if wire == 1 => {
+                format!("{RT}::encoding::put_fixed64_field({field},*{value} as u64,output);")
+            }
+            _ => format!(
+                "{RT}::encoding::put_varint_field({field},{},output);",
+                self.numeric(kind, value)
+            ),
         }
-        out
+    }
+    fn write_packed_value(&self, kind: ValueType, value: &str) -> String {
+        match kind {
+            ValueType::Scalar(Scalar::Float) => {
+                format!("{RT}::encoding::put_fixed32_value({value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Double) => {
+                format!("{RT}::encoding::put_fixed64_value({value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Fixed32) => {
+                format!("{RT}::encoding::put_fixed32_value(*{value},output);")
+            }
+            ValueType::Scalar(Scalar::Fixed64) => {
+                format!("{RT}::encoding::put_fixed64_value(*{value},output);")
+            }
+            _ if Self::wire(kind) == 5 => {
+                format!("{RT}::encoding::put_fixed32_value(*{value} as u32,output);")
+            }
+            _ if Self::wire(kind) == 1 => {
+                format!("{RT}::encoding::put_fixed64_value(*{value} as u64,output);")
+            }
+            _ => format!(
+                "{RT}::encoding::put_varint({},output);",
+                self.numeric(kind, value)
+            ),
+        }
     }
     fn read_value(&self, kind: ValueType, storage: BytesStorage, input: &str) -> String {
         match kind {
@@ -678,8 +736,12 @@ impl Emitter<'_> {
             out.push_str(&self.encode_field(field, false));
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}\nfn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
-        for field in &fields {
-            out.push_str(&self.encode_field(field, true));
+        if let Some(grouped) = self.grouped_writer(&fields, false) {
+            out.push_str(&grouped);
+        } else {
+            for field in &fields {
+                out.push_str(&self.encode_field(field, true));
+            }
         }
         // Keeping this wide dispatch separate avoids a large stack frame on each decode.
         let inline = if message.full_name == ".whatsapp.SyncActionValue" {
@@ -737,6 +799,54 @@ impl Emitter<'_> {
         out.push_str("}}\n");
         out
     }
+    fn grouped_writer(&self, fields: &[&Field], view: bool) -> Option<String> {
+        if fields.len() < 64
+            || !fields.iter().all(|field| {
+                matches!(
+                    field.shape,
+                    FieldShape::Singular {
+                        presence: Presence::Explicit,
+                        value: ValueType::Message(..) | ValueType::Scalar(Scalar::String),
+                        ..
+                    }
+                )
+            })
+        {
+            return None;
+        }
+        let mut out = String::new();
+        for group in fields.chunks(16) {
+            let conditions = group
+                .iter()
+                .map(|field| {
+                    let slot = self.slot(field);
+                    if matches!(
+                        field.shape,
+                        FieldShape::Singular {
+                            value: ValueType::Message(..),
+                            ..
+                        }
+                    ) {
+                        format!("self.{slot}.is_set()")
+                    } else {
+                        format!("self.{slot}.is_some()")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            out.push_str(&format!("if {conditions}{{"));
+            for field in group {
+                out.push_str(&if view {
+                    self.view_encode_field(field, true)
+                } else {
+                    self.encode_field(field, true)
+                });
+            }
+            out.push('}');
+        }
+        Some(out)
+    }
+
     fn encode_field(&self, field: &Field, write: bool) -> String {
         let number = field.number.get();
         if let FieldShape::Map { key, value, .. } = field.shape {
@@ -751,11 +861,11 @@ impl Emitter<'_> {
             let mut out = format!("for(k,v)in &self.{slot}{{");
             if let ValueType::Message(..) = value {
                 if write {
-                    out.push_str(&format!("let entry_n=cache.consume_next();{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(u64::from(entry_n),output);",(u64::from(number)<<3)|2));
+                    out.push_str(&format!("let n=cache.consume_next();let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(u64::from({RT}::saturate_size(entry)),output);",(u64::from(number)<<3)|2));
                     out.push_str(&self.write_value(key_ty, 1, "k"));
-                    out.push_str(&self.write_value(value, 2, "v"));
+                    out.push_str(&format!("{RT}::encoding::put_varint(18,output);{RT}::encoding::put_varint(u64::from(n),output);{RT}::Message::write_to(v,cache,output);"));
                 } else {
-                    out.push_str(&format!("let entry_slot=cache.reserve();let value_slot=cache.reserve();let n={RT}::Message::compute_size(v,cache);cache.set(value_slot,n);let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);cache.set(entry_slot,{RT}::saturate_size(entry));size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(entry)as u64+entry);",(u64::from(number)<<3)|2));
+                    out.push_str(&format!("let value_slot=cache.reserve();let n={RT}::Message::compute_size(v,cache);cache.set(value_slot,n);let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(entry)as u64+entry);",(u64::from(number)<<3)|2));
                 }
             } else {
                 out.push_str(&format!("let entry=1u64+{key_size}+1u64+{value_size};"));
@@ -784,9 +894,7 @@ impl Emitter<'_> {
             );
             if write {
                 out.push_str(&format!("{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(n,output);for v in &self.{slot}{{",(u64::from(number)<<3)|2));
-                let encoded = self.write_value(value, number, "v");
-                let start = encoded.find(';').expect("tag terminator") + 1;
-                out.push_str(&encoded[start..]);
+                out.push_str(&self.write_packed_value(value, "v"));
                 out.push('}');
             } else {
                 out.push_str(&format!("size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(n)as u64+n);",(u64::from(number)<<3)|2));
@@ -1261,7 +1369,7 @@ impl Emitter<'_> {
                 } else {
                     format!("{RT}::types::borrow_bytes(&mut entry)?")
                 };
-                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::MessageView::merge_into_view(&mut value,payload,child_context)?;"));
+                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::view::merge_generated_view(&mut value,payload,child_context)?;"));
             } else if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
                 out.push_str(&format!(
@@ -1323,9 +1431,9 @@ impl Emitter<'_> {
                 "let child_context=context.descend()?;let payload={payload};"
             ));
             match field.shape{
-                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::MessageView::merge_into_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);}}",self.view_path(id))),
-                FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);",self.view_path(id))),
-                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::MessageView::merge_into_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
+                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::view::merge_generated_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);}}",self.view_path(id))),
+                FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);",self.view_path(id))),
+                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::view::merge_generated_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
             }
         } else {
             if matches!(field.shape, FieldShape::Repeated { .. })
@@ -1490,7 +1598,7 @@ impl Emitter<'_> {
         } else {
             "match(tag.field_number(),tag.wire_type()){ "
         };
-        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
+        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{let mut value=Self::default();{RT}::view::merge_generated_view(&mut value,input,context)?;Ok(value)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
         for field in &message.fields {
             out.push_str(
                 &self.view_decode_field(
@@ -1628,8 +1736,12 @@ impl Emitter<'_> {
             out.push_str(&self.view_encode_field(field, false));
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}fn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
-        for field in &fields {
-            out.push_str(&self.view_encode_field(field, true));
+        if let Some(grouped) = self.grouped_writer(&fields, true) {
+            out.push_str(&grouped);
+        } else {
+            for field in &fields {
+                out.push_str(&self.view_encode_field(field, true));
+            }
         }
         out.push_str("}}\n");
         out.push_str(&self.owned_view_source(message, id));
@@ -1789,7 +1901,7 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
     };
     let old = Emitter {
         schema,
-        base: "waproto::reference",
+        base: "crate::reference",
     };
     let mut source = String::new();
     for (index, message) in schema.messages.iter().enumerate() {
@@ -1884,7 +1996,7 @@ fn generate_view_oracle(schema: &Schema) -> String {
     };
     let old = Emitter {
         schema,
-        base: "waproto::reference",
+        base: "crate::reference",
     };
     let mut out = String::new();
     let value_assert = |value, a: &str, b: &str| {

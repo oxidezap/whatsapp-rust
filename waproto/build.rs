@@ -13,6 +13,8 @@ mod descriptor;
 mod emit_owned;
 #[path = "codegen/features.rs"]
 mod features;
+#[path = "codegen/media_retry_schema.rs"]
+mod media_retry_schema;
 #[path = "codegen/names.rs"]
 #[allow(dead_code)]
 mod names;

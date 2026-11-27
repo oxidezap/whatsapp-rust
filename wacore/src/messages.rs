@@ -754,7 +754,7 @@ pub fn unpad_plaintext(
 /// Only the generated schema tags needed to reach the inline byte field are
 /// inspected. The field is removed from a lazily rewritten wire buffer before
 /// the regular generated decoder runs, so the large payload is never copied
-/// into the owned protobuf tree. Every other field is still decoded by Buffa's
+/// into the owned protobuf tree. Every other field is still decoded by the
 /// generated implementation, keeping protobuf merge and unknown-field
 /// semantics in one place.
 ///
@@ -1018,7 +1018,7 @@ pub fn decode_plaintext_view(
     wa::MessageView::decode_view(plaintext_slice).map_err(PlaintextDecodeError::Decode)
 }
 
-/// Decode a plaintext buffer into a self-contained Buffa view.
+/// Decode a plaintext buffer into a self-contained protobuf view.
 pub fn decode_plaintext_owned_view(
     padded_plaintext: Vec<u8>,
     padding_version: u8,
@@ -3109,7 +3109,7 @@ mod device_sent_tests {
         );
     }
 
-    // Unpad (v2) + buffa-decode a padded plaintext.
+    // Unpad (v2) and decode a padded plaintext.
     fn decode_padded(b: &[u8]) -> wa::Message {
         wa::Message::decode_from_slice(MessageUtils::unpad_message_ref(b, 2).unwrap()).unwrap()
     }
@@ -3238,7 +3238,7 @@ mod device_sent_tests {
 
     /// Pin the spliced field numbers to the generated schema: encode a probe
     /// with only the relevant field set and read the first protobuf key. If the
-    /// .proto ever renumbers one of these fields, Buffa regenerates and this fails
+    /// .proto ever renumbers one of these fields, the generated tags change and this fails
     /// with a precise message, so the hand-written framing cannot silently drift.
     #[test]
     fn splice_tags_match_generated_schema() {

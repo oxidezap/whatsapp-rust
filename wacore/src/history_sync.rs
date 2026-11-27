@@ -675,7 +675,7 @@ impl<'a> HistorySyncStream<'a> {
     /// the next entry into `conversation`, returning `Ok(false)` at clean EOF.
     /// Same per-entry decode leniency.
     ///
-    /// buffa's `clear()` retains `Vec` capacity, so reusing one struct across a
+    /// The generated `clear()` retains `Vec` capacity, so reusing one struct across a
     /// drain loop skips the per-conversation message-spine reallocations. After
     /// `Ok(false)` (or an error) the struct contents are unspecified.
     pub fn next_conversation_into(
@@ -3171,7 +3171,7 @@ mod tests {
         }
     }
 
-    /// Differential corpus: every structurally interesting shape, buffa-built
+    /// Differential corpus: every structurally interesting shape, proto-built
     /// and hand-crafted, must extract identically through the fast path and
     /// the full-decode oracle.
     #[test]

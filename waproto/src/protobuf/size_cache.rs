@@ -161,4 +161,78 @@ mod tests {
     fn divergent_write_traversal_is_rejected() {
         SizeCache::new().consume_next();
     }
+
+    #[test]
+    fn overflow_rejects_reservation_without_mutating_cache() {
+        let mut cache = SizeCache::new();
+        cache.len = u32::MAX;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.reserve()));
+        assert!(result.is_err());
+        assert_eq!(cache.len, u32::MAX);
+        assert_eq!(cache.cursor, 0);
+        assert!(cache.spill.is_empty());
+        assert_eq!(cache.inline, [0; INLINE_CAPACITY]);
+    }
+
+    #[test]
+    fn spill_bounds_and_clear_preserve_invariants() {
+        let mut cache = SizeCache::new();
+        for value in 0..(INLINE_CAPACITY + 2) {
+            let index = cache.reserve();
+            cache.set(index, value as u32);
+        }
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.set(INLINE_CAPACITY + 2, 99);
+        }));
+        assert!(error.is_err());
+        for value in 0..(INLINE_CAPACITY + 2) {
+            assert_eq!(cache.consume_next(), value as u32);
+        }
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.consume_next()));
+        assert!(error.is_err());
+        let capacity = cache.spill.capacity();
+        cache.clear();
+        assert_eq!(cache.spill.capacity(), capacity);
+        assert_eq!(cache.reserve(), 0);
+        assert_eq!(cache.consume_next(), 0);
+    }
+
+    #[test]
+    fn clearing_between_reserve_and_set_rejects_the_stale_slot() {
+        #[derive(Clone, Default, PartialEq)]
+        struct CustomChild;
+
+        impl super::super::DefaultInstance for CustomChild {
+            fn default_instance() -> &'static Self {
+                static INSTANCE: CustomChild = CustomChild;
+                &INSTANCE
+            }
+        }
+
+        impl super::super::Message for CustomChild {
+            fn compute_size(&self, cache: &mut SizeCache) -> u32 {
+                cache.clear();
+                0
+            }
+
+            fn write_to(&self, _: &mut SizeCache, _: &mut impl super::super::EncodeSink) {}
+
+            fn merge_field(
+                &mut self,
+                _: super::super::encoding::Tag,
+                _: &mut impl bytes::Buf,
+                _: super::super::DecodeContext<'_>,
+            ) -> Result<(), super::super::DecodeError> {
+                Ok(())
+            }
+
+            fn clear(&mut self) {}
+        }
+        let mut cache = SizeCache::new();
+        let slot = cache.reserve();
+        super::super::Message::compute_size(&CustomChild, &mut cache);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.set(slot, 1)));
+        assert!(error.is_err());
+        assert_eq!(cache.len, 0);
+    }
 }

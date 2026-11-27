@@ -2,6 +2,7 @@ use e2e_tests::TestClient;
 use log::info;
 use wacore::types::events::Event;
 use whatsapp_rust::download::MediaType;
+use whatsapp_rust::waproto::protobuf::MessageField as ProtoMessageField;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 #[tokio::test]
@@ -276,7 +277,7 @@ async fn test_newsletter_send_media_message() -> anyhow::Result<()> {
     // Build and send an image message
     let message = {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.image_message = whatsapp_rust::buffa::MessageField::some({
+        proto_contract_fixture.image_message = ProtoMessageField::some({
             let mut proto_contract_fixture = wa::message::ImageMessage::default();
             proto_contract_fixture.url = Some(upload.url.clone());
             proto_contract_fixture.direct_path = Some(upload.direct_path.clone());

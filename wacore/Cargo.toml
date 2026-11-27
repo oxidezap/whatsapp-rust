@@ -140,6 +140,10 @@ name = "usync_response_benchmark"
 harness = false
 
 [[bench]]
+name = "adv_key_index_benchmark"
+harness = false
+
+[[bench]]
 name = "send_receive_benchmark"
 harness = false
 
@@ -186,6 +190,10 @@ harness = false
 
 [[bench]]
 name = "media_benchmark"
+harness = false
+
+[[bench]]
+name = "media_retry_benchmark"
 harness = false
 
 [[bench]]

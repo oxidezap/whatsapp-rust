@@ -31,6 +31,52 @@ fn lid_mapping_retention_survives_regeneration() {
 }
 
 #[test]
+fn lid_mapping_payload_preserves_shared_limits_and_late_error_order() {
+    use waproto::protobuf::{
+        DecodeError, DecodeOptions,
+        encoding::{put_bytes_field, put_varint},
+    };
+
+    let mut wire = Vec::new();
+    put_bytes_field(1, &[0x08, 42, 0x10, 123], &mut wire);
+    put_varint(100 << 3, &mut wire);
+    put_varint(1, &mut wire);
+    wire.extend_from_slice(&[0x0a, 0x80]);
+    assert_eq!(
+        wa::LIDMigrationMappingSyncPayload::decode_from_slice(&wire).unwrap_err(),
+        DecodeError::UnexpectedEof
+    );
+    assert_eq!(
+        DecodeOptions::new()
+            .with_unknown_field_limit(0)
+            .decode_from_slice::<wa::LIDMigrationMappingSyncPayload>(&wire)
+            .unwrap_err(),
+        DecodeError::UnknownFieldLimitExceeded
+    );
+    assert_eq!(
+        DecodeOptions::new()
+            .with_element_memory_limit(size_of::<wa::LIDMigrationMapping>())
+            .decode_from_slice::<wa::LIDMigrationMappingSyncPayload>(&wire)
+            .unwrap_err(),
+        DecodeError::ElementMemoryLimitExceeded
+    );
+
+    let mut nested = vec![0x08, 42, 0x10, 123];
+    put_varint((100 << 3) | 3, &mut nested);
+    put_varint(1 << 3, &mut nested);
+    put_varint(7, &mut nested);
+    put_varint((100 << 3) | 4, &mut nested);
+    let mut grouped = Vec::new();
+    put_bytes_field(1, &nested, &mut grouped);
+    for limit in [0, 1, 2] {
+        let decoded = DecodeOptions::new()
+            .with_unknown_field_limit(limit)
+            .decode_from_slice::<wa::LIDMigrationMappingSyncPayload>(&grouped);
+        assert_eq!(decoded.is_ok(), limit == 2);
+    }
+}
+
+#[test]
 fn absent_bundle_families_keep_their_public_types() {
     let _ = wa::LabyrinthWaCommand::default();
     let _ = wa::MinosCommand::default();

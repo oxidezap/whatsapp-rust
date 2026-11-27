@@ -14,6 +14,7 @@ pub fn generate(bytes: &[u8]) -> io::Result<(FileDescriptorSet, String, String)>
     crate::wallpaper::retain_fields(&mut descriptors)?;
     crate::signal_storage::check(&crate::names::wire_api(&descriptors))?;
     let schema = crate::project::project(&descriptors).map_err(io::Error::other)?;
+    crate::media_retry_schema::validate(&schema).map_err(io::Error::other)?;
     let source = crate::emit_owned::generate(&schema, "crate::protobuf::generated::whatsapp")
         .map_err(io::Error::other)?;
     let tags = crate::retained::tags(&descriptors);

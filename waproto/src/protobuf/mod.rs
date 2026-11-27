@@ -7,11 +7,14 @@ mod decode;
 pub mod encoding;
 mod enumeration;
 mod error;
+#[allow(dead_code)]
+mod indexed_wire;
 mod message;
 mod message_field;
 pub mod open_enum_serde;
 #[allow(unsafe_code)]
 mod owned_view;
+pub(crate) mod projection;
 mod sink;
 mod size_cache;
 pub mod types;

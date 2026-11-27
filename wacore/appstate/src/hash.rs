@@ -399,7 +399,7 @@ pub fn generate_patch_mac(patch: &wa::SyncdPatch, name: &str, key: &[u8], versio
         mac.update(sm);
     }
     for m in &patch.mutations {
-        // `m.record.is_set()` is a field-presence check (buffa's `MessageField`),
+        // `m.record.is_set()` checks the presence of the message field,
         // not a filter on the SET operation: WA Web folds every mutation's value
         // blob in, REMOVE included, so narrowing this to SET would change the MAC
         // of every patch carrying a removal.

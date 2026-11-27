@@ -57,6 +57,23 @@ pub trait MessageView<'a>: Sized {
     }
 }
 
+pub(crate) fn merge_generated_view<'a, V: MessageView<'a>>(
+    view: &mut V,
+    mut input: &'a [u8],
+    context: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    while !input.is_empty() {
+        let Some((tag, tag_len)) = super::encoding::probe_tag(input) else {
+            return view.merge_into_view(input, context);
+        };
+        let Some(payload) = input.get(tag_len..) else {
+            return view.merge_into_view(input, context);
+        };
+        input = view.merge_view_field(tag, payload, input, context)?;
+    }
+    Ok(())
+}
+
 pub trait HasMessageView: Message + Sized {
     type View<'a>: MessageView<'a, Owned = Self> + super::OwnedViewSource + Send + Sync;
     type ViewHandle: From<super::OwnedView<Self::View<'static>>>
@@ -102,7 +119,14 @@ pub trait DefaultViewInstance {
 }
 
 pub trait ViewEncode<'a>: MessageView<'a> {
+    /// Computes the encoded size and records nested sizes in `cache`.
+    ///
+    /// Start each top-level sizing pass with a fresh cache or call
+    /// [`SizeCache::clear`] first. A corresponding [`Self::write_to`] consumes
+    /// the entries recorded by this pass. Do not clear the cache in nested
+    /// implementations, and do not reuse it for another view before writing.
     fn compute_size(&self, cache: &mut SizeCache) -> u32;
+    /// Writes using the cache produced by [`Self::compute_size`] for this view.
     fn write_to(&self, cache: &mut SizeCache, output: &mut impl EncodeSink);
     fn try_encoded_len(&self) -> Result<u32, EncodeError> {
         checked_encode_size(self.compute_size(&mut SizeCache::new()))

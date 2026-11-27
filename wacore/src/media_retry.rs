@@ -255,13 +255,21 @@ pub fn parse_media_retry_notification(
         .ok_or(MediaRetryError::MissingIv)?;
 
     let plaintext = decrypt_media_retry_notification(media_key, &msg_id, enc_iv, enc_p)?;
-    let notification =
-        wa::MediaRetryNotificationView::decode_view(&plaintext).map_err(MediaRetryError::Decode)?;
+    let projected = waproto::codec::media_retry_success(&plaintext);
+    let notification = if projected.is_none() {
+        Some(
+            wa::MediaRetryNotificationView::decode_view(&plaintext)
+                .map_err(MediaRetryError::Decode)?,
+        )
+    } else {
+        None
+    };
 
     // The encrypted payload must bind to the outer correlation ID, including
     // on error results. Plaintext <error> notifications take the branch above.
-    let returned_id = notification
-        .stanza_id
+    let returned_id = projected
+        .map(|(id, _)| id)
+        .or_else(|| notification.as_ref().and_then(|message| message.stanza_id))
         .ok_or(MediaRetryError::MissingStanzaId)?;
     if returned_id != msg_id.as_str() {
         return Err(MediaRetryError::StanzaIdMismatch {
@@ -271,13 +279,23 @@ pub fn parse_media_retry_notification(
     }
 
     // Check result enum
-    let result_type = notification
-        .result
-        .unwrap_or(wa::media_retry_notification::ResultType::GENERAL_ERROR);
+    let result_type = if projected.is_some() {
+        wa::media_retry_notification::ResultType::SUCCESS
+    } else {
+        notification
+            .as_ref()
+            .and_then(|message| message.result)
+            .unwrap_or(wa::media_retry_notification::ResultType::GENERAL_ERROR)
+    };
     match result_type {
         wa::media_retry_notification::ResultType::SUCCESS => {
-            let direct_path = notification
-                .direct_path
+            let direct_path = projected
+                .map(|(_, path)| path)
+                .or_else(|| {
+                    notification
+                        .as_ref()
+                        .and_then(|message| message.direct_path)
+                })
                 .ok_or(MediaRetryError::MissingDirectPath)?
                 .to_string();
             Ok(MediaRetryResult::Success { direct_path })
@@ -350,6 +368,59 @@ mod tests {
                 );
             } else {
                 assert!(result.unwrap_err().to_string().contains("stanza ID"));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn encrypted_error_results_and_missing_path_use_fallback() {
+        use wa::media_retry_notification::ResultType;
+        use waproto::protobuf::Message;
+        let key = [42; 32];
+        for result_type in [
+            ResultType::NOT_FOUND,
+            ResultType::DECRYPTION_ERROR,
+            ResultType::GENERAL_ERROR,
+            ResultType::SUCCESS,
+        ] {
+            let mut proto = wa::MediaRetryNotification::default();
+            proto.stanza_id = Some("MSG".into());
+            proto.result = Some(result_type);
+            let plaintext = proto.encode_to_vec();
+            assert!(waproto::codec::media_retry_success(&plaintext).is_none());
+            let iv = [1; 12];
+            let mut encrypted = Vec::new();
+            aes_256_gcm_encrypt(
+                &derive_media_retry_key(&key).unwrap(),
+                &iv,
+                b"MSG",
+                &plaintext,
+                &mut encrypted,
+            )
+            .unwrap();
+            let node = NodeBuilder::new("notification")
+                .attr("id", "MSG")
+                .children([NodeBuilder::new("encrypt")
+                    .children([
+                        NodeBuilder::new("enc_p").bytes(encrypted).build(),
+                        NodeBuilder::new("enc_iv").bytes(iv.to_vec()).build(),
+                    ])
+                    .build()])
+                .build();
+            let actual = parse_media_retry_notification(&node.as_node_ref(), &key);
+            match result_type {
+                ResultType::NOT_FOUND => assert!(matches!(actual, Ok(MediaRetryResult::NotFound))),
+                ResultType::DECRYPTION_ERROR => {
+                    assert!(matches!(actual, Ok(MediaRetryResult::DecryptionError)))
+                }
+                ResultType::GENERAL_ERROR => {
+                    assert!(matches!(actual, Ok(MediaRetryResult::GeneralError)))
+                }
+                ResultType::SUCCESS => {
+                    assert!(matches!(actual, Err(MediaRetryError::MissingDirectPath)))
+                }
+                _ => unreachable!(),
             }
         }
     }

@@ -1,9 +1,396 @@
 use waproto::protobuf::MessageView as _;
+#[cfg(feature = "protobuf-reference")]
+#[path = "support/reference.rs"]
+mod reference;
+#[cfg(feature = "protobuf-reference")]
+#[path = "support/reference_enum_serde.rs"]
+mod reference_enum_serde;
 use waproto::protobuf::{DecodeError, DecodeOptions, Message as _};
 use waproto::whatsapp::message::interactive_message::{Header, header::Media};
 use waproto::whatsapp::{
     ADVKeyIndexList, ADVKeyIndexListView, BotCapabilityMetadata, BotCapabilityMetadataView,
 };
+
+#[test]
+fn repeated_message_view_keeps_order_and_partial_state() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+    use waproto::whatsapp::{ConversationView, HistorySyncView};
+
+    let element_size = size_of::<ConversationView<'_>>();
+    let tag = Tag::new(2, WireType::LengthDelimited);
+    let first = &[3, 0x0a, 1, b'a'][..];
+    let second = &[3, 0x0a, 1, b'b'][..];
+    let truncated = &[2, 0x0a, 1][..];
+    for extra in [false, true] {
+        let unknown = Cell::new(10);
+        let budget = Cell::new(element_size * if extra { 3 } else { 2 });
+        let context = DecodeContext::new(10, &unknown).with_element_memory(&budget);
+        let mut view = HistorySyncView::default();
+        view.merge_view_field(tag, first, first, context).unwrap();
+        view.merge_view_field(tag, second, second, context).unwrap();
+        let error = view
+            .merge_view_field(tag, truncated, truncated, context)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if extra {
+                DecodeError::UnexpectedEof
+            } else {
+                DecodeError::ElementMemoryLimitExceeded
+            }
+        );
+        assert_eq!(
+            view.conversations
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(budget.get(), 0);
+        assert_eq!(unknown.get(), 10);
+    }
+}
+
+#[test]
+fn repeated_message_view_error_preserves_free_and_full_capacity() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+    use waproto::whatsapp::{ConversationView, HistorySyncView};
+
+    let tag = Tag::new(2, WireType::LengthDelimited);
+    let valid = &[3, 0x0a, 1, b'a'][..];
+    let truncated = &[2, 0x0a, 1][..];
+    for full in [false, true] {
+        let mut view = HistorySyncView::default();
+        view.conversations.as_mut_vec().reserve_exact(4);
+        let capacity = view.conversations.as_mut_vec().capacity();
+        let count = if full { capacity } else { 2 };
+        let unknown = Cell::new(10);
+        let budget = Cell::new((count + 1) * size_of::<ConversationView<'_>>());
+        let context = DecodeContext::new(10, &unknown).with_element_memory(&budget);
+        for _ in 0..count {
+            view.merge_view_field(tag, valid, valid, context).unwrap();
+        }
+        assert_eq!(
+            view.merge_view_field(tag, truncated, truncated, context)
+                .unwrap_err(),
+            DecodeError::UnexpectedEof
+        );
+        assert_eq!(view.conversations.len(), count);
+        assert!(view.conversations.iter().all(|item| item.id == "a"));
+        assert_eq!(view.conversations.as_mut_vec().capacity(), capacity);
+        assert_eq!(budget.get(), 0);
+        assert_eq!(unknown.get(), 10);
+    }
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn nested_message_maps_encode_with_consistent_size_cache() {
+    use waproto::protobuf::{SizeCache, ViewEncode as _};
+    use waproto::whatsapp::{Config, ConfigView, Field};
+
+    let mut config = Config::default();
+    for key in [0, 1, 127, 128, u32::MAX] {
+        let mut value = Field::default();
+        value.min_version = Some(key);
+        for child_key in 0..20 {
+            let mut child = Field::default();
+            child.max_version = Some(child_key);
+            value.subfield.insert(child_key, child);
+        }
+        config.field.insert(key, value);
+    }
+
+    let expected = config.encode_to_vec();
+    let mut cache = SizeCache::new();
+    assert_eq!(config.compute_size(&mut cache) as usize, expected.len());
+    let mut encoded = Vec::new();
+    config.write_to(&mut cache, &mut encoded);
+    assert_eq!(encoded, expected);
+    cache.clear();
+    assert_eq!(config.compute_size(&mut cache) as usize, expected.len());
+    let mut repeated = Vec::new();
+    config.write_to(&mut cache, &mut repeated);
+    assert_eq!(repeated, expected);
+    let view = ConfigView::decode_view(&expected).unwrap();
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap(), config);
+    #[cfg(feature = "protobuf-reference")]
+    {
+        let reference =
+            <reference::Config as buffa::Message>::decode_from_slice(&expected).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(reference).unwrap()
+        );
+    }
+}
+
+#[cfg(feature = "protobuf-reference")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn map_key_changes_between_passes_match_reference() {
+    use waproto::protobuf::{SizeCache, ViewEncode};
+    use waproto::whatsapp::{Config, ConfigView, Field};
+
+    for (before, after) in [(1, 128), (128, 1)] {
+        let mut initial = Config::default();
+        let mut child = Field::default();
+        child.min_version = Some(7);
+        child.subfield.insert(2, Field::default());
+        initial.field.insert(before, child);
+        let initial_wire = initial.encode_to_vec();
+        let child = initial.field.remove(&before).unwrap();
+        initial.field.insert(after, child);
+        let changed_wire = initial.encode_to_vec();
+
+        let mut owned = Config::decode_from_slice(&initial_wire).unwrap();
+        let mut reference =
+            <reference::Config as buffa::Message>::decode_from_slice(&initial_wire).unwrap();
+        let mut cache = SizeCache::new();
+        let mut reference_cache = buffa::SizeCache::new();
+        owned.compute_size(&mut cache);
+        buffa::Message::compute_size(&reference, &mut reference_cache);
+        owned.field = Config::decode_from_slice(&changed_wire).unwrap().field;
+        reference.field = <reference::Config as buffa::Message>::decode_from_slice(&changed_wire)
+            .unwrap()
+            .field;
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        owned.write_to(&mut cache, &mut actual);
+        buffa::Message::write_to(&reference, &mut reference_cache, &mut expected);
+        assert_eq!(actual, expected);
+
+        let mut view = ConfigView::decode_view(&initial_wire).unwrap();
+        let mut reference_view =
+            <reference::ConfigView<'_> as buffa::MessageView>::decode_view(&initial_wire).unwrap();
+        let mut cache = SizeCache::new();
+        let mut reference_cache = buffa::SizeCache::new();
+        ViewEncode::compute_size(&view, &mut cache);
+        buffa::ViewEncode::compute_size(&reference_view, &mut reference_cache);
+        view.field = ConfigView::decode_view(&changed_wire).unwrap().field;
+        reference_view.field =
+            <reference::ConfigView<'_> as buffa::MessageView>::decode_view(&changed_wire)
+                .unwrap()
+                .field;
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        ViewEncode::write_to(&view, &mut cache, &mut actual);
+        buffa::ViewEncode::write_to(&reference_view, &mut reference_cache, &mut expected);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn single_text_view_preserves_presence_and_decode_limits() {
+    let options = DecodeOptions::new()
+        .with_recursion_limit(0)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let decoded = options
+        .decode_view::<waproto::whatsapp::MessageView<'_>>(&[0x0a, 0])
+        .unwrap();
+    assert_eq!(decoded.conversation, Some(""));
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_max_message_size(1)
+            .decode_view::<waproto::whatsapp::MessageView<'_>>(&[0x0a, 0]),
+        Err(DecodeError::MessageTooLarge)
+    ));
+    let mut with_unknown = vec![0x0a, 30];
+    with_unknown.extend_from_slice(&[b'a'; 30]);
+    with_unknown.extend_from_slice(&[0x82, 0xb5, 0x18, 1, b'x']);
+    assert!(matches!(
+        options.decode_view::<waproto::whatsapp::MessageView<'_>>(&with_unknown),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn single_numeric_view_preserves_presence_and_decode_limits() {
+    let options = DecodeOptions::new()
+        .with_recursion_limit(0)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let decoded = options
+        .decode_view::<ADVKeyIndexListView<'_>>(&[0x08, 0x96, 0x01])
+        .unwrap();
+    assert_eq!(decoded.raw_id, Some(150));
+    assert!(matches!(
+        options.decode_view::<ADVKeyIndexListView<'_>>(&[0x0a, 1, 0]),
+        Err(DecodeError::WireTypeMismatch { .. })
+    ));
+    assert!(matches!(
+        options.decode_view::<ADVKeyIndexListView<'_>>(&[0x08, 1, 0x80, 0xb5, 0x18, 1]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn single_enum_views_preserve_open_and_closed_unknown_values() {
+    use waproto::protobuf::EnumValue;
+    use waproto::whatsapp::ai_rich_response_dynamic_metadata::AIRichResponseDynamicMetadataType;
+    use waproto::whatsapp::{AIRichResponseDynamicMetadataView, SyncdMutationView};
+    let options = DecodeOptions::new()
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let open = options
+        .decode_view::<SyncdMutationView<'_>>(&[0x08, 99])
+        .unwrap();
+    assert_eq!(open.operation, Some(EnumValue::Unknown(99)));
+    let mut negative = vec![0x08];
+    waproto::protobuf::encoding::encode_varint(u64::MAX, &mut negative);
+    let open = options
+        .decode_view::<SyncdMutationView<'_>>(&negative)
+        .unwrap();
+    assert_eq!(open.operation, Some(EnumValue::Unknown(-1)));
+    let closed = options
+        .decode_view::<AIRichResponseDynamicMetadataView<'_>>(&[0x08, 1])
+        .unwrap();
+    assert_eq!(
+        closed.r#type,
+        Some(AIRichResponseDynamicMetadataType::AI_RICH_RESPONSE_DYNAMIC_METADATA_TYPE_IMAGE)
+    );
+    assert!(matches!(
+        options.decode_view::<AIRichResponseDynamicMetadataView<'_>>(&[0x08, 99]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn single_nested_view_preserves_shared_limits_and_error_order() {
+    use waproto::whatsapp::AIQueryFanoutView;
+    let input = [0x0a, 5, 0x0a, 3, b'a', b'b', b'c'];
+    let options = DecodeOptions::new()
+        .with_recursion_limit(1)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let view = options
+        .decode_view::<AIQueryFanoutView<'_>>(&input)
+        .unwrap();
+    assert_eq!(
+        view.message_key.as_option().unwrap().remote_jid,
+        Some("abc")
+    );
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_recursion_limit(0)
+            .decode_view::<AIQueryFanoutView<'_>>(&input),
+        Err(DecodeError::RecursionLimitExceeded)
+    ));
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_recursion_limit(0)
+            .decode_view::<AIQueryFanoutView<'_>>(&[0x0a, 2, 0x0a]),
+        Err(DecodeError::RecursionLimitExceeded)
+    ));
+    assert!(matches!(
+        options.decode_view::<AIQueryFanoutView<'_>>(&[0x0a, 4, 0x80, 0xb5, 0x18, 1]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn generated_views_preserve_overlong_tag_boundaries() {
+    let input = [0x8a, 0, 1, b'a', 0x8a, 0, 1, b'b'];
+    let view = waproto::whatsapp::MessageView::decode_view(&input).unwrap();
+    assert_eq!(view.conversation, Some("b"));
+    let owned = waproto::codec::message_decode(&input).unwrap();
+    assert_eq!(owned.conversation.as_deref(), Some("b"));
+}
+
+#[test]
+fn generated_and_default_view_decoders_preserve_results_and_budgets() {
+    use std::cell::Cell;
+    use std::fmt::Debug;
+    use waproto::protobuf::DecodeContext;
+
+    fn compare<'a, V: waproto::protobuf::MessageView<'a> + Default + Debug + PartialEq>(
+        input: &'a [u8],
+        depth: u32,
+        unknown_limit: usize,
+        element_limit: usize,
+    ) {
+        let raw_unknown = Cell::new(unknown_limit);
+        let raw_elements = Cell::new(element_limit);
+        let indexed_unknown = Cell::new(unknown_limit);
+        let indexed_elements = Cell::new(element_limit);
+        let raw_context =
+            DecodeContext::new(depth, &raw_unknown).with_element_memory(&raw_elements);
+        let indexed_context =
+            DecodeContext::new(depth, &indexed_unknown).with_element_memory(&indexed_elements);
+        let raw = V::decode_view_ctx(input, raw_context);
+        let indexed = V::decode_view_with_ctx(input, indexed_context);
+        assert_eq!(
+            indexed, raw,
+            "input={input:02x?}, depth={depth}, unknown={unknown_limit}, elements={element_limit}"
+        );
+        assert_eq!(indexed_unknown.get(), raw_unknown.get());
+        assert_eq!(indexed_elements.get(), raw_elements.get());
+    }
+
+    for input in [
+        &[][..],
+        &[0x08, 0x96, 1, 0x22, 3, 1, 0xac, 2][..],
+        &[0x08, 0x80][..],
+        &[0x0a, 2, 0xff][..],
+        &[0x28, 99][..],
+        &[0x82, 0xb5, 0x18, 2, 1][..],
+        &[0x88, 0, 1][..],
+        &[0xab, 0x06, 0x08, 1, 0xac, 0x06][..],
+    ] {
+        for unknown in [0, 1, 10] {
+            for elements in [0, 4, 128] {
+                compare::<ADVKeyIndexListView<'_>>(input, 2, unknown, elements);
+            }
+        }
+    }
+    for input in [
+        &[0x0a, 5, 0x0a, 3, b'a', b'b', b'c'][..],
+        &[0x0a, 2, 0x0a][..],
+    ] {
+        for depth in [0, 1, 2] {
+            compare::<waproto::whatsapp::AIQueryFanoutView<'_>>(input, depth, 1, 128);
+        }
+    }
+    for input in [
+        &[0x0a, 4, 0x08, 1, 0x12, 0][..],
+        &[0x0a, 4, 0x08, 1, 0x12][..],
+        &[0x0a, 2, 0x18, 0][..],
+    ] {
+        for depth in [0, 1, 2] {
+            for unknown in [0, 1] {
+                for elements in [0, 128] {
+                    compare::<waproto::whatsapp::ConfigView<'_>>(input, depth, unknown, elements);
+                }
+            }
+        }
+    }
+    let mut state = 0x96a3_5f27_31dc_b40eu64;
+    for length in 0..=24 {
+        for _ in 0..256 {
+            let input: Vec<u8> = (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            compare::<ADVKeyIndexListView<'_>>(&input, 2, 1, 64);
+            compare::<waproto::whatsapp::MessageView<'_>>(&input, 2, 1, 64);
+            compare::<waproto::whatsapp::ConfigView<'_>>(&input, 2, 1, 64);
+        }
+    }
+}
 
 struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
 
@@ -296,13 +683,13 @@ fn required_fields_reuse_buffers() {
 fn invalid_singular_fields_match_reference_presence() {
     use buffa::Message as _;
     let mut actual = waproto::whatsapp::sync_action_value::ContactAction::default();
-    let mut expected = waproto::reference::sync_action_value::ContactAction::default();
+    let mut expected = reference::sync_action_value::ContactAction::default();
     assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 1, 0xff]).is_err());
     assert!(expected.merge_from_slice(&[0x0a, 1, 0xff]).is_err());
     assert_eq!(actual.full_name, expected.full_name);
 
     let mut actual = waproto::whatsapp::message::HistorySyncNotification::default();
-    let mut expected = waproto::reference::message::HistorySyncNotification::default();
+    let mut expected = reference::message::HistorySyncNotification::default();
     assert!(waproto::protobuf::Message::merge_from_slice(&mut actual, &[0x0a, 2, 0x01]).is_err());
     assert!(expected.merge_from_slice(&[0x0a, 2, 0x01]).is_err());
     assert_eq!(actual.file_sha256, expected.file_sha256);
@@ -360,6 +747,36 @@ fn repeated_numeric_fields_respect_element_memory_limit() {
 }
 
 #[test]
+fn packed_decode_preserves_limit_and_wire_error_precedence() {
+    let unknown_then_malformed = [0x98, 0x06, 1, 0x22, 1, 0x80];
+    assert_eq!(
+        DecodeOptions::new()
+            .with_unknown_field_limit(0)
+            .decode_from_slice::<ADVKeyIndexList>(&unknown_then_malformed),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    );
+
+    let malformed = [0x22, 3, 1, 2, 0x80];
+    for (limit, expected) in [
+        (size_of::<u32>(), DecodeError::ElementMemoryLimitExceeded),
+        (2 * size_of::<u32>(), DecodeError::UnexpectedEof),
+    ] {
+        assert_eq!(
+            DecodeOptions::new()
+                .with_element_memory_limit(limit)
+                .decode_from_slice::<ADVKeyIndexList>(&malformed),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        DecodeOptions::new()
+            .with_max_message_size(malformed.len() - 1)
+            .decode_from_slice::<ADVKeyIndexList>(&malformed),
+        Err(DecodeError::MessageTooLarge)
+    );
+}
+
+#[test]
 fn numeric_element_budget_is_shared_across_packed_and_unpacked_values() {
     let input = [0x22, 1, 1, 0x20, 2];
     let one_element = DecodeOptions::new().with_element_memory_limit(size_of::<u32>());
@@ -389,6 +806,339 @@ fn numeric_element_budget_is_shared_across_packed_and_unpacked_values() {
             .unwrap()
             .valid_indexes,
         &[1, 2]
+    );
+}
+
+#[test]
+fn packed_view_preserves_partial_values_and_budget() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+
+    let payloads: &[&[u8]] = &[
+        &[1, 0xac, 2, 3],
+        &[1, 0x80],
+        &[
+            1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 3,
+        ],
+        &[1, 0x80, 0x80, 1, 2],
+        &[0x80, 0x80, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        &[0x80, 0x80, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x80],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2],
+    ];
+    for payload in payloads {
+        let mut wire = vec![payload.len() as u8];
+        wire.extend_from_slice(payload);
+        for budget in [0, 4, 8, 16, 64] {
+            let unknown_a = Cell::new(10);
+            let unknown_b = Cell::new(10);
+            let elements_a = Cell::new(budget);
+            let elements_b = Cell::new(budget);
+            let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+            let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+            let tag = Tag::new(4, WireType::LengthDelimited);
+            let mut owned = ADVKeyIndexList::default();
+            let mut view = ADVKeyIndexListView::default();
+            let mut input = &wire[..];
+            let a = owned.merge_field(tag, &mut input, ctx_a);
+            let b = view.merge_view_field(tag, &wire, &wire, ctx_b).map(|_| ());
+            assert_eq!(a, b, "payload={payload:?}, budget={budget}");
+            assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+            assert_eq!(elements_a.get(), elements_b.get());
+            assert_eq!(unknown_a.get(), unknown_b.get());
+        }
+    }
+}
+
+#[test]
+fn packed_view_preserves_values_across_block_boundaries_and_errors() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType, encode_varint},
+    };
+
+    for count in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+        for suffix in [
+            &[][..],
+            &[0x80][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1][..],
+            &[
+                0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0,
+            ][..],
+        ] {
+            let mut payload = vec![1; count];
+            payload.extend_from_slice(suffix);
+            let mut wire = Vec::new();
+            encode_varint(payload.len() as u64, &mut wire);
+            wire.extend_from_slice(&payload);
+            for budget in [
+                0usize, 4, 60, 64, 68, 128, 252, 255, 256, 257, 260, 512, 1024,
+            ] {
+                let unknown_a = Cell::new(10);
+                let unknown_b = Cell::new(10);
+                let elements_a = Cell::new(budget);
+                let elements_b = Cell::new(budget);
+                let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+                let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+                let tag = Tag::new(4, WireType::LengthDelimited);
+                let mut owned = ADVKeyIndexList::default();
+                let mut view = ADVKeyIndexListView::default();
+                owned.valid_indexes.push(9);
+                view.valid_indexes.push(9);
+                for _ in 0..2 {
+                    let mut input = &wire[..];
+                    let a = owned.merge_field(tag, &mut input, ctx_a);
+                    let b = view.merge_view_field(tag, &wire, &wire, ctx_b).map(|_| ());
+                    assert_eq!(a, b, "count={count}, suffix={suffix:?}, budget={budget}");
+                    assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+                    assert_eq!(elements_a.get(), elements_b.get());
+                    assert_eq!(unknown_a.get(), unknown_b.get());
+                    if a.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_view_returns_following_fields_after_ascii_blocks() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+    let mut wire = vec![64];
+    wire.extend_from_slice(&[1; 64]);
+    wire.extend_from_slice(&[0x08, 7]);
+    let unknown = Cell::new(10);
+    let budget = Cell::new(64 * size_of::<u32>());
+    let context = DecodeContext::new(10, &unknown).with_element_memory(&budget);
+    let mut view = ADVKeyIndexListView::default();
+    let rest = view
+        .merge_view_field(
+            Tag::new(4, WireType::LengthDelimited),
+            &wire,
+            &wire,
+            context,
+        )
+        .unwrap();
+    assert_eq!(rest, &[0x08, 7]);
+    assert_eq!(&*view.valid_indexes, &[1; 64]);
+    assert_eq!(budget.get(), 0);
+}
+
+#[test]
+fn packed_owned_buffer_observes_budget_after_each_advance() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        bytes::Buf,
+        encoding::{Tag, WireType, decode_varint, encode_varint},
+    };
+
+    struct ObservingBuf<'a> {
+        input: &'a [u8],
+        chunk_size: usize,
+        budget: &'a Cell<usize>,
+        advances: Vec<(usize, usize)>,
+    }
+    impl Buf for ObservingBuf<'_> {
+        fn remaining(&self) -> usize {
+            self.input.len()
+        }
+        fn chunk(&self) -> &[u8] {
+            &self.input[..self.input.len().min(self.chunk_size)]
+        }
+        fn advance(&mut self, count: usize) {
+            self.advances.push((count, self.budget.get()));
+            self.input = &self.input[count..];
+        }
+    }
+    fn scalar(
+        input: &mut impl Buf,
+        output: &mut Vec<u32>,
+        context: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        let length =
+            usize::try_from(decode_varint(input)?).map_err(|_| DecodeError::MessageTooLarge)?;
+        if length > input.remaining() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let mut packed = input.take(length);
+        while packed.has_remaining() {
+            let value = decode_varint(&mut packed)? as u32;
+            context.register_element_memory(size_of::<u32>())?;
+            output.push(value);
+        }
+        Ok(())
+    }
+
+    for count in [0usize, 1, 63, 64, 65, 128] {
+        for suffix in [
+            &[][..],
+            &[0x80][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2][..],
+            &[0xac, 2][..],
+        ] {
+            let mut payload = vec![1; count];
+            payload.extend_from_slice(suffix);
+            let mut wire = Vec::new();
+            encode_varint(payload.len() as u64, &mut wire);
+            wire.extend_from_slice(&payload);
+            wire.push(0x55);
+            for budget in [0, 4, 252, 255, 256, 260, 512, 1024] {
+                for chunk_size in [1, 2, 7, 64, 1024] {
+                    let actual_budget = Cell::new(budget);
+                    let reference_budget = Cell::new(budget);
+                    let actual_unknown = Cell::new(10);
+                    let reference_unknown = Cell::new(10);
+                    let mut actual_input = ObservingBuf {
+                        input: &wire,
+                        chunk_size,
+                        budget: &actual_budget,
+                        advances: Vec::new(),
+                    };
+                    let mut reference_input = ObservingBuf {
+                        input: &wire,
+                        chunk_size,
+                        budget: &reference_budget,
+                        advances: Vec::new(),
+                    };
+                    let actual_context =
+                        DecodeContext::new(10, &actual_unknown).with_element_memory(&actual_budget);
+                    let reference_context = DecodeContext::new(10, &reference_unknown)
+                        .with_element_memory(&reference_budget);
+                    let mut actual = ADVKeyIndexList::default();
+                    actual.valid_indexes.push(9);
+                    let mut expected = vec![9];
+                    let result = actual.merge_field(
+                        Tag::new(4, WireType::LengthDelimited),
+                        &mut actual_input,
+                        actual_context,
+                    );
+                    let reference = scalar(&mut reference_input, &mut expected, reference_context);
+                    assert_eq!(result, reference);
+                    assert_eq!(actual.valid_indexes, expected);
+                    assert_eq!(actual_budget.get(), reference_budget.get());
+                    assert_eq!(actual_input.input, reference_input.input);
+                    assert_eq!(actual_input.advances, reference_input.advances);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_u32_blocks_match_owned_partial_state() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+
+    let mut payloads = Vec::new();
+    for len in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 256] {
+        let small = vec![1; len];
+        payloads.push(small.clone());
+        for pos in [0, len / 2, len.saturating_sub(1)] {
+            if pos < len {
+                let mut mixed = small.clone();
+                mixed.splice(pos..=pos, [0xac, 2]);
+                payloads.push(mixed);
+                let mut truncated = small.clone();
+                truncated[pos] = 0x80;
+                truncated.truncate(pos + 1);
+                payloads.push(truncated);
+                let mut overflow = small.clone();
+                overflow.splice(pos..=pos, [0x80; 10].into_iter().chain([2]));
+                payloads.push(overflow);
+            }
+        }
+    }
+
+    for payload in payloads {
+        let mut wire = Vec::new();
+        waproto::protobuf::encoding::encode_varint(payload.len() as u64, &mut wire);
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&[0x55, 0x44]);
+        for budget in [
+            0, 1, 4, 7, 16, 28, 31, 32, 33, 60, 64, 128, 252, 255, 256, 257, 260, 1024, 4096,
+        ] {
+            for initial in [0, 3, 9, 63, 64, 65, 127, 128, 129] {
+                let unknown_a = Cell::new(10);
+                let unknown_b = Cell::new(10);
+                let elements_a = Cell::new(budget);
+                let elements_b = Cell::new(budget);
+                let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+                let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+                let tag = Tag::new(4, WireType::LengthDelimited);
+                let mut owned = ADVKeyIndexList::default();
+                owned.valid_indexes = vec![99; initial];
+                let mut view = ADVKeyIndexListView::default();
+                view.valid_indexes = vec![99; initial].into();
+                let mut input = &wire[..];
+                let a = owned.merge_field(tag, &mut input, ctx_a);
+                let b = view.merge_view_field(tag, &wire, &wire, ctx_b);
+                assert_eq!(a, b.as_ref().map(|_| ()).map_err(Clone::clone));
+                if let Ok(rest) = b {
+                    assert_eq!(input, rest);
+                }
+                assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+                assert_eq!(elements_a.get(), elements_b.get());
+                assert_eq!(unknown_a.get(), unknown_b.get());
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_long_payload_preserves_error_order_and_limits() {
+    let mut input = vec![0x22, 33];
+    input.extend_from_slice(&[1; 32]);
+    input.push(0x80);
+    for budget in [0, 4, 64, 128, 132] {
+        let options = DecodeOptions::new().with_element_memory_limit(budget);
+        let expected = if budget < 128 {
+            DecodeError::ElementMemoryLimitExceeded
+        } else {
+            DecodeError::UnexpectedEof
+        };
+        assert_eq!(
+            options
+                .decode_from_slice::<ADVKeyIndexList>(&input)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            options
+                .decode_view::<ADVKeyIndexListView<'_>>(&input)
+                .unwrap_err(),
+            expected
+        );
+    }
+    *input.last_mut().unwrap() = 1;
+    let options = DecodeOptions::new().with_element_memory_limit(132);
+    assert_eq!(
+        options
+            .decode_from_slice::<ADVKeyIndexList>(&input)
+            .unwrap()
+            .valid_indexes
+            .len(),
+        33
+    );
+    assert_eq!(
+        options
+            .decode_view::<ADVKeyIndexListView<'_>>(&input)
+            .unwrap()
+            .valid_indexes
+            .len(),
+        33
     );
 }
 

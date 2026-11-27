@@ -82,6 +82,12 @@ impl Tag {
     }
 }
 
+pub(crate) fn probe_tag(input: &[u8]) -> Option<(Tag, usize)> {
+    let (number, wire, length) = super::indexed_wire::tag_prefix(input).ok()?;
+    let kind = WireType::from_u32(u32::from(wire)).ok()?;
+    Some((Tag::new(number.get(), kind), length))
+}
+
 #[inline]
 pub fn check_wire_type(tag: Tag, expected: WireType) -> Result<(), DecodeError> {
     if tag.kind != expected {
@@ -118,37 +124,7 @@ impl<'a> Reader<'a> {
     }
     #[inline]
     pub fn varint(&mut self) -> Result<u64, DecodeError> {
-        let original = self.remaining;
-        let (&first, tail) = self
-            .remaining
-            .split_first()
-            .ok_or(DecodeError::UnexpectedEof)?;
-        self.remaining = tail;
-        if first < 128 {
-            return Ok(u64::from(first));
-        }
-        if original.len() > 10 || original.last().is_some_and(|byte| *byte < 128) {
-            self.remaining = original;
-            let (value, count) = varint_in_slice(original)?;
-            self.remaining = &original[count..];
-            return Ok(value);
-        }
-        let mut value = u64::from(first & 127);
-        for shift in (7..70).step_by(7) {
-            let (&byte, tail) = self
-                .remaining
-                .split_first()
-                .ok_or(DecodeError::UnexpectedEof)?;
-            self.remaining = tail;
-            if shift == 63 && byte > 1 {
-                return Err(DecodeError::VarintTooLong);
-            }
-            value |= u64::from(byte & 127) << shift;
-            if byte < 128 {
-                return Ok(value);
-            }
-        }
-        Err(DecodeError::VarintTooLong)
+        decode_varint(&mut self.remaining)
     }
     #[inline]
     pub fn tag(&mut self) -> Result<Tag, DecodeError> {
@@ -250,36 +226,6 @@ impl<'a> Reader<'a> {
 }
 
 #[inline]
-fn varint_in_slice(input: &[u8]) -> Result<(u64, usize), DecodeError> {
-    assert!(!input.is_empty());
-    assert!(input.len() > 10 || input[input.len() - 1] < 128);
-    let mut value = 0u64;
-    macro_rules! byte {
-        ($index:literal, $shift:literal) => {{
-            let byte = input[$index];
-            value |= u64::from(byte & 127) << $shift;
-            if byte < 128 {
-                return Ok((value, $index + 1));
-            }
-        }};
-    }
-    byte!(0, 0);
-    byte!(1, 7);
-    byte!(2, 14);
-    byte!(3, 21);
-    byte!(4, 28);
-    byte!(5, 35);
-    byte!(6, 42);
-    byte!(7, 49);
-    byte!(8, 56);
-    let last = input[9];
-    if last > 1 {
-        return Err(DecodeError::VarintTooLong);
-    }
-    Ok((value | (u64::from(last) << 63), 10))
-}
-
-#[inline]
 pub const fn varint_len(value: u64) -> usize {
     if value < 128 {
         1
@@ -289,21 +235,77 @@ pub const fn varint_len(value: u64) -> usize {
 }
 
 #[inline]
-pub fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 128 {
-        output.push(value as u8 | 128);
-        value >>= 7;
-    }
-    output.push(value as u8);
+pub fn encode_varint(value: u64, output: &mut Vec<u8>) {
+    super::indexed_wire::encode_varint(value, output);
 }
 
 #[inline]
-pub fn put_varint(mut value: u64, output: &mut impl super::EncodeSink) {
-    while value >= 128 {
-        output.put_u8(value as u8 | 128);
-        value >>= 7;
+pub fn put_varint(value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_varint(value);
+}
+
+struct WriterSink<'a, S: super::EncodeSink>(&'a mut S);
+
+impl<S: super::EncodeSink> super::indexed_wire::WriteSink for WriterSink<'_, S> {
+    fn put_u8(&mut self, value: u8) {
+        self.0.put_u8(value);
     }
-    output.put_u8(value as u8);
+    fn put_slice(&mut self, value: &[u8]) {
+        self.0.put_slice(value);
+    }
+    fn put_u32_le(&mut self, value: u32) {
+        self.0.put_u32_le(value);
+    }
+    fn put_u64_le(&mut self, value: u64) {
+        self.0.put_u64_le(value);
+    }
+}
+
+fn writer_field_number(number: u32) -> super::indexed_wire::FieldNumber {
+    match super::indexed_wire::FieldNumber::new(number) {
+        Ok(number) => number,
+        Err(_) => panic!("invalid protobuf field number"),
+    }
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed32_value(value: u32, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_fixed32(value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed64_value(value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_fixed64(value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_varint_field(number: u32, value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .varint(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed32_field(number: u32, value: u32, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .fixed32(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed64_field(number: u32, value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .fixed64(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_bytes_field(number: u32, value: &[u8], output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .bytes(writer_field_number(number), value);
 }
 
 #[inline]
@@ -315,30 +317,19 @@ pub fn decode_varint(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
         return Ok(u64::from(first));
     }
     if chunk.len() > 10 || chunk.last().is_some_and(|byte| *byte < 128) {
-        let (value, length) = varint_in_slice(chunk)?;
+        let (value, length) = super::indexed_wire::decode_varint(chunk).map_err(varint_error)?;
         input.advance(length);
         return Ok(value);
     }
-    decode_varint_slow(input)
+    super::indexed_wire::decode_varint_buffer(input).map_err(varint_error)
 }
 
-#[cold]
-fn decode_varint_slow(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
-    let mut value = 0;
-    for shift in (0..70).step_by(7) {
-        if !input.has_remaining() {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        let byte = input.get_u8();
-        if shift == 63 && byte > 1 {
-            return Err(DecodeError::VarintTooLong);
-        }
-        value |= u64::from(byte & 127) << shift;
-        if byte < 128 {
-            return Ok(value);
-        }
+fn varint_error(error: super::indexed_wire::DecodeError) -> DecodeError {
+    match error {
+        super::indexed_wire::DecodeError::Truncated => DecodeError::UnexpectedEof,
+        super::indexed_wire::DecodeError::VarintOverflow => DecodeError::VarintTooLong,
+        _ => unreachable!("varint decoder returned a field error"),
     }
-    Err(DecodeError::VarintTooLong)
 }
 
 pub fn skip_field_depth(
@@ -422,6 +413,66 @@ pub fn skip_field(tag: Tag, input: &mut impl bytes::Buf) -> Result<(), DecodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingBuf<'a> {
+        input: &'a [u8],
+        advances: Vec<usize>,
+    }
+
+    impl bytes::Buf for RecordingBuf<'_> {
+        fn remaining(&self) -> usize {
+            self.input.len()
+        }
+        fn chunk(&self) -> &[u8] {
+            self.input
+        }
+        fn advance(&mut self, count: usize) {
+            self.advances.push(count);
+            self.input = &self.input[count..];
+        }
+    }
+
+    #[test]
+    fn tag_probe_accepts_incomplete_payloads_without_consuming_them() {
+        for (input, number, kind, width) in [
+            (&[0x08][..], 1, WireType::Varint, 1),
+            (&[0x8a, 0, 2, 1][..], 1, WireType::LengthDelimited, 2),
+            (&[0x0b][..], 1, WireType::StartGroup, 1),
+        ] {
+            assert_eq!(probe_tag(input), Some((Tag::new(number, kind), width)));
+        }
+        assert_eq!(probe_tag(&[0x80]), None);
+        assert_eq!(probe_tag(&[0x06]), None);
+    }
+
+    #[test]
+    fn varint_boundaries_and_cursor_match_reference() {
+        for value in [0, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            let mut input = Vec::new();
+            encode_varint(value, &mut input);
+            input.push(42);
+            let mut reader = Reader::new(&input).unwrap();
+            assert_eq!(reader.varint(), Ok(value));
+            assert_eq!(reader.remaining(), &[42]);
+            let mut buf = input.as_slice();
+            assert_eq!(decode_varint(&mut buf), Ok(value));
+            assert_eq!(buf, &[42]);
+        }
+        for input in [
+            vec![0x80; 9],
+            vec![0x80; 10],
+            vec![0xff; 10],
+            vec![0x80; 11],
+        ] {
+            let mut reference = input.as_slice();
+            let mut reader = Reader::new(&input).unwrap();
+            assert_eq!(
+                reader.varint(),
+                buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
+            );
+            assert_eq!(reader.remaining(), reference);
+        }
+    }
 
     fn reference_error(error: buffa::DecodeError) -> DecodeError {
         match error {
@@ -508,6 +559,112 @@ mod tests {
                 assert_eq!(candidate.get_u8(), reference.get_u8());
             }
         }
+    }
+
+    #[test]
+    fn fragmented_varints_match_the_reference_at_every_split() {
+        use bytes::Buf as _;
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0],
+            &[0x80, 1],
+            &[0x80, 0],
+            &[0x80],
+            &[0x80; 10],
+            &[0xff; 10],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 42],
+        ];
+        for input in cases {
+            for split in 0..=input.len() {
+                let mut candidate = input[..split].chain(&input[split..]);
+                let mut reference = input[..split].chain(&input[split..]);
+                assert_eq!(
+                    decode_varint(&mut candidate),
+                    buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
+                );
+                assert_eq!(candidate.remaining(), reference.remaining());
+                while candidate.has_remaining() {
+                    assert_eq!(candidate.get_u8(), reference.get_u8());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_values_preserve_fragmented_input_and_error_order() {
+        use bytes::Buf as _;
+        let tag = Tag::new(7, WireType::Varint);
+        let mut fragmented = (&[0x80][..]).chain(&[1, 42][..]);
+        skip_field_depth(tag, &mut fragmented, 100).unwrap();
+        assert_eq!(fragmented.remaining(), 1);
+        assert_eq!(fragmented.get_u8(), 42);
+
+        let tag = Tag::new(7, WireType::LengthDelimited);
+        let mut input = &[2, 0xff][..];
+        let unknown = std::cell::Cell::new(0);
+        let context = super::super::DecodeContext::new(100, &unknown);
+        assert_eq!(
+            skip_unknown_field(tag, &mut input, context),
+            Err(DecodeError::UnknownFieldLimitExceeded)
+        );
+        assert_eq!(input, &[2, 0xff]);
+        unknown.set(1);
+        assert_eq!(
+            skip_unknown_field(tag, &mut input, context),
+            Err(DecodeError::UnexpectedEof)
+        );
+        assert_eq!(input, &[0xff]);
+    }
+
+    #[test]
+    fn skipped_complete_values_leave_the_following_field_untouched() {
+        for (kind, bytes, consumed) in [
+            (WireType::Varint, &[0x96, 1, 42][..], 2),
+            (WireType::Fixed32, &[1, 2, 3, 4, 42][..], 4),
+            (WireType::Fixed64, &[1, 2, 3, 4, 5, 6, 7, 8, 42][..], 8),
+            (WireType::LengthDelimited, &[2, 7, 8, 42][..], 3),
+        ] {
+            let mut input = bytes;
+            skip_field_depth(Tag::new(7, kind), &mut input, 100).unwrap();
+            assert_eq!(input, &bytes[consumed..]);
+        }
+    }
+
+    #[test]
+    fn length_delimited_skip_preserves_advance_boundaries() {
+        let mut input = RecordingBuf {
+            input: &[2, 7, 8, 42],
+            advances: Vec::new(),
+        };
+        skip_field_depth(Tag::new(7, WireType::LengthDelimited), &mut input, 100).unwrap();
+        assert_eq!(input.input, &[42]);
+        assert_eq!(input.advances, [1, 2]);
+    }
+
+    #[test]
+    fn owned_decoder_preserves_multibyte_tag_advance_boundaries() {
+        let bytes = &[0xc5, 0x0c, 1, 2, 3, 0xff];
+        let mut reference = RecordingBuf {
+            input: bytes,
+            advances: Vec::new(),
+        };
+        let tag = Tag::decode(&mut reference).unwrap();
+        let unknown = std::cell::Cell::new(1);
+        skip_unknown_field(
+            tag,
+            &mut reference,
+            super::super::DecodeContext::new(100, &unknown),
+        )
+        .unwrap();
+        let mut actual = RecordingBuf {
+            input: bytes,
+            advances: Vec::new(),
+        };
+        super::super::DecodeOptions::new()
+            .decode::<crate::whatsapp::Message>(&mut actual)
+            .unwrap();
+        assert_eq!(actual.input, reference.input);
+        assert_eq!(actual.advances, reference.advances);
     }
 
     #[test]

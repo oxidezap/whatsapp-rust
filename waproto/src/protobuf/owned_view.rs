@@ -65,7 +65,7 @@ impl<V: MessageView<'static>> OwnedView<V> {
     /// Decode with a generated view that cannot leak the synthetic lifetime.
     ///
     /// ```
-    /// use waproto::buffa::{MessageView, OwnedView, OwnedViewSource, bytes::Bytes};
+    /// use waproto::protobuf::{MessageView, OwnedView, OwnedViewSource, bytes::Bytes};
     /// fn generated<V: MessageView<'static> + OwnedViewSource>(bytes: Bytes) -> OwnedView<V> {
     ///     OwnedView::decode(bytes).expect("valid generated message")
     /// }
@@ -76,7 +76,7 @@ impl<V: MessageView<'static>> OwnedView<V> {
     /// ```
     ///
     /// ```compile_fail
-    /// use waproto::buffa::{MessageView, OwnedView, bytes::Bytes};
+    /// use waproto::protobuf::{MessageView, OwnedView, bytes::Bytes};
     /// fn arbitrary_view<V: MessageView<'static>>(bytes: Bytes) {
     ///     let _ = OwnedView::<V>::decode(bytes);
     /// }
@@ -98,7 +98,7 @@ impl<V: MessageView<'static>> OwnedView<V> {
         })
     }
     /// ```compile_fail
-    /// use waproto::buffa::{DecodeOptions, MessageView, OwnedView, bytes::Bytes};
+    /// use waproto::protobuf::{DecodeOptions, MessageView, OwnedView, bytes::Bytes};
     /// fn arbitrary_view<V: MessageView<'static>>(bytes: Bytes) {
     ///     let _ = OwnedView::<V>::decode_with_options(bytes, &DecodeOptions::new());
     /// }
@@ -118,7 +118,7 @@ impl<V: MessageView<'static>> OwnedView<V> {
         })
     }
     /// ```compile_fail
-    /// use waproto::buffa::{MessageView, OwnedView};
+    /// use waproto::protobuf::{MessageView, OwnedView};
     /// fn arbitrary_view<V: MessageView<'static>>(message: &V::Owned) {
     ///     let _ = OwnedView::<V>::from_owned(message);
     /// }

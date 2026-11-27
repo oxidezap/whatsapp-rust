@@ -455,7 +455,6 @@ pub use futures;
 pub use serde;
 pub use serde_json;
 pub use wacore::time::{self, Timestamp};
-pub use waproto::buffa;
 pub use waproto::protobuf;
 
 pub mod cache;

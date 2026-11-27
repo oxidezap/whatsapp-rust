@@ -12,6 +12,8 @@ pub mod descriptor;
 pub mod features;
 #[path = "../build_support/inventory.rs"]
 mod inventory;
+#[path = "media_retry_schema.rs"]
+mod media_retry_schema;
 #[path = "names.rs"]
 pub mod names;
 #[path = "retained.rs"]
