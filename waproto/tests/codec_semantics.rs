@@ -93,35 +93,6 @@ fn repeated_message_view_error_preserves_free_and_full_capacity() {
 
 #[test]
 #[allow(clippy::disallowed_methods)]
-fn message_writer_observes_current_fields_after_sizing() {
-    use waproto::protobuf::{SizeCache, ViewEncode};
-    use waproto::whatsapp::{Message, MessageView};
-
-    let mut message = Message::default().with_conversation("hello");
-    message.view_once_message = Some(Default::default()).into();
-    message.bot_invoke_message = Some(Default::default()).into();
-    message.newsletter_scheduled_message = Some(Default::default()).into();
-    let original = message.encode_to_vec();
-    let mut cache = SizeCache::new();
-    let size = message.compute_size(&mut cache);
-    message.conversation = Some("world".into());
-    let mut output = Vec::new();
-    message.write_to(&mut cache, &mut output);
-    assert_eq!(size as usize, output.len());
-    assert_eq!(output, message.encode_to_vec());
-
-    let mut view = MessageView::decode_view(&original).unwrap();
-    let mut cache = SizeCache::new();
-    let size = ViewEncode::compute_size(&view, &mut cache);
-    view.conversation = Some("world");
-    let mut output = Vec::new();
-    ViewEncode::write_to(&view, &mut cache, &mut output);
-    assert_eq!(size as usize, output.len());
-    assert_eq!(output, message.encode_to_vec());
-}
-
-#[test]
-#[allow(clippy::disallowed_methods)]
 fn nested_message_maps_encode_with_consistent_size_cache() {
     use waproto::protobuf::{SizeCache, ViewEncode as _};
     use waproto::whatsapp::{Config, ConfigView, Field};

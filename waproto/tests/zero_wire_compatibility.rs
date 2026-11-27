@@ -6,6 +6,8 @@ mod zero_wire;
 
 use waproto::protobuf::encoding::{Tag, skip_field_depth};
 
+type FieldSpans<'a> = &'a [(u32, &'a [u8])];
+
 #[test]
 fn zero_wire_errors_keep_their_messages() {
     use zero_wire::DecodeError::*;
@@ -49,24 +51,48 @@ fn zero_fields(input: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, ()> {
 
 #[test]
 fn wire_reader_matches_generated_decoder_on_field_framing() {
-    let cases: &[&[u8]] = &[
-        &[],
-        &[0x08, 0],
-        &[0x08, 0x80, 0x01],
-        &[0x11, 1, 2, 3, 4, 5, 6, 7, 8],
-        &[0x1a, 3, 1, 2, 3],
-        &[0x25, 1, 2, 3, 4],
-        &[0x2b, 0x30, 1, 0x2c],
-        &[0x08, 1, 0x12, 0, 0x1d, 1, 2, 3, 4],
-        &[0],
-        &[0x08],
-        &[0x1a, 2, 1],
-        &[0x2b, 0x34],
-        &[0x0f],
-        &[0x80; 10],
+    let cases: &[(&[u8], FieldSpans<'_>)] = &[
+        (&[], &[]),
+        (&[0x08, 0], &[(1, &[0x08, 0])]),
+        (&[0x08, 0x80, 0x01], &[(1, &[0x08, 0x80, 0x01])]),
+        (
+            &[0x11, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[(2, &[0x11, 1, 2, 3, 4, 5, 6, 7, 8])],
+        ),
+        (&[0x1a, 3, 1, 2, 3], &[(3, &[0x1a, 3, 1, 2, 3])]),
+        (&[0x25, 1, 2, 3, 4], &[(4, &[0x25, 1, 2, 3, 4])]),
+        (&[0x2b, 0x30, 1, 0x2c], &[(5, &[0x2b, 0x30, 1, 0x2c])]),
+        (
+            &[0x08, 1, 0x12, 0, 0x1d, 1, 2, 3, 4],
+            &[(1, &[0x08, 1]), (2, &[0x12, 0]), (3, &[0x1d, 1, 2, 3, 4])],
+        ),
     ];
-    for input in cases {
-        assert_eq!(zero_fields(input), reference_fields(input), "{input:?}");
+    for (input, expected) in cases {
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(number, raw)| (*number, raw.to_vec()))
+            .collect();
+        assert_eq!(zero_fields(input), Ok(expected.clone()), "{input:?}");
+        assert_eq!(reference_fields(input), Ok(expected), "{input:?}");
+    }
+
+    use zero_wire::DecodeError;
+    for (input, expected) in [
+        (&[0][..], DecodeError::InvalidTag),
+        (&[0x08][..], DecodeError::Truncated),
+        (&[0x1a, 2, 1][..], DecodeError::Truncated),
+        (&[0x2b, 0x34][..], DecodeError::MismatchedEndGroup),
+        (&[0x0f][..], DecodeError::InvalidWireType),
+        (&[0x80; 10][..], DecodeError::VarintOverflow),
+    ] {
+        let actual = zero_wire::Reader::new(input, zero_wire::Limits::default())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(actual, expected, "{input:?}");
+        assert_eq!(zero_fields(input), Err(()), "{input:?}");
+        assert_eq!(reference_fields(input), Err(()), "{input:?}");
     }
 }
 

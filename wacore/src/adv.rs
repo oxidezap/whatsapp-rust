@@ -549,6 +549,14 @@ mod tests {
             let owned = options.decode_from_slice::<ADVSignedKeyIndexList>(&group);
             let view = options.decode_view::<ADVSignedKeyIndexListView<'_>>(&group);
             assert_eq!(owned.as_ref().err(), view.as_ref().err(), "limit={limit}");
+            if limit == 0 {
+                assert_eq!(
+                    owned,
+                    Err(waproto::protobuf::DecodeError::RecursionLimitExceeded)
+                );
+            } else {
+                assert!(owned.is_ok(), "limit={limit}");
+            }
         }
     }
 
