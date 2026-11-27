@@ -28,6 +28,36 @@ pub mod schema;
 use descriptor::FileDescriptorSet;
 
 #[test]
+fn fragmented_whatsapp_formatting_matches_full_file_formatting() {
+    let descriptor =
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/whatsapp.desc")).unwrap();
+    let mut descriptor = FileDescriptorSet::decode_from_slice(&descriptor).unwrap();
+    names::apply(
+        &mut descriptor,
+        names::TYPES,
+        names::FIELDS,
+        names::ENUM_VALUES,
+        names::ONEOFS,
+    )
+    .unwrap();
+    retained::apply_local_fields(&mut descriptor).unwrap();
+    wallpaper::retain_fields(&mut descriptor).unwrap();
+    let schema = project::project(&descriptor).unwrap();
+    let base = "crate::protobuf::generated::whatsapp";
+    let raw = emit_owned::generate_raw(&schema, base);
+    let expected = prettyplease::unparse(&syn::parse_file(&raw).unwrap());
+    let actual = emit_owned::generate(&schema, base).unwrap();
+    assert!(
+        actual == expected,
+        "formatted output differs at byte {:?}",
+        actual
+            .bytes()
+            .zip(expected.bytes())
+            .position(|(a, b)| a != b)
+    );
+}
+
+#[test]
 fn media_retry_projection_rejects_schema_shape_changes() {
     use schema::{FieldNumber, FieldShape, OneofId, Presence, Scalar, ValueType};
 

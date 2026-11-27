@@ -8,7 +8,7 @@ const RT: &str = "crate::protobuf";
 
 #[derive(Default)]
 struct Module {
-    items: String,
+    items: Vec<String>,
     children: BTreeMap<String, Module>,
 }
 impl Module {
@@ -24,13 +24,58 @@ impl Module {
         out.push_str(
             "#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n",
         );
-        out.push_str(&self.items);
+        for item in &self.items {
+            out.push_str(item);
+        }
         for (name, child) in &self.children {
             out.push_str(&format!("pub mod {name} {{\n"));
             child.render(out);
             out.push_str("}\n");
         }
     }
+
+    fn render_formatted(&self, out: &mut String, depth: usize) -> Result<(), syn::Error> {
+        let imports = "#[allow(unused_imports)] use crate::protobuf::Message as _;\n#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n";
+        format_fragment(out, imports, depth)?;
+        for item in &self.items {
+            format_fragment(out, item, depth)?;
+        }
+        for (name, child) in &self.children {
+            out.push_str(&"    ".repeat(depth));
+            out.push_str(&format!("pub mod {name} {{\n"));
+            child.render_formatted(out, depth + 1)?;
+            out.push_str(&"    ".repeat(depth));
+            out.push_str("}\n");
+        }
+        Ok(())
+    }
+}
+
+fn format_fragment(out: &mut String, source: &str, depth: usize) -> Result<(), syn::Error> {
+    let mut wrapped = String::new();
+    for level in 0..depth {
+        wrapped.push_str(&format!("mod __format_{level} {{\n"));
+    }
+    wrapped.push_str(source);
+    for _ in 0..depth {
+        wrapped.push_str("}\n");
+    }
+    let formatted = prettyplease::unparse(&syn::parse_file(&wrapped)?);
+    let mut body = formatted.as_str();
+    for level in 0..depth {
+        let opening = format!("{}mod __format_{level} {{\n", "    ".repeat(level));
+        body = body
+            .strip_prefix(&opening)
+            .expect("formatter module opening");
+    }
+    for level in 0..depth {
+        let closing = format!("{}}}\n", "    ".repeat(level));
+        body = body
+            .strip_suffix(&closing)
+            .expect("formatter module closing");
+    }
+    out.push_str(body);
+    Ok(())
 }
 
 fn ident(name: &str) -> String {
@@ -1119,9 +1164,10 @@ impl Emitter<'_> {
 }
 
 pub fn generate(schema: &Schema, base: &str) -> Result<String, syn::Error> {
-    let source = generate_raw(schema, base);
-    let parsed = syn::parse_file(&source)?;
-    Ok(prettyplease::unparse(&parsed))
+    let root = generate_modules(schema, base, true);
+    let mut source = String::new();
+    root.render_formatted(&mut source, 0)?;
+    Ok(source)
 }
 
 pub fn generate_raw(schema: &Schema, base: &str) -> String {
@@ -1168,12 +1214,19 @@ pub fn generate_private_owned_raw(schema: &Schema, base: &str, runtime: &str) ->
 }
 
 fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
+    let root = generate_modules(schema, base, views);
+    let mut source = String::new();
+    root.render(&mut source);
+    source
+}
+
+fn generate_modules(schema: &Schema, base: &str, views: bool) -> Module {
     let emitter = Emitter { schema, base };
     let mut root = Module::default();
     for enumeration in &schema.enumerations {
         root.at(&emitter.scope(enumeration.parent))
             .items
-            .push_str(&emitter.enum_source(enumeration));
+            .push(emitter.enum_source(enumeration));
     }
     for (index, message) in schema.messages.iter().enumerate() {
         if message.map_entry {
@@ -1181,26 +1234,24 @@ fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
         }
         root.at(&emitter.scope(message.parent))
             .items
-            .push_str(&emitter.message_source(message));
+            .push(emitter.message_source(message));
         if views {
             root.at(&emitter.scope(message.parent))
                 .items
-                .push_str(&emitter.view_source(message, MessageId(index)));
+                .push(emitter.view_source(message, MessageId(index)));
         }
         for id in &message.oneofs {
             root.at(&emitter.scope(Some(MessageId(index))))
                 .items
-                .push_str(&emitter.oneof_source(schema.oneof(*id)));
+                .push(emitter.oneof_source(schema.oneof(*id)));
             if views {
                 root.at(&emitter.scope(Some(MessageId(index))))
                     .items
-                    .push_str(&emitter.view_oneof_source(schema.oneof(*id), *id));
+                    .push(emitter.view_oneof_source(schema.oneof(*id), *id));
             }
         }
     }
-    let mut source = String::new();
-    root.render(&mut source);
-    source
+    root
 }
 
 impl Emitter<'_> {
