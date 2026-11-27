@@ -213,9 +213,8 @@ pub type IndexMac = [u8; 32];
 ///
 /// Small patches dedup with a linear scan; larger patches sort + dedup the
 /// inline arrays in place. Either way the only allocation is the returned `Vec`
-/// itself: the comparator touches contiguous 32-byte elements (never re-walking
-/// the boxed record/index/blob `MessageField` chain, the part buffa makes
-/// pricier than prost's `Option` derefs).
+/// itself: the comparator touches contiguous 32-byte elements without repeatedly
+/// traversing the boxed record/index/blob `MessageField` chain.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMac> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
         let mut out: Vec<IndexMac> = Vec::with_capacity(mutations.len());

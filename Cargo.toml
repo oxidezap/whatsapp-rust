@@ -532,7 +532,7 @@ incremental = false
 # Off-hot-path crates run per connection / sync / request, not per message,
 # so size-optimizing them shrinks the binary at no measurable throughput cost.
 # The per-message/per-frame crypto/protocol crates (libsignal, wacore-binary,
-# waproto, buffa, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
+# waproto, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
 # opt-level 3 — wacore-noise's NoiseCipher runs the transport AEAD per frame,
 # so despite owning the once-per-connection handshake it is not handshake-only.
 # z = persistence (Diesel/SQLite, I/O-bound), media HTTP (ureq, network-bound),
