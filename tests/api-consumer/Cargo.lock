@@ -1781,11 +1781,8 @@ dependencies = [
  "bytes",
  "hashbrown 0.15.5",
  "heck",
- "prettyplease",
- "quote",
  "serde",
  "sha2",
- "syn 3.0.6",
  "thiserror",
 ]
 
