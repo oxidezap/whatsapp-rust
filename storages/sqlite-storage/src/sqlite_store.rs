@@ -540,35 +540,19 @@ fn insert_app_state_mutation_macs(
     mutations: &[AppStateMutationMAC],
     device_id: i32,
 ) -> std::result::Result<(), DieselError> {
-    let records: Vec<_> = mutations
-        .iter()
-        .map(|m| {
-            (
-                app_state_mutation_macs::name.eq(name),
-                app_state_mutation_macs::version.eq(version as i64),
-                app_state_mutation_macs::index_mac.eq(&m.index_mac),
-                app_state_mutation_macs::value_mac.eq(&m.value_mac),
-                app_state_mutation_macs::device_id.eq(device_id),
-            )
-        })
-        .collect();
-    // SQLite's variable limit is typically 999 or 32766; five columns per
-    // row keeps 100 rows at 500 parameters.
     const CHUNK_SIZE: usize = 100;
-    for chunk in records.chunks(CHUNK_SIZE) {
-        diesel::insert_into(app_state_mutation_macs::table)
-            .values(chunk)
-            .on_conflict((
-                app_state_mutation_macs::name,
-                app_state_mutation_macs::index_mac,
-                app_state_mutation_macs::device_id,
-            ))
-            .do_update()
-            .set((
-                app_state_mutation_macs::version.eq(excluded(app_state_mutation_macs::version)),
-                app_state_mutation_macs::value_mac.eq(excluded(app_state_mutation_macs::value_mac)),
-            ))
-            .execute(conn)?;
+    for chunk in mutations.chunks(CHUNK_SIZE) {
+        let [first, rest @ ..] = chunk else {
+            continue;
+        };
+        crate::upsert_queries::UpsertAppStateMacBatch {
+            name,
+            version: version as i64,
+            device_id,
+            first,
+            rest,
+        }
+        .execute(conn)?;
     }
     Ok(())
 }

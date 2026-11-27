@@ -537,6 +537,48 @@ impl QueryFragment<Sqlite> for UpsertMsgSecret<'_> {
     }
 }
 
+#[derive(QueryId)]
+pub(crate) struct UpsertAppStateMacBatch<'a> {
+    pub name: &'a str,
+    pub version: i64,
+    pub device_id: i32,
+    pub first: &'a wacore::appstate::processor::AppStateMutationMAC,
+    pub rest: &'a [wacore::appstate::processor::AppStateMutationMAC],
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertAppStateMacBatch<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertAppStateMacBatch<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.unsafe_to_cache_prepared();
+        out.push_sql(
+            "INSERT INTO app_state_mutation_macs (name, version, device_id, index_mac, value_mac) VALUES (",
+        );
+        out.push_bind_param::<Text, _>(self.name)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.version)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Binary, _>(self.first.index_mac.as_slice())?;
+        out.push_sql(", ");
+        out.push_bind_param::<Binary, _>(self.first.value_mac.as_slice())?;
+        out.push_sql(")");
+        for row in self.rest {
+            out.push_sql(", (?1, ?2, ?3, ");
+            out.push_bind_param::<Binary, _>(row.index_mac.as_slice())?;
+            out.push_sql(", ");
+            out.push_bind_param::<Binary, _>(row.value_mac.as_slice())?;
+            out.push_sql(")");
+        }
+        out.push_sql(
+            " ON CONFLICT (name, index_mac, device_id) DO UPDATE SET \
+             version = excluded.version, value_mac = excluded.value_mac",
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
