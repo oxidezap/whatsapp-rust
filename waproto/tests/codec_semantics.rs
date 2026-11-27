@@ -659,6 +659,9 @@ fn packed_view_preserves_partial_values_and_budget() {
             1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 3,
         ],
         &[1, 0x80, 0x80, 1, 2],
+        &[0x80, 0x80, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        &[0x80, 0x80, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x80],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2],
     ];
     for payload in payloads {
         let mut wire = vec![payload.len() as u8];
@@ -680,6 +683,67 @@ fn packed_view_preserves_partial_values_and_budget() {
             assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
             assert_eq!(elements_a.get(), elements_b.get());
             assert_eq!(unknown_a.get(), unknown_b.get());
+        }
+    }
+}
+
+#[test]
+fn packed_u32_blocks_match_owned_partial_state() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+
+    let mut payloads = Vec::new();
+    for len in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 256] {
+        let small = vec![1; len];
+        payloads.push(small.clone());
+        for pos in [0, len / 2, len.saturating_sub(1)] {
+            if pos < len {
+                let mut mixed = small.clone();
+                mixed.splice(pos..=pos, [0xac, 2]);
+                payloads.push(mixed);
+                let mut truncated = small.clone();
+                truncated[pos] = 0x80;
+                truncated.truncate(pos + 1);
+                payloads.push(truncated);
+                let mut overflow = small.clone();
+                overflow.splice(pos..=pos, [0x80; 10].into_iter().chain([2]));
+                payloads.push(overflow);
+            }
+        }
+    }
+
+    for payload in payloads {
+        let mut wire = Vec::new();
+        waproto::protobuf::encoding::encode_varint(payload.len() as u64, &mut wire);
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&[0x55, 0x44]);
+        for budget in [0, 1, 4, 7, 16, 28, 31, 32, 33, 60, 64, 128, 1024, 4096] {
+            for initial in [0, 3, 9] {
+                let unknown_a = Cell::new(10);
+                let unknown_b = Cell::new(10);
+                let elements_a = Cell::new(budget);
+                let elements_b = Cell::new(budget);
+                let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+                let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+                let tag = Tag::new(4, WireType::LengthDelimited);
+                let mut owned = ADVKeyIndexList::default();
+                owned.valid_indexes = vec![99; initial];
+                let mut view = ADVKeyIndexListView::default();
+                view.valid_indexes = vec![99; initial].into();
+                let mut input = &wire[..];
+                let a = owned.merge_field(tag, &mut input, ctx_a);
+                let b = view.merge_view_field(tag, &wire, &wire, ctx_b);
+                assert_eq!(a, b.as_ref().map(|_| ()).map_err(Clone::clone));
+                if let Ok(rest) = b {
+                    assert_eq!(input, rest);
+                }
+                assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+                assert_eq!(elements_a.get(), elements_b.get());
+                assert_eq!(unknown_a.get(), unknown_b.get());
+            }
         }
     }
 }

@@ -72,6 +72,56 @@ mod packed_sizes {
                 "small" => index % 128,
                 "mixed" => index,
                 "large" => u32::MAX - index,
+                "three" => 16_384 + index,
+                "first3" => {
+                    if index == 0 {
+                        16_384
+                    } else {
+                        1
+                    }
+                }
+                "middle3" => {
+                    if index == count / 2 {
+                        16_384
+                    } else {
+                        1
+                    }
+                }
+                "last3" => {
+                    if index + 1 == count {
+                        16_384
+                    } else {
+                        1
+                    }
+                }
+                "alternate3" => {
+                    if index % 2 == 0 {
+                        16_384
+                    } else {
+                        1
+                    }
+                }
+                "first5" => {
+                    if index == 0 {
+                        u32::MAX
+                    } else {
+                        1
+                    }
+                }
+                "firstshort" => {
+                    if index == 0 {
+                        1
+                    } else {
+                        u32::MAX
+                    }
+                }
+                "ten" | "firstten" => {
+                    if pattern == "ten" || index == 0 {
+                        u32::MAX
+                    } else {
+                        1
+                    }
+                }
                 "first" => {
                     if index == 0 {
                         128
@@ -96,7 +146,23 @@ mod packed_sizes {
                 _ => unreachable!(),
             })
             .collect();
-        let wire = value.encode_to_vec();
+        let wire = if matches!(pattern, "ten" | "firstten") {
+            let mut payload = Vec::new();
+            for index in 0..count {
+                let n = if pattern == "ten" || index == 0 {
+                    u64::MAX
+                } else {
+                    1
+                };
+                waproto::protobuf::encoding::encode_varint(n, &mut payload);
+            }
+            let mut wire = vec![0x22];
+            waproto::protobuf::encoding::encode_varint(payload.len() as u64, &mut wire);
+            wire.extend_from_slice(&payload);
+            wire
+        } else {
+            value.encode_to_vec()
+        };
         let reference = <reference::ADVKeyIndexList as buffa::Message>::decode_from_slice(&wire)
             .expect("synthetic protobuf benchmark fixture must be valid");
         assert_eq!(value.valid_indexes, reference.valid_indexes);
@@ -105,7 +171,7 @@ mod packed_sizes {
 
     macro_rules! bench {
         ($name:ident, $ty:ty, $trait:path, $decode:ident) => {
-            #[divan::bench(args = ["0-small", "1-small", "4-small", "8-small", "16-small", "32-small", "256-small", "256-mixed", "256-large", "256-first", "256-middle", "256-last", "4096-mixed", "4096-first", "4096-middle", "4096-last"])]
+            #[divan::bench(args = ["0-small", "1-small", "4-small", "8-small", "16-small", "32-small", "256-small", "256-mixed", "256-large", "256-first", "256-middle", "256-last", "256-three", "256-first3", "256-middle3", "256-last3", "256-alternate3", "256-first5", "256-firstshort", "256-ten", "256-firstten", "4096-mixed", "4096-first", "4096-middle", "4096-last"])]
             fn $name(bencher: divan::Bencher, case: &str) {
                 let wire = wire(case);
                 bencher.bench(|| black_box(<$ty as $trait>::$decode(black_box(&wire)).expect("synthetic protobuf benchmark fixture must be valid")));
