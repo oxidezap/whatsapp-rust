@@ -16,6 +16,8 @@ pub mod wallpaper;
 
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;
+#[path = "../codegen/format.rs"]
+mod format;
 #[path = "../codegen/media_retry_schema.rs"]
 pub mod media_retry_schema;
 #[path = "../codegen/policy.rs"]
@@ -50,7 +52,7 @@ fn fragmented_whatsapp_formatting_matches_full_file_formatting() {
     let base = "crate::protobuf::generated::whatsapp";
     let raw = raw::generate_raw(&schema, base);
     let expected = prettyplease::unparse(&syn::parse_file(&raw).unwrap());
-    let actual = emit_owned::generate(&schema, base).unwrap();
+    let actual = format::generate(&schema, base).unwrap();
     assert!(
         actual == expected,
         "formatted output differs at byte {:?}",

@@ -19,48 +19,6 @@ impl Module {
         }
         current
     }
-    fn render_formatted(&self, out: &mut String, depth: usize) -> Result<(), syn::Error> {
-        let imports = "#[allow(unused_imports)] use crate::protobuf::Message as _;\n#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n";
-        format_fragment(out, imports, depth)?;
-        for item in &self.items {
-            format_fragment(out, item, depth)?;
-        }
-        for (name, child) in &self.children {
-            out.push_str(&"    ".repeat(depth));
-            out.push_str(&format!("pub mod {name} {{\n"));
-            child.render_formatted(out, depth + 1)?;
-            out.push_str(&"    ".repeat(depth));
-            out.push_str("}\n");
-        }
-        Ok(())
-    }
-}
-
-fn format_fragment(out: &mut String, source: &str, depth: usize) -> Result<(), syn::Error> {
-    let mut wrapped = String::new();
-    for level in 0..depth {
-        wrapped.push_str(&format!("mod __format_{level} {{\n"));
-    }
-    wrapped.push_str(source);
-    for _ in 0..depth {
-        wrapped.push_str("}\n");
-    }
-    let formatted = prettyplease::unparse(&syn::parse_file(&wrapped)?);
-    let mut body = formatted.as_str();
-    for level in 0..depth {
-        let opening = format!("{}mod __format_{level} {{\n", "    ".repeat(level));
-        body = body
-            .strip_prefix(&opening)
-            .expect("formatter module opening");
-    }
-    for level in 0..depth {
-        let closing = format!("{}}}\n", "    ".repeat(level));
-        body = body
-            .strip_suffix(&closing)
-            .expect("formatter module closing");
-    }
-    out.push_str(body);
-    Ok(())
 }
 
 pub(crate) fn ident(name: &str) -> String {
@@ -278,7 +236,7 @@ impl Emitter<'_> {
         ));
         out.push_str(&format!("impl {RT}::Enumeration for {name} {{ fn from_i32(value:i32)->::core::option::Option<Self>{{match value{{"));
         for (number, variant) in &canonical {
-            out.push_str(&format!("{number}=>Some(Self::{variant}),"));
+            out.push_str(&format!("{number}=>Some(Self::{variant}),\n"));
         }
         out.push_str(
             "_=>None}}\nfn to_i32(&self)->i32{*self as i32}\nfn proto_name(&self)->&'static str{",
@@ -297,7 +255,7 @@ impl Emitter<'_> {
                     .find(|value| value.number == *number)
                     .expect("enum name")
                     .name;
-                out.push_str(&format!("Self::{variant}=>{proto:?},"));
+                out.push_str(&format!("Self::{variant}=>{proto:?},\n"));
             }
             out.push('}');
         }
@@ -306,7 +264,7 @@ impl Emitter<'_> {
         );
         for value in &enumeration.values {
             out.push_str(&format!(
-                "{:?}=>Some(Self::{}),",
+                "{:?}=>Some(Self::{}),\n",
                 value.name, canonical[&value.number]
             ));
         }
@@ -314,7 +272,7 @@ impl Emitter<'_> {
         let mut seen = BTreeSet::new();
         for value in &enumeration.values {
             if seen.insert(value.number) {
-                out.push_str(&format!("Self::{},", canonical[&value.number]));
+                out.push_str(&format!("Self::{},\n", canonical[&value.number]));
             }
         }
         out.push_str("]}}\n");
@@ -653,14 +611,14 @@ impl Emitter<'_> {
                 if !matches!(field.shape, FieldShape::Oneof { .. }) {
                     let slot = member(&field.name);
                     out.push_str(&format!(
-                        "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                        "{slot}: ::core::clone::Clone::clone(&self.{slot}),\n"
                     ));
                 }
             }
             for id in &message.oneofs {
                 let slot = member(&self.schema.oneof(*id).name);
                 out.push_str(&format!(
-                    "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                    "{slot}: ::core::clone::Clone::clone(&self.{slot}),\n"
                 ));
             }
             out.push_str("}}}\n");
@@ -670,14 +628,14 @@ impl Emitter<'_> {
             let field = self.schema.field(*id);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 initial.push_str(&format!(
-                    "{}: {},",
+                    "{}: {},\n",
                     member(&field.name),
                     self.default_field(field)
                 ));
             }
         }
         for id in &message.oneofs {
-            initial.push_str(&format!("{}:None,", member(&self.schema.oneof(*id).name)));
+            initial.push_str(&format!("{}:None,\n", member(&self.schema.oneof(*id).name)));
         }
         out.push_str(&format!(
             "impl ::core::default::Default for {name}{{fn default()->Self{{Self{{{initial}}}}}}}\n"
@@ -733,7 +691,7 @@ impl Emitter<'_> {
                 ty
             };
             let expression = if convert { "value.into()" } else { "value" };
-            out.push_str(&format!("#[must_use] #[inline] pub fn with_{}(mut self,value:{arg})->Self{{self.{}=Some({expression});self}}",field.name.to_snake_case(),member(&field.name)));
+            out.push_str(&format!("#[must_use] #[inline] pub fn with_{}(mut self,value:{arg})->Self{{self.{}=Some({expression});self}}\n",field.name.to_snake_case(),member(&field.name)));
         }
         out.push_str("}\n");
         let mut fields = message
@@ -764,6 +722,7 @@ impl Emitter<'_> {
         out.push_str(&format!("impl {RT}::Message for {name}{{fn compute_size(&self,cache:&mut {RT}::SizeCache)->u32{{let {mutable}size=0u64;let _=&cache;"));
         for field in &fields {
             out.push_str(&self.encode_field(field, false));
+            out.push('\n');
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}\nfn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
         if let Some(grouped) = self.grouped_writer(&fields, false) {
@@ -771,6 +730,7 @@ impl Emitter<'_> {
         } else {
             for field in &fields {
                 out.push_str(&self.encode_field(field, true));
+                out.push('\n');
             }
         }
         // Keeping this wide dispatch separate avoids a large stack frame on each decode.
@@ -785,6 +745,7 @@ impl Emitter<'_> {
         }
         for field in &fields {
             out.push_str(&self.decode_field(field));
+            out.push('\n');
         }
         let mut known = BTreeSet::new();
         for field in &fields {
@@ -795,7 +756,7 @@ impl Emitter<'_> {
                     | FieldShape::Oneof { value, .. } => value,
                     FieldShape::Map { .. } => ValueType::Scalar(Scalar::Bytes),
                 });
-                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({wire})?)),",field.number.get()));
+                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({wire})?)),\n",field.number.get()));
             }
         }
         if fields.is_empty() {
@@ -871,8 +832,9 @@ impl Emitter<'_> {
                 } else {
                     self.encode_field(field, true)
                 });
+                out.push('\n');
             }
-            out.push('}');
+            out.push_str("}\n");
         }
         Some(out)
     }
@@ -957,7 +919,7 @@ impl Emitter<'_> {
             let key_ty = Self::scalar_type(key, BytesStorage::Vector);
             let val_ty = self.value_type(value, field.bytes_storage);
             let mut out = format!(
-                "({number},{RT}::encoding::WireType::LengthDelimited)=>{{context.register_element_memory(::std::mem::size_of::<({key_ty},{val_ty})>())?;let context=context.descend()?;let n={RT}::encoding::decode_varint(input)?;if n>u64::from({RT}::MAX_MESSAGE_BYTES){{return Err({RT}::DecodeError::MessageTooLarge);}}if n as usize>input.remaining(){{return Err({RT}::DecodeError::UnexpectedEof);}}let limit=input.remaining()-n as usize;let mut key: {key_ty}=::core::default::Default::default();let mut value: {val_ty}=::core::default::Default::default();while input.remaining()>limit{{let item={RT}::encoding::Tag::decode(input)?;match item.field_number(){{1=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;key={};}},2=>{{",
+                "({number},{RT}::encoding::WireType::LengthDelimited)=>{{context.register_element_memory(::std::mem::size_of::<({key_ty},{val_ty})>())?;let context=context.descend()?;let n={RT}::encoding::decode_varint(input)?;if n>u64::from({RT}::MAX_MESSAGE_BYTES){{return Err({RT}::DecodeError::MessageTooLarge);}}\nif n as usize>input.remaining(){{return Err({RT}::DecodeError::UnexpectedEof);}}let limit=input.remaining()-n as usize;let mut key: {key_ty}=::core::default::Default::default();let mut value: {val_ty}=::core::default::Default::default();while input.remaining()>limit{{let item={RT}::encoding::Tag::decode(input)?;match item.field_number(){{1=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;key={};}},2=>{{",
                 Self::wire(ValueType::Scalar(key)),
                 self.read_value(ValueType::Scalar(key), BytesStorage::Vector, "input")
             );
@@ -988,7 +950,7 @@ impl Emitter<'_> {
                     self.read_value(value, field.bytes_storage, "input")
                 ));
             }
-            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,input,context)?,}}}}if input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
+            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,input,context)?,}}}}\nif input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
             return out;
         }
         let value = match field.shape {
@@ -1146,13 +1108,6 @@ impl Emitter<'_> {
         out.push_str("Ok(())},");
         out
     }
-}
-
-pub fn generate(schema: &Schema, base: &str) -> Result<String, syn::Error> {
-    let root = generate_modules(schema, base, true);
-    let mut source = String::new();
-    root.render_formatted(&mut source, 0)?;
-    Ok(source)
 }
 
 pub(crate) fn generate_modules(schema: &Schema, base: &str, views: bool) -> Module {
@@ -1493,7 +1448,7 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 out.push_str(&format!(
-                    "pub {}: {},",
+                    "pub {}: {},\n",
                     member(&field.name),
                     self.view_field_type(field)
                 ));
@@ -1521,7 +1476,7 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 initial.push_str(&format!(
-                    "{}: {},",
+                    "{}: {},\n",
                     member(&field.name),
                     self.view_default(field)
                 ));
@@ -1529,7 +1484,7 @@ impl Emitter<'_> {
         }
         for group in &message.oneofs {
             initial.push_str(&format!(
-                "{}:None,",
+                "{}:None,\n",
                 member(&self.schema.oneof(*group).name)
             ));
         }
@@ -1570,12 +1525,12 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 let n = member(&field.name);
-                out.push_str(&format!("d.field({n:?},&self.{n});"));
+                out.push_str(&format!("d.field({n:?},&self.{n});\n"));
             }
         }
         for group in &message.oneofs {
             let n = member(&self.schema.oneof(*group).name);
-            out.push_str(&format!("d.field({n:?},&self.{n});"));
+            out.push_str(&format!("d.field({n:?},&self.{n});\n"));
         }
         out.push_str("d.finish()}}\n");
         out.push_str(&format!("impl<'a>{RT}::owned_view::sealed::View for {name}<'a>{{}}impl {RT}::ViewReborrow for {name}<'static>{{type Reborrowed<'b>={name}<'b>;fn reborrow<'b>(this:&'b Self)->&'b Self::Reborrowed<'b>{{this}}}}impl<'a>{RT}::MessageName for {name}<'a>{{const NAME:&'static str=<{owned} as {RT}::MessageName>::NAME;const PACKAGE:&'static str=<{owned} as {RT}::MessageName>::PACKAGE;const FULL_NAME:&'static str=<{owned} as {RT}::MessageName>::FULL_NAME;const TYPE_URL:&'static str=<{owned} as {RT}::MessageName>::TYPE_URL;}}\n"));
@@ -1592,6 +1547,7 @@ impl Emitter<'_> {
                     required_bits.get(field).copied(),
                 ),
             );
+            out.push('\n');
         }
         let mut known = BTreeSet::new();
         for field in &message.fields {
@@ -1603,7 +1559,7 @@ impl Emitter<'_> {
                     | FieldShape::Oneof { value, .. } => value,
                     _ => ValueType::Scalar(Scalar::Bytes),
                 };
-                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({})?)),",field.number.get(),Self::wire(value)));
+                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({})?)),\n",field.number.get(),Self::wire(value)));
             }
         }
         let (fallback, end) = if message.fields.is_empty() {
@@ -1649,7 +1605,7 @@ impl Emitter<'_> {
                     self.promoted(value, field.bytes_storage, "v")
                 ),
             };
-            out.push_str(&format!("{slot}: {expr},"));
+            out.push_str(&format!("{slot}: {expr},\n"));
         }
         for group in &message.oneofs {
             let oneof = self.schema.oneof(*group);
@@ -1683,7 +1639,7 @@ impl Emitter<'_> {
                     promoted = format!("::std::boxed::Box::new({promoted})");
                 }
                 out.push_str(&format!(
-                    "Some({}::{variant}(v))=>Some({}::{variant}({promoted})),",
+                    "Some({}::{variant}(v))=>Some({}::{variant}({promoted})),\n",
                     self.view_oneof_path(*group),
                     self.oneof_path(*group)
                 ));
@@ -1720,6 +1676,7 @@ impl Emitter<'_> {
         out.push_str(&format!("impl<'a>{RT}::ViewEncode<'a> for {name}<'a>{{fn compute_size(&self,cache:&mut {RT}::SizeCache)->u32{{let _=&cache;let {mutable}size=0u64;"));
         for field in &fields {
             out.push_str(&self.view_encode_field(field, false));
+            out.push('\n');
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}fn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
         if let Some(grouped) = self.grouped_writer(&fields, true) {
@@ -1727,6 +1684,7 @@ impl Emitter<'_> {
         } else {
             for field in &fields {
                 out.push_str(&self.view_encode_field(field, true));
+                out.push('\n');
             }
         }
         out.push_str("}}\n");
@@ -1780,7 +1738,7 @@ impl Emitter<'_> {
             );
             let borrow = if reference { "&" } else { "" };
             out.push_str(&format!(
-                "pub fn {slot}(&self)->{borrow}{ty}{{{borrow}self.view().{slot}}}"
+                "pub fn {slot}(&self)->{borrow}{ty}{{{borrow}self.view().{slot}}}\n"
             ));
         }
         for gid in &message.oneofs {

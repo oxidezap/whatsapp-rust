@@ -10,6 +10,8 @@ mod api_guard;
 pub mod descriptor;
 #[path = "features.rs"]
 pub mod features;
+#[path = "format.rs"]
+mod format;
 #[path = "../build_support/inventory.rs"]
 mod inventory;
 #[path = "media_retry_schema.rs"]
@@ -91,7 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "WhatsApp generation requires the library module paths and '-' output".into(),
             );
         }
-        let (descriptors, source, _) = whatsapp::generate(&descriptor)?;
+        let (descriptors, schema) = whatsapp::prepare(&descriptor)?;
+        let source = format::generate(&schema, &arguments[1])?;
         let parsed = syn::parse_file(&source)?;
         let mut api = std::collections::BTreeSet::new();
         inventory::inventory_compact(&parsed.items, "whatsapp", &mut api);

@@ -18,9 +18,6 @@
 //! Fields this crate persists but upstream does not declare go in
 //! [`LOCAL_FIELDS`], never in the `.proto`.
 
-#[path = "../codegen/raw.rs"]
-mod raw;
-
 #[path = "../codegen/oracle.rs"]
 mod oracle;
 
@@ -28,7 +25,7 @@ mod oracle;
 mod emission;
 #[path = "../build_support/names.rs"]
 mod names;
-use crate::{descriptor, emit_owned, policy, project, signal_storage};
+use crate::{descriptor, policy, project, raw, signal_storage};
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
@@ -150,14 +147,7 @@ pub fn generate_reference() -> std::io::Result<()> {
     {
         let input = descriptor::FileDescriptorSet::decode_from_slice(&encoded)?;
         let projected = project::project(&input).map_err(std::io::Error::other)?;
-        let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")
-            .map_err(|error| {
-                let _ = std::fs::write(
-                    out_path.join("codec_parse_failure.rs"),
-                    raw::generate_raw(&projected, "crate::protobuf::generated::whatsapp"),
-                );
-                std::io::Error::other(error)
-            })?;
+        let source = raw::generate_raw(&projected, "crate::protobuf::generated::whatsapp");
         std::fs::write(out_path.join("owned_full.rs"), source)?;
         std::fs::write(
             out_path.join("owned_full_oracle.rs"),
