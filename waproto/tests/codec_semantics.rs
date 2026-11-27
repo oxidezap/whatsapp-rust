@@ -56,6 +56,42 @@ fn repeated_message_view_keeps_order_and_partial_state() {
 }
 
 #[test]
+fn repeated_message_view_error_preserves_free_and_full_capacity() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+    use waproto::whatsapp::{ConversationView, HistorySyncView};
+
+    let tag = Tag::new(2, WireType::LengthDelimited);
+    let valid = &[3, 0x0a, 1, b'a'][..];
+    let truncated = &[2, 0x0a, 1][..];
+    for full in [false, true] {
+        let mut view = HistorySyncView::default();
+        view.conversations.as_mut_vec().reserve_exact(4);
+        let capacity = view.conversations.as_mut_vec().capacity();
+        let count = if full { capacity } else { 2 };
+        let unknown = Cell::new(10);
+        let budget = Cell::new((count + 1) * size_of::<ConversationView<'_>>());
+        let context = DecodeContext::new(10, &unknown).with_element_memory(&budget);
+        for _ in 0..count {
+            view.merge_view_field(tag, valid, valid, context).unwrap();
+        }
+        assert_eq!(
+            view.merge_view_field(tag, truncated, truncated, context)
+                .unwrap_err(),
+            DecodeError::UnexpectedEof
+        );
+        assert_eq!(view.conversations.len(), count);
+        assert!(view.conversations.iter().all(|item| item.id == "a"));
+        assert_eq!(view.conversations.as_mut_vec().capacity(), capacity);
+        assert_eq!(budget.get(), 0);
+        assert_eq!(unknown.get(), 10);
+    }
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn message_writer_observes_current_fields_after_sizing() {
     use waproto::protobuf::{SizeCache, ViewEncode};
