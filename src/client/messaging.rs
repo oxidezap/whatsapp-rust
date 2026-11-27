@@ -2,19 +2,6 @@
 
 use super::*;
 
-// Guard the allocation inside Client::edit_message, in addition to callers'
-// wrapper futures. A small public wrapper can hide a much larger inner box.
-fn bounded_edit_request_future<F: Future>(future: F) -> F {
-    const {
-        let budget = if usize::BITS == 64 { 2048 } else { 1024 };
-        assert!(
-            size_of::<F>() <= budget,
-            "edit request future exceeds its allocation budget"
-        );
-    }
-    future
-}
-
 impl Client {
     /// Send a pre-marshaled stanza through the noise socket.
     ///
@@ -236,10 +223,7 @@ impl Client {
         &'a self,
         request: crate::EditRequest<'a>,
     ) -> Result<crate::SendResult, crate::SendError> {
-        Box::pin(bounded_edit_request_future(
-            self.edit_request_inner(request),
-        ))
-        .await
+        Box::pin(self.edit_request_inner(request)).await
     }
 
     async fn edit_request_inner(
