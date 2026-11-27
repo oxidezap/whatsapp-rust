@@ -6,7 +6,6 @@ use diesel::r2d2::ConnectionManager;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
 use std::future::Future;
 use std::pin::Pin;
@@ -95,8 +94,6 @@ pub(crate) async fn retry_backoff(delay_ms: u64) {
 pub(crate) async fn retry_backoff(delay_ms: u64) {
     gloo_timers::future::TimeoutFuture::new(delay_ms as u32).await;
 }
-
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 pub(crate) type SqlitePool = crate::pool::Pool;
 
@@ -1347,8 +1344,7 @@ impl SqliteStore {
                     .map_err(|e| StoreError::Database(Box::new(e)))?
                     .journal_mode;
 
-                conn.run_pending_migrations(MIGRATIONS)
-                    .map_err(StoreError::Migration)?;
+                crate::migrations::run_pending(&mut conn)?;
                 // Returned to the pool before the pool is: on the web the
                 // checkout is the only connection there is, and a pool moved
                 // out from under a live one would not compile there.
@@ -5694,6 +5690,9 @@ mod retry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
     async fn create_test_store() -> SqliteStore {
         use portable_atomic::AtomicU64;
