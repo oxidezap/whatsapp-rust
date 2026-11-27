@@ -31,6 +31,23 @@ pub(crate) fn media_retry_success(input: &[u8], limits: Limits) -> Option<(&str,
     media_short::project_short_media_success(input, limits)
 }
 
+pub(crate) fn single_text_view<'a>(input: &'a [u8], schema: &'static Schema) -> Option<&'a str> {
+    let (&tag, rest) = input.split_first()?;
+    let spec = schema.fields.first()?;
+    if spec.number() >= 16 || u32::from(tag) != spec.number() * 8 + 2 {
+        return None;
+    }
+    let (length, prefix) = protobuf::decode_varint(rest).ok()?;
+    if rest.len().checked_sub(prefix)? != usize::try_from(length).ok()? {
+        return None;
+    }
+    let view = View::parse_with_single_text(input, schema, Limits::default()).ok()?;
+    if view.work_fields() != 1 {
+        return None;
+    }
+    Some(view.single_text()?.text)
+}
+
 fn parse_media_retry_success(
     input: &[u8],
     limits: Limits,
@@ -5577,6 +5594,55 @@ mod migration_tests {
             .collect();
         assert_eq!(values, vec![Value::Bytes(b"a"), Value::Bytes(b"b")]);
         assert_eq!(view.unknown_fields().count(), 1);
+    }
+
+    #[test]
+    fn message_conversation_index_matches_generated_view() {
+        let index = SCHEMA_NAMES
+            .iter()
+            .position(|name| *name == ".whatsapp.Message")
+            .unwrap();
+        let schema = &SCHEMAS[index];
+        let conversation = *schema
+            .fields
+            .iter()
+            .find(|field| field.number() == 1)
+            .unwrap();
+        for input in [
+            &[][..],
+            &b"\x0a\x01a"[..],
+            &b"\x0a\x01a\x0a\x01b"[..],
+            &b"\x0a\x02\xc3\xa1\x80\xb5\x18\x01"[..],
+        ] {
+            let indexed = View::parse(input, schema, Limits::default()).unwrap();
+            let value = indexed
+                .range(conversation)
+                .last()
+                .map(|field| match field.value() {
+                    Value::Bytes(bytes) => core::str::from_utf8(bytes).unwrap(),
+                    other => panic!("unexpected field value {other:?}"),
+                });
+            let reference = crate::whatsapp::MessageView::decode_view(input).unwrap();
+            assert_eq!(value, reference.conversation);
+        }
+    }
+
+    #[test]
+    fn single_text_adapter_rejects_additional_fields_and_invalid_text() {
+        let index = SCHEMA_NAMES
+            .iter()
+            .position(|name| *name == ".whatsapp.Message")
+            .unwrap();
+        let schema = SCHEMAS[index];
+        assert_eq!(single_text_view(b"\x0a\x02hi", schema), Some("hi"));
+        assert_eq!(single_text_view(b"\x0a\x00", schema), Some(""));
+        assert_eq!(single_text_view(b"\x0a\x01\xff", schema), None);
+        assert_eq!(single_text_view(b"\x0a\x01a\x0a\x01b", schema), None);
+        assert_eq!(single_text_view(b"\x0a\x01a\x80\xb5\x18\x01", schema), None);
+        let mut filtered = vec![0x0a, 30];
+        filtered.extend_from_slice(&[b'a'; 30]);
+        filtered.extend_from_slice(&[0x82, 0xb5, 0x18, 1, b'x']);
+        assert_eq!(single_text_view(&filtered, schema), None);
     }
 
     #[test]

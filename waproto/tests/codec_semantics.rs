@@ -11,6 +11,31 @@ use waproto::whatsapp::{
     ADVKeyIndexList, ADVKeyIndexListView, BotCapabilityMetadata, BotCapabilityMetadataView,
 };
 
+#[test]
+fn single_text_view_preserves_presence_and_decode_limits() {
+    let options = DecodeOptions::new()
+        .with_recursion_limit(0)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let decoded = options
+        .decode_view::<waproto::whatsapp::MessageView<'_>>(&[0x0a, 0])
+        .unwrap();
+    assert_eq!(decoded.conversation, Some(""));
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_max_message_size(1)
+            .decode_view::<waproto::whatsapp::MessageView<'_>>(&[0x0a, 0]),
+        Err(DecodeError::MessageTooLarge)
+    ));
+    let mut with_unknown = vec![0x0a, 30];
+    with_unknown.extend_from_slice(&[b'a'; 30]);
+    with_unknown.extend_from_slice(&[0x82, 0xb5, 0x18, 1, b'x']);
+    assert!(matches!(
+        options.decode_view::<waproto::whatsapp::MessageView<'_>>(&with_unknown),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
 struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
 
 impl<'a> waproto::protobuf::MessageView<'a> for CustomIndexView<'a> {

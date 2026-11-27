@@ -101,7 +101,8 @@ fn map_default(schema: &Schema, field: &Field) -> Result<String, String> {
 }
 
 pub fn generate(schema: &Schema) -> Result<String, String> {
-    let mut output = String::from("#[cfg(test)] pub(crate) static SCHEMAS: &[Schema] = &[\n");
+    let mut output = String::new();
+    let mut entries = String::new();
     let mut media = None;
     for (index, message) in schema.messages.iter().enumerate() {
         let identity = u32::try_from(index).map_err(|_| "too many messages".to_owned())?;
@@ -158,11 +159,28 @@ pub fn generate(schema: &Schema) -> Result<String, String> {
                 field_spec(schema, message, field)
             };
             media = Some((declaration.clone(), spec(1)?, spec(2)?, spec(3)?));
-            output.push_str("MEDIA_RETRY_SCHEMA,\n");
+            writeln!(
+                output,
+                "pub(crate) static SCHEMA_{index}: Schema = MEDIA_RETRY_SCHEMA;"
+            )
+            .map_err(|error| error.to_string())?;
         } else {
-            output.push_str(&declaration);
-            output.push_str(",\n");
+            writeln!(
+                output,
+                "pub(crate) static SCHEMA_{index}: Schema = {declaration};"
+            )
+            .map_err(|error| error.to_string())?;
         }
+        write!(entries, "&SCHEMA_{index},").map_err(|error| error.to_string())?;
+    }
+    writeln!(
+        output,
+        "#[cfg(test)] pub(crate) static SCHEMAS: &[&Schema] = &[{entries}];"
+    )
+    .map_err(|error| error.to_string())?;
+    output.push_str("#[cfg(test)] static SCHEMA_NAMES: &[&str] = &[");
+    for message in &schema.messages {
+        write!(output, "{:?},", message.full_name).map_err(|error| error.to_string())?;
     }
     output.push_str("];\n");
     if let Some((declaration, stanza, path, result)) = media {
