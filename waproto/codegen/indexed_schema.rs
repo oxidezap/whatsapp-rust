@@ -101,7 +101,8 @@ fn map_default(schema: &Schema, field: &Field) -> Result<String, String> {
 }
 
 pub fn generate(schema: &Schema) -> Result<String, String> {
-    let mut output = String::from("pub(crate) static SCHEMAS: &[Schema] = &[\n");
+    let mut output = String::from("#[cfg(test)] pub(crate) static SCHEMAS: &[Schema] = &[\n");
+    let mut media = None;
     for (index, message) in schema.messages.iter().enumerate() {
         let identity = u32::try_from(index).map_err(|_| "too many messages".to_owned())?;
         let mut fields: Vec<_> = message.fields.iter().map(|id| schema.field(*id)).collect();
@@ -131,13 +132,41 @@ pub fn generate(schema: &Schema) -> Result<String, String> {
         } else {
             String::new()
         };
-        write!(output, "Schema{{identity:SchemaIdentity({identity}),oneofs:{},required_prefix:{required_prefix},map_defaults:&[{defaults}],fields:&[", message.oneofs.len()).map_err(|error| error.to_string())?;
-        for field in fields {
-            output.push_str(&field_spec(schema, message, field)?);
-            output.push(',');
+        let mut declaration = String::new();
+        write!(declaration, "Schema{{identity:SchemaIdentity({identity}),oneofs:{},required_prefix:{required_prefix},map_defaults:&[{defaults}],fields:&[", message.oneofs.len()).map_err(|error| error.to_string())?;
+        for field in &fields {
+            declaration.push_str(&field_spec(schema, message, field)?);
+            declaration.push(',');
         }
-        output.push_str("]},\n");
+        declaration.push_str("]}");
+        if message.full_name == ".whatsapp.MediaRetryNotification" {
+            let expected = [(1, "String"), (2, "String"), (3, "Enum"), (4, "Bytes")];
+            if fields.len() != expected.len()
+                || !message.oneofs.is_empty()
+                || fields.iter().zip(expected).any(|(field, (number, expected_kind))| {
+                    field.number.get() != number
+                        || !matches!(field.shape, FieldShape::Singular { value, presence: Presence::Explicit } if kind(value) == expected_kind)
+                })
+            {
+                return Err("media retry schema no longer matches the indexed reader".into());
+            }
+            let spec = |number| {
+                let field = fields
+                    .iter()
+                    .find(|field| field.number.get() == number)
+                    .ok_or_else(|| format!("missing media retry field {number}"))?;
+                field_spec(schema, message, field)
+            };
+            media = Some((declaration.clone(), spec(1)?, spec(2)?, spec(3)?));
+            output.push_str("MEDIA_RETRY_SCHEMA,\n");
+        } else {
+            output.push_str(&declaration);
+            output.push_str(",\n");
+        }
     }
     output.push_str("];\n");
+    if let Some((declaration, stanza, path, result)) = media {
+        write!(output, "const MEDIA_RETRY_SCHEMA: Schema = {declaration};\nconst MEDIA_STANZA: Spec = {stanza};\nconst MEDIA_PATH: Spec = {path};\nconst MEDIA_RESULT: Spec = {result};\n").map_err(|error| error.to_string())?;
+    }
     Ok(output)
 }

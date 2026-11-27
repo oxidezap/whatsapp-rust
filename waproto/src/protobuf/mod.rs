@@ -7,6 +7,10 @@ mod decode;
 pub mod encoding;
 mod enumeration;
 mod error;
+#[allow(dead_code, unused_qualifications)]
+pub(crate) mod indexed;
+#[allow(dead_code)]
+mod indexed_wire;
 mod message;
 mod message_field;
 pub mod open_enum_serde;

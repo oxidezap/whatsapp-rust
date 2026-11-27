@@ -15,6 +15,7 @@
 //! Durable input bytes and replay semantics are defined by the receiving API.
 //!
 #![allow(clippy::large_enum_variant)]
+extern crate alloc;
 /// Compatibility path for the protobuf traits and containers used by this crate.
 pub use protobuf as buffa;
 
@@ -141,6 +142,14 @@ pub mod tags {
 pub mod codec {
     use crate::protobuf::Message as _;
     use crate::whatsapp;
+
+    #[doc(hidden)]
+    pub fn media_retry_success(input: &[u8]) -> Option<(&str, &str)> {
+        crate::protobuf::indexed::media_retry_success(
+            input,
+            crate::protobuf::indexed::Limits::default(),
+        )
+    }
 
     /// Protobuf packs the field number above the 3-bit wire type in the tag.
     const PROTOBUF_WIRE_TYPE_BITS: u32 = 3;

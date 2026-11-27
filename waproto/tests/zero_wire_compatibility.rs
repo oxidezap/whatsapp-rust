@@ -1,7 +1,7 @@
 extern crate alloc;
 
 #[allow(dead_code)]
-#[path = "support/zero_wire/mod.rs"]
+#[path = "../src/protobuf/indexed_wire/mod.rs"]
 mod zero_wire;
 
 use waproto::protobuf::encoding::{Tag, skip_field_depth};

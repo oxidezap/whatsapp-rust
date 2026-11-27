@@ -1,3 +1,8 @@
 src/protobuf/owned_view.rs adapts the OwnedView ownership mechanism from
 buffa 0.9.2, https://github.com/anthropics/buffa, licensed under Apache-2.0.
 The original license is reproduced in licenses/BUFFA-APACHE-2.0.
+
+codegen/indexed_schema.rs, src/protobuf/indexed and src/protobuf/indexed_wire
+adapt the protobuf generator, reader and index from whatsapp-rust-zero,
+licensed under MIT. The original license is reproduced in
+licenses/WHATSAPP-RUST-ZERO-MIT.
