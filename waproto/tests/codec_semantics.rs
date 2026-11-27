@@ -85,6 +85,7 @@ fn nested_message_maps_encode_with_consistent_size_cache() {
 
 #[cfg(feature = "protobuf-reference")]
 #[test]
+#[allow(clippy::disallowed_methods)]
 fn map_key_changes_between_passes_match_reference() {
     use waproto::protobuf::{SizeCache, ViewEncode};
     use waproto::whatsapp::{Config, ConfigView, Field};
