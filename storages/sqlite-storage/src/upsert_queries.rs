@@ -1,8 +1,112 @@
-use diesel::query_builder::{AstPass, QueryFragment, QueryId};
+use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::QueryResult;
 use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
+
+macro_rules! device_upsert {
+    ($first:ident: $first_value:ty => $first_sql:ty, $($column:ident: $value:ty => $sql:ty,)*) => {
+        pub(crate) struct DeviceWrite<'a, const UPSERT: bool> {
+            pub id: Option<i32>,
+            pub $first: $first_value,
+            $(pub $column: $value,)*
+        }
+
+        impl<const UPSERT: bool> QueryId for DeviceWrite<'_, UPSERT> {
+            type QueryId = DeviceWrite<'static, UPSERT>;
+            const HAS_STATIC_QUERY_ID: bool = true;
+        }
+
+        impl<Conn, const UPSERT: bool> RunQueryDsl<Conn> for DeviceWrite<'_, UPSERT> {}
+
+        impl<const UPSERT: bool> QueryFragment<Sqlite> for DeviceWrite<'_, UPSERT> {
+            fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+                out.push_sql(concat!(
+                    "INSERT INTO device (id, ", stringify!($first),
+                    $(", ", stringify!($column),)*
+                    ") VALUES ("
+                ));
+                out.push_bind_param::<Nullable<Integer>, _>(&self.id)?;
+                out.push_sql(", ");
+                out.push_bind_param::<$first_sql, _>(&self.$first)?;
+                $(
+                    out.push_sql(", ");
+                    out.push_bind_param::<$sql, _>(&self.$column)?;
+                )*
+                out.push_sql(")");
+                if UPSERT {
+                    out.push_sql(concat!(
+                        " ON CONFLICT (id) DO UPDATE SET ",
+                        stringify!($first), " = excluded.", stringify!($first),
+                        $(", ", stringify!($column), " = excluded.", stringify!($column),)*
+                    ));
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+device_upsert! {
+    lid: &'a str => Text,
+    pn: &'a str => Text,
+    registration_id: i32 => Integer,
+    noise_key: &'a [u8] => Binary,
+    identity_key: &'a [u8] => Binary,
+    signed_pre_key: &'a [u8] => Binary,
+    signed_pre_key_id: i32 => Integer,
+    signed_pre_key_signature: &'a [u8] => Binary,
+    adv_secret_key: &'a [u8] => Binary,
+    account: Option<&'a [u8]> => Nullable<Binary>,
+    push_name: &'a str => Text,
+    app_version_primary: i32 => Integer,
+    app_version_secondary: i32 => Integer,
+    app_version_tertiary: i64 => BigInt,
+    app_version_last_fetched_ms: i64 => BigInt,
+    edge_routing_info: Option<&'a [u8]> => Nullable<Binary>,
+    props_hash: Option<&'a str> => Nullable<Text>,
+    next_pre_key_id: i32 => Integer,
+    first_unupload_pre_key_id: i32 => Integer,
+    server_has_prekeys: bool => Bool,
+    nct_salt: Option<&'a [u8]> => Nullable<Binary>,
+    mobile_session_binding: Option<&'a [u8]> => Nullable<Binary>,
+    status_privacy: Option<&'a [u8]> => Nullable<Binary>,
+    server_cert_chain: Option<&'a [u8]> => Nullable<Binary>,
+    login_counter: i32 => Integer,
+    lid_migrated: bool => Bool,
+    last_signed_pre_key_rotation_ms: i64 => BigInt,
+    read_receipts_disabled: bool => Bool,
+    server_client_expiration: Option<&'a str> => Nullable<Text>,
+}
+
+#[derive(QueryId)]
+pub(crate) struct LoadDevice {
+    pub id: i32,
+}
+
+impl Query for LoadDevice {
+    type SqlType = diesel::sql_types::Untyped;
+}
+
+impl<Conn> RunQueryDsl<Conn> for LoadDevice {}
+
+impl QueryFragment<Sqlite> for LoadDevice {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql(concat!(
+            "SELECT id, lid, pn, registration_id, noise_key, ",
+            "identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_signature, adv_secret_key, ",
+            "account, push_name, app_version_primary, app_version_secondary, app_version_tertiary, ",
+            "app_version_last_fetched_ms, edge_routing_info, props_hash, next_pre_key_id, nct_salt, ",
+            "server_has_prekeys, server_cert_chain, login_counter, first_unupload_pre_key_id, lid_migrated, ",
+            "last_signed_pre_key_rotation_ms, read_receipts_disabled, server_client_expiration, status_privacy, ",
+        ));
+        crate::bounded_mobile_binding::GuardedMobileBindingExpression.walk_ast(out.reborrow())?;
+        out.push_sql(" AS mobile_session_binding FROM device WHERE id = ");
+        out.push_bind_param::<Integer, _>(&self.id)?;
+        out.push_sql(" LIMIT 1");
+        Ok(())
+    }
+}
 
 pub(crate) struct InsertMissingPendingId<const TIMED: bool>;
 
