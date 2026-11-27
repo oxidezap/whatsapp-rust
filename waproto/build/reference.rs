@@ -18,6 +18,9 @@
 //! Fields this crate persists but upstream does not declare go in
 //! [`LOCAL_FIELDS`], never in the `.proto`.
 
+#[path = "../codegen/raw.rs"]
+mod raw;
+
 #[path = "../codegen/oracle.rs"]
 mod oracle;
 
@@ -151,7 +154,7 @@ pub fn generate_reference() -> std::io::Result<()> {
             .map_err(|error| {
                 let _ = std::fs::write(
                     out_path.join("codec_parse_failure.rs"),
-                    emit_owned::generate_raw(&projected, "crate::protobuf::generated::whatsapp"),
+                    raw::generate_raw(&projected, "crate::protobuf::generated::whatsapp"),
                 );
                 std::io::Error::other(error)
             })?;
