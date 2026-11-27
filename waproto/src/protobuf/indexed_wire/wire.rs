@@ -548,6 +548,14 @@ fn read_value<'a>(
     })
 }
 
+pub(crate) fn probe_value(input: &[u8], number: u32, wire: u8) -> Option<usize> {
+    let number = FieldNumber::new(number).ok()?;
+    let mut remaining = input;
+    let mut fields_left = 1;
+    read_value(&mut remaining, number, wire, &mut fields_left, 0).ok()?;
+    Some(input.len() - remaining.len())
+}
+
 /// Encodes scalar fields into a reusable caller-owned buffer.
 pub struct Writer<'a> {
     output: &'a mut Vec<u8>,

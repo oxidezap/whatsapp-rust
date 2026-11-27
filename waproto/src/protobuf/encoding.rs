@@ -285,6 +285,12 @@ pub fn skip_field_depth(
     input: &mut impl bytes::Buf,
     depth: u32,
 ) -> Result<(), DecodeError> {
+    if let Some(length) =
+        super::indexed_wire::probe_value(input.chunk(), tag.number, tag.kind as u8)
+    {
+        input.advance(length);
+        return Ok(());
+    }
     let count = match tag.kind {
         WireType::Varint => {
             decode_varint(input)?;
@@ -334,9 +340,6 @@ pub fn skip_unknown_field(
     context: super::DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     context.register_unknown_field()?;
-    if tag.kind == WireType::LengthDelimited {
-        return skip_length_delimited(input);
-    }
     if tag.kind != WireType::StartGroup {
         return skip_field_depth(tag, input, context.depth());
     }
@@ -504,6 +507,46 @@ mod tests {
                     assert_eq!(candidate.get_u8(), reference.get_u8());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn skipped_values_preserve_fragmented_input_and_error_order() {
+        use bytes::Buf as _;
+        let tag = Tag::new(7, WireType::Varint);
+        let mut fragmented = (&[0x80][..]).chain(&[1, 42][..]);
+        skip_field_depth(tag, &mut fragmented, 100).unwrap();
+        assert_eq!(fragmented.remaining(), 1);
+        assert_eq!(fragmented.get_u8(), 42);
+
+        let tag = Tag::new(7, WireType::LengthDelimited);
+        let mut input = &[2, 0xff][..];
+        let unknown = std::cell::Cell::new(0);
+        let context = super::super::DecodeContext::new(100, &unknown);
+        assert_eq!(
+            skip_unknown_field(tag, &mut input, context),
+            Err(DecodeError::UnknownFieldLimitExceeded)
+        );
+        assert_eq!(input, &[2, 0xff]);
+        unknown.set(1);
+        assert_eq!(
+            skip_unknown_field(tag, &mut input, context),
+            Err(DecodeError::UnexpectedEof)
+        );
+        assert_eq!(input, &[0xff]);
+    }
+
+    #[test]
+    fn skipped_complete_values_leave_the_following_field_untouched() {
+        for (kind, bytes, consumed) in [
+            (WireType::Varint, &[0x96, 1, 42][..], 2),
+            (WireType::Fixed32, &[1, 2, 3, 4, 42][..], 4),
+            (WireType::Fixed64, &[1, 2, 3, 4, 5, 6, 7, 8, 42][..], 8),
+            (WireType::LengthDelimited, &[2, 7, 8, 42][..], 3),
+        ] {
+            let mut input = bytes;
+            skip_field_depth(Tag::new(7, kind), &mut input, 100).unwrap();
+            assert_eq!(input, &bytes[consumed..]);
         }
     }
 
