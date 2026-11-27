@@ -688,6 +688,58 @@ fn packed_view_preserves_partial_values_and_budget() {
 }
 
 #[test]
+fn packed_view_preserves_values_across_block_boundaries_and_errors() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType, encode_varint},
+    };
+
+    for count in [0usize, 1, 15, 16, 17, 31, 32, 33] {
+        for suffix in [
+            &[][..],
+            &[0x80][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1][..],
+            &[
+                0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0,
+            ][..],
+        ] {
+            let mut payload = vec![1; count];
+            payload.extend_from_slice(suffix);
+            let mut wire = Vec::new();
+            encode_varint(payload.len() as u64, &mut wire);
+            wire.extend_from_slice(&payload);
+            for budget in [0usize, 4, 60, 64, 68, 128, 256] {
+                let unknown_a = Cell::new(10);
+                let unknown_b = Cell::new(10);
+                let elements_a = Cell::new(budget);
+                let elements_b = Cell::new(budget);
+                let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+                let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+                let tag = Tag::new(4, WireType::LengthDelimited);
+                let mut owned = ADVKeyIndexList::default();
+                let mut view = ADVKeyIndexListView::default();
+                owned.valid_indexes.push(9);
+                view.valid_indexes.push(9);
+                for _ in 0..2 {
+                    let mut input = &wire[..];
+                    let a = owned.merge_field(tag, &mut input, ctx_a);
+                    let b = view.merge_view_field(tag, &wire, &wire, ctx_b).map(|_| ());
+                    assert_eq!(a, b, "count={count}, suffix={suffix:?}, budget={budget}");
+                    assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+                    assert_eq!(elements_a.get(), elements_b.get());
+                    assert_eq!(unknown_a.get(), unknown_b.get());
+                    if a.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn packed_u32_blocks_match_owned_partial_state() {
     use std::cell::Cell;
     use waproto::protobuf::{

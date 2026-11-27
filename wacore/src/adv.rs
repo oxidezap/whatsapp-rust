@@ -391,6 +391,168 @@ mod tests {
     }
 
     #[test]
+    fn signed_key_index_envelopes_preserve_wire_and_signature_semantics() {
+        use waproto::protobuf::encoding::{put_bytes_field, put_varint};
+        use waproto::whatsapp::{ADVKeyIndexList, ADVSignedKeyIndexListView};
+
+        fn field(out: &mut Vec<u8>, number: u32, value: &[u8]) {
+            put_bytes_field(number, value, out);
+        }
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let foreign = KeyPair::generate(&mut rng);
+        let account_key = id32(&account);
+        let foreign_key = id32(&foreign);
+        let mut list = ADVKeyIndexList::default();
+        list.raw_id = Some(7);
+        list.timestamp = Some(42);
+        list.current_index = Some(2);
+        list.valid_indexes = vec![1, 2];
+        let first = list.encode_to_vec();
+        list.raw_id = Some(9);
+        let second = list.encode_to_vec();
+        let sign = |details: &[u8]| {
+            account
+                .private_key
+                .calculate_signature(
+                    &[&[6, 2], details].concat(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .unwrap()
+                .to_vec()
+        };
+        let first_signature = sign(&first);
+        let second_signature = sign(&second);
+
+        let mut cases: Vec<(Vec<u8>, Option<u32>, Option<u32>)> = Vec::new();
+        let mut canonical = Vec::new();
+        field(&mut canonical, 1, &first);
+        field(&mut canonical, 2, &first_signature);
+        field(&mut canonical, 3, &account_key);
+        cases.push((canonical.clone(), Some(7), Some(7)));
+
+        let mut duplicate_details = canonical.clone();
+        field(&mut duplicate_details, 1, &second);
+        field(&mut duplicate_details, 2, &second_signature);
+        cases.push((duplicate_details.clone(), Some(9), Some(9)));
+        field(&mut duplicate_details, 1, &first);
+        cases.push((duplicate_details, None, None));
+
+        let mut duplicate_key = canonical.clone();
+        field(&mut duplicate_key, 3, &foreign_key);
+        cases.push((duplicate_key.clone(), Some(7), None));
+        field(&mut duplicate_key, 3, &account_key);
+        cases.push((duplicate_key, Some(7), Some(7)));
+
+        let mut unknown = canonical.clone();
+        put_varint(100 << 3, &mut unknown);
+        put_varint(123, &mut unknown);
+        cases.push((unknown, Some(7), Some(7)));
+
+        let mut invalid_wire = canonical.clone();
+        put_varint(1 << 3, &mut invalid_wire);
+        put_varint(7, &mut invalid_wire);
+        cases.push((invalid_wire, None, None));
+        let mut truncated = canonical.clone();
+        truncated.extend_from_slice(&[0x0a, 0x80]);
+        cases.push((truncated, None, None));
+        let mut empty_details = canonical.clone();
+        field(&mut empty_details, 1, &[]);
+        cases.push((empty_details, None, None));
+
+        let mut overlong_tag = vec![0x8a, 0];
+        put_varint(first.len() as u64, &mut overlong_tag);
+        overlong_tag.extend_from_slice(&first);
+        field(&mut overlong_tag, 2, &first_signature);
+        field(&mut overlong_tag, 3, &account_key);
+        cases.push((overlong_tag, Some(7), Some(7)));
+
+        let mut modified_details = first.clone();
+        put_varint(100 << 3, &mut modified_details);
+        put_varint(1, &mut modified_details);
+        let mut signed_different_bytes = Vec::new();
+        field(&mut signed_different_bytes, 1, &modified_details);
+        field(&mut signed_different_bytes, 2, &first_signature);
+        field(&mut signed_different_bytes, 3, &account_key);
+        cases.push((signed_different_bytes, None, None));
+        let mut signed_exact_bytes = Vec::new();
+        field(&mut signed_exact_bytes, 1, &modified_details);
+        field(&mut signed_exact_bytes, 2, &sign(&modified_details));
+        field(&mut signed_exact_bytes, 3, &account_key);
+        cases.push((signed_exact_bytes, Some(7), Some(7)));
+
+        for (wire, ordinary, hosted) in cases {
+            let view = ADVSignedKeyIndexListView::decode_view(&wire);
+            let owned = waproto::codec::adv_signed_key_index_list_decode(&wire);
+            assert_eq!(
+                view.as_ref().err(),
+                owned.as_ref().err(),
+                "wire={wire:02x?}"
+            );
+            if let (Ok(view), Ok(owned)) = (view, owned) {
+                assert_eq!(view.details, owned.details.as_deref());
+                assert_eq!(view.account_signature, owned.account_signature.as_deref());
+                assert_eq!(
+                    view.account_signature_key,
+                    owned.account_signature_key.as_deref()
+                );
+            }
+            let actual = verify_key_index_list(&wire, &account_key);
+            assert_eq!(
+                actual.as_ref().map(|value| value.raw_id),
+                ordinary,
+                "wire={wire:02x?}"
+            );
+            if let Some(value) = actual {
+                assert_eq!((value.timestamp, value.current_index), (42, 2));
+                assert_eq!(value.valid_indexes, [1, 2]);
+            }
+            let actual_hosted = verify_hosted_key_index_list(&wire);
+            assert_eq!(
+                actual_hosted.as_ref().map(|(value, _)| value.raw_id),
+                hosted
+            );
+            if let Some((_, key)) = actual_hosted {
+                assert_eq!(key, account_key);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_key_index_owned_and_view_apply_the_same_decode_limits() {
+        use waproto::protobuf::{DecodeOptions, encoding::put_varint};
+        use waproto::whatsapp::{ADVSignedKeyIndexList, ADVSignedKeyIndexListView};
+
+        let mut wire = vec![0x0a, 0];
+        for _ in 0..3 {
+            put_varint(100 << 3, &mut wire);
+            put_varint(1, &mut wire);
+        }
+        for limit in [0, 1, 2, 3, 4] {
+            let options = DecodeOptions::new().with_unknown_field_limit(limit);
+            let owned = options.decode_from_slice::<ADVSignedKeyIndexList>(&wire);
+            let view = options.decode_view::<ADVSignedKeyIndexListView<'_>>(&wire);
+            assert_eq!(owned.as_ref().err(), view.as_ref().err(), "limit={limit}");
+            assert_eq!(owned.is_ok(), limit >= 3);
+        }
+        for limit in [0, wire.len() - 1, wire.len(), wire.len() + 1] {
+            let options = DecodeOptions::new().with_max_message_size(limit);
+            let owned = options.decode_from_slice::<ADVSignedKeyIndexList>(&wire);
+            let view = options.decode_view::<ADVSignedKeyIndexListView<'_>>(&wire);
+            assert_eq!(owned.as_ref().err(), view.as_ref().err(), "limit={limit}");
+            assert_eq!(owned.is_ok(), limit >= wire.len());
+        }
+        let group = [0x0a, 0, 0xa3, 0x06, 0x08, 1, 0xa4, 0x06];
+        for limit in [0, 1, 2] {
+            let options = DecodeOptions::new().with_recursion_limit(limit);
+            let owned = options.decode_from_slice::<ADVSignedKeyIndexList>(&group);
+            let view = options.decode_view::<ADVSignedKeyIndexListView<'_>>(&group);
+            assert_eq!(owned.as_ref().err(), view.as_ref().err(), "limit={limit}");
+        }
+    }
+
+    #[test]
     fn primary_device_always_kept() {
         let devices = vec![dev(0, None), dev(5, Some(3))];
         let decoded = DecodedKeyIndex {
