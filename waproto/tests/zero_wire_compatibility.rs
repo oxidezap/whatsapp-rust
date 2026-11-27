@@ -6,6 +6,22 @@ mod zero_wire;
 
 use waproto::protobuf::encoding::{Tag, skip_field_depth};
 
+#[test]
+fn zero_wire_errors_keep_their_messages() {
+    use zero_wire::DecodeError::*;
+    for (error, expected) in [
+        (Truncated, "truncated protobuf varint"),
+        (VarintOverflow, "protobuf varint exceeds 64 bits"),
+        (InvalidTag, "invalid protobuf field number"),
+        (InvalidWireType, "invalid protobuf wire type"),
+        (UnexpectedEndGroup, "unexpected protobuf end group"),
+        (MismatchedEndGroup, "mismatched protobuf end group"),
+        (LimitExceeded, "protobuf decoding limit exceeded"),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
 fn reference_fields(mut input: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, ()> {
     let mut fields = Vec::new();
     while !input.is_empty() {

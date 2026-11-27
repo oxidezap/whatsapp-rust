@@ -136,37 +136,7 @@ impl<'a> Reader<'a> {
     }
     #[inline]
     pub fn varint(&mut self) -> Result<u64, DecodeError> {
-        let original = self.remaining;
-        let (&first, tail) = self
-            .remaining
-            .split_first()
-            .ok_or(DecodeError::UnexpectedEof)?;
-        self.remaining = tail;
-        if first < 128 {
-            return Ok(u64::from(first));
-        }
-        if original.len() > 10 || original.last().is_some_and(|byte| *byte < 128) {
-            self.remaining = original;
-            let (value, count) = varint_in_slice(original)?;
-            self.remaining = &original[count..];
-            return Ok(value);
-        }
-        let mut value = u64::from(first & 127);
-        for shift in (7..70).step_by(7) {
-            let (&byte, tail) = self
-                .remaining
-                .split_first()
-                .ok_or(DecodeError::UnexpectedEof)?;
-            self.remaining = tail;
-            if shift == 63 && byte > 1 {
-                return Err(DecodeError::VarintTooLong);
-            }
-            value |= u64::from(byte & 127) << shift;
-            if byte < 128 {
-                return Ok(value);
-            }
-        }
-        Err(DecodeError::VarintTooLong)
+        decode_varint(&mut self.remaining)
     }
     #[inline]
     pub fn tag(&mut self) -> Result<Tag, DecodeError> {
@@ -268,22 +238,6 @@ impl<'a> Reader<'a> {
 }
 
 #[inline]
-fn varint_in_slice(input: &[u8]) -> Result<(u64, usize), DecodeError> {
-    let mut value = 0u64;
-    for index in 0..10 {
-        let byte = *input.get(index).ok_or(DecodeError::UnexpectedEof)?;
-        if index == 9 && byte > 1 {
-            return Err(DecodeError::VarintTooLong);
-        }
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            return Ok((value, index + 1));
-        }
-    }
-    Err(DecodeError::VarintTooLong)
-}
-
-#[inline]
 pub const fn varint_len(value: u64) -> usize {
     if value < 128 {
         1
@@ -311,30 +265,19 @@ pub fn decode_varint(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
         return Ok(u64::from(first));
     }
     if chunk.len() > 10 || chunk.last().is_some_and(|byte| *byte < 128) {
-        let (value, length) = varint_in_slice(chunk)?;
+        let (value, length) = super::indexed_wire::decode_varint(chunk).map_err(varint_error)?;
         input.advance(length);
         return Ok(value);
     }
-    decode_varint_slow(input)
+    super::indexed_wire::decode_varint_buffer(input).map_err(varint_error)
 }
 
-#[cold]
-fn decode_varint_slow(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
-    let mut value = 0;
-    for shift in (0..70).step_by(7) {
-        if !input.has_remaining() {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        let byte = input.get_u8();
-        if shift == 63 && byte > 1 {
-            return Err(DecodeError::VarintTooLong);
-        }
-        value |= u64::from(byte & 127) << shift;
-        if byte < 128 {
-            return Ok(value);
-        }
+fn varint_error(error: super::indexed_wire::DecodeError) -> DecodeError {
+    match error {
+        super::indexed_wire::DecodeError::Truncated => DecodeError::UnexpectedEof,
+        super::indexed_wire::DecodeError::VarintOverflow => DecodeError::VarintTooLong,
+        _ => unreachable!("varint decoder returned a field error"),
     }
-    Err(DecodeError::VarintTooLong)
 }
 
 pub fn skip_field_depth(
@@ -531,6 +474,35 @@ mod tests {
             assert_eq!(candidate.remaining(), reference.remaining());
             while candidate.has_remaining() {
                 assert_eq!(candidate.get_u8(), reference.get_u8());
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_varints_match_the_reference_at_every_split() {
+        use bytes::Buf as _;
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0],
+            &[0x80, 1],
+            &[0x80, 0],
+            &[0x80],
+            &[0x80; 10],
+            &[0xff; 10],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 42],
+        ];
+        for input in cases {
+            for split in 0..=input.len() {
+                let mut candidate = input[..split].chain(&input[split..]);
+                let mut reference = input[..split].chain(&input[split..]);
+                assert_eq!(
+                    decode_varint(&mut candidate),
+                    buffa::encoding::decode_varint(&mut reference).map_err(reference_error)
+                );
+                assert_eq!(candidate.remaining(), reference.remaining());
+                while candidate.has_remaining() {
+                    assert_eq!(candidate.get_u8(), reference.get_u8());
+                }
             }
         }
     }

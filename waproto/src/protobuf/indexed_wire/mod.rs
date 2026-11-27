@@ -1,35 +1,24 @@
 use alloc::vec::Vec;
-use core::fmt;
-
 mod wire;
 pub use wire::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
+    #[error("truncated protobuf varint")]
     Truncated,
+    #[error("protobuf varint exceeds 64 bits")]
     VarintOverflow,
+    #[error("invalid protobuf field number")]
     InvalidTag,
+    #[error("invalid protobuf wire type")]
     InvalidWireType,
+    #[error("unexpected protobuf end group")]
     UnexpectedEndGroup,
+    #[error("mismatched protobuf end group")]
     MismatchedEndGroup,
+    #[error("protobuf decoding limit exceeded")]
     LimitExceeded,
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Truncated => "truncated protobuf varint",
-            Self::VarintOverflow => "protobuf varint exceeds 64 bits",
-            Self::InvalidTag => "invalid protobuf field number",
-            Self::InvalidWireType => "invalid protobuf wire type",
-            Self::UnexpectedEndGroup => "unexpected protobuf end group",
-            Self::MismatchedEndGroup => "mismatched protobuf end group",
-            Self::LimitExceeded => "protobuf decoding limit exceeded",
-        })
-    }
-}
-
-impl core::error::Error for DecodeError {}
 
 #[inline]
 pub(crate) fn encode_varint_with(mut value: u64, mut push: impl FnMut(u8)) {
@@ -55,6 +44,25 @@ pub fn decode_varint(input: &[u8]) -> Result<(u64, usize), DecodeError> {
         value |= u64::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
             return Ok((value, index + 1));
+        }
+    }
+    Err(DecodeError::VarintOverflow)
+}
+
+#[cold]
+pub(crate) fn decode_varint_buffer(input: &mut impl bytes::Buf) -> Result<u64, DecodeError> {
+    let mut value = 0u64;
+    for index in 0..10 {
+        if !input.has_remaining() {
+            return Err(DecodeError::Truncated);
+        }
+        let byte = input.get_u8();
+        if index == 9 && byte > 1 {
+            return Err(DecodeError::VarintOverflow);
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(value);
         }
     }
     Err(DecodeError::VarintOverflow)

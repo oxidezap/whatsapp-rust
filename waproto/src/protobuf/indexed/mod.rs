@@ -163,31 +163,19 @@ impl Default for Limits {
         Self::DEFAULT
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    Wire(protobuf::DecodeError),
+    #[error("schema protobuf {0}")]
+    Wire(#[from] protobuf::DecodeError),
+    #[error("schema field wire type mismatch")]
     Type,
+    #[error("schema string is not UTF-8")]
     Utf8,
+    #[error("required schema field {0} is missing")]
     Required(u32),
+    #[error("schema resource limit exceeded")]
     Limit,
 }
-impl From<protobuf::DecodeError> for Error {
-    fn from(value: protobuf::DecodeError) -> Self {
-        Self::Wire(value)
-    }
-}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Wire(e) => write!(f, "schema protobuf {e}"),
-            Self::Type => f.write_str("schema field wire type mismatch"),
-            Self::Utf8 => f.write_str("schema string is not UTF-8"),
-            Self::Required(n) => write!(f, "required schema field {n} is missing"),
-            Self::Limit => f.write_str("schema resource limit exceeded"),
-        }
-    }
-}
-impl core::error::Error for Error {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Double,
@@ -5567,6 +5555,22 @@ mod media_retry_notification {
 mod migration_tests {
     use super::*;
     use crate::protobuf::MessageView as _;
+
+    #[test]
+    fn indexed_errors_keep_their_messages() {
+        for (error, expected) in [
+            (
+                Error::Wire(protobuf::DecodeError::Truncated),
+                "schema protobuf truncated protobuf varint",
+            ),
+            (Error::Type, "schema field wire type mismatch"),
+            (Error::Utf8, "schema string is not UTF-8"),
+            (Error::Required(7), "required schema field 7 is missing"),
+            (Error::Limit, "schema resource limit exceeded"),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn indexes_known_and_unknown_fields_using_generated_schema() {
