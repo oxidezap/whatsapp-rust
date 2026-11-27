@@ -778,7 +778,7 @@ fn packed_view_preserves_values_across_block_boundaries_and_errors() {
         encoding::{Tag, WireType, encode_varint},
     };
 
-    for count in [0usize, 1, 15, 16, 17, 31, 32, 33] {
+    for count in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
         for suffix in [
             &[][..],
             &[0x80][..],
@@ -793,7 +793,9 @@ fn packed_view_preserves_values_across_block_boundaries_and_errors() {
             let mut wire = Vec::new();
             encode_varint(payload.len() as u64, &mut wire);
             wire.extend_from_slice(&payload);
-            for budget in [0usize, 4, 60, 64, 68, 128, 256] {
+            for budget in [
+                0usize, 4, 60, 64, 68, 128, 252, 255, 256, 257, 260, 512, 1024,
+            ] {
                 let unknown_a = Cell::new(10);
                 let unknown_b = Cell::new(10);
                 let elements_a = Cell::new(budget);
@@ -816,6 +818,107 @@ fn packed_view_preserves_values_across_block_boundaries_and_errors() {
                     if a.is_err() {
                         break;
                     }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_owned_buffer_observes_budget_after_each_advance() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        bytes::Buf,
+        encoding::{Tag, WireType, decode_varint, encode_varint},
+    };
+
+    struct ObservingBuf<'a> {
+        input: &'a [u8],
+        chunk_size: usize,
+        budget: &'a Cell<usize>,
+        advances: Vec<(usize, usize)>,
+    }
+    impl Buf for ObservingBuf<'_> {
+        fn remaining(&self) -> usize {
+            self.input.len()
+        }
+        fn chunk(&self) -> &[u8] {
+            &self.input[..self.input.len().min(self.chunk_size)]
+        }
+        fn advance(&mut self, count: usize) {
+            self.advances.push((count, self.budget.get()));
+            self.input = &self.input[count..];
+        }
+    }
+    fn scalar(
+        input: &mut impl Buf,
+        output: &mut Vec<u32>,
+        context: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        let length =
+            usize::try_from(decode_varint(input)?).map_err(|_| DecodeError::MessageTooLarge)?;
+        if length > input.remaining() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let mut packed = input.take(length);
+        while packed.has_remaining() {
+            let value = decode_varint(&mut packed)? as u32;
+            context.register_element_memory(size_of::<u32>())?;
+            output.push(value);
+        }
+        Ok(())
+    }
+
+    for count in [0usize, 1, 63, 64, 65, 128] {
+        for suffix in [
+            &[][..],
+            &[0x80][..],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2][..],
+            &[0xac, 2][..],
+        ] {
+            let mut payload = vec![1; count];
+            payload.extend_from_slice(suffix);
+            let mut wire = Vec::new();
+            encode_varint(payload.len() as u64, &mut wire);
+            wire.extend_from_slice(&payload);
+            wire.push(0x55);
+            for budget in [0, 4, 252, 255, 256, 260, 512, 1024] {
+                for chunk_size in [1, 2, 7, 64, 1024] {
+                    let actual_budget = Cell::new(budget);
+                    let reference_budget = Cell::new(budget);
+                    let actual_unknown = Cell::new(10);
+                    let reference_unknown = Cell::new(10);
+                    let mut actual_input = ObservingBuf {
+                        input: &wire,
+                        chunk_size,
+                        budget: &actual_budget,
+                        advances: Vec::new(),
+                    };
+                    let mut reference_input = ObservingBuf {
+                        input: &wire,
+                        chunk_size,
+                        budget: &reference_budget,
+                        advances: Vec::new(),
+                    };
+                    let actual_context =
+                        DecodeContext::new(10, &actual_unknown).with_element_memory(&actual_budget);
+                    let reference_context = DecodeContext::new(10, &reference_unknown)
+                        .with_element_memory(&reference_budget);
+                    let mut actual = ADVKeyIndexList::default();
+                    actual.valid_indexes.push(9);
+                    let mut expected = vec![9];
+                    let result = actual.merge_field(
+                        Tag::new(4, WireType::LengthDelimited),
+                        &mut actual_input,
+                        actual_context,
+                    );
+                    let reference = scalar(&mut reference_input, &mut expected, reference_context);
+                    assert_eq!(result, reference);
+                    assert_eq!(actual.valid_indexes, expected);
+                    assert_eq!(actual_budget.get(), reference_budget.get());
+                    assert_eq!(actual_input.input, reference_input.input);
+                    assert_eq!(actual_input.advances, reference_input.advances);
                 }
             }
         }
@@ -855,8 +958,10 @@ fn packed_u32_blocks_match_owned_partial_state() {
         waproto::protobuf::encoding::encode_varint(payload.len() as u64, &mut wire);
         wire.extend_from_slice(&payload);
         wire.extend_from_slice(&[0x55, 0x44]);
-        for budget in [0, 1, 4, 7, 16, 28, 31, 32, 33, 60, 64, 128, 1024, 4096] {
-            for initial in [0, 3, 9] {
+        for budget in [
+            0, 1, 4, 7, 16, 28, 31, 32, 33, 60, 64, 128, 252, 255, 256, 257, 260, 1024, 4096,
+        ] {
+            for initial in [0, 3, 9, 63, 64, 65, 127, 128, 129] {
                 let unknown_a = Cell::new(10);
                 let unknown_b = Cell::new(10);
                 let elements_a = Cell::new(budget);
