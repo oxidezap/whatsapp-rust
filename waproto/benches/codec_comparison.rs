@@ -29,7 +29,8 @@ fn message_wire(shape: &str) -> Vec<u8> {
         _ => unreachable!(),
     };
     let wire = message.encode_to_vec();
-    let old = <reference::Message as buffa::Message>::decode_from_slice(&wire).unwrap();
+    let old = <reference::Message as buffa::Message>::decode_from_slice(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     assert_eq!(buffa::Message::encode_to_vec(&old), wire);
     wire
 }
@@ -42,8 +43,10 @@ fn sync_wire() -> Vec<u8> {
         0x12, 0x0a, 0x08, 0x80, 0xe2, 0xcf, 0xaa, 0x06, 0x12, 0x02, 0x08, 0x01, 0x1a, 0x00, 0x20,
         0x01,
     ]);
-    let current = wa::SyncActionData::decode_from_slice(&wire).unwrap();
-    let old = <reference::SyncActionData as buffa::Message>::decode_from_slice(&wire).unwrap();
+    let current = wa::SyncActionData::decode_from_slice(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
+    let old = <reference::SyncActionData as buffa::Message>::decode_from_slice(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     assert_eq!(current.encode_to_vec(), buffa::Message::encode_to_vec(&old));
     wire
 }
@@ -59,8 +62,10 @@ mod packed_sizes {
     use super::*;
 
     fn wire(case: &str) -> Vec<u8> {
-        let (count, pattern) = case.split_once('-').unwrap();
-        let count: u32 = count.parse().unwrap();
+        let (count, pattern) = case
+            .split_once('-')
+            .expect("benchmark case must contain a count and pattern");
+        let count: u32 = count.parse().expect("benchmark count must be numeric");
         let mut value = wa::ADVKeyIndexList::default();
         value.valid_indexes = (0..count)
             .map(|index| match pattern {
@@ -92,8 +97,8 @@ mod packed_sizes {
             })
             .collect();
         let wire = value.encode_to_vec();
-        let reference =
-            <reference::ADVKeyIndexList as buffa::Message>::decode_from_slice(&wire).unwrap();
+        let reference = <reference::ADVKeyIndexList as buffa::Message>::decode_from_slice(&wire)
+            .expect("synthetic protobuf benchmark fixture must be valid");
         assert_eq!(value.valid_indexes, reference.valid_indexes);
         wire
     }
@@ -103,7 +108,7 @@ mod packed_sizes {
             #[divan::bench(args = ["0-small", "1-small", "4-small", "8-small", "16-small", "32-small", "256-small", "256-mixed", "256-large", "256-first", "256-middle", "256-last", "4096-mixed", "4096-first", "4096-middle", "4096-last"])]
             fn $name(bencher: divan::Bencher, case: &str) {
                 let wire = wire(case);
-                bencher.bench(|| black_box(<$ty as $trait>::$decode(black_box(&wire)).unwrap()));
+                bencher.bench(|| black_box(<$ty as $trait>::$decode(black_box(&wire)).expect("synthetic protobuf benchmark fixture must be valid")));
             }
         };
     }
@@ -178,12 +183,15 @@ macro_rules! codec_pair {
             use super::*;
             fn wire() -> Vec<u8> {
                 let wire = $fixture();
-                let current =
-                    <$model as waproto::protobuf::Message>::decode_from_slice(&wire).unwrap();
-                let reference = <$reference as buffa::Message>::decode_from_slice(&wire).unwrap();
+                let current = <$model as waproto::protobuf::Message>::decode_from_slice(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
+                let reference = <$reference as buffa::Message>::decode_from_slice(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
                 assert_eq!(
-                    serde_json::to_value(&current).unwrap(),
-                    serde_json::to_value(&reference).unwrap()
+                    serde_json::to_value(&current)
+                        .expect("synthetic protobuf benchmark fixture must be valid"),
+                    serde_json::to_value(&reference)
+                        .expect("synthetic protobuf benchmark fixture must be valid")
                 );
                 wire
             }
@@ -193,7 +201,7 @@ macro_rules! codec_pair {
                 bencher.bench(|| {
                     black_box(
                         <$model as waproto::protobuf::Message>::decode_from_slice(black_box(&wire))
-                            .unwrap(),
+                            .expect("synthetic protobuf benchmark fixture must be valid"),
                     )
                 });
             }
@@ -203,7 +211,7 @@ macro_rules! codec_pair {
                 bencher.bench(|| {
                     black_box(
                         <$reference as buffa::Message>::decode_from_slice(black_box(&wire))
-                            .unwrap(),
+                            .expect("synthetic protobuf benchmark fixture must be valid"),
                     )
                 });
             }
@@ -213,7 +221,7 @@ macro_rules! codec_pair {
                 bencher.bench(|| {
                     black_box(
                         <$view as waproto::protobuf::MessageView>::decode_view(black_box(&wire))
-                            .unwrap(),
+                            .expect("synthetic protobuf benchmark fixture must be valid"),
                     )
                 });
             }
@@ -223,15 +231,15 @@ macro_rules! codec_pair {
                 bencher.bench(|| {
                     black_box(
                         <$reference_view as buffa::MessageView>::decode_view(black_box(&wire))
-                            .unwrap(),
+                            .expect("synthetic protobuf benchmark fixture must be valid"),
                     )
                 });
             }
             #[divan::bench]
             fn encode_owned_sdk(bencher: divan::Bencher) {
                 let wire = wire();
-                let value =
-                    <$model as waproto::protobuf::Message>::decode_from_slice(&wire).unwrap();
+                let value = <$model as waproto::protobuf::Message>::decode_from_slice(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
                 bencher.bench(|| {
                     black_box(waproto::protobuf::Message::encode_to_vec(black_box(&value)))
                 });
@@ -239,13 +247,15 @@ macro_rules! codec_pair {
             #[divan::bench]
             fn encode_owned_buffa(bencher: divan::Bencher) {
                 let wire = wire();
-                let value = <$reference as buffa::Message>::decode_from_slice(&wire).unwrap();
+                let value = <$reference as buffa::Message>::decode_from_slice(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
                 bencher.bench(|| black_box(buffa::Message::encode_to_vec(black_box(&value))));
             }
             #[divan::bench]
             fn encode_view_sdk(bencher: divan::Bencher) {
                 let wire = wire();
-                let value = <$view as waproto::protobuf::MessageView>::decode_view(&wire).unwrap();
+                let value = <$view as waproto::protobuf::MessageView>::decode_view(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
                 bencher.bench(|| {
                     black_box(waproto::protobuf::ViewEncode::encode_to_vec(black_box(
                         &value,
@@ -255,7 +265,8 @@ macro_rules! codec_pair {
             #[divan::bench]
             fn encode_view_buffa(bencher: divan::Bencher) {
                 let wire = wire();
-                let value = <$reference_view as buffa::MessageView>::decode_view(&wire).unwrap();
+                let value = <$reference_view as buffa::MessageView>::decode_view(&wire)
+                    .expect("synthetic protobuf benchmark fixture must be valid");
                 bencher.bench(|| black_box(buffa::ViewEncode::encode_to_vec(black_box(&value))));
             }
         }
@@ -310,11 +321,15 @@ mod fragmented {
     fn wire() -> Vec<u8> {
         let mut wire = vec![0x0a, 0x8e, 0];
         wire.extend_from_slice(b"synthetic text");
-        let current = wa::Message::decode_from_slice(&wire).unwrap();
-        let reference = <reference::Message as buffa::Message>::decode_from_slice(&wire).unwrap();
+        let current = wa::Message::decode_from_slice(&wire)
+            .expect("synthetic protobuf benchmark fixture must be valid");
+        let reference = <reference::Message as buffa::Message>::decode_from_slice(&wire)
+            .expect("synthetic protobuf benchmark fixture must be valid");
         assert_eq!(
-            serde_json::to_value(current).unwrap(),
-            serde_json::to_value(reference).unwrap()
+            serde_json::to_value(current)
+                .expect("synthetic protobuf benchmark fixture must be valid"),
+            serde_json::to_value(reference)
+                .expect("synthetic protobuf benchmark fixture must be valid")
         );
         wire
     }
@@ -324,7 +339,10 @@ mod fragmented {
         let wire = wire();
         bencher.bench(|| {
             let mut input = wire[..2].chain(&wire[2..]);
-            black_box(wa::Message::decode(black_box(&mut input)).unwrap())
+            black_box(
+                wa::Message::decode(black_box(&mut input))
+                    .expect("synthetic protobuf benchmark fixture must be valid"),
+            )
         });
     }
 
@@ -334,7 +352,8 @@ mod fragmented {
         bencher.bench(|| {
             let mut input = wire[..2].chain(&wire[2..]);
             black_box(
-                <reference::Message as buffa::Message>::decode(black_box(&mut input)).unwrap(),
+                <reference::Message as buffa::Message>::decode(black_box(&mut input))
+                    .expect("synthetic protobuf benchmark fixture must be valid"),
             )
         });
     }
@@ -343,7 +362,12 @@ mod fragmented {
 #[divan::bench(args = ["text", "media"])]
 fn message_owned_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
-    bencher.bench(|| black_box(wa::Message::decode_from_slice(black_box(&wire)).unwrap()));
+    bencher.bench(|| {
+        black_box(
+            wa::Message::decode_from_slice(black_box(&wire))
+                .expect("synthetic protobuf benchmark fixture must be valid"),
+        )
+    });
 }
 
 #[divan::bench(args = ["text", "media"])]
@@ -351,7 +375,8 @@ fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
         black_box(
-            <reference::Message as buffa::Message>::decode_from_slice(black_box(&wire)).unwrap(),
+            <reference::Message as buffa::Message>::decode_from_slice(black_box(&wire))
+                .expect("synthetic protobuf benchmark fixture must be valid"),
         )
     });
 }
@@ -359,7 +384,12 @@ fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
 #[divan::bench(args = ["text", "media"])]
 fn message_view_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
-    bencher.bench(|| black_box(wa::MessageView::decode_view(black_box(&wire)).unwrap()));
+    bencher.bench(|| {
+        black_box(
+            wa::MessageView::decode_view(black_box(&wire))
+                .expect("synthetic protobuf benchmark fixture must be valid"),
+        )
+    });
 }
 
 #[divan::bench(args = ["text", "media"])]
@@ -368,7 +398,7 @@ fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
     bencher.bench(|| {
         black_box(
             <reference::MessageView<'_> as buffa::MessageView>::decode_view(black_box(&wire))
-                .unwrap(),
+                .expect("synthetic protobuf benchmark fixture must be valid"),
         )
     });
 }
@@ -376,21 +406,28 @@ fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
 #[divan::bench(args = ["text", "media"])]
 fn message_encode_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
-    let message = wa::Message::decode_from_slice(&wire).unwrap();
+    let message = wa::Message::decode_from_slice(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
 #[divan::bench(args = ["text", "media"])]
 fn message_encode_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
-    let message = <reference::Message as buffa::Message>::decode_from_slice(&wire).unwrap();
+    let message = <reference::Message as buffa::Message>::decode_from_slice(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     bencher.bench(|| black_box(buffa::Message::encode_to_vec(black_box(&message))));
 }
 
 #[divan::bench]
 fn sync_owned_zero(bencher: divan::Bencher) {
     let wire = sync_wire();
-    bencher.bench(|| black_box(wa::SyncActionData::decode_from_slice(black_box(&wire)).unwrap()));
+    bencher.bench(|| {
+        black_box(
+            wa::SyncActionData::decode_from_slice(black_box(&wire))
+                .expect("synthetic protobuf benchmark fixture must be valid"),
+        )
+    });
 }
 
 #[divan::bench]
@@ -399,7 +436,7 @@ fn sync_owned_buffa(bencher: divan::Bencher) {
     bencher.bench(|| {
         black_box(
             <reference::SyncActionData as buffa::Message>::decode_from_slice(black_box(&wire))
-                .unwrap(),
+                .expect("synthetic protobuf benchmark fixture must be valid"),
         )
     });
 }
@@ -407,25 +444,32 @@ fn sync_owned_buffa(bencher: divan::Bencher) {
 #[divan::bench]
 fn sync_view_zero(bencher: divan::Bencher) {
     let wire = sync_wire();
-    let view = wa::SyncActionDataView::decode_view(&wire).unwrap();
+    let view = wa::SyncActionDataView::decode_view(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     assert_eq!(
         view.encode_to_vec(),
         wa::SyncActionData::decode_from_slice(&wire)
-            .unwrap()
+            .expect("synthetic protobuf benchmark fixture must be valid")
             .encode_to_vec()
     );
-    bencher.bench(|| black_box(wa::SyncActionDataView::decode_view(black_box(&wire)).unwrap()));
+    bencher.bench(|| {
+        black_box(
+            wa::SyncActionDataView::decode_view(black_box(&wire))
+                .expect("synthetic protobuf benchmark fixture must be valid"),
+        )
+    });
 }
 
 #[divan::bench]
 fn sync_view_buffa(bencher: divan::Bencher) {
     let wire = sync_wire();
-    let view =
-        <reference::SyncActionDataView<'_> as buffa::MessageView>::decode_view(&wire).unwrap();
+    let view = <reference::SyncActionDataView<'_> as buffa::MessageView>::decode_view(&wire)
+        .expect("synthetic protobuf benchmark fixture must be valid");
     assert_eq!(
         buffa::ViewEncode::encode_to_vec(&view),
         buffa::Message::encode_to_vec(
-            &<reference::SyncActionData as buffa::Message>::decode_from_slice(&wire).unwrap()
+            &<reference::SyncActionData as buffa::Message>::decode_from_slice(&wire)
+                .expect("synthetic protobuf benchmark fixture must be valid")
         )
     );
     bencher.bench(|| {
@@ -433,7 +477,7 @@ fn sync_view_buffa(bencher: divan::Bencher) {
             <reference::SyncActionDataView<'_> as buffa::MessageView>::decode_view(black_box(
                 &wire,
             ))
-            .unwrap(),
+            .expect("synthetic protobuf benchmark fixture must be valid"),
         )
     });
 }
