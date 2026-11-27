@@ -85,7 +85,6 @@ fn main() -> io::Result<()> {
             ("desc", "src/whatsapp.desc"),
         ],
     )?;
-    println!("cargo:rerun-if-changed=codegen");
     println!("cargo:rerun-if-changed=build_support/signal_storage.rs");
     println!("cargo:rerun-if-changed=signal-storage.snapshot");
     let descriptor = std::fs::read("src/whatsapp.desc")?;
