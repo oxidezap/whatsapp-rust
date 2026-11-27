@@ -35,6 +35,8 @@ macro_rules! device_upsert {
                 )*
                 out.push_sql(")");
                 if UPSERT {
+                    // Keep the device upsert transient, as with Diesel's DoUpdate.
+                    out.unsafe_to_cache_prepared();
                     out.push_sql(concat!(
                         " ON CONFLICT (id) DO UPDATE SET ",
                         stringify!($first), " = excluded.", stringify!($first),
