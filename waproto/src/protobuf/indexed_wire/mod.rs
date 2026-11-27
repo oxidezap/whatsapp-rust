@@ -31,12 +31,17 @@ impl fmt::Display for DecodeError {
 
 impl core::error::Error for DecodeError {}
 
-pub fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+#[inline]
+pub(crate) fn encode_varint_with(mut value: u64, mut push: impl FnMut(u8)) {
     while value >= 128 {
-        output.push((value as u8 & 0x7f) | 0x80);
+        push((value as u8 & 0x7f) | 0x80);
         value >>= 7;
     }
-    output.push(value as u8);
+    push(value as u8);
+}
+
+pub fn encode_varint(value: u64, output: &mut Vec<u8>) {
+    encode_varint_with(value, |byte| output.push(byte));
 }
 
 /// Returns the value and consumed byte count without changing the input.

@@ -100,6 +100,40 @@ fn zero_reader_enforces_field_and_group_limits() {
 }
 
 #[test]
+fn zero_reader_retains_original_tag_width() {
+    for (input, width) in [
+        (&[0x08, 1][..], 1),
+        (&[0x88, 0, 1][..], 2),
+        (&[0x82, 0xb5, 0x18, 0][..], 3),
+    ] {
+        let field = zero_wire::Reader::new(input, zero_wire::Limits::default())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(field.tag_len, width);
+        assert_eq!(field.raw, input);
+    }
+}
+
+#[test]
+fn varint_encoders_match_reference_and_append_to_sinks() {
+    for value in [0, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+        let mut reference = vec![42];
+        buffa::encoding::encode_varint(value, &mut reference);
+        let mut vector = vec![42];
+        waproto::protobuf::encoding::encode_varint(value, &mut vector);
+        let mut sink = bytes::BytesMut::from(&[42][..]);
+        waproto::protobuf::encoding::put_varint(value, &mut sink);
+        let mut zero = vec![42];
+        zero_wire::encode_varint(value, &mut zero);
+        assert_eq!(vector, reference);
+        assert_eq!(sink.as_ref(), reference);
+        assert_eq!(zero, reference);
+    }
+}
+
+#[test]
 fn borrowed_length_delimited_fields_preserve_cursor_on_errors() {
     use waproto::protobuf::{DecodeError, types::borrow_bytes};
     for (input, expected, remaining) in [
@@ -123,6 +157,12 @@ fn unknown_field_budget_precedes_payload_validation() {
         DecodeOptions::new()
             .with_unknown_field_limit(0)
             .decode_view::<waproto::whatsapp::MessageView<'_>>(&input),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_unknown_field_limit(0)
+            .decode_from_slice::<waproto::whatsapp::Message>(&input),
         Err(DecodeError::UnknownFieldLimitExceeded)
     ));
 }

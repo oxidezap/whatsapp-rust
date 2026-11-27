@@ -56,6 +56,79 @@ fn single_numeric_view_preserves_presence_and_decode_limits() {
     ));
 }
 
+#[test]
+fn single_enum_views_preserve_open_and_closed_unknown_values() {
+    use waproto::protobuf::EnumValue;
+    use waproto::whatsapp::ai_rich_response_dynamic_metadata::AIRichResponseDynamicMetadataType;
+    use waproto::whatsapp::{AIRichResponseDynamicMetadataView, SyncdMutationView};
+    let options = DecodeOptions::new()
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let open = options
+        .decode_view::<SyncdMutationView<'_>>(&[0x08, 99])
+        .unwrap();
+    assert_eq!(open.operation, Some(EnumValue::Unknown(99)));
+    let mut negative = vec![0x08];
+    waproto::protobuf::encoding::encode_varint(u64::MAX, &mut negative);
+    let open = options
+        .decode_view::<SyncdMutationView<'_>>(&negative)
+        .unwrap();
+    assert_eq!(open.operation, Some(EnumValue::Unknown(-1)));
+    let closed = options
+        .decode_view::<AIRichResponseDynamicMetadataView<'_>>(&[0x08, 1])
+        .unwrap();
+    assert_eq!(
+        closed.r#type,
+        Some(AIRichResponseDynamicMetadataType::AI_RICH_RESPONSE_DYNAMIC_METADATA_TYPE_IMAGE)
+    );
+    assert!(matches!(
+        options.decode_view::<AIRichResponseDynamicMetadataView<'_>>(&[0x08, 99]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn single_nested_view_preserves_shared_limits_and_error_order() {
+    use waproto::whatsapp::AIQueryFanoutView;
+    let input = [0x0a, 5, 0x0a, 3, b'a', b'b', b'c'];
+    let options = DecodeOptions::new()
+        .with_recursion_limit(1)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let view = options
+        .decode_view::<AIQueryFanoutView<'_>>(&input)
+        .unwrap();
+    assert_eq!(
+        view.message_key.as_option().unwrap().remote_jid,
+        Some("abc")
+    );
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_recursion_limit(0)
+            .decode_view::<AIQueryFanoutView<'_>>(&input),
+        Err(DecodeError::RecursionLimitExceeded)
+    ));
+    assert!(matches!(
+        DecodeOptions::new()
+            .with_recursion_limit(0)
+            .decode_view::<AIQueryFanoutView<'_>>(&[0x0a, 2, 0x0a]),
+        Err(DecodeError::RecursionLimitExceeded)
+    ));
+    assert!(matches!(
+        options.decode_view::<AIQueryFanoutView<'_>>(&[0x0a, 4, 0x80, 0xb5, 0x18, 1]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
+#[test]
+fn generated_views_preserve_overlong_tag_boundaries() {
+    let input = [0x8a, 0, 1, b'a', 0x8a, 0, 1, b'b'];
+    let view = waproto::whatsapp::MessageView::decode_view(&input).unwrap();
+    assert_eq!(view.conversation, Some("b"));
+    let owned = waproto::codec::message_decode(&input).unwrap();
+    assert_eq!(owned.conversation.as_deref(), Some("b"));
+}
+
 struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
 
 impl<'a> waproto::protobuf::MessageView<'a> for CustomIndexView<'a> {

@@ -161,13 +161,13 @@ pub fn generate(schema: &Schema) -> Result<String, String> {
             media = Some((declaration.clone(), spec(1)?, spec(2)?, spec(3)?));
             writeln!(
                 output,
-                "pub(crate) static SCHEMA_{index}: Schema = MEDIA_RETRY_SCHEMA;"
+                "#[cfg(test)] pub(crate) static SCHEMA_{index}: Schema = MEDIA_RETRY_SCHEMA;"
             )
             .map_err(|error| error.to_string())?;
         } else {
             writeln!(
                 output,
-                "pub(crate) static SCHEMA_{index}: Schema = {declaration};"
+                "#[cfg(test)] pub(crate) static SCHEMA_{index}: Schema = {declaration};"
             )
             .map_err(|error| error.to_string())?;
         }

@@ -35,6 +35,7 @@ pub struct Field<'a> {
     pub number: FieldNumber,
     pub value: Value<'a>,
     pub raw: &'a [u8],
+    pub(crate) tag_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,12 +317,24 @@ impl<'a> Iterator for Reader<'a> {
             return None;
         }
         let start = self.remaining;
-        let result = read_field(&mut self.remaining, &mut self.fields_left, self.group_depth);
+        let result = (|| {
+            let (number, wire) = tag(&mut self.remaining)?;
+            let tag_len = start.len() - self.remaining.len();
+            let value = read_value(
+                &mut self.remaining,
+                number,
+                wire,
+                &mut self.fields_left,
+                self.group_depth,
+            )?;
+            Ok::<_, DecodeError>((number, value, tag_len))
+        })();
         Some(match result {
-            Ok((number, value)) => Ok(Field {
+            Ok((number, value, tag_len)) => Ok(Field {
                 number,
                 value,
                 raw: &start[..start.len() - self.remaining.len()],
+                tag_len,
             }),
             Err(error) => {
                 self.remaining = &[];

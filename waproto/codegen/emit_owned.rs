@@ -1261,7 +1261,7 @@ impl Emitter<'_> {
                 } else {
                     format!("{RT}::types::borrow_bytes(&mut entry)?")
                 };
-                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::MessageView::merge_into_view(&mut value,payload,child_context)?;"));
+                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::indexed::merge_generated_view(&mut value,payload,child_context)?;"));
             } else if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
             {
                 out.push_str(&format!(
@@ -1323,9 +1323,9 @@ impl Emitter<'_> {
                 "let child_context=context.descend()?;let payload={payload};"
             ));
             match field.shape{
-                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::MessageView::merge_into_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);}}",self.view_path(id))),
-                FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);",self.view_path(id))),
-                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::MessageView::merge_into_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
+                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::indexed::merge_generated_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);}}",self.view_path(id))),
+                FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?);",self.view_path(id))),
+                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::indexed::merge_generated_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_with_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
             }
         } else {
             if matches!(field.shape, FieldShape::Repeated { .. })
@@ -1490,27 +1490,7 @@ impl Emitter<'_> {
         } else {
             "match(tag.field_number(),tag.wire_type()){ "
         };
-        let first = message
-            .fields
-            .iter()
-            .map(|id| self.schema.field(*id))
-            .min_by_key(|field| field.number.get());
-        let single_scalar = first.filter(|field| {
-            message.oneofs.is_empty()
-                && !message.fields.iter().any(|id| matches!(self.schema.field(*id).shape, FieldShape::Singular { presence: Presence::Required, .. }))
-                && message.fields.iter().filter(|id| self.schema.field(**id).number == field.number).count() == 1
-                && matches!(field.shape, FieldShape::Singular { value: ValueType::Scalar(scalar), presence: Presence::Explicit | Presence::Implicit } if scalar != Scalar::String || field.number.get() < 16)
-        }).map_or_else(String::new, |field| {
-            let value = if matches!(field.shape, FieldShape::Singular { presence: Presence::Explicit, .. }) { "Some(value)" } else { "value" };
-            let FieldShape::Singular { value: ValueType::Scalar(scalar), .. } = field.shape else { unreachable!() };
-            let function = if scalar == Scalar::String {
-                format!("{RT}::indexed::single_text_view")
-            } else {
-                format!("{RT}::indexed::single_scalar_view::<{}>", self.view_value_type(ValueType::Scalar(scalar)))
-            };
-            format!("if let Some(value)={function}(input,&{RT}::indexed::SCHEMA_{}){{return Ok(Self{{{}:{value},..Self::default()}});}}", id.0, member(&field.name))
-        });
-        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{{single_scalar}Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
+        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{let mut value=Self::default();{RT}::indexed::merge_generated_view(&mut value,input,context)?;Ok(value)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
         for field in &message.fields {
             out.push_str(
                 &self.view_decode_field(

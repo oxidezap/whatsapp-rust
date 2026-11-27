@@ -31,42 +31,21 @@ pub(crate) fn media_retry_success(input: &[u8], limits: Limits) -> Option<(&str,
     media_short::project_short_media_success(input, limits)
 }
 
-pub(crate) fn single_text_view<'a>(input: &'a [u8], schema: &'static Schema) -> Option<&'a str> {
-    let (&tag, rest) = input.split_first()?;
-    let spec = schema.fields.first()?;
-    if spec.number() >= 16 || u32::from(tag) != spec.number() * 8 + 2 {
-        return None;
+pub(crate) fn merge_generated_view<'a, V: super::MessageView<'a>>(
+    view: &mut V,
+    mut input: &'a [u8],
+    context: super::DecodeContext<'_>,
+) -> Result<(), super::DecodeError> {
+    while !input.is_empty() {
+        let Some((tag, tag_len)) = super::encoding::probe_tag(input) else {
+            return view.merge_into_view(input, context);
+        };
+        let Some(payload) = input.get(tag_len..) else {
+            return view.merge_into_view(input, context);
+        };
+        input = view.merge_view_field(tag, payload, input, context)?;
     }
-    let (length, prefix) = protobuf::decode_varint(rest).ok()?;
-    if rest.len().checked_sub(prefix)? != usize::try_from(length).ok()? {
-        return None;
-    }
-    let view = View::parse_with_single_text(input, schema, Limits::default()).ok()?;
-    if view.work_fields() != 1 {
-        return None;
-    }
-    Some(view.single_text()?.text)
-}
-
-pub(crate) fn single_scalar_view<'a, T: Scalar<'a>>(
-    input: &'a [u8],
-    schema: &'static Schema,
-) -> Option<T> {
-    let spec = *schema.fields.first()?;
-    let (tag, _) = protobuf::decode_varint(input).ok()?;
-    if tag != ((u64::from(spec.number()) << 3) | u64::from(spec.kind().wire())) {
-        return None;
-    }
-    let limits = protobuf::Limits {
-        max_fields: 1,
-        ..protobuf::Limits::default()
-    };
-    let mut reader = Reader::new(input, limits).ok()?;
-    let field = reader.next()?.ok()?;
-    if !reader.remaining().is_empty() || !spec.known(field.value) {
-        return None;
-    }
-    T::read(field.value, spec.kind()).ok()?
+    Ok(())
 }
 
 fn parse_media_retry_success(
@@ -5646,45 +5625,6 @@ mod migration_tests {
             let reference = crate::whatsapp::MessageView::decode_view(input).unwrap();
             assert_eq!(value, reference.conversation);
         }
-    }
-
-    #[test]
-    fn single_text_adapter_rejects_additional_fields_and_invalid_text() {
-        let index = SCHEMA_NAMES
-            .iter()
-            .position(|name| *name == ".whatsapp.Message")
-            .unwrap();
-        let schema = SCHEMAS[index];
-        assert_eq!(single_text_view(b"\x0a\x02hi", schema), Some("hi"));
-        assert_eq!(single_text_view(b"\x0a\x00", schema), Some(""));
-        assert_eq!(single_text_view(b"\x0a\x01\xff", schema), None);
-        assert_eq!(single_text_view(b"\x0a\x01a\x0a\x01b", schema), None);
-        assert_eq!(single_text_view(b"\x0a\x01a\x80\xb5\x18\x01", schema), None);
-        let mut filtered = vec![0x0a, 30];
-        filtered.extend_from_slice(&[b'a'; 30]);
-        filtered.extend_from_slice(&[0x82, 0xb5, 0x18, 1, b'x']);
-        assert_eq!(single_text_view(&filtered, schema), None);
-    }
-
-    #[test]
-    fn single_scalar_adapter_preserves_values_and_rejects_other_fields() {
-        let index = SCHEMA_NAMES
-            .iter()
-            .position(|name| *name == ".whatsapp.ADVKeyIndexList")
-            .unwrap();
-        let schema = SCHEMAS[index];
-        assert_eq!(
-            single_scalar_view::<u32>(b"\x08\x96\x01", schema),
-            Some(150)
-        );
-        assert_eq!(single_scalar_view::<u32>(b"\x08\x00", schema), Some(0));
-        assert_eq!(single_scalar_view::<u32>(b"\x08\x80", schema), None);
-        assert_eq!(single_scalar_view::<u32>(b"\x0a\x01\x01", schema), None);
-        assert_eq!(single_scalar_view::<u32>(b"\x08\x01\x10\x02", schema), None);
-        assert_eq!(
-            single_scalar_view::<u32>(b"\x08\x01\x80\xb5\x18\x01", schema),
-            None
-        );
     }
 
     #[test]

@@ -179,7 +179,15 @@ pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
         limit: usize,
     ) -> Result<(), DecodeError> {
         while input.remaining() > limit {
-            let tag = Tag::decode(input)?;
+            let available = input.remaining() - limit;
+            let chunk = input.chunk();
+            let probe = encoding::probe_tag(&chunk[..chunk.len().min(available)]);
+            let tag = if let Some((tag, length)) = probe {
+                input.advance(length);
+                tag
+            } else {
+                Tag::decode(input)?
+            };
             self.merge_field(tag, input, context)?;
         }
         Ok(())

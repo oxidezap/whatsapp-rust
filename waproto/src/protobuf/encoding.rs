@@ -82,6 +82,24 @@ impl Tag {
     }
 }
 
+pub(crate) fn probe_tag(input: &[u8]) -> Option<(Tag, usize)> {
+    use super::indexed_wire::{Limits, Reader, Value};
+    let limits = Limits {
+        max_message_bytes: MAX_MESSAGE_BYTES as usize,
+        max_fields: 1,
+        max_group_depth: 0,
+    };
+    let field = Reader::new(input, limits).ok()?.next()?.ok()?;
+    let kind = match field.value {
+        Value::Varint(_) => WireType::Varint,
+        Value::Fixed64(_) => WireType::Fixed64,
+        Value::Bytes(_) => WireType::LengthDelimited,
+        Value::Fixed32(_) => WireType::Fixed32,
+        Value::Group(_) => return None,
+    };
+    Some((Tag::new(field.number.get(), kind), field.tag_len))
+}
+
 #[inline]
 pub fn check_wire_type(tag: Tag, expected: WireType) -> Result<(), DecodeError> {
     if tag.kind != expected {
@@ -275,21 +293,13 @@ pub const fn varint_len(value: u64) -> usize {
 }
 
 #[inline]
-pub fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 128 {
-        output.push(value as u8 | 128);
-        value >>= 7;
-    }
-    output.push(value as u8);
+pub fn encode_varint(value: u64, output: &mut Vec<u8>) {
+    super::indexed_wire::encode_varint(value, output);
 }
 
 #[inline]
-pub fn put_varint(mut value: u64, output: &mut impl super::EncodeSink) {
-    while value >= 128 {
-        output.put_u8(value as u8 | 128);
-        value >>= 7;
-    }
-    output.put_u8(value as u8);
+pub fn put_varint(value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::encode_varint_with(value, |byte| output.put_u8(byte));
 }
 
 #[inline]
