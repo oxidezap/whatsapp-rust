@@ -12,6 +12,49 @@ use waproto::whatsapp::{
 };
 
 #[test]
+#[allow(clippy::disallowed_methods)]
+fn nested_message_maps_encode_with_consistent_size_cache() {
+    use waproto::protobuf::{SizeCache, ViewEncode as _};
+    use waproto::whatsapp::{Config, ConfigView, Field};
+
+    let mut config = Config::default();
+    for key in [0, 1, 127, 128, u32::MAX] {
+        let mut value = Field::default();
+        value.min_version = Some(key);
+        for child_key in 0..20 {
+            let mut child = Field::default();
+            child.max_version = Some(child_key);
+            value.subfield.insert(child_key, child);
+        }
+        config.field.insert(key, value);
+    }
+
+    let expected = config.encode_to_vec();
+    let mut cache = SizeCache::new();
+    assert_eq!(config.compute_size(&mut cache) as usize, expected.len());
+    let mut encoded = Vec::new();
+    config.write_to(&mut cache, &mut encoded);
+    assert_eq!(encoded, expected);
+    cache.clear();
+    assert_eq!(config.compute_size(&mut cache) as usize, expected.len());
+    let mut repeated = Vec::new();
+    config.write_to(&mut cache, &mut repeated);
+    assert_eq!(repeated, expected);
+    let view = ConfigView::decode_view(&expected).unwrap();
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap(), config);
+    #[cfg(feature = "protobuf-reference")]
+    {
+        let reference =
+            <reference::Config as buffa::Message>::decode_from_slice(&expected).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(reference).unwrap()
+        );
+    }
+}
+
+#[test]
 fn single_text_view_preserves_presence_and_decode_limits() {
     let options = DecodeOptions::new()
         .with_recursion_limit(0)
@@ -599,6 +642,46 @@ fn numeric_element_budget_is_shared_across_packed_and_unpacked_values() {
             .valid_indexes,
         &[1, 2]
     );
+}
+
+#[test]
+fn packed_view_preserves_partial_values_and_budget() {
+    use std::cell::Cell;
+    use waproto::protobuf::{
+        DecodeContext,
+        encoding::{Tag, WireType},
+    };
+
+    let payloads: &[&[u8]] = &[
+        &[1, 0xac, 2, 3],
+        &[1, 0x80],
+        &[
+            1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 3,
+        ],
+        &[1, 0x80, 0x80, 1, 2],
+    ];
+    for payload in payloads {
+        let mut wire = vec![payload.len() as u8];
+        wire.extend_from_slice(payload);
+        for budget in [0, 4, 8, 16, 64] {
+            let unknown_a = Cell::new(10);
+            let unknown_b = Cell::new(10);
+            let elements_a = Cell::new(budget);
+            let elements_b = Cell::new(budget);
+            let ctx_a = DecodeContext::new(10, &unknown_a).with_element_memory(&elements_a);
+            let ctx_b = DecodeContext::new(10, &unknown_b).with_element_memory(&elements_b);
+            let tag = Tag::new(4, WireType::LengthDelimited);
+            let mut owned = ADVKeyIndexList::default();
+            let mut view = ADVKeyIndexListView::default();
+            let mut input = &wire[..];
+            let a = owned.merge_field(tag, &mut input, ctx_a);
+            let b = view.merge_view_field(tag, &wire, &wire, ctx_b).map(|_| ());
+            assert_eq!(a, b, "payload={payload:?}, budget={budget}");
+            assert_eq!(&owned.valid_indexes, &*view.valid_indexes);
+            assert_eq!(elements_a.get(), elements_b.get());
+            assert_eq!(unknown_a.get(), unknown_b.get());
+        }
+    }
 }
 
 #[test]
