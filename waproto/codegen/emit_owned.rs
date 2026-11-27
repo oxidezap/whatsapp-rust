@@ -736,8 +736,12 @@ impl Emitter<'_> {
             out.push_str(&self.encode_field(field, false));
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}\nfn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
-        for field in &fields {
-            out.push_str(&self.encode_field(field, true));
+        if let Some(grouped) = self.grouped_writer(&fields, false) {
+            out.push_str(&grouped);
+        } else {
+            for field in &fields {
+                out.push_str(&self.encode_field(field, true));
+            }
         }
         // Keeping this wide dispatch separate avoids a large stack frame on each decode.
         let inline = if message.full_name == ".whatsapp.SyncActionValue" {
@@ -795,6 +799,54 @@ impl Emitter<'_> {
         out.push_str("}}\n");
         out
     }
+    fn grouped_writer(&self, fields: &[&Field], view: bool) -> Option<String> {
+        if fields.len() < 64
+            || !fields.iter().all(|field| {
+                matches!(
+                    field.shape,
+                    FieldShape::Singular {
+                        presence: Presence::Explicit,
+                        value: ValueType::Message(..) | ValueType::Scalar(Scalar::String),
+                        ..
+                    }
+                )
+            })
+        {
+            return None;
+        }
+        let mut out = String::new();
+        for group in fields.chunks(16) {
+            let conditions = group
+                .iter()
+                .map(|field| {
+                    let slot = self.slot(field);
+                    if matches!(
+                        field.shape,
+                        FieldShape::Singular {
+                            value: ValueType::Message(..),
+                            ..
+                        }
+                    ) {
+                        format!("self.{slot}.is_set()")
+                    } else {
+                        format!("self.{slot}.is_some()")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            out.push_str(&format!("if {conditions}{{"));
+            for field in group {
+                out.push_str(&if view {
+                    self.view_encode_field(field, true)
+                } else {
+                    self.encode_field(field, true)
+                });
+            }
+            out.push('}');
+        }
+        Some(out)
+    }
+
     fn encode_field(&self, field: &Field, write: bool) -> String {
         let number = field.number.get();
         if let FieldShape::Map { key, value, .. } = field.shape {
@@ -809,11 +861,11 @@ impl Emitter<'_> {
             let mut out = format!("for(k,v)in &self.{slot}{{");
             if let ValueType::Message(..) = value {
                 if write {
-                    out.push_str(&format!("let entry_n=cache.consume_next();{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(u64::from(entry_n),output);",(u64::from(number)<<3)|2));
+                    out.push_str(&format!("let n=cache.consume_next();let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(u64::from({RT}::saturate_size(entry)),output);",(u64::from(number)<<3)|2));
                     out.push_str(&self.write_value(key_ty, 1, "k"));
-                    out.push_str(&self.write_value(value, 2, "v"));
+                    out.push_str(&format!("{RT}::encoding::put_varint(18,output);{RT}::encoding::put_varint(u64::from(n),output);{RT}::Message::write_to(v,cache,output);"));
                 } else {
-                    out.push_str(&format!("let entry_slot=cache.reserve();let value_slot=cache.reserve();let n={RT}::Message::compute_size(v,cache);cache.set(value_slot,n);let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);cache.set(entry_slot,{RT}::saturate_size(entry));size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(entry)as u64+entry);",(u64::from(number)<<3)|2));
+                    out.push_str(&format!("let value_slot=cache.reserve();let n={RT}::Message::compute_size(v,cache);cache.set(value_slot,n);let entry=1u64+{key_size}+1u64+{RT}::encoding::varint_len(u64::from(n))as u64+u64::from(n);size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(entry)as u64+entry);",(u64::from(number)<<3)|2));
                 }
             } else {
                 out.push_str(&format!("let entry=1u64+{key_size}+1u64+{value_size};"));
@@ -1684,8 +1736,12 @@ impl Emitter<'_> {
             out.push_str(&self.view_encode_field(field, false));
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}fn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
-        for field in &fields {
-            out.push_str(&self.view_encode_field(field, true));
+        if let Some(grouped) = self.grouped_writer(&fields, true) {
+            out.push_str(&grouped);
+        } else {
+            for field in &fields {
+                out.push_str(&self.view_encode_field(field, true));
+            }
         }
         out.push_str("}}\n");
         out.push_str(&self.owned_view_source(message, id));

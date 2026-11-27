@@ -13,6 +13,35 @@ use waproto::whatsapp::{
 
 #[test]
 #[allow(clippy::disallowed_methods)]
+fn message_writer_observes_current_fields_after_sizing() {
+    use waproto::protobuf::{SizeCache, ViewEncode};
+    use waproto::whatsapp::{Message, MessageView};
+
+    let mut message = Message::default().with_conversation("hello");
+    message.view_once_message = Some(Default::default()).into();
+    message.bot_invoke_message = Some(Default::default()).into();
+    message.newsletter_scheduled_message = Some(Default::default()).into();
+    let original = message.encode_to_vec();
+    let mut cache = SizeCache::new();
+    let size = message.compute_size(&mut cache);
+    message.conversation = Some("world".into());
+    let mut output = Vec::new();
+    message.write_to(&mut cache, &mut output);
+    assert_eq!(size as usize, output.len());
+    assert_eq!(output, message.encode_to_vec());
+
+    let mut view = MessageView::decode_view(&original).unwrap();
+    let mut cache = SizeCache::new();
+    let size = ViewEncode::compute_size(&view, &mut cache);
+    view.conversation = Some("world");
+    let mut output = Vec::new();
+    ViewEncode::write_to(&view, &mut cache, &mut output);
+    assert_eq!(size as usize, output.len());
+    assert_eq!(output, message.encode_to_vec());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
 fn nested_message_maps_encode_with_consistent_size_cache() {
     use waproto::protobuf::{SizeCache, ViewEncode as _};
     use waproto::whatsapp::{Config, ConfigView, Field};
@@ -51,6 +80,60 @@ fn nested_message_maps_encode_with_consistent_size_cache() {
             serde_json::to_value(&config).unwrap(),
             serde_json::to_value(reference).unwrap()
         );
+    }
+}
+
+#[cfg(feature = "protobuf-reference")]
+#[test]
+fn map_key_changes_between_passes_match_reference() {
+    use waproto::protobuf::{SizeCache, ViewEncode};
+    use waproto::whatsapp::{Config, ConfigView, Field};
+
+    for (before, after) in [(1, 128), (128, 1)] {
+        let mut initial = Config::default();
+        let mut child = Field::default();
+        child.min_version = Some(7);
+        child.subfield.insert(2, Field::default());
+        initial.field.insert(before, child);
+        let initial_wire = initial.encode_to_vec();
+        let child = initial.field.remove(&before).unwrap();
+        initial.field.insert(after, child);
+        let changed_wire = initial.encode_to_vec();
+
+        let mut owned = Config::decode_from_slice(&initial_wire).unwrap();
+        let mut reference =
+            <reference::Config as buffa::Message>::decode_from_slice(&initial_wire).unwrap();
+        let mut cache = SizeCache::new();
+        let mut reference_cache = buffa::SizeCache::new();
+        owned.compute_size(&mut cache);
+        buffa::Message::compute_size(&reference, &mut reference_cache);
+        owned.field = Config::decode_from_slice(&changed_wire).unwrap().field;
+        reference.field = <reference::Config as buffa::Message>::decode_from_slice(&changed_wire)
+            .unwrap()
+            .field;
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        owned.write_to(&mut cache, &mut actual);
+        buffa::Message::write_to(&reference, &mut reference_cache, &mut expected);
+        assert_eq!(actual, expected);
+
+        let mut view = ConfigView::decode_view(&initial_wire).unwrap();
+        let mut reference_view =
+            <reference::ConfigView<'_> as buffa::MessageView>::decode_view(&initial_wire).unwrap();
+        let mut cache = SizeCache::new();
+        let mut reference_cache = buffa::SizeCache::new();
+        ViewEncode::compute_size(&view, &mut cache);
+        buffa::ViewEncode::compute_size(&reference_view, &mut reference_cache);
+        view.field = ConfigView::decode_view(&changed_wire).unwrap().field;
+        reference_view.field =
+            <reference::ConfigView<'_> as buffa::MessageView>::decode_view(&changed_wire)
+                .unwrap()
+                .field;
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        ViewEncode::write_to(&view, &mut cache, &mut actual);
+        buffa::ViewEncode::write_to(&reference_view, &mut reference_cache, &mut expected);
+        assert_eq!(actual, expected);
     }
 }
 

@@ -102,7 +102,12 @@ pub trait DefaultViewInstance {
 }
 
 pub trait ViewEncode<'a>: MessageView<'a> {
+    /// Computes the encoded size and records nested sizes in `cache`.
+    ///
+    /// Use the cache with `write_to` on the same view without mutation
+    /// between calls.
     fn compute_size(&self, cache: &mut SizeCache) -> u32;
+    /// Writes using the cache produced by `compute_size` for this unchanged view.
     fn write_to(&self, cache: &mut SizeCache, output: &mut impl EncodeSink);
     fn try_encoded_len(&self) -> Result<u32, EncodeError> {
         checked_encode_size(self.compute_size(&mut SizeCache::new()))

@@ -16,6 +16,56 @@ fn main() {
 fn message_wire(shape: &str) -> Vec<u8> {
     let message = match shape {
         "text" => wa::Message::default().with_conversation("synthetic text"),
+        "text_context" => {
+            let mut message = wa::Message::default().with_conversation("synthetic text");
+            let mut context = wa::MessageContextInfo::default();
+            context.message_secret = Some(vec![0x5a; 32]);
+            message.message_context_info = Some(context).into();
+            message
+        }
+        "oneof" => {
+            let image = wa::message::ImageMessage::default().with_caption("synthetic image");
+            let mut header = wa::message::interactive_message::Header::default();
+            header.media = Some(
+                wa::message::interactive_message::header::Media::ImageMessage(Box::new(image)),
+            );
+            let mut interactive = wa::message::InteractiveMessage::default();
+            interactive.header = Some(header).into();
+            let mut message = wa::Message::default();
+            message.interactive_message = Some(interactive).into();
+            message
+        }
+        "dense" => {
+            let mut message = wa::Message::default().with_conversation("synthetic text");
+            macro_rules! set_fields {
+                ($($field:ident),+ $(,)?) => { $(message.$field = Some(Default::default()).into();)+ };
+            }
+            set_fields!(
+                view_once_message,
+                ephemeral_message,
+                document_with_caption_message,
+                view_once_message_v2,
+                edited_message,
+                view_once_message_v2_extension,
+                group_mentioned_message,
+                bot_invoke_message,
+                lottie_sticker_message,
+                event_cover_image,
+                status_mention_message,
+                poll_creation_option_image_message,
+                associated_child_message,
+                group_status_mention_message,
+                poll_creation_message_v4,
+                status_add_yours,
+                group_status_message,
+                limit_sharing_message,
+                bot_task_message,
+                question_message,
+                group_status_message_v2,
+                bot_forwarded_message
+            );
+            message
+        }
         "media" => {
             let mut message = wa::Message::default();
             message.image_message = Some(
@@ -425,7 +475,7 @@ mod fragmented {
     }
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_owned_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -436,7 +486,7 @@ fn message_owned_zero(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -447,7 +497,7 @@ fn message_owned_buffa(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_view_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -458,7 +508,7 @@ fn message_view_zero(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     bencher.bench(|| {
@@ -469,7 +519,7 @@ fn message_view_buffa(bencher: divan::Bencher, shape: &str) {
     });
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_encode_zero(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     let message = wa::Message::decode_from_slice(&wire)
@@ -477,7 +527,7 @@ fn message_encode_zero(bencher: divan::Bencher, shape: &str) {
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
-#[divan::bench(args = ["text", "media"])]
+#[divan::bench(args = ["text", "text_context", "media", "oneof", "dense"])]
 fn message_encode_buffa(bencher: divan::Bencher, shape: &str) {
     let wire = message_wire(shape);
     let message = <reference::Message as buffa::Message>::decode_from_slice(&wire)

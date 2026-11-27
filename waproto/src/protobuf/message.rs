@@ -45,7 +45,12 @@ pub trait MessageName {
 /// Custom `merge_field` implementations must validate the wire format and
 /// charge the shared decode context for unknown fields and repeated elements.
 pub trait Message: DefaultInstance + Clone + PartialEq + Send + Sync {
+    /// Computes the encoded size and records nested sizes in `cache`.
+    ///
+    /// Use the cache with `write_to` on the same message without mutation
+    /// between calls.
     fn compute_size(&self, cache: &mut SizeCache) -> u32;
+    /// Writes using the cache produced by `compute_size` for this unchanged message.
     fn write_to(&self, cache: &mut SizeCache, output: &mut impl EncodeSink);
     fn merge_field(
         &mut self,
