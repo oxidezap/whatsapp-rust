@@ -111,23 +111,19 @@ impl ::waproto::protobuf::Message for HeapWindow {
         }
         if self.g_cc != 0 {
             let v = &self.g_cc;
-            ::waproto::protobuf::encoding::put_varint(16, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(2, *v as u64, output);
         }
         if self.g_nrg != 0 {
             let v = &self.g_nrg;
-            ::waproto::protobuf::encoding::put_varint(24, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(3, *v as u64, output);
         }
         if self.g_pitch != 0 {
             let v = &self.g_pitch;
-            ::waproto::protobuf::encoding::put_varint(32, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(4, *v as u64, output);
         }
         if self.g_clk != 0 {
             let v = &self.g_clk;
-            ::waproto::protobuf::encoding::put_varint(40, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(5, *v as u64, output);
         }
     }
     fn merge_field(
@@ -287,14 +283,11 @@ impl ::waproto::protobuf::Message for Region {
         let _ = &output;
         if self.base != 0 {
             let v = &self.base;
-            ::waproto::protobuf::encoding::put_varint(8, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(1, *v as u64, output);
         }
         if !self.data.is_empty() {
             let v = &self.data;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
     }
     fn merge_field(
@@ -677,39 +670,27 @@ impl ::waproto::protobuf::Message for LsfSeed {
         let _ = &output;
         if !self.rot_8.is_empty() {
             let v = &self.rot_8;
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, v, output);
         }
         if !self.rot_cond_8.is_empty() {
             let v = &self.rot_cond_8;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         if !self.st2_all_qlvls_8.is_empty() {
             let v = &self.st2_all_qlvls_8;
-            ::waproto::protobuf::encoding::put_varint(26, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(3, v, output);
         }
         if !self.st2_all_qlvl_dcmfs.is_empty() {
             let v = &self.st2_all_qlvl_dcmfs;
-            ::waproto::protobuf::encoding::put_varint(34, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(4, v, output);
         }
         if !self.st2_min_qi.is_empty() {
             let v = &self.st2_min_qi;
-            ::waproto::protobuf::encoding::put_varint(42, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(5, v, output);
         }
         if !self.st2_max_qi.is_empty() {
             let v = &self.st2_max_qi;
-            ::waproto::protobuf::encoding::put_varint(50, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(6, v, output);
         }
         if !self.cb_16.is_empty() {
             let n = self
@@ -842,7 +823,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
             ::waproto::protobuf::encoding::put_varint(106, output);
             ::waproto::protobuf::encoding::put_varint(n, output);
             for v in &self.mean {
-                output.put_u32_le(v.to_bits());
+                ::waproto::protobuf::encoding::put_fixed32_value(v.to_bits(), output);
             }
         }
         if !self.min_dist.is_empty() {
@@ -862,7 +843,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
             ::waproto::protobuf::encoding::put_varint(114, output);
             ::waproto::protobuf::encoding::put_varint(n, output);
             for v in &self.min_dist {
-                output.put_u32_le(v.to_bits());
+                ::waproto::protobuf::encoding::put_fixed32_value(v.to_bits(), output);
             }
         }
         if !self.reg_cond.is_empty() {
@@ -882,7 +863,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
             ::waproto::protobuf::encoding::put_varint(122, output);
             ::waproto::protobuf::encoding::put_varint(n, output);
             for v in &self.reg_cond {
-                output.put_u32_le(v.to_bits());
+                ::waproto::protobuf::encoding::put_fixed32_value(v.to_bits(), output);
             }
         }
         if !self.qstep.is_empty() {
@@ -902,7 +883,7 @@ impl ::waproto::protobuf::Message for LsfSeed {
             ::waproto::protobuf::encoding::put_varint(130, output);
             ::waproto::protobuf::encoding::put_varint(n, output);
             for v in &self.qstep {
-                output.put_u32_le(v.to_bits());
+                ::waproto::protobuf::encoding::put_fixed32_value(v.to_bits(), output);
             }
         }
     }
@@ -1453,45 +1434,31 @@ impl ::waproto::protobuf::Message for PitchSeed {
         let _ = &output;
         if !self.blocksegs_bitstream.is_empty() {
             let v = &self.blocksegs_bitstream;
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, v, output);
         }
         if !self.blocksegs2idx.is_empty() {
             let v = &self.blocksegs2idx;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         if !self.blocksegs_ix.is_empty() {
             let v = &self.blocksegs_ix;
-            ::waproto::protobuf::encoding::put_varint(26, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(3, v, output);
         }
         if !self.firstblock_range.is_empty() {
             let v = &self.firstblock_range;
-            ::waproto::protobuf::encoding::put_varint(34, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(4, v, output);
         }
         if !self.blockseg_idx_dcmf.is_empty() {
             let v = &self.blockseg_idx_dcmf;
-            ::waproto::protobuf::encoding::put_varint(42, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(5, v, output);
         }
         if !self.delta_lag_dcmfs.is_empty() {
             let v = &self.delta_lag_dcmfs;
-            ::waproto::protobuf::encoding::put_varint(50, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(6, v, output);
         }
         if !self.block_transition_dcmf.is_empty() {
             let v = &self.block_transition_dcmf;
-            ::waproto::protobuf::encoding::put_varint(58, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(7, v, output);
         }
     }
     fn merge_field(
@@ -1812,39 +1779,27 @@ impl ::waproto::protobuf::Message for CcSeed {
         let _ = &output;
         if !self.nrgres_gain4_dcmf.is_empty() {
             let v = &self.nrgres_gain4_dcmf;
-            ::waproto::protobuf::encoding::put_varint(10, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(1, v, output);
         }
         if !self.nrgres_shape4_dcmf.is_empty() {
             let v = &self.nrgres_shape4_dcmf;
-            ::waproto::protobuf::encoding::put_varint(18, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(2, v, output);
         }
         if !self.fcbg_offset_dcmf.is_empty() {
             let v = &self.fcbg_offset_dcmf;
-            ::waproto::protobuf::encoding::put_varint(26, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(3, v, output);
         }
         if !self.acbgains_hr_dcmf.is_empty() {
             let v = &self.acbgains_hr_dcmf;
-            ::waproto::protobuf::encoding::put_varint(34, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(4, v, output);
         }
         if !self.fcbgains_v_dcmf.is_empty() {
             let v = &self.fcbgains_v_dcmf;
-            ::waproto::protobuf::encoding::put_varint(42, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(5, v, output);
         }
         if !self.fcbgains_v_delta_dcmf.is_empty() {
             let v = &self.fcbgains_v_delta_dcmf;
-            ::waproto::protobuf::encoding::put_varint(50, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(6, v, output);
         }
         if !self.acbgains_cb_hr_q14.is_empty() {
             let n = self
@@ -1872,32 +1827,23 @@ impl ::waproto::protobuf::Message for CcSeed {
         }
         if self.gain_recon_base != 0 {
             let v = &self.gain_recon_base;
-            ::waproto::protobuf::encoding::put_varint(64, output);
-            ::waproto::protobuf::encoding::put_varint(*v as u64, output);
+            ::waproto::protobuf::encoding::put_varint_field(8, *v as u64, output);
         }
         if !self.gain_recon.is_empty() {
             let v = &self.gain_recon;
-            ::waproto::protobuf::encoding::put_varint(74, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(9, v, output);
         }
         if !self.n_pulses_dcmf_bgn.is_empty() {
             let v = &self.n_pulses_dcmf_bgn;
-            ::waproto::protobuf::encoding::put_varint(82, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(10, v, output);
         }
         if !self.n_pulses_dcmf_uv.is_empty() {
             let v = &self.n_pulses_dcmf_uv;
-            ::waproto::protobuf::encoding::put_varint(90, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(11, v, output);
         }
         if !self.n_pulses_dcmf_v.is_empty() {
             let v = &self.n_pulses_dcmf_v;
-            ::waproto::protobuf::encoding::put_varint(98, output);
-            ::waproto::protobuf::encoding::put_varint(v.len() as u64, output);
-            output.put_slice(v);
+            ::waproto::protobuf::encoding::put_bytes_field(12, v, output);
         }
     }
     fn merge_field(

@@ -434,20 +434,78 @@ impl Emitter<'_> {
     fn write_value(&self, kind: ValueType, field: u32, value: &str) -> String {
         let wire = Self::wire(kind);
         let tag = (u64::from(field) << 3) | u64::from(wire);
-        let mut out = format!("{RT}::encoding::put_varint({tag},output);");
         match kind {
-            ValueType::Message(_, encoding) => { if encoding==MessageEncoding::LengthPrefixed { out.push_str(&format!("{RT}::encoding::put_varint(u64::from(cache.consume_next()),output);")); } out.push_str(&format!("{RT}::Message::write_to({value},cache,output);")); if encoding==MessageEncoding::Group { out.push_str(&format!("{RT}::encoding::put_varint({},output);",(u64::from(field)<<3)|4)); } }
-            ValueType::Scalar(Scalar::String) => out.push_str(&format!("{RT}::encoding::put_varint({value}.len()as u64,output);output.put_slice({value}.as_bytes());")),
-            ValueType::Scalar(Scalar::Bytes) => out.push_str(&format!("{RT}::encoding::put_varint({value}.len()as u64,output);output.put_slice({value});")),
-            ValueType::Scalar(Scalar::Float) => out.push_str(&format!("output.put_u32_le({value}.to_bits());")),
-            ValueType::Scalar(Scalar::Double) => out.push_str(&format!("output.put_u64_le({value}.to_bits());")),
-            ValueType::Scalar(Scalar::Fixed32) => out.push_str(&format!("output.put_u32_le(*{value});")),
-            ValueType::Scalar(Scalar::Fixed64) => out.push_str(&format!("output.put_u64_le(*{value});")),
-            _ if wire==5 => out.push_str(&format!("output.put_u32_le(*{value} as u32);")),
-            _ if wire==1 => out.push_str(&format!("output.put_u64_le(*{value} as u64);")),
-            _=>out.push_str(&format!("{RT}::encoding::put_varint({},output);",self.numeric(kind,value))),
+            ValueType::Message(_, encoding) => {
+                let mut out = format!("{RT}::encoding::put_varint({tag},output);");
+                if encoding == MessageEncoding::LengthPrefixed {
+                    out.push_str(&format!(
+                        "{RT}::encoding::put_varint(u64::from(cache.consume_next()),output);"
+                    ));
+                }
+                out.push_str(&format!("{RT}::Message::write_to({value},cache,output);"));
+                if encoding == MessageEncoding::Group {
+                    out.push_str(&format!(
+                        "{RT}::encoding::put_varint({},output);",
+                        (u64::from(field) << 3) | 4
+                    ));
+                }
+                out
+            }
+            ValueType::Scalar(Scalar::String) => {
+                format!("{RT}::encoding::put_bytes_field({field},{value}.as_bytes(),output);")
+            }
+            ValueType::Scalar(Scalar::Bytes) => {
+                format!("{RT}::encoding::put_bytes_field({field},{value},output);")
+            }
+            ValueType::Scalar(Scalar::Float) => {
+                format!("{RT}::encoding::put_fixed32_field({field},{value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Double) => {
+                format!("{RT}::encoding::put_fixed64_field({field},{value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Fixed32) => {
+                format!("{RT}::encoding::put_fixed32_field({field},*{value},output);")
+            }
+            ValueType::Scalar(Scalar::Fixed64) => {
+                format!("{RT}::encoding::put_fixed64_field({field},*{value},output);")
+            }
+            _ if wire == 5 => {
+                format!("{RT}::encoding::put_fixed32_field({field},*{value} as u32,output);")
+            }
+            _ if wire == 1 => {
+                format!("{RT}::encoding::put_fixed64_field({field},*{value} as u64,output);")
+            }
+            _ => format!(
+                "{RT}::encoding::put_varint_field({field},{},output);",
+                self.numeric(kind, value)
+            ),
         }
-        out
+    }
+    fn write_packed_value(&self, kind: ValueType, value: &str) -> String {
+        match kind {
+            ValueType::Scalar(Scalar::Float) => {
+                format!("{RT}::encoding::put_fixed32_value({value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Double) => {
+                format!("{RT}::encoding::put_fixed64_value({value}.to_bits(),output);")
+            }
+            ValueType::Scalar(Scalar::Fixed32) => {
+                format!("{RT}::encoding::put_fixed32_value(*{value},output);")
+            }
+            ValueType::Scalar(Scalar::Fixed64) => {
+                format!("{RT}::encoding::put_fixed64_value(*{value},output);")
+            }
+            _ if Self::wire(kind) == 5 => {
+                format!("{RT}::encoding::put_fixed32_value(*{value} as u32,output);")
+            }
+            _ if Self::wire(kind) == 1 => {
+                format!("{RT}::encoding::put_fixed64_value(*{value} as u64,output);")
+            }
+            _ => format!(
+                "{RT}::encoding::put_varint({},output);",
+                self.numeric(kind, value)
+            ),
+        }
     }
     fn read_value(&self, kind: ValueType, storage: BytesStorage, input: &str) -> String {
         match kind {
@@ -784,9 +842,7 @@ impl Emitter<'_> {
             );
             if write {
                 out.push_str(&format!("{RT}::encoding::put_varint({},output);{RT}::encoding::put_varint(n,output);for v in &self.{slot}{{",(u64::from(number)<<3)|2));
-                let encoded = self.write_value(value, number, "v");
-                let start = encoded.find(';').expect("tag terminator") + 1;
-                out.push_str(&encoded[start..]);
+                out.push_str(&self.write_packed_value(value, "v"));
                 out.push('}');
             } else {
                 out.push_str(&format!("size=size.saturating_add({RT}::encoding::varint_len({})as u64+{RT}::encoding::varint_len(n)as u64+n);",(u64::from(number)<<3)|2));

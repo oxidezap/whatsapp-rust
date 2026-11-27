@@ -1,4 +1,4 @@
-use super::{DecodeError, decode_varint, encode_varint};
+use super::{DecodeError, decode_varint};
 use alloc::vec::Vec;
 
 pub const MAX_FIELD_NUMBER: u32 = (1 << 29) - 1;
@@ -556,46 +556,77 @@ pub(crate) fn probe_value(input: &[u8], number: u32, wire: u8) -> Option<usize> 
     Some(input.len() - remaining.len())
 }
 
-/// Encodes scalar fields into a reusable caller-owned buffer.
-pub struct Writer<'a> {
-    output: &'a mut Vec<u8>,
+pub trait WriteSink {
+    fn put_u8(&mut self, value: u8);
+    fn put_slice(&mut self, value: &[u8]);
+    fn put_u32_le(&mut self, value: u32);
+    fn put_u64_le(&mut self, value: u64);
 }
 
-impl<'a> Writer<'a> {
-    pub fn new(output: &'a mut Vec<u8>) -> Self {
+impl WriteSink for Vec<u8> {
+    fn put_u8(&mut self, value: u8) {
+        self.push(value);
+    }
+    fn put_slice(&mut self, value: &[u8]) {
+        self.extend_from_slice(value);
+    }
+    fn put_u32_le(&mut self, value: u32) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+    fn put_u64_le(&mut self, value: u64) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Encodes scalar fields into a reusable caller-owned buffer.
+pub struct Writer<'a, S: WriteSink + ?Sized> {
+    output: &'a mut S,
+}
+
+impl<'a, S: WriteSink + ?Sized> Writer<'a, S> {
+    pub fn new(output: &'a mut S) -> Self {
         Self { output }
     }
 
     fn tag(&mut self, number: FieldNumber, wire: u8) {
-        encode_varint(
-            (u64::from(number.get()) << 3) | u64::from(wire),
-            self.output,
-        );
+        self.raw_varint((u64::from(number.get()) << 3) | u64::from(wire));
+    }
+
+    pub fn raw_varint(&mut self, value: u64) {
+        super::encode_varint_with(value, |byte| self.output.put_u8(byte));
+    }
+
+    pub fn raw_fixed32(&mut self, value: u32) {
+        self.output.put_u32_le(value);
+    }
+
+    pub fn raw_fixed64(&mut self, value: u64) {
+        self.output.put_u64_le(value);
     }
 
     pub fn varint(&mut self, number: FieldNumber, value: u64) {
         self.tag(number, 0);
-        encode_varint(value, self.output);
+        self.raw_varint(value);
     }
 
     pub fn fixed64(&mut self, number: FieldNumber, value: u64) {
         self.tag(number, 1);
-        self.output.extend_from_slice(&value.to_le_bytes());
+        self.raw_fixed64(value);
     }
 
     pub fn bytes(&mut self, number: FieldNumber, value: &[u8]) {
         self.tag(number, 2);
-        encode_varint(value.len() as u64, self.output);
-        self.output.extend_from_slice(value);
+        self.raw_varint(value.len() as u64);
+        self.output.put_slice(value);
     }
 
     pub fn fixed32(&mut self, number: FieldNumber, value: u32) {
         self.tag(number, 5);
-        self.output.extend_from_slice(&value.to_le_bytes());
+        self.raw_fixed32(value);
     }
 
     pub fn raw_field(&mut self, field: Field<'_>) {
-        self.output.extend_from_slice(field.raw);
+        self.output.put_slice(field.raw);
     }
 }
 

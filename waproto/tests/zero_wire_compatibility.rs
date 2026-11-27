@@ -150,6 +150,70 @@ fn varint_encoders_match_reference_and_append_to_sinks() {
 }
 
 #[test]
+fn zero_writer_encodes_each_wire_value() {
+    let mut output = vec![42];
+    let mut writer = zero_wire::Writer::new(&mut output);
+    writer.varint(zero_wire::FieldNumber::new(1).unwrap(), 150);
+    writer.fixed64(
+        zero_wire::FieldNumber::new(2).unwrap(),
+        0x0807_0605_0403_0201,
+    );
+    writer.bytes(zero_wire::FieldNumber::new(3).unwrap(), b"hi");
+    writer.fixed32(zero_wire::FieldNumber::new(4).unwrap(), 0x0403_0201);
+    assert_eq!(
+        output,
+        [
+            42, 8, 0x96, 1, 0x11, 1, 2, 3, 4, 5, 6, 7, 8, 0x1a, 2, b'h', b'i', 0x25, 1, 2, 3, 4
+        ]
+    );
+}
+
+#[test]
+fn zero_writer_adapter_supports_existing_sinks() {
+    use waproto::protobuf::encoding::{
+        put_bytes_field, put_fixed32_field, put_fixed32_value, put_fixed64_field,
+        put_fixed64_value, put_varint_field,
+    };
+    fn write(output: &mut impl waproto::protobuf::EncodeSink) {
+        put_varint_field(1, 150, output);
+        put_fixed64_field(2, 0x0807_0605_0403_0201, output);
+        put_bytes_field(3, b"hi", output);
+        put_fixed32_field(4, 0x0403_0201, output);
+    }
+    let expected = [
+        42, 8, 0x96, 1, 0x11, 1, 2, 3, 4, 5, 6, 7, 8, 0x1a, 2, b'h', b'i', 0x25, 1, 2, 3, 4,
+    ];
+    let mut vector = vec![42];
+    write(&mut vector);
+    assert_eq!(vector, expected);
+    let mut bytes = bytes::BytesMut::from(&[42][..]);
+    write(&mut bytes);
+    assert_eq!(bytes.as_ref(), expected);
+    struct CustomSink(Vec<u8>);
+    impl waproto::protobuf::EncodeSink for CustomSink {
+        fn put_u8(&mut self, value: u8) {
+            self.0.push(value);
+        }
+        fn put_slice(&mut self, value: &[u8]) {
+            self.0.extend_from_slice(value);
+        }
+        fn put_u32_le(&mut self, value: u32) {
+            self.0.extend_from_slice(&value.to_le_bytes());
+        }
+        fn put_u64_le(&mut self, value: u64) {
+            self.0.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let mut custom = CustomSink(vec![42]);
+    write(&mut custom);
+    assert_eq!(custom.0, expected);
+    let mut packed = Vec::new();
+    put_fixed32_value(0x0403_0201, &mut packed);
+    put_fixed64_value(0x0807_0605_0403_0201, &mut packed);
+    assert_eq!(packed, [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
 fn borrowed_length_delimited_fields_preserve_cursor_on_errors() {
     use waproto::protobuf::{DecodeError, types::borrow_bytes};
     for (input, expected, remaining) in [

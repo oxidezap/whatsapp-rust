@@ -253,7 +253,71 @@ pub fn encode_varint(value: u64, output: &mut Vec<u8>) {
 
 #[inline]
 pub fn put_varint(value: u64, output: &mut impl super::EncodeSink) {
-    super::indexed_wire::encode_varint_with(value, |byte| output.put_u8(byte));
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_varint(value);
+}
+
+struct WriterSink<'a, S: super::EncodeSink>(&'a mut S);
+
+impl<S: super::EncodeSink> super::indexed_wire::WriteSink for WriterSink<'_, S> {
+    fn put_u8(&mut self, value: u8) {
+        self.0.put_u8(value);
+    }
+    fn put_slice(&mut self, value: &[u8]) {
+        self.0.put_slice(value);
+    }
+    fn put_u32_le(&mut self, value: u32) {
+        self.0.put_u32_le(value);
+    }
+    fn put_u64_le(&mut self, value: u64) {
+        self.0.put_u64_le(value);
+    }
+}
+
+fn writer_field_number(number: u32) -> super::indexed_wire::FieldNumber {
+    match super::indexed_wire::FieldNumber::new(number) {
+        Ok(number) => number,
+        Err(_) => panic!("invalid protobuf field number"),
+    }
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed32_value(value: u32, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_fixed32(value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed64_value(value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output)).raw_fixed64(value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_varint_field(number: u32, value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .varint(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed32_field(number: u32, value: u32, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .fixed32(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_fixed64_field(number: u32, value: u64, output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .fixed64(writer_field_number(number), value);
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn put_bytes_field(number: u32, value: &[u8], output: &mut impl super::EncodeSink) {
+    super::indexed_wire::Writer::new(&mut WriterSink(output))
+        .bytes(writer_field_number(number), value);
 }
 
 #[inline]
