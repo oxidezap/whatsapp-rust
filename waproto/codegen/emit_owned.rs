@@ -1495,17 +1495,22 @@ impl Emitter<'_> {
             .iter()
             .map(|id| self.schema.field(*id))
             .min_by_key(|field| field.number.get());
-        let single_text = first.filter(|field| {
-            field.number.get() < 16
-                && message.oneofs.is_empty()
+        let single_scalar = first.filter(|field| {
+            message.oneofs.is_empty()
                 && !message.fields.iter().any(|id| matches!(self.schema.field(*id).shape, FieldShape::Singular { presence: Presence::Required, .. }))
                 && message.fields.iter().filter(|id| self.schema.field(**id).number == field.number).count() == 1
-                && matches!(field.shape, FieldShape::Singular { value: ValueType::Scalar(Scalar::String), presence: Presence::Explicit | Presence::Implicit })
+                && matches!(field.shape, FieldShape::Singular { value: ValueType::Scalar(scalar), presence: Presence::Explicit | Presence::Implicit } if scalar != Scalar::String || field.number.get() < 16)
         }).map_or_else(String::new, |field| {
             let value = if matches!(field.shape, FieldShape::Singular { presence: Presence::Explicit, .. }) { "Some(value)" } else { "value" };
-            format!("if let Some(value)={RT}::indexed::single_text_view(input,&{RT}::indexed::SCHEMA_{}){{return Ok(Self{{{}:{value},..Self::default()}});}}", id.0, member(&field.name))
+            let FieldShape::Singular { value: ValueType::Scalar(scalar), .. } = field.shape else { unreachable!() };
+            let function = if scalar == Scalar::String {
+                format!("{RT}::indexed::single_text_view")
+            } else {
+                format!("{RT}::indexed::single_scalar_view::<{}>", self.view_value_type(ValueType::Scalar(scalar)))
+            };
+            format!("if let Some(value)={function}(input,&{RT}::indexed::SCHEMA_{}){{return Ok(Self{{{}:{value},..Self::default()}});}}", id.0, member(&field.name))
         });
-        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{{single_text}Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
+        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{{single_scalar}Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
         for field in &message.fields {
             out.push_str(
                 &self.view_decode_field(

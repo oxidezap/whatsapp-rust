@@ -36,6 +36,26 @@ fn single_text_view_preserves_presence_and_decode_limits() {
     ));
 }
 
+#[test]
+fn single_numeric_view_preserves_presence_and_decode_limits() {
+    let options = DecodeOptions::new()
+        .with_recursion_limit(0)
+        .with_unknown_field_limit(0)
+        .with_element_memory_limit(0);
+    let decoded = options
+        .decode_view::<ADVKeyIndexListView<'_>>(&[0x08, 0x96, 0x01])
+        .unwrap();
+    assert_eq!(decoded.raw_id, Some(150));
+    assert!(matches!(
+        options.decode_view::<ADVKeyIndexListView<'_>>(&[0x0a, 1, 0]),
+        Err(DecodeError::WireTypeMismatch { .. })
+    ));
+    assert!(matches!(
+        options.decode_view::<ADVKeyIndexListView<'_>>(&[0x08, 1, 0x80, 0xb5, 0x18, 1]),
+        Err(DecodeError::UnknownFieldLimitExceeded)
+    ));
+}
+
 struct CustomIndexView<'a>(ADVKeyIndexListView<'a>);
 
 impl<'a> waproto::protobuf::MessageView<'a> for CustomIndexView<'a> {
