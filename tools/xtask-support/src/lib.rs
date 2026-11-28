@@ -178,11 +178,17 @@ pub fn descriptor(proto: &Path, descriptor: &Path, source_info: bool) -> Result<
         sha256(&std::fs::read(proto)?),
         sha256(&data)
     );
-    write(descriptor, &data)?;
-    write(
-        &descriptor.with_extension("desc.sha256"),
-        sidecar.as_bytes(),
-    )
+    let sidecar_path = descriptor.with_extension("desc.sha256");
+    // Cargo watches both files, so replacing identical bytes invalidates the codec build.
+    for (path, bytes) in [
+        (descriptor, data.as_slice()),
+        (sidecar_path.as_path(), sidecar.as_bytes()),
+    ] {
+        if !std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+            write(path, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Preserve a process exit code, including conventional Unix signal exit statuses.
