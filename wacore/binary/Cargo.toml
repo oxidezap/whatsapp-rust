@@ -26,6 +26,8 @@ smallvec = { workspace = true }
 smoothutf8 = { workspace = true }
 stable_deref_trait = "1.2.1"
 yoke = { workspace = true }
+# The derive crate avoids yoke's transitive ZeroFrom derive.
+yoke-derive = { workspace = true }
 zlib-rs = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

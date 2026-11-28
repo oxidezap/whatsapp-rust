@@ -28,7 +28,7 @@ pub enum TokenKind {
     Double(u8, u8),
 }
 
-include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
+include!("token_maps.generated.rs");
 
 /// The table uses open addressing. Keys of up to four bytes match their
 /// padded u32 exactly. Longer keys match a two-load signature and are
@@ -53,11 +53,11 @@ fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
     if len == 0 || len > MAX_TOKEN_LEN {
         return None;
     }
-    // Key derivation must mirror build.rs exactly. For len <= 4 the padded
+    // Key derivation must mirror the generator. For len <= 4 the padded
     // word IS the key (tokens are NUL-free, so padding can't collide with
     // real bytes) and the meta tag pins the exact length; longer keys match
     // a signature and byte-verify against the length-prefixed blob. In both
-    // loops 0 marks an empty slot (build.rs asserts no key is 0), so most
+    // loops 0 marks an empty slot (the generator rejects zero keys), so most
     // misses stop on the first load, and a false key match — an alias across
     // the short/long split or a signature collision — just keeps probing:
     // the real owner may live further down the chain.

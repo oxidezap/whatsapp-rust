@@ -1634,6 +1634,7 @@ dependencies = [
  "smoothutf8",
  "stable_deref_trait",
  "yoke",
+ "yoke-derive",
  "zlib-rs",
 ]
 
@@ -2017,7 +2018,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
- "yoke-derive",
  "zerofrom",
 ]
 
@@ -2058,21 +2058,6 @@ name = "zerofrom"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
-dependencies = [
- "zerofrom-derive",
-]
-
-[[package]]
-name = "zerofrom-derive"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f75b4683f6c7f45248d4d64056a24298c6281e0993356d7d1b4a1a962ef10d4a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
- "synstructure",
-]
 
 [[package]]
 name = "zeroize"

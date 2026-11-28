@@ -5683,6 +5683,7 @@ dependencies = [
  "smoothutf8",
  "stable_deref_trait",
  "yoke",
+ "yoke-derive",
  "zlib-rs",
 ]
 

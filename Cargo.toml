@@ -156,6 +156,8 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 uuid = { version = "1", default-features = false }
+yoke = "0.8"
+yoke-derive = { version = "0.8", default-features = false }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 # Internal workspace crates
@@ -166,7 +168,6 @@ wacore-derive = { path = "./wacore/derive", version = "0.7.0" }
 wacore-libsignal = { path = "./wacore/libsignal", version = "0.7.0" }
 wacore-noise = { path = "./wacore/noise", version = "0.7.0" }
 waproto = { path = "./waproto", version = "0.7.0" }
-yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8.55", default-features = false, features = ["derive"] }
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 

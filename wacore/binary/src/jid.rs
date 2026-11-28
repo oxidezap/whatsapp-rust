@@ -573,7 +573,7 @@ pub struct Jid {
     pub integrator: u16,
 }
 
-#[derive(Debug, Clone, yoke::Yokeable)]
+#[derive(Debug, Clone, yoke_derive::Yokeable)]
 pub struct JidRef<'a> {
     pub user: NodeStr<'a>,
     pub server: Server,
