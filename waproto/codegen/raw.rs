@@ -34,6 +34,7 @@ pub fn generate_raw(schema: &Schema, base: &str) -> String {
     generate_raw_models(schema, base, true)
 }
 
+#[allow(dead_code)]
 pub(crate) fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
     let mut source = Vec::new();
     generate_modules(schema, base, views)
