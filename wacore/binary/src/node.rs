@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 /// Borrowed-or-inline string for decoded nodes. Short owned values (≤24 bytes)
 /// are stored inline via `CompactString`, avoiding heap allocation.
-#[derive(Clone, yoke::Yokeable)]
+#[derive(Clone, yoke_derive::Yokeable)]
 pub enum NodeStr<'a> {
     Borrowed(&'a str),
     Owned(CompactString),
@@ -402,7 +402,7 @@ impl FromIterator<(Cow<'static, str>, NodeValue)> for Attrs {
 /// entirely. The boxed slice is allocated once with exact size from the decoder.
 ///
 /// Covariant in `'a` (both Box and slices are covariant), compatible with yoke::Yokeable.
-#[derive(Debug, Clone, yoke::Yokeable)]
+#[derive(Debug, Clone, yoke_derive::Yokeable)]
 pub enum AttrsRef<'a> {
     Empty,
     Slice(Box<[(NodeStr<'a>, ValueRef<'a>)]>),
@@ -461,7 +461,7 @@ impl<'a> FromIterator<(NodeStr<'a>, ValueRef<'a>)> for AttrsRef<'a> {
 /// A decoded attribute value that can be either a string or a structured JID.
 /// This avoids string allocation when decoding JID tokens - the JidRef is returned
 /// directly and only converted to a string when actually needed.
-#[derive(Debug, Clone, PartialEq, yoke::Yokeable)]
+#[derive(Debug, Clone, PartialEq, yoke_derive::Yokeable)]
 pub enum ValueRef<'a> {
     String(NodeStr<'a>),
     Jid(JidRef<'a>),
@@ -571,7 +571,7 @@ pub enum NodeContent {
     Nodes(Vec<Node>),
 }
 
-#[derive(Debug, Clone, PartialEq, yoke::Yokeable)]
+#[derive(Debug, Clone, PartialEq, yoke_derive::Yokeable)]
 pub enum NodeContentRef<'a> {
     Bytes(Cow<'a, [u8]>),
     String(NodeStr<'a>),
@@ -617,7 +617,7 @@ pub struct Node {
     pub content: Option<NodeContent>,
 }
 
-#[derive(Debug, Clone, PartialEq, yoke::Yokeable)]
+#[derive(Debug, Clone, PartialEq, yoke_derive::Yokeable)]
 pub struct NodeRef<'a> {
     pub tag: NodeStr<'a>,
     pub attrs: AttrsRef<'a>,
