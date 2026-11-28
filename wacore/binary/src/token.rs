@@ -30,11 +30,9 @@ pub enum TokenKind {
 
 include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
 
-/// One open-addressing probe over the build-generated table (layout and
-/// rationale in build.rs). Keys of length <= 4 — the bulk of probe traffic —
-/// are matched exactly by their padded u32; longer keys match a two-load
-/// signature first and byte-verify only on signature hits, so a miss of any
-/// shape costs a handful of instructions and no full compare.
+/// The table uses open addressing. Keys of up to four bytes match their
+/// padded u32 exactly. Longer keys match a two-load signature and are
+/// compared byte for byte on signature hits. A miss skips the full comparison.
 #[inline]
 pub fn index_of_token(token: &str) -> Option<TokenKind> {
     lookup_bytes(token.as_bytes())

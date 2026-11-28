@@ -436,6 +436,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             rust: false,
         },
         Artifact {
+            path: "wacore/binary/src/token_maps.generated.rs",
+            content: emit::token_maps::generate(&tokens, wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "plugins/wam-catalog/src/generated.rs",
             content: wam.catalog,
             rust: true,
