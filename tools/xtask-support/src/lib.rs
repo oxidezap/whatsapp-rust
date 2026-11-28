@@ -173,16 +173,22 @@ pub fn descriptor(proto: &Path, descriptor: &Path, source_info: bool) -> Result<
     }
     run(cmd.arg("-I").arg(directory).arg(proto))?;
     let data = std::fs::read(temporary.path())?;
-    let sidecar = format!(
-        "proto {}\ndesc {}\n",
-        sha256(&std::fs::read(proto)?),
-        sha256(&data)
-    );
-    write(descriptor, &data)?;
-    write(
-        &descriptor.with_extension("desc.sha256"),
-        sidecar.as_bytes(),
-    )
+    write_descriptor_outputs(descriptor, &std::fs::read(proto)?, &data)
+}
+
+fn write_descriptor_outputs(descriptor: &Path, proto: &[u8], data: &[u8]) -> Result<()> {
+    let sidecar = format!("proto {}\ndesc {}\n", sha256(proto), sha256(data));
+    let sidecar_path = descriptor.with_extension("desc.sha256");
+    // Cargo watches both files, so replacing identical bytes invalidates the codec build.
+    for (path, bytes) in [
+        (descriptor, data),
+        (sidecar_path.as_path(), sidecar.as_bytes()),
+    ] {
+        if !std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+            write(path, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Preserve a process exit code, including conventional Unix signal exit statuses.
@@ -213,6 +219,58 @@ pub fn hash_input(value: &str, hexadecimal: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backdate(path: &Path) -> std::io::Result<std::time::SystemTime> {
+        let file = std::fs::File::options().write(true).open(path)?;
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))?;
+        file.metadata()?.modified()
+    }
+
+    #[test]
+    fn unchanged_descriptor_outputs_keep_their_mtimes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let descriptor = dir.path().join("example.desc");
+        let sidecar = descriptor.with_extension("desc.sha256");
+        write_descriptor_outputs(&descriptor, b"schema", b"descriptor")?;
+        let descriptor_mtime = backdate(&descriptor)?;
+        let sidecar_mtime = backdate(&sidecar)?;
+
+        write_descriptor_outputs(&descriptor, b"schema", b"descriptor")?;
+
+        assert_eq!(
+            std::fs::metadata(&descriptor)?.modified()?,
+            descriptor_mtime
+        );
+        assert_eq!(std::fs::metadata(&sidecar)?.modified()?, sidecar_mtime);
+        Ok(())
+    }
+
+    #[test]
+    fn repairs_descriptor_outputs_independently() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let descriptor = dir.path().join("example.desc");
+        let sidecar = descriptor.with_extension("desc.sha256");
+        write_descriptor_outputs(&descriptor, b"schema", b"descriptor")?;
+
+        for (updated, untouched) in [(&descriptor, &sidecar), (&sidecar, &descriptor)] {
+            let expected = std::fs::read(updated)?;
+            for missing in [false, true] {
+                let untouched_mtime = backdate(untouched)?;
+                if missing {
+                    std::fs::remove_file(updated)?;
+                } else {
+                    std::fs::write(updated, b"stale")?;
+                }
+
+                write_descriptor_outputs(&descriptor, b"schema", b"descriptor")?;
+
+                assert_eq!(std::fs::read(updated)?, expected);
+                assert_eq!(std::fs::metadata(untouched)?.modified()?, untouched_mtime);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn malformed_scalar_snapshots_are_rejected() {
         assert!(unpack(&[0, 0, 0], "f").is_err());
