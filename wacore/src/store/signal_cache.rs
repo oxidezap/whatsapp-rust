@@ -423,6 +423,17 @@ enum PrekeyProbe {
     Deferred,
 }
 
+struct FlushRecords<Encoded, Record: ?Sized> {
+    batch: Vec<(Arc<str>, Encoded)>,
+    versions: Vec<(Arc<str>, Weak<Record>)>,
+    deleted: Vec<Arc<str>>,
+}
+
+struct SessionFlush {
+    records: FlushRecords<bytes::Bytes, SessionRecord>,
+    prekeys: Vec<(u32, Arc<str>, PrekeyProbe)>,
+}
+
 // A weak version prevents allocation-address reuse without making ordinary
 // checkouts clone their records while the serialized snapshot is in I/O.
 fn same_flush_version<T: ?Sized>(record: &Arc<T>, version: &Weak<T>) -> bool {
@@ -982,6 +993,40 @@ struct SessionStoreState {
 }
 
 impl SessionStoreState {
+    fn collect_flush_records(&self) -> SessionFlush {
+        let mut batch = Vec::with_capacity(self.dirty.len());
+        let mut versions = Vec::with_capacity(self.dirty.len());
+        for address in &self.dirty {
+            if let Some(record) = self
+                .cache
+                .get(address.as_ref())
+                .and_then(SessionEntry::flushable_record)
+            {
+                let mut bytes = Vec::new();
+                record.serialize_into_for_store(&mut bytes, &self.incarnation);
+                batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                versions.push((address.clone(), Arc::downgrade(record)));
+            }
+        }
+        // Capture consumption together with its session snapshot: a prekey
+        // buffered during the I/O must wait for the next snapshot, even if
+        // this flush persisted an older session at the same address.
+        let prekeys = self
+            .removed_prekeys
+            .iter()
+            .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
+            .collect::<Vec<_>>();
+        let deleted = self.deleted.iter().cloned().collect();
+        SessionFlush {
+            records: FlushRecords {
+                batch,
+                versions,
+                deleted,
+            },
+            prekeys,
+        }
+    }
+
     fn new(incarnation: StoreIncarnation) -> Self {
         Self {
             incarnation,
@@ -1185,6 +1230,35 @@ struct SenderKeyStoreState {
 }
 
 impl SenderKeyStoreState {
+    fn collect_flush_records(
+        &self,
+    ) -> Result<FlushRecords<bytes::Bytes, SenderKeyRecord>, SignalCacheFlushError> {
+        let mut batch = Vec::with_capacity(self.dirty.len());
+        let mut versions = Vec::with_capacity(self.dirty.len());
+        let mut deleted = Vec::new();
+        for address in &self.dirty {
+            match self.cache.get(address.as_ref()) {
+                Some(Some(record)) => {
+                    let bytes = record
+                        .serialize_for_store(&self.incarnation)
+                        .map_err(|error| SignalCacheFlushError::SenderKeySerialization {
+                            address: Arc::clone(address),
+                            source: crate::error::BoxedErrorSource::new(error),
+                        })?;
+                    batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                    versions.push((address.clone(), Arc::downgrade(record)));
+                }
+                Some(None) => deleted.push(address.clone()),
+                None => {}
+            }
+        }
+        Ok(FlushRecords {
+            batch,
+            versions,
+            deleted,
+        })
+    }
+
     fn new(incarnation: StoreIncarnation) -> Self {
         Self {
             incarnation,
@@ -1254,6 +1328,29 @@ struct ByteStoreState {
 }
 
 impl ByteStoreState {
+    fn collect_flush_records(&self) -> Result<FlushRecords<[u8; 32], [u8]>, SignalCacheFlushError> {
+        let mut batch = Vec::with_capacity(self.dirty.len());
+        let mut versions = Vec::with_capacity(self.dirty.len());
+        for address in &self.dirty {
+            if let Some(Some(data)) = self.cache.get(address.as_ref()) {
+                let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
+                    SignalCacheFlushError::InvalidIdentity {
+                        address: Arc::clone(address),
+                        length: data.len(),
+                    }
+                })?;
+                batch.push((address.clone(), key));
+                versions.push((address.clone(), Arc::downgrade(data)));
+            }
+        }
+        let deleted = self.deleted.iter().cloned().collect();
+        Ok(FlushRecords {
+            batch,
+            versions,
+            deleted,
+        })
+    }
+
     fn new() -> Self {
         Self {
             cache: UserIndexedCache::new(),
@@ -2938,36 +3035,17 @@ impl SignalStoreCache {
     }
 
     async fn flush_sessions(&self, backend: &dyn SignalStore) -> crate::store::error::Result<()> {
-        let (batch, versions, deleted, mut prekeys) = {
+        let SessionFlush {
+            records:
+                FlushRecords {
+                    batch,
+                    versions,
+                    deleted,
+                },
+            mut prekeys,
+        } = {
             let state = self.lock_sessions().await;
-            let mut batch = Vec::with_capacity(state.dirty.len());
-            let mut versions = Vec::with_capacity(state.dirty.len());
-            for address in &state.dirty {
-                if let Some(record) = state
-                    .cache
-                    .get(address.as_ref())
-                    .and_then(SessionEntry::flushable_record)
-                {
-                    let mut bytes = Vec::new();
-                    record.serialize_into_for_store(&mut bytes, &state.incarnation);
-                    batch.push((address.clone(), bytes::Bytes::from(bytes)));
-                    versions.push((address.clone(), Arc::downgrade(record)));
-                }
-            }
-            // Capture consumption together with its session snapshot: a prekey
-            // buffered during the I/O must wait for the next snapshot, even if
-            // this flush persisted an older session at the same address.
-            let prekeys = state
-                .removed_prekeys
-                .iter()
-                .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
-                .collect::<Vec<_>>();
-            (
-                batch,
-                versions,
-                state.deleted.iter().cloned().collect::<Vec<_>>(),
-                prekeys,
-            )
+            state.collect_flush_records()
         };
 
         if !batch.is_empty() {
@@ -3064,27 +3142,13 @@ impl SignalStoreCache {
         &self,
         backend: &dyn SignalStore,
     ) -> Result<(), SignalCacheFlushError> {
-        let (batch, versions, deleted) = {
+        let FlushRecords {
+            batch,
+            versions,
+            deleted,
+        } = {
             let state = self.identities.lock().await;
-            let mut batch = Vec::with_capacity(state.dirty.len());
-            let mut versions = Vec::with_capacity(state.dirty.len());
-            for address in &state.dirty {
-                if let Some(Some(data)) = state.cache.get(address.as_ref()) {
-                    let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
-                        SignalCacheFlushError::InvalidIdentity {
-                            address: Arc::clone(address),
-                            length: data.len(),
-                        }
-                    })?;
-                    batch.push((address.clone(), key));
-                    versions.push((address.clone(), Arc::downgrade(data)));
-                }
-            }
-            (
-                batch,
-                versions,
-                state.deleted.iter().cloned().collect::<Vec<_>>(),
-            )
+            state.collect_flush_records()?
         };
         if !batch.is_empty() {
             backend.put_identities_batch(&batch).await?;
@@ -3114,29 +3178,13 @@ impl SignalStoreCache {
         &self,
         backend: &dyn SignalStore,
     ) -> Result<(), SignalCacheFlushError> {
-        let (batch, versions, deleted) = {
+        let FlushRecords {
+            batch,
+            versions,
+            deleted,
+        } = {
             let state = self.sender_keys.lock().await;
-            let mut batch = Vec::with_capacity(state.dirty.len());
-            let mut versions = Vec::with_capacity(state.dirty.len());
-            let mut deleted = Vec::new();
-            for address in &state.dirty {
-                match state.cache.get(address.as_ref()) {
-                    Some(Some(record)) => {
-                        let bytes =
-                            record
-                                .serialize_for_store(&state.incarnation)
-                                .map_err(|error| SignalCacheFlushError::SenderKeySerialization {
-                                    address: Arc::clone(address),
-                                    source: crate::error::BoxedErrorSource::new(error),
-                                })?;
-                        batch.push((address.clone(), bytes::Bytes::from(bytes)));
-                        versions.push((address.clone(), Arc::downgrade(record)));
-                    }
-                    Some(None) => deleted.push(address.clone()),
-                    None => {}
-                }
-            }
-            (batch, versions, deleted)
+            state.collect_flush_records()?
         };
         if !deleted.is_empty() {
             backend.delete_sender_keys_batch(&deleted).await?;
