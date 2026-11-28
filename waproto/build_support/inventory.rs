@@ -277,9 +277,12 @@ fn normalize(input: &str, scope: &str) -> String {
     // formatting. Rewrite only explicit relative paths and buffa's namespace;
     // leave Self, generic parameters and dependency-qualified types unchanged.
     let words: Vec<_> = input.split_whitespace().collect();
-    let mut output = Vec::new();
+    let mut output = String::with_capacity(input.len());
     let mut i = 0;
     while i < words.len() {
+        if i != 0 {
+            output.push(' ');
+        }
         if matches!(words[i], "super" | "self" | "__buffa") && words.get(i + 1) == Some(&"::") {
             let mut resolved: Vec<String> = scope.split("::").map(str::to_owned).collect();
             loop {
@@ -301,11 +304,11 @@ fn normalize(input: &str, scope: &str) -> String {
                 }
                 i += 1;
             }
-            output.push(canonical(resolved, true));
+            output.push_str(&canonical(resolved, true));
         } else {
-            output.push(words[i].to_owned());
+            output.push_str(words[i]);
             i += 1;
         }
     }
-    output.join(" ")
+    output
 }

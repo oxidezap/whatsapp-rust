@@ -18,6 +18,8 @@ pub mod wallpaper;
 pub mod emit_owned;
 #[path = "../codegen/format.rs"]
 mod format;
+#[path = "../build_support/inventory.rs"]
+mod inventory;
 #[path = "../codegen/media_retry_schema.rs"]
 pub mod media_retry_schema;
 #[path = "../codegen/policy.rs"]
@@ -34,7 +36,7 @@ pub mod schema;
 use descriptor::FileDescriptorSet;
 
 #[test]
-fn fragmented_whatsapp_formatting_matches_full_file_formatting() {
+fn fragmented_whatsapp_inventory_matches_full_file_formatting() {
     let descriptor =
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/whatsapp.desc")).unwrap();
     let mut descriptor = FileDescriptorSet::decode_from_slice(&descriptor).unwrap();
@@ -51,15 +53,16 @@ fn fragmented_whatsapp_formatting_matches_full_file_formatting() {
     let schema = project::project(&descriptor).unwrap();
     let base = "crate::protobuf::generated::whatsapp";
     let raw = raw::generate_raw(&schema, base);
-    let expected = prettyplease::unparse(&syn::parse_file(&raw).unwrap());
-    let actual = format::generate(&schema, base).unwrap();
+    let formatted = prettyplease::unparse(&syn::parse_file(&raw).unwrap());
+    let parsed = syn::parse_file(&formatted).unwrap();
+    let mut expected = std::collections::BTreeSet::new();
+    inventory::inventory_compact(&parsed.items, "whatsapp", &mut expected);
+    let actual = format::inventory(&schema, base).unwrap();
     assert!(
         actual == expected,
-        "formatted output differs at byte {:?}",
-        actual
-            .bytes()
-            .zip(expected.bytes())
-            .position(|(a, b)| a != b)
+        "missing {:?}; added {:?}",
+        expected.difference(&actual).next(),
+        actual.difference(&expected).next(),
     );
 }
 
