@@ -94,13 +94,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let (descriptors, schema) = whatsapp::prepare(&descriptor)?;
-        let source = format::generate(&schema, &arguments[1])?;
-        let parsed = syn::parse_file(&source)?;
-        let mut api = std::collections::BTreeSet::new();
-        inventory::inventory_compact(&parsed.items, "whatsapp", &mut api);
-        let mut api: std::collections::BTreeSet<_> = api
+        let mut api: std::collections::BTreeSet<_> = format::inventory(&schema, &arguments[1])?
             .into_iter()
-            .map(|entry| entry.trim_end().to_owned())
+            .map(|mut entry| {
+                entry.truncate(entry.trim_end().len());
+                entry
+            })
             .collect();
         api.extend(names::wire_api(&descriptors));
         let snapshot = Path::new("waproto/generated-api.snapshot");

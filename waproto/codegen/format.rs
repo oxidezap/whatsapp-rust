@@ -1,27 +1,39 @@
 #![forbid(unsafe_code)]
 
 use crate::emit_owned::{Module, generate_modules};
+use crate::inventory::inventory_compact;
 use crate::schema::Schema;
+use std::collections::BTreeSet;
 
 impl Module {
-    fn render_formatted(&self, out: &mut String, depth: usize) -> Result<(), syn::Error> {
-        let imports = "#[allow(unused_imports)] use crate::protobuf::Message as _;\n#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n";
-        format_fragment(out, imports, depth)?;
-        for item in &self.items {
-            format_fragment(out, item, depth)?;
+    fn collect_inventory(
+        self,
+        scope: &str,
+        depth: usize,
+        api: &mut BTreeSet<String>,
+    ) -> Result<(), syn::Error> {
+        for item in self.items {
+            inventory_fragment(&item, scope, depth, api)?;
         }
-        for (name, child) in &self.children {
-            out.push_str(&"    ".repeat(depth));
-            out.push_str(&format!("pub mod {name} {{\n"));
-            child.render_formatted(out, depth + 1)?;
-            out.push_str(&"    ".repeat(depth));
-            out.push_str("}\n");
+        for (name, child) in self.children {
+            if name.starts_with("__") {
+                continue;
+            }
+            let module: syn::Item = syn::parse_str(&format!("pub mod {name} {{}}"))?;
+            inventory_compact(&[module], scope, api);
+            child.collect_inventory(&format!("{scope}::{name}"), depth + 1, api)?;
         }
         Ok(())
     }
 }
 
-fn format_fragment(out: &mut String, source: &str, depth: usize) -> Result<(), syn::Error> {
+fn inventory_fragment(
+    source: &str,
+    scope: &str,
+    depth: usize,
+    api: &mut BTreeSet<String>,
+) -> Result<(), syn::Error> {
+    // Prettyplease can insert trailing commas based on the indentation depth.
     let mut wrapped = String::new();
     for level in 0..depth {
         wrapped.push_str(&format!("mod __format_{level} {{\n"));
@@ -30,27 +42,42 @@ fn format_fragment(out: &mut String, source: &str, depth: usize) -> Result<(), s
     for _ in 0..depth {
         wrapped.push_str("}\n");
     }
-    let formatted = prettyplease::unparse(&syn::parse_file(&wrapped)?);
-    let mut body = formatted.as_str();
-    for level in 0..depth {
-        let opening = format!("{}mod __format_{level} {{\n", "    ".repeat(level));
-        body = body
-            .strip_prefix(&opening)
-            .expect("formatter module opening");
+    let mut parsed = syn::parse_file(&wrapped)?;
+    strip_impl_method_bodies(&mut parsed.items);
+    let formatted = syn::parse_file(&prettyplease::unparse(&parsed))?;
+    let mut items = formatted.items.as_slice();
+    for _ in 0..depth {
+        let [syn::Item::Mod(module)] = items else {
+            unreachable!("formatter module wrapper");
+        };
+        items = &module.content.as_ref().expect("inline formatter module").1;
     }
-    for level in 0..depth {
-        let closing = format!("{}}}\n", "    ".repeat(level));
-        body = body
-            .strip_suffix(&closing)
-            .expect("formatter module closing");
-    }
-    out.push_str(body);
+    inventory_compact(items, scope, api);
     Ok(())
 }
 
-pub fn generate(schema: &Schema, base: &str) -> Result<String, syn::Error> {
-    let root = generate_modules(schema, base, true);
-    let mut source = String::new();
-    root.render_formatted(&mut source, 0)?;
-    Ok(source)
+fn strip_impl_method_bodies(items: &mut [syn::Item]) {
+    for item in items {
+        match item {
+            syn::Item::Impl(implementation) => {
+                for item in &mut implementation.items {
+                    if let syn::ImplItem::Fn(method) = item {
+                        method.block.stmts.clear();
+                    }
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &mut module.content {
+                    strip_impl_method_bodies(items);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn inventory(schema: &Schema, base: &str) -> Result<BTreeSet<String>, syn::Error> {
+    let mut api = BTreeSet::new();
+    generate_modules(schema, base, true).collect_inventory("whatsapp", 0, &mut api)?;
+    Ok(api)
 }

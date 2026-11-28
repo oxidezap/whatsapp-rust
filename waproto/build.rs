@@ -1,7 +1,7 @@
 //! Generate the protobuf model from the committed descriptor.
 
 use sha2::{Digest as _, Sha256};
-use std::io::{self, Read as _};
+use std::io::{self, BufWriter, Read as _, Write as _};
 
 #[cfg(test)]
 #[path = "build_support/api_guard.rs"]
@@ -91,13 +91,13 @@ fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed=signal-storage.snapshot");
     let descriptor = std::fs::read("src/whatsapp.desc")?;
     let (descriptors, schema) = whatsapp::prepare(&descriptor)?;
-    let source = raw::generate_raw(&schema, "crate::protobuf::generated::whatsapp");
-    let tags = retained::tags(&descriptors);
     let out = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is not set"))?,
     );
-    std::fs::write(out.join("generated-whatsapp.rs"), source)?;
-    std::fs::write(out.join("generated-tags.rs"), tags)?;
+    let mut source = BufWriter::new(std::fs::File::create(out.join("generated-whatsapp.rs"))?);
+    raw::write_whatsapp(&schema, "crate::protobuf::generated::whatsapp", &mut source)?;
+    source.flush()?;
+    std::fs::write(out.join("generated-tags.rs"), retained::tags(&descriptors))?;
     #[cfg(feature = "protobuf-reference")]
     reference::generate_reference()?;
     Ok(())
