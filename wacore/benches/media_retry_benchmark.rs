@@ -15,13 +15,7 @@ const CASES: [&str; 8] = [
     "error_result",
     "invalid_utf8",
 ];
-
-struct Fixture {
-    plaintext: Vec<u8>,
-    node: Node,
-}
-
-fn fixture(case: &str) -> Fixture {
+fn fixture(case: &str) -> Node {
     let mut plaintext = Vec::new();
     if case == "duplicate" {
         put_bytes_field(1, b"old-id", &mut plaintext);
@@ -86,27 +80,17 @@ fn fixture(case: &str) -> Fixture {
             matches!(result, Ok(MediaRetryResult::Success { direct_path }) if direct_path == path)
         ),
     }
-    Fixture { plaintext, node }
+    node
 }
 
 #[divan::bench(args = CASES)]
 fn notification(bencher: divan::Bencher, case: &str) {
-    let fixture = fixture(case);
+    let node = fixture(case);
     bencher.bench(|| {
         black_box(parse_media_retry_notification(
-            black_box(&fixture.node.as_node_ref()),
+            black_box(&node.as_node_ref()),
             black_box(&MEDIA_KEY),
         ))
-    });
-}
-
-#[divan::bench(args = CASES)]
-fn projection(bencher: divan::Bencher, case: &str) {
-    let fixture = fixture(case);
-    bencher.bench(|| {
-        black_box(waproto::codec::media_retry_success(black_box(
-            &fixture.plaintext,
-        )))
     });
 }
 

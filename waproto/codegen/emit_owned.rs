@@ -4,12 +4,12 @@ use super::schema::*;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use std::collections::{BTreeMap, BTreeSet};
 
-const RT: &str = "crate::protobuf";
+pub(crate) const RT: &str = "crate::protobuf";
 
 #[derive(Default)]
-struct Module {
-    items: String,
-    children: BTreeMap<String, Module>,
+pub(crate) struct Module {
+    pub(crate) items: Vec<String>,
+    pub(crate) children: BTreeMap<String, Module>,
 }
 impl Module {
     fn at(&mut self, path: &[String]) -> &mut Self {
@@ -19,21 +19,9 @@ impl Module {
         }
         current
     }
-    fn render(&self, out: &mut String) {
-        out.push_str("#[allow(unused_imports)] use crate::protobuf::Message as _;\n");
-        out.push_str(
-            "#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n",
-        );
-        out.push_str(&self.items);
-        for (name, child) in &self.children {
-            out.push_str(&format!("pub mod {name} {{\n"));
-            child.render(out);
-            out.push_str("}\n");
-        }
-    }
 }
 
-fn ident(name: &str) -> String {
+pub(crate) fn ident(name: &str) -> String {
     match name {
         "_" | "Self" | "self" | "super" | "crate" | "extern" => format!("{name}_"),
         "as" | "break" | "const" | "continue" | "else" | "enum" | "false" | "fn" | "for" | "if"
@@ -45,7 +33,7 @@ fn ident(name: &str) -> String {
         _ => name.into(),
     }
 }
-fn member(name: &str) -> String {
+pub(crate) fn member(name: &str) -> String {
     ident(&name.to_snake_case())
 }
 
@@ -69,9 +57,9 @@ fn module_name(name: &str) -> String {
     ident(&output)
 }
 
-struct Emitter<'a> {
-    schema: &'a Schema,
-    base: &'a str,
+pub(crate) struct Emitter<'a> {
+    pub(crate) schema: &'a Schema,
+    pub(crate) base: &'a str,
 }
 impl Emitter<'_> {
     fn scope(&self, parent: Option<MessageId>) -> Vec<String> {
@@ -91,7 +79,7 @@ impl Emitter<'_> {
         parts.push(ident(name));
         parts.join("::")
     }
-    fn message_path(&self, id: MessageId) -> String {
+    pub(crate) fn message_path(&self, id: MessageId) -> String {
         let message = self.schema.message(id);
         self.path(message.parent, &message.name)
     }
@@ -99,7 +87,7 @@ impl Emitter<'_> {
         let enumeration = self.schema.enumeration(id);
         self.path(enumeration.parent, &enumeration.name)
     }
-    fn oneof_path(&self, id: OneofId) -> String {
+    pub(crate) fn oneof_path(&self, id: OneofId) -> String {
         let oneof = self.schema.oneof(id);
         self.path(Some(oneof.owner), &oneof.name.to_upper_camel_case())
     }
@@ -248,7 +236,7 @@ impl Emitter<'_> {
         ));
         out.push_str(&format!("impl {RT}::Enumeration for {name} {{ fn from_i32(value:i32)->::core::option::Option<Self>{{match value{{"));
         for (number, variant) in &canonical {
-            out.push_str(&format!("{number}=>Some(Self::{variant}),"));
+            out.push_str(&format!("{number}=>Some(Self::{variant}),\n"));
         }
         out.push_str(
             "_=>None}}\nfn to_i32(&self)->i32{*self as i32}\nfn proto_name(&self)->&'static str{",
@@ -267,7 +255,7 @@ impl Emitter<'_> {
                     .find(|value| value.number == *number)
                     .expect("enum name")
                     .name;
-                out.push_str(&format!("Self::{variant}=>{proto:?},"));
+                out.push_str(&format!("Self::{variant}=>{proto:?},\n"));
             }
             out.push('}');
         }
@@ -276,7 +264,7 @@ impl Emitter<'_> {
         );
         for value in &enumeration.values {
             out.push_str(&format!(
-                "{:?}=>Some(Self::{}),",
+                "{:?}=>Some(Self::{}),\n",
                 value.name, canonical[&value.number]
             ));
         }
@@ -284,7 +272,7 @@ impl Emitter<'_> {
         let mut seen = BTreeSet::new();
         for value in &enumeration.values {
             if seen.insert(value.number) {
-                out.push_str(&format!("Self::{},", canonical[&value.number]));
+                out.push_str(&format!("Self::{},\n", canonical[&value.number]));
             }
         }
         out.push_str("]}}\n");
@@ -389,7 +377,7 @@ impl Emitter<'_> {
             _ => format!("*{value} as u64"),
         }
     }
-    fn wire(kind: ValueType) -> u8 {
+    pub(crate) fn wire(kind: ValueType) -> u8 {
         match kind {
             ValueType::Message(_, MessageEncoding::Group) => 3,
             ValueType::Message(..) | ValueType::Scalar(Scalar::String | Scalar::Bytes) => 2,
@@ -623,14 +611,14 @@ impl Emitter<'_> {
                 if !matches!(field.shape, FieldShape::Oneof { .. }) {
                     let slot = member(&field.name);
                     out.push_str(&format!(
-                        "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                        "{slot}: ::core::clone::Clone::clone(&self.{slot}),\n"
                     ));
                 }
             }
             for id in &message.oneofs {
                 let slot = member(&self.schema.oneof(*id).name);
                 out.push_str(&format!(
-                    "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                    "{slot}: ::core::clone::Clone::clone(&self.{slot}),\n"
                 ));
             }
             out.push_str("}}}\n");
@@ -640,14 +628,14 @@ impl Emitter<'_> {
             let field = self.schema.field(*id);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 initial.push_str(&format!(
-                    "{}: {},",
+                    "{}: {},\n",
                     member(&field.name),
                     self.default_field(field)
                 ));
             }
         }
         for id in &message.oneofs {
-            initial.push_str(&format!("{}:None,", member(&self.schema.oneof(*id).name)));
+            initial.push_str(&format!("{}:None,\n", member(&self.schema.oneof(*id).name)));
         }
         out.push_str(&format!(
             "impl ::core::default::Default for {name}{{fn default()->Self{{Self{{{initial}}}}}}}\n"
@@ -703,7 +691,7 @@ impl Emitter<'_> {
                 ty
             };
             let expression = if convert { "value.into()" } else { "value" };
-            out.push_str(&format!("#[must_use] #[inline] pub fn with_{}(mut self,value:{arg})->Self{{self.{}=Some({expression});self}}",field.name.to_snake_case(),member(&field.name)));
+            out.push_str(&format!("#[must_use] #[inline] pub fn with_{}(mut self,value:{arg})->Self{{self.{}=Some({expression});self}}\n",field.name.to_snake_case(),member(&field.name)));
         }
         out.push_str("}\n");
         let mut fields = message
@@ -734,6 +722,7 @@ impl Emitter<'_> {
         out.push_str(&format!("impl {RT}::Message for {name}{{fn compute_size(&self,cache:&mut {RT}::SizeCache)->u32{{let {mutable}size=0u64;let _=&cache;"));
         for field in &fields {
             out.push_str(&self.encode_field(field, false));
+            out.push('\n');
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}\nfn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
         if let Some(grouped) = self.grouped_writer(&fields, false) {
@@ -741,6 +730,7 @@ impl Emitter<'_> {
         } else {
             for field in &fields {
                 out.push_str(&self.encode_field(field, true));
+                out.push('\n');
             }
         }
         // Keeping this wide dispatch separate avoids a large stack frame on each decode.
@@ -755,6 +745,7 @@ impl Emitter<'_> {
         }
         for field in &fields {
             out.push_str(&self.decode_field(field));
+            out.push('\n');
         }
         let mut known = BTreeSet::new();
         for field in &fields {
@@ -765,7 +756,7 @@ impl Emitter<'_> {
                     | FieldShape::Oneof { value, .. } => value,
                     FieldShape::Map { .. } => ValueType::Scalar(Scalar::Bytes),
                 });
-                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({wire})?)),",field.number.get()));
+                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({wire})?)),\n",field.number.get()));
             }
         }
         if fields.is_empty() {
@@ -841,8 +832,9 @@ impl Emitter<'_> {
                 } else {
                     self.encode_field(field, true)
                 });
+                out.push('\n');
             }
-            out.push('}');
+            out.push_str("}\n");
         }
         Some(out)
     }
@@ -927,7 +919,7 @@ impl Emitter<'_> {
             let key_ty = Self::scalar_type(key, BytesStorage::Vector);
             let val_ty = self.value_type(value, field.bytes_storage);
             let mut out = format!(
-                "({number},{RT}::encoding::WireType::LengthDelimited)=>{{context.register_element_memory(::std::mem::size_of::<({key_ty},{val_ty})>())?;let context=context.descend()?;let n={RT}::encoding::decode_varint(input)?;if n>u64::from({RT}::MAX_MESSAGE_BYTES){{return Err({RT}::DecodeError::MessageTooLarge);}}if n as usize>input.remaining(){{return Err({RT}::DecodeError::UnexpectedEof);}}let limit=input.remaining()-n as usize;let mut key: {key_ty}=::core::default::Default::default();let mut value: {val_ty}=::core::default::Default::default();while input.remaining()>limit{{let item={RT}::encoding::Tag::decode(input)?;match item.field_number(){{1=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;key={};}},2=>{{",
+                "({number},{RT}::encoding::WireType::LengthDelimited)=>{{context.register_element_memory(::std::mem::size_of::<({key_ty},{val_ty})>())?;let context=context.descend()?;let n={RT}::encoding::decode_varint(input)?;if n>u64::from({RT}::MAX_MESSAGE_BYTES){{return Err({RT}::DecodeError::MessageTooLarge);}}\nif n as usize>input.remaining(){{return Err({RT}::DecodeError::UnexpectedEof);}}let limit=input.remaining()-n as usize;let mut key: {key_ty}=::core::default::Default::default();let mut value: {val_ty}=::core::default::Default::default();while input.remaining()>limit{{let item={RT}::encoding::Tag::decode(input)?;match item.field_number(){{1=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;key={};}},2=>{{",
                 Self::wire(ValueType::Scalar(key)),
                 self.read_value(ValueType::Scalar(key), BytesStorage::Vector, "input")
             );
@@ -958,7 +950,7 @@ impl Emitter<'_> {
                     self.read_value(value, field.bytes_storage, "input")
                 ));
             }
-            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,input,context)?,}}}}if input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
+            out.push_str(&format!("}},_=>{RT}::encoding::skip_unknown_field(item,input,context)?,}}}}\nif input.remaining()!=limit{{return Err({RT}::DecodeError::UnexpectedEof);}}self.{slot}.insert(key,value);Ok(())}},"));
             return out;
         }
         let value = match field.shape {
@@ -1118,62 +1110,13 @@ impl Emitter<'_> {
     }
 }
 
-pub fn generate(schema: &Schema, base: &str) -> Result<String, syn::Error> {
-    let source = generate_raw(schema, base);
-    let parsed = syn::parse_file(&source)?;
-    Ok(prettyplease::unparse(&parsed))
-}
-
-pub fn generate_raw(schema: &Schema, base: &str) -> String {
-    generate_raw_models(schema, base, true)
-}
-
-pub fn generate_private_owned(
-    schema: &Schema,
-    base: &str,
-    runtime: &str,
-) -> Result<String, syn::Error> {
-    use syn::visit_mut::VisitMut as _;
-    let _: syn::Path = syn::parse_str(runtime)?;
-    let source = generate_private_owned_raw(schema, base, runtime);
-    let mut parsed = syn::parse_file(&source)?;
-    struct BinaryOnly;
-    impl syn::visit_mut::VisitMut for BinaryOnly {
-        fn visit_attributes_mut(&mut self, attributes: &mut Vec<syn::Attribute>) {
-            attributes.retain(|attribute| {
-                !attribute.path().is_ident("serde") && !attribute.path().is_ident("cfg_attr")
-            });
-            for attribute in attributes {
-                if attribute.path().is_ident("derive") {
-                    let mut paths = attribute.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated).expect("emitted derives parse");
-                    paths = paths
-                        .into_iter()
-                        .filter(|path| {
-                            !path.segments.first().is_some_and(|segment| {
-                                segment.ident == "serde" || segment.ident == "serde_repr"
-                            })
-                        })
-                        .collect();
-                    attribute.meta = syn::parse_quote!(derive(#paths));
-                }
-            }
-        }
-    }
-    BinaryOnly.visit_file_mut(&mut parsed);
-    Ok(prettyplease::unparse(&parsed))
-}
-
-pub fn generate_private_owned_raw(schema: &Schema, base: &str, runtime: &str) -> String {
-    generate_raw_models(schema, base, false).replace(RT, &format!(" {runtime}"))
-}
-
-fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
+pub(crate) fn generate_modules(schema: &Schema, base: &str, views: bool) -> Module {
     let emitter = Emitter { schema, base };
     let mut root = Module::default();
     for enumeration in &schema.enumerations {
         root.at(&emitter.scope(enumeration.parent))
             .items
-            .push_str(&emitter.enum_source(enumeration));
+            .push(emitter.enum_source(enumeration));
     }
     for (index, message) in schema.messages.iter().enumerate() {
         if message.map_entry {
@@ -1181,34 +1124,32 @@ fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
         }
         root.at(&emitter.scope(message.parent))
             .items
-            .push_str(&emitter.message_source(message));
+            .push(emitter.message_source(message));
         if views {
             root.at(&emitter.scope(message.parent))
                 .items
-                .push_str(&emitter.view_source(message, MessageId(index)));
+                .push(emitter.view_source(message, MessageId(index)));
         }
         for id in &message.oneofs {
             root.at(&emitter.scope(Some(MessageId(index))))
                 .items
-                .push_str(&emitter.oneof_source(schema.oneof(*id)));
+                .push(emitter.oneof_source(schema.oneof(*id)));
             if views {
                 root.at(&emitter.scope(Some(MessageId(index))))
                     .items
-                    .push_str(&emitter.view_oneof_source(schema.oneof(*id), *id));
+                    .push(emitter.view_oneof_source(schema.oneof(*id), *id));
             }
         }
     }
-    let mut source = String::new();
-    root.render(&mut source);
-    source
+    root
 }
 
 impl Emitter<'_> {
-    fn view_path(&self, id: MessageId) -> String {
+    pub(crate) fn view_path(&self, id: MessageId) -> String {
         let message = self.schema.message(id);
         self.path(message.parent, &format!("{}View", message.name))
     }
-    fn view_oneof_path(&self, id: OneofId) -> String {
+    pub(crate) fn view_oneof_path(&self, id: OneofId) -> String {
         let group = self.schema.oneof(id);
         self.path(
             Some(group.owner),
@@ -1507,7 +1448,7 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 out.push_str(&format!(
-                    "pub {}: {},",
+                    "pub {}: {},\n",
                     member(&field.name),
                     self.view_field_type(field)
                 ));
@@ -1535,7 +1476,7 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 initial.push_str(&format!(
-                    "{}: {},",
+                    "{}: {},\n",
                     member(&field.name),
                     self.view_default(field)
                 ));
@@ -1543,7 +1484,7 @@ impl Emitter<'_> {
         }
         for group in &message.oneofs {
             initial.push_str(&format!(
-                "{}:None,",
+                "{}:None,\n",
                 member(&self.schema.oneof(*group).name)
             ));
         }
@@ -1584,12 +1525,12 @@ impl Emitter<'_> {
             let field = self.schema.field(*field);
             if !matches!(field.shape, FieldShape::Oneof { .. }) {
                 let n = member(&field.name);
-                out.push_str(&format!("d.field({n:?},&self.{n});"));
+                out.push_str(&format!("d.field({n:?},&self.{n});\n"));
             }
         }
         for group in &message.oneofs {
             let n = member(&self.schema.oneof(*group).name);
-            out.push_str(&format!("d.field({n:?},&self.{n});"));
+            out.push_str(&format!("d.field({n:?},&self.{n});\n"));
         }
         out.push_str("d.finish()}}\n");
         out.push_str(&format!("impl<'a>{RT}::owned_view::sealed::View for {name}<'a>{{}}impl {RT}::ViewReborrow for {name}<'static>{{type Reborrowed<'b>={name}<'b>;fn reborrow<'b>(this:&'b Self)->&'b Self::Reborrowed<'b>{{this}}}}impl<'a>{RT}::MessageName for {name}<'a>{{const NAME:&'static str=<{owned} as {RT}::MessageName>::NAME;const PACKAGE:&'static str=<{owned} as {RT}::MessageName>::PACKAGE;const FULL_NAME:&'static str=<{owned} as {RT}::MessageName>::FULL_NAME;const TYPE_URL:&'static str=<{owned} as {RT}::MessageName>::TYPE_URL;}}\n"));
@@ -1606,6 +1547,7 @@ impl Emitter<'_> {
                     required_bits.get(field).copied(),
                 ),
             );
+            out.push('\n');
         }
         let mut known = BTreeSet::new();
         for field in &message.fields {
@@ -1617,7 +1559,7 @@ impl Emitter<'_> {
                     | FieldShape::Oneof { value, .. } => value,
                     _ => ValueType::Scalar(Scalar::Bytes),
                 };
-                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({})?)),",field.number.get(),Self::wire(value)));
+                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({})?)),\n",field.number.get(),Self::wire(value)));
             }
         }
         let (fallback, end) = if message.fields.is_empty() {
@@ -1663,7 +1605,7 @@ impl Emitter<'_> {
                     self.promoted(value, field.bytes_storage, "v")
                 ),
             };
-            out.push_str(&format!("{slot}: {expr},"));
+            out.push_str(&format!("{slot}: {expr},\n"));
         }
         for group in &message.oneofs {
             let oneof = self.schema.oneof(*group);
@@ -1697,7 +1639,7 @@ impl Emitter<'_> {
                     promoted = format!("::std::boxed::Box::new({promoted})");
                 }
                 out.push_str(&format!(
-                    "Some({}::{variant}(v))=>Some({}::{variant}({promoted})),",
+                    "Some({}::{variant}(v))=>Some({}::{variant}({promoted})),\n",
                     self.view_oneof_path(*group),
                     self.oneof_path(*group)
                 ));
@@ -1734,6 +1676,7 @@ impl Emitter<'_> {
         out.push_str(&format!("impl<'a>{RT}::ViewEncode<'a> for {name}<'a>{{fn compute_size(&self,cache:&mut {RT}::SizeCache)->u32{{let _=&cache;let {mutable}size=0u64;"));
         for field in &fields {
             out.push_str(&self.view_encode_field(field, false));
+            out.push('\n');
         }
         out.push_str(&format!("{RT}::saturate_size(size)}}fn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
         if let Some(grouped) = self.grouped_writer(&fields, true) {
@@ -1741,6 +1684,7 @@ impl Emitter<'_> {
         } else {
             for field in &fields {
                 out.push_str(&self.view_encode_field(field, true));
+                out.push('\n');
             }
         }
         out.push_str("}}\n");
@@ -1794,7 +1738,7 @@ impl Emitter<'_> {
             );
             let borrow = if reference { "&" } else { "" };
             out.push_str(&format!(
-                "pub fn {slot}(&self)->{borrow}{ty}{{{borrow}self.view().{slot}}}"
+                "pub fn {slot}(&self)->{borrow}{ty}{{{borrow}self.view().{slot}}}\n"
             ));
         }
         for gid in &message.oneofs {
@@ -1814,248 +1758,4 @@ impl Emitter<'_> {
         out.push_str(&format!("}}impl From<{inner}> for {name}{{fn from(value:{inner})->Self{{Self(value)}}}}impl From<{name}> for {inner}{{fn from(value:{name})->Self{{value.0}}}}impl AsRef<{inner}> for {name}{{fn as_ref(&self)->&{inner}{{&self.0}}}}impl {RT}::HasMessageView for {owned}{{type View<'a>={view}<'a>;type ViewHandle={name};}}\n"));
         out
     }
-    fn oracle_value(&self, value: ValueType, a: &str, b: &str) -> String {
-        match value {
-            ValueType::Scalar(Scalar::Float | Scalar::Double) => {
-                format!("assert_eq!({a}.to_bits(),{b}.to_bits());")
-            }
-            ValueType::Scalar(Scalar::Bytes) => {
-                format!("assert_eq!(AsRef::<[u8]>::as_ref({a}),AsRef::<[u8]>::as_ref({b}));")
-            }
-            ValueType::Scalar(_) => format!("assert_eq!({a},{b});"),
-            ValueType::Enumeration(id) if self.schema.enumeration(id).open => format!(
-                "assert_eq!({a}.to_i32(),{b}.to_i32());assert_eq!({a}.is_known(),{b}.is_known());"
-            ),
-            ValueType::Enumeration(_) => {
-                format!("assert_eq!(rt::Enumeration::to_i32({a}),buffa::Enumeration::to_i32({b}));")
-            }
-            ValueType::Message(id, _) => format!("assert_m{}({a},{b});", id.0),
-        }
-    }
-}
-
-fn oracle_seed(schema: &Schema, id: MessageId, depth: usize) -> Vec<u8> {
-    fn varint(mut value: u64, out: &mut Vec<u8>) {
-        while value >= 128 {
-            out.push((value as u8 & 127) | 128);
-            value >>= 7;
-        }
-        out.push(value as u8);
-    }
-    let mut out = Vec::new();
-    for fid in &schema.message(id).fields {
-        let field = schema.field(*fid);
-        // Keep one map key across combined fixtures so randomized map
-        // iteration cannot obscure the byte-exact codec comparison.
-        if schema.message(id).map_entry && field.number.get() == 1 {
-            continue;
-        }
-        let value = match field.shape {
-            FieldShape::Singular { value, .. }
-            | FieldShape::Repeated { value, .. }
-            | FieldShape::Oneof { value, .. } => value,
-            FieldShape::Map { entry, .. } => {
-                ValueType::Message(entry, MessageEncoding::LengthPrefixed)
-            }
-        };
-        let payload = match value {
-            ValueType::Message(child, _) if depth > 0 => oracle_seed(schema, child, depth - 1),
-            ValueType::Message(..) => continue,
-            ValueType::Scalar(Scalar::String) => b"fixture".to_vec(),
-            ValueType::Scalar(Scalar::Bytes) => vec![0x42, 0x81],
-            ValueType::Enumeration(id) => {
-                let mut payload = Vec::new();
-                varint(
-                    schema.enumeration(id).values[0].number as i64 as u64,
-                    &mut payload,
-                );
-                payload
-            }
-            _ => match Emitter::wire(value) {
-                0 => vec![1],
-                1 => 1f64.to_le_bytes().to_vec(),
-                5 => 1f32.to_le_bytes().to_vec(),
-                _ => unreachable!(),
-            },
-        };
-        let wire = Emitter::wire(value);
-        varint(
-            (u64::from(field.number.get()) << 3) | u64::from(wire),
-            &mut out,
-        );
-        if wire == 2 {
-            varint(payload.len() as u64, &mut out);
-        }
-        out.extend_from_slice(&payload);
-        if wire == 3 {
-            varint((u64::from(field.number.get()) << 3) | 4, &mut out);
-        }
-    }
-    out
-}
-
-pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
-    let new = Emitter {
-        schema,
-        base: "waproto::whatsapp",
-    };
-    let old = Emitter {
-        schema,
-        base: "crate::reference",
-    };
-    let mut source = String::new();
-    for (index, message) in schema.messages.iter().enumerate() {
-        if message.map_entry {
-            continue;
-        }
-        let id = MessageId(index);
-        source.push_str(&format!(
-            "fn assert_m{index}(a:&{},b:&{}){{let _=(a,b);",
-            new.message_path(id),
-            old.message_path(id)
-        ));
-        for fid in &message.fields {
-            let field = schema.field(*fid);
-            let slot = member(&field.name);
-            match field.shape {
-                FieldShape::Singular { value: ValueType::Message(child,_), .. } => source.push_str(&format!("assert_eq!(a.{slot}.is_set(),b.{slot}.is_set());if let(Some(a),Some(b))=(a.{slot}.as_option(),b.{slot}.as_option()){{assert_m{}(a,b);}}",child.0)),
-                FieldShape::Singular { value, presence: Presence::Explicit } => source.push_str(&format!("match(&a.{slot},&b.{slot}){{(Some(a),Some(b))=>{{{}}},(None,None)=>{{}},_=>panic!(\"presence mismatch {}.{slot}\"),}}",new.oracle_value(value,"a","b"),message.full_name)),
-                FieldShape::Singular { value, .. } => source.push_str(&new.oracle_value(value,&format!("&a.{slot}"),&format!("&b.{slot}"))),
-                FieldShape::Repeated { value, .. } => source.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for(a,b)in a.{slot}.iter().zip(&b.{slot}){{{}}}",new.oracle_value(value,"a","b"))),
-                FieldShape::Map { value, .. } => source.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for(key,a)in &a.{slot}{{let b=b.{slot}.get(key).expect(\"same map key\");{}}}",new.oracle_value(value,"a","b"))),
-                FieldShape::Oneof { .. } => {},
-            }
-        }
-        for oid in &message.oneofs {
-            let oneof = schema.oneof(*oid);
-            let slot = member(&oneof.name);
-            source.push_str(&format!("match(&a.{slot},&b.{slot}){{(None,None)=>{{}},"));
-            for fid in &oneof.fields {
-                let field = schema.field(*fid);
-                let FieldShape::Oneof { value, .. } = field.shape else {
-                    unreachable!()
-                };
-                let variant = ident(&field.name.to_upper_camel_case());
-                source.push_str(&format!(
-                    "(Some({}::{variant}(a)),Some({}::{variant}(b)))=>{{{}}},",
-                    new.oneof_path(*oid),
-                    old.oneof_path(*oid),
-                    new.oracle_value(value, "a", "b")
-                ));
-            }
-            source.push_str("_=>panic!(\"oneof discriminator mismatch\"),}");
-        }
-        source.push_str("}\n");
-        source.push_str(&format!(
-            "#[test]fn m{index}(){{compare::<{},{}>(assert_m{index},check_v{index},&[",
-            new.message_path(id),
-            old.message_path(id)
-        ));
-        for fid in &message.fields {
-            let field = schema.field(*fid);
-            let value = match field.shape {
-                FieldShape::Singular { value, .. }
-                | FieldShape::Repeated { value, .. }
-                | FieldShape::Oneof { value, .. } => value,
-                FieldShape::Map { entry, .. } => {
-                    ValueType::Message(entry, MessageEncoding::LengthPrefixed)
-                }
-            };
-            let kind = match value {
-                ValueType::Message(..) => "Message",
-                ValueType::Scalar(Scalar::String) => "String",
-                ValueType::Scalar(Scalar::Bytes) => "Bytes",
-                _ => match Emitter::wire(value) {
-                    0 => "Varint",
-                    1 => "Fixed64",
-                    5 => "Fixed32",
-                    _ => unreachable!(),
-                },
-            };
-            if let ValueType::Message(child, _) = value {
-                let seed = oracle_seed(schema, child, 1);
-                source.push_str(&format!(
-                    "({},Kind::Message(&{seed:?})),",
-                    field.number.get()
-                ));
-            } else {
-                source.push_str(&format!("({},Kind::{kind}),", field.number.get()));
-            }
-        }
-        source.push_str("]);}\n");
-    }
-    source.push_str(&generate_view_oracle(schema));
-    let parsed = syn::parse_file(&source)?;
-    Ok(prettyplease::unparse(&parsed))
-}
-
-fn generate_view_oracle(schema: &Schema) -> String {
-    let new = Emitter {
-        schema,
-        base: "waproto::whatsapp",
-    };
-    let old = Emitter {
-        schema,
-        base: "crate::reference",
-    };
-    let mut out = String::new();
-    let value_assert = |value, a: &str, b: &str| {
-        new.oracle_value(value, a, b)
-            .replace("assert_m", "assert_v")
-    };
-    for (index, message) in schema.messages.iter().enumerate() {
-        if message.map_entry {
-            continue;
-        }
-        let id = MessageId(index);
-        out.push_str(&format!(
-            "fn assert_v{index}(a:&{}<'_>,b:&{}<'_>){{let _=(a,b);",
-            new.view_path(id),
-            old.view_path(id)
-        ));
-        for fid in &message.fields {
-            let field = schema.field(*fid);
-            let slot = member(&field.name);
-            if matches!(
-                field.shape,
-                FieldShape::Singular {
-                    presence: Presence::Required,
-                    ..
-                }
-            ) {
-                let accessor = ident(&format!("has_{}", field.name.to_snake_case()));
-                out.push_str(&format!("assert_eq!(a.{accessor}(),b.{accessor}());"));
-            }
-            match field.shape{
-            FieldShape::Singular{value:ValueType::Message(child,_),..}=>out.push_str(&format!("assert_eq!(a.{slot}.is_set(),b.{slot}.is_set());if let(Some(a),Some(b))=(a.{slot}.as_option(),b.{slot}.as_option()){{assert_v{}(a,b);}}",child.0)),
-            FieldShape::Singular{value,presence:Presence::Explicit}=>out.push_str(&format!("match(&a.{slot},&b.{slot}){{(Some(a),Some(b))=>{{{}}},(None,None)=>{{}},_=>panic!(\"borrowed presence mismatch\"),}}",value_assert(value,"a","b"))),
-            FieldShape::Singular{value,..}=>out.push_str(&value_assert(value,&format!("&a.{slot}"),&format!("&b.{slot}"))),
-            FieldShape::Repeated{value,..}=>out.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for(a,b)in a.{slot}.iter().zip(b.{slot}.iter()){{{}}}",value_assert(value,"a","b"))),
-            FieldShape::Map{key,value,..}=>out.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for((ak,av),(bk,bv))in a.{slot}.iter().zip(b.{slot}.iter()){{{}{}}}",value_assert(ValueType::Scalar(key),"ak","bk"),value_assert(value,"av","bv"))),
-            FieldShape::Oneof{..}=>{},
-        }
-        }
-        for oid in &message.oneofs {
-            let oneof = schema.oneof(*oid);
-            let slot = member(&oneof.name);
-            out.push_str(&format!("match(&a.{slot},&b.{slot}){{(None,None)=>{{}},"));
-            for fid in &oneof.fields {
-                let field = schema.field(*fid);
-                let FieldShape::Oneof { value, .. } = field.shape else {
-                    unreachable!()
-                };
-                let variant = ident(&field.name.to_upper_camel_case());
-                out.push_str(&format!(
-                    "(Some({}::{variant}(a)),Some({}::{variant}(b)))=>{{{}}},",
-                    new.view_oneof_path(*oid),
-                    old.view_oneof_path(*oid),
-                    value_assert(value, "a", "b")
-                ));
-            }
-            out.push_str("_=>panic!(\"borrowed oneof discriminator mismatch\"),}");
-        }
-        out.push_str("}\n");
-        out.push_str(&format!("fn check_v{index}(input:&[u8]){{let a=<{}<'_>as rt::MessageView>::decode_view(input);let b=<{}<'_>as buffa::MessageView>::decode_view(input);match(a,b){{(Ok(a),Ok(b))=>{{assert_v{index}(&a,&b);let ao=rt::MessageView::to_owned_message(&a).expect(\"valid view\");let bo=buffa::MessageView::to_owned_message(&b).expect(\"valid reference view\");assert_m{index}(&ao,&bo);assert_eq!(rt::ViewEncode::encode_to_vec(&a),buffa::ViewEncode::encode_to_vec(&b));let handle=<{} as rt::HasMessageView>::decode_view_handle(bytes::Bytes::copy_from_slice(input)).expect(\"valid handle\");assert_v{index}(handle.view(),&b);assert_m{index}(&handle.to_owned_message(),&bo);let cloned=handle.clone();drop(handle);assert_v{index}(cloned.view(),&b);assert_eq!(cloned.into_bytes().as_ref(),input);}},(Err(a),Err(b))=>assert_eq!(format!(\"{{a:?}}\"),format!(\"{{b:?}}\")),(a,b)=>panic!(\"borrowed rejection mismatch {{a:?}} {{b:?}}\"),}}}}\n",new.view_path(id),old.view_path(id),new.message_path(id)));
-    }
-    out
 }

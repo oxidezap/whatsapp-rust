@@ -20,7 +20,10 @@ serde-snake-case = ["serde-deserialize"]
 # Enums (de)serialize as their numeric repr instead of the variant name — what
 # the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
-protobuf-reference = ["dep:buffa", "dep:buffa-build", "dep:buffa-descriptor"]
+protobuf-reference = [
+    "dep:buffa", "dep:buffa-build", "dep:buffa-descriptor",
+    "dep:prettyplease", "dep:quote", "dep:syn",
+]
 
 [dependencies]
 bytes = { workspace = true }
@@ -37,9 +40,9 @@ buffa-build = { workspace = true, optional = true }
 buffa-descriptor = { workspace = true, optional = true }
 heck = { workspace = true }
 sha2 = { workspace = true }
-syn = { version = "3.0", features = ["full", "visit-mut"] }
-quote = { version = "1" }
-prettyplease = { version = "0.3" }
+syn = { version = "3.0", features = ["full", "visit-mut"], optional = true }
+quote = { version = "1", optional = true }
+prettyplease = { version = "0.3", optional = true }
 
 [dev-dependencies]
 buffa = { workspace = true }
@@ -52,11 +55,6 @@ serde_json = { workspace = true, features = ["std"] }
 syn = { version = "3.0", features = ["full", "visit-mut"] }
 quote = "1"
 prettyplease = "0.3"
-
-[[bench]]
-name = "codec_comparison"
-harness = false
-required-features = ["protobuf-reference"]
 
 [lints]
 workspace = true

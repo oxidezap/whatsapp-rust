@@ -6,7 +6,6 @@ use diesel::r2d2::ConnectionManager;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
 use std::future::Future;
 use std::pin::Pin;
@@ -96,52 +95,70 @@ pub(crate) async fn retry_backoff(delay_ms: u64) {
     gloo_timers::future::TimeoutFuture::new(delay_ms as u32).await;
 }
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
-
 pub(crate) type SqlitePool = crate::pool::Pool;
 
-/// Row representation for the `device` table.
-///
-/// Field order must match the column order in `schema::device`.
-/// Using a named struct instead of a positional tuple so fields are
-/// accessed by name, reducing the risk of mix-ups when columns are added.
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = device)]
+#[derive(QueryableByName)]
 #[allow(dead_code)]
 struct DeviceRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     lid: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     pn: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     registration_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
     noise_key: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
     identity_key: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
     signed_pre_key: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     signed_pre_key_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
     signed_pre_key_signature: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
     adv_secret_key: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     account: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     push_name: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     app_version_primary: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     app_version_secondary: i32,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
     app_version_tertiary: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
     app_version_last_fetched_ms: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     edge_routing_info: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     props_hash: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     next_pre_key_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     nct_salt: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     server_has_prekeys: bool,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     server_cert_chain: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     login_counter: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
     first_unupload_pre_key_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     lid_migrated: bool,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
     last_signed_pre_key_rotation_ms: i64,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     read_receipts_disabled: bool,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     server_client_expiration: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     status_privacy: Option<Vec<u8>>,
-    #[diesel(
-        select_expression = crate::bounded_mobile_binding::GuardedMobileBindingExpression,
-        select_expression_type = crate::bounded_mobile_binding::GuardedMobileBindingExpression
-    )]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
     mobile_session_binding: crate::bounded_mobile_binding::GuardedMobileBinding,
 }
 
@@ -167,15 +184,11 @@ pub struct StoredDeviceSummary {
 /// [`crate::SqliteDatabase::reset_device`]. Building the column list twice is how the two
 /// drift as fields are added.
 ///
-/// `id` uses `treat_none_as_default_value`, so `None` drops the column from the
-/// insert entirely and leaves allocation to `device.id`'s `AUTOINCREMENT`.
+/// A NULL id leaves allocation to the `AUTOINCREMENT` primary key.
 /// Choosing the id in Rust instead (`MAX(id) + 1`) races between concurrent
 /// creates and can hand back an id that was deleted, which would make an
 /// `AccountId` resolve to a different person.
-#[derive(Insertable)]
-#[diesel(table_name = device)]
 struct FreshDeviceRow {
-    #[diesel(treat_none_as_default_value = true)]
     id: Option<i32>,
     lid: String,
     pn: String,
@@ -293,10 +306,40 @@ impl FreshDeviceRow {
     }
 
     fn insert(&self, conn: &mut SqliteConnection) -> std::result::Result<(), DieselError> {
-        diesel::insert_into(device::table)
-            .values(self)
-            .execute(conn)
-            .map(|_| ())
+        crate::upsert_queries::DeviceWrite::<false> {
+            id: self.id,
+            lid: &self.lid,
+            pn: &self.pn,
+            registration_id: self.registration_id,
+            noise_key: &self.noise_key,
+            identity_key: &self.identity_key,
+            signed_pre_key: &self.signed_pre_key,
+            signed_pre_key_id: self.signed_pre_key_id,
+            signed_pre_key_signature: &self.signed_pre_key_signature,
+            adv_secret_key: &self.adv_secret_key,
+            account: self.account.as_deref(),
+            push_name: &self.push_name,
+            app_version_primary: self.app_version_primary,
+            app_version_secondary: self.app_version_secondary,
+            app_version_tertiary: self.app_version_tertiary,
+            app_version_last_fetched_ms: self.app_version_last_fetched_ms,
+            edge_routing_info: self.edge_routing_info.as_deref(),
+            props_hash: self.props_hash.as_deref(),
+            next_pre_key_id: self.next_pre_key_id,
+            nct_salt: self.nct_salt.as_deref(),
+            server_has_prekeys: self.server_has_prekeys,
+            server_cert_chain: self.server_cert_chain.as_deref(),
+            login_counter: self.login_counter,
+            first_unupload_pre_key_id: self.first_unupload_pre_key_id,
+            lid_migrated: self.lid_migrated,
+            last_signed_pre_key_rotation_ms: self.last_signed_pre_key_rotation_ms,
+            read_receipts_disabled: self.read_receipts_disabled,
+            server_client_expiration: self.server_client_expiration.as_deref(),
+            status_privacy: self.status_privacy.as_deref(),
+            mobile_session_binding: self.mobile_session_binding.as_deref(),
+        }
+        .execute(conn)
+        .map(|_| ())
     }
 }
 
@@ -494,35 +537,19 @@ fn insert_app_state_mutation_macs(
     mutations: &[AppStateMutationMAC],
     device_id: i32,
 ) -> std::result::Result<(), DieselError> {
-    let records: Vec<_> = mutations
-        .iter()
-        .map(|m| {
-            (
-                app_state_mutation_macs::name.eq(name),
-                app_state_mutation_macs::version.eq(version as i64),
-                app_state_mutation_macs::index_mac.eq(&m.index_mac),
-                app_state_mutation_macs::value_mac.eq(&m.value_mac),
-                app_state_mutation_macs::device_id.eq(device_id),
-            )
-        })
-        .collect();
-    // SQLite's variable limit is typically 999 or 32766; five columns per
-    // row keeps 100 rows at 500 parameters.
     const CHUNK_SIZE: usize = 100;
-    for chunk in records.chunks(CHUNK_SIZE) {
-        diesel::insert_into(app_state_mutation_macs::table)
-            .values(chunk)
-            .on_conflict((
-                app_state_mutation_macs::name,
-                app_state_mutation_macs::index_mac,
-                app_state_mutation_macs::device_id,
-            ))
-            .do_update()
-            .set((
-                app_state_mutation_macs::version.eq(excluded(app_state_mutation_macs::version)),
-                app_state_mutation_macs::value_mac.eq(excluded(app_state_mutation_macs::value_mac)),
-            ))
-            .execute(conn)?;
+    for chunk in mutations.chunks(CHUNK_SIZE) {
+        let [first, rest @ ..] = chunk else {
+            continue;
+        };
+        crate::upsert_queries::UpsertAppStateMacBatch {
+            name,
+            version: version as i64,
+            device_id,
+            first,
+            rest,
+        }
+        .execute(conn)?;
     }
     Ok(())
 }
@@ -1317,8 +1344,7 @@ impl SqliteStore {
                     .map_err(|e| StoreError::Database(Box::new(e)))?
                     .journal_mode;
 
-                conn.run_pending_migrations(MIGRATIONS)
-                    .map_err(StoreError::Migration)?;
+                crate::migrations::run_pending(&mut conn)?;
                 // Returned to the pool before the pool is: on the web the
                 // checkout is the only connection there is, and a pool moved
                 // out from under a live one would not compile there.
@@ -1922,79 +1948,40 @@ impl SqliteStore {
             let new_pn = Arc::clone(&new_pn);
 
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::insert_into(device::table)
-                    .values((
-                        device::id.eq(device_id),
-                        device::lid.eq(&*new_lid),
-                        device::pn.eq(&*new_pn),
-                        device::registration_id.eq(registration_id),
-                        device::noise_key.eq(&*noise_key_data),
-                        device::identity_key.eq(&*identity_key_data),
-                        device::signed_pre_key.eq(&*signed_pre_key_data),
-                        device::signed_pre_key_id.eq(signed_pre_key_id),
-                        device::signed_pre_key_signature.eq(&*signed_pre_key_signature),
-                        device::adv_secret_key.eq(&*adv_secret_key),
-                        device::account.eq(account_data.as_deref()),
-                        device::push_name.eq(&*push_name),
-                        device::app_version_primary.eq(app_version_primary),
-                        device::app_version_secondary.eq(app_version_secondary),
-                        device::app_version_tertiary.eq(app_version_tertiary),
-                        device::app_version_last_fetched_ms.eq(app_version_last_fetched_ms),
-                        device::edge_routing_info.eq(edge_routing_info.as_deref()),
-                        device::props_hash.eq(props_hash.as_deref()),
-                        device::next_pre_key_id.eq(next_pre_key_id),
-                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
-                        device::server_has_prekeys.eq(server_has_prekeys),
-                        device::nct_salt.eq(nct_salt.as_deref()),
-                        device::mobile_session_binding.eq(mobile_session_binding.as_deref()),
-                        device::status_privacy.eq(status_privacy.as_deref()),
-                        device::server_cert_chain.eq(server_cert_chain.as_deref()),
-                        device::login_counter.eq(login_counter),
-                        device::lid_migrated.eq(lid_migrated),
-                        device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
-                        device::read_receipts_disabled.eq(read_receipts_disabled),
-                        device::server_client_expiration.eq(server_client_expiration.as_deref()),
-                    ))
-                    .on_conflict(device::id)
-                    .do_update()
-                    .set((
-                        device::lid.eq(excluded(device::lid)),
-                        device::pn.eq(excluded(device::pn)),
-                        device::registration_id.eq(excluded(device::registration_id)),
-                        device::noise_key.eq(excluded(device::noise_key)),
-                        device::identity_key.eq(excluded(device::identity_key)),
-                        device::signed_pre_key.eq(excluded(device::signed_pre_key)),
-                        device::signed_pre_key_id.eq(excluded(device::signed_pre_key_id)),
-                        device::signed_pre_key_signature
-                            .eq(excluded(device::signed_pre_key_signature)),
-                        device::adv_secret_key.eq(excluded(device::adv_secret_key)),
-                        device::account.eq(excluded(device::account)),
-                        device::push_name.eq(excluded(device::push_name)),
-                        device::app_version_primary.eq(excluded(device::app_version_primary)),
-                        device::app_version_secondary.eq(excluded(device::app_version_secondary)),
-                        device::app_version_tertiary.eq(excluded(device::app_version_tertiary)),
-                        device::app_version_last_fetched_ms
-                            .eq(excluded(device::app_version_last_fetched_ms)),
-                        device::edge_routing_info.eq(excluded(device::edge_routing_info)),
-                        device::props_hash.eq(excluded(device::props_hash)),
-                        device::next_pre_key_id.eq(excluded(device::next_pre_key_id)),
-                        device::first_unupload_pre_key_id
-                            .eq(excluded(device::first_unupload_pre_key_id)),
-                        device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
-                        device::nct_salt.eq(excluded(device::nct_salt)),
-                        device::mobile_session_binding.eq(excluded(device::mobile_session_binding)),
-                        device::status_privacy.eq(excluded(device::status_privacy)),
-                        device::server_cert_chain.eq(excluded(device::server_cert_chain)),
-                        device::login_counter.eq(excluded(device::login_counter)),
-                        device::lid_migrated.eq(excluded(device::lid_migrated)),
-                        device::last_signed_pre_key_rotation_ms
-                            .eq(excluded(device::last_signed_pre_key_rotation_ms)),
-                        device::read_receipts_disabled.eq(excluded(device::read_receipts_disabled)),
-                        device::server_client_expiration
-                            .eq(excluded(device::server_client_expiration)),
-                    ))
-                    .execute(conn)
-                    .map(|_| ())
+                crate::upsert_queries::DeviceWrite::<true> {
+                    id: Some(device_id),
+                    lid: &new_lid,
+                    pn: &new_pn,
+                    registration_id,
+                    noise_key: &noise_key_data,
+                    identity_key: &identity_key_data,
+                    signed_pre_key: &signed_pre_key_data,
+                    signed_pre_key_id,
+                    signed_pre_key_signature: &signed_pre_key_signature,
+                    adv_secret_key: &adv_secret_key,
+                    account: account_data.as_deref(),
+                    push_name: &push_name,
+                    app_version_primary,
+                    app_version_secondary,
+                    app_version_tertiary,
+                    app_version_last_fetched_ms,
+                    edge_routing_info: edge_routing_info.as_deref(),
+                    props_hash: props_hash.as_deref(),
+                    next_pre_key_id,
+                    first_unupload_pre_key_id,
+                    server_has_prekeys,
+                    nct_salt: nct_salt.as_deref(),
+                    mobile_session_binding: mobile_session_binding.as_deref(),
+                    status_privacy: status_privacy.as_deref(),
+                    server_cert_chain: server_cert_chain.as_deref(),
+                    login_counter,
+                    lid_migrated,
+                    last_signed_pre_key_rotation_ms,
+                    read_receipts_disabled,
+                    server_client_expiration: server_client_expiration.as_deref(),
+                }
+                .execute(conn)
+                .map(|_| ())
             })
         })
         .await
@@ -2032,41 +2019,40 @@ impl SqliteStore {
             let push_name = Arc::clone(&push_name);
 
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::insert_into(device::table)
-                    .values((
-                        device::id.eq(device_id),
-                        device::lid.eq(""),
-                        device::pn.eq(""),
-                        device::registration_id.eq(registration_id),
-                        device::noise_key.eq(&*noise_key_data),
-                        device::identity_key.eq(&*identity_key_data),
-                        device::signed_pre_key.eq(&*signed_pre_key_data),
-                        device::signed_pre_key_id.eq(signed_pre_key_id),
-                        device::signed_pre_key_signature.eq(&*signed_pre_key_signature),
-                        device::adv_secret_key.eq(&*adv_secret_key),
-                        device::account.eq(None::<&[u8]>),
-                        device::push_name.eq(&*push_name),
-                        device::app_version_primary.eq(app_version_primary),
-                        device::app_version_secondary.eq(app_version_secondary),
-                        device::app_version_tertiary.eq(app_version_tertiary),
-                        device::app_version_last_fetched_ms.eq(app_version_last_fetched_ms),
-                        device::edge_routing_info.eq(None::<&[u8]>),
-                        device::props_hash.eq(None::<&str>),
-                        device::next_pre_key_id.eq(next_pre_key_id),
-                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
-                        device::server_has_prekeys.eq(server_has_prekeys),
-                        device::nct_salt.eq(None::<&[u8]>),
-                        device::mobile_session_binding.eq(None::<&[u8]>),
-                        device::status_privacy.eq(None::<&[u8]>),
-                        device::server_cert_chain.eq(None::<&[u8]>),
-                        device::login_counter.eq(0i32),
-                        device::lid_migrated.eq(false),
-                        device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
-                        device::read_receipts_disabled.eq(false),
-                        device::server_client_expiration.eq(None::<&str>),
-                    ))
-                    .execute(conn)
-                    .map(|_| device_id)
+                crate::upsert_queries::DeviceWrite::<false> {
+                    id: Some(device_id),
+                    lid: "",
+                    pn: "",
+                    registration_id,
+                    noise_key: &noise_key_data,
+                    identity_key: &identity_key_data,
+                    signed_pre_key: &signed_pre_key_data,
+                    signed_pre_key_id,
+                    signed_pre_key_signature: &signed_pre_key_signature,
+                    adv_secret_key: &adv_secret_key,
+                    account: None::<&[u8]>,
+                    push_name: &push_name,
+                    app_version_primary,
+                    app_version_secondary,
+                    app_version_tertiary,
+                    app_version_last_fetched_ms,
+                    edge_routing_info: None::<&[u8]>,
+                    props_hash: None::<&str>,
+                    next_pre_key_id,
+                    first_unupload_pre_key_id,
+                    server_has_prekeys,
+                    nct_salt: None::<&[u8]>,
+                    mobile_session_binding: None::<&[u8]>,
+                    status_privacy: None::<&[u8]>,
+                    server_cert_chain: None::<&[u8]>,
+                    login_counter: 0i32,
+                    lid_migrated: false,
+                    last_signed_pre_key_rotation_ms,
+                    read_receipts_disabled: false,
+                    server_client_expiration: None::<&str>,
+                }
+                .execute(conn)
+                .map(|_| device_id)
             })
         })
         .await
@@ -2251,14 +2237,10 @@ impl SqliteStore {
     }
 
     async fn load_device_data_for_device(&self, device_id: i32) -> Result<Option<CoreDevice>> {
-        use crate::schema::device;
-
         let row = self
             .read_query(move |conn| {
-                device::table
-                    .filter(device::id.eq(device_id))
-                    .select(DeviceRow::as_select())
-                    .first::<DeviceRow>(conn)
+                crate::upsert_queries::LoadDevice { id: device_id }
+                    .get_result::<DeviceRow>(conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))
             })
@@ -5708,6 +5690,9 @@ mod retry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
     async fn create_test_store() -> SqliteStore {
         use portable_atomic::AtomicU64;

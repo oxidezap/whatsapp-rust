@@ -34,7 +34,6 @@ wasm-test = ["js"]
 async-trait = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
-diesel_migrations = { workspace = true }
 libsqlite3-sys = { version = "0.40.0", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
@@ -52,6 +51,7 @@ waproto = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+diesel_migrations = { workspace = true }
 divan = { workspace = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }

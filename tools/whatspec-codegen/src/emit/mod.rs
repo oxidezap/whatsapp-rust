@@ -16,6 +16,7 @@ pub mod join_shapes;
 pub mod mex;
 pub mod notif;
 pub mod proto;
+pub mod token_maps;
 pub mod tokens;
 pub mod version;
 pub mod wam;

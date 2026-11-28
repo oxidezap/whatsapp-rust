@@ -2,7 +2,7 @@
 //!
 //! The IR is already canonicalized to the wire-indexable form (index 0 of the
 //! single-byte table is the reserved empty token), so this is a re-serialization
-//! under the two keys `wacore-binary`'s build script reads.
+//! under the existing dictionary keys.
 
 use anyhow::{Result, ensure};
 use serde::Serialize;
@@ -52,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_the_two_keys_the_build_script_reads() {
+    fn preserves_the_dictionary_keys_and_indices() {
         let out =
             generate(&ir(&["", "xmlstreamstart"], &[&["read-self"], &["reject"]])).expect("tokens");
         let v: serde_json::Value = serde_json::from_str(&out).expect("json");

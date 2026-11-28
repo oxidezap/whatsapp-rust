@@ -32,10 +32,6 @@ zlib-rs = { workspace = true }
 getrandom = { workspace = true, features = ["wasm_js"] }
 siphasher = "1.0"
 
-[build-dependencies]
-serde = { workspace = true, features = ["alloc"] }
-serde_json = { workspace = true, features = ["std"] }
-
 [dev-dependencies]
 siphasher = "1.0"
 divan = { workspace = true }

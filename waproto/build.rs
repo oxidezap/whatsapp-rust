@@ -24,6 +24,8 @@ mod policy;
 #[path = "codegen/project.rs"]
 #[allow(dead_code)]
 mod project;
+#[path = "codegen/raw.rs"]
+mod raw;
 #[cfg(feature = "protobuf-reference")]
 #[path = "build/reference.rs"]
 #[allow(dead_code)]
@@ -85,11 +87,12 @@ fn main() -> io::Result<()> {
             ("desc", "src/whatsapp.desc"),
         ],
     )?;
-    println!("cargo:rerun-if-changed=codegen");
     println!("cargo:rerun-if-changed=build_support/signal_storage.rs");
     println!("cargo:rerun-if-changed=signal-storage.snapshot");
     let descriptor = std::fs::read("src/whatsapp.desc")?;
-    let (_, source, tags) = whatsapp::generate(&descriptor)?;
+    let (descriptors, schema) = whatsapp::prepare(&descriptor)?;
+    let source = raw::generate_raw(&schema, "crate::protobuf::generated::whatsapp");
+    let tags = retained::tags(&descriptors);
     let out = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is not set"))?,
     );

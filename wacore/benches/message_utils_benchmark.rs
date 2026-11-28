@@ -3,7 +3,6 @@
 //! pad/encode steps every outgoing message pays before encryption, and the
 //! unpad/decode steps every incoming message pays after decryption.
 
-// Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
 use divan::black_box;
