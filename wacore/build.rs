@@ -3,17 +3,17 @@
 //! schema changes regenerate the descriptor and codec with `cargo xt tables-desc`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build.rs");
+    #[cfg(feature = "voip")]
+    verify_voip_tables()?;
+    Ok(())
+}
+
+#[cfg(feature = "voip")]
+fn verify_voip_tables() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=src/voip/mlow/tables.desc");
     println!("cargo:rerun-if-changed=src/voip/mlow/tables.proto");
     println!("cargo:rerun-if-changed=src/voip/mlow/tables.desc.sha256");
-    println!("cargo:rerun-if-changed=build.rs");
-
-    if std::env::var_os("CARGO_FEATURE_VOIP").is_none() {
-        return Ok(());
-    }
-
-    // Gated inside the voip block: the .sha256 only matters when the descriptor
-    // is actually consumed, so non-voip builds neither read nor validate it.
     ensure_descriptor_fresh(
         "src/voip/mlow/tables.proto",
         "src/voip/mlow/tables.desc",
@@ -26,10 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "src/voip/mlow/tables.desc",
         "src/voip/mlow/tables.generated.rs",
         "src/voip/mlow/tables.generated.rs.sha256",
-    )?;
-    Ok(())
+    )
 }
 
+#[cfg(feature = "voip")]
 fn ensure_generated_fresh(descriptor: &str, source: &str, manifest: &str) -> std::io::Result<()> {
     use sha2::{Digest as _, Sha256};
     println!("cargo:rerun-if-changed={source}");
@@ -55,6 +55,7 @@ fn ensure_generated_fresh(descriptor: &str, source: &str, manifest: &str) -> std
 /// Fail the build if the committed `.desc` no longer matches its `.proto` (proto
 /// edited without rerunning the regenerate script), so codegen never silently
 /// runs against a stale descriptor.
+#[cfg(feature = "voip")]
 fn ensure_descriptor_fresh(
     proto: &str,
     desc: &str,
