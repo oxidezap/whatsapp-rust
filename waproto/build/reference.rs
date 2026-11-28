@@ -147,8 +147,11 @@ pub fn generate_reference() -> std::io::Result<()> {
     {
         let input = descriptor::FileDescriptorSet::decode_from_slice(&encoded)?;
         let projected = project::project(&input).map_err(std::io::Error::other)?;
-        let source = raw::generate_raw(&projected, "crate::protobuf::generated::whatsapp");
-        std::fs::write(out_path.join("owned_full.rs"), source)?;
+        raw::write_whatsapp(
+            &projected,
+            "crate::protobuf::generated::whatsapp",
+            &out_path.join("owned_full.rs"),
+        )?;
         std::fs::write(
             out_path.join("owned_full_oracle.rs"),
             oracle::generate_oracle(&projected).map_err(std::io::Error::other)?,

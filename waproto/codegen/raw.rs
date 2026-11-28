@@ -2,7 +2,8 @@
 
 use crate::emit_owned::{Module, generate_modules};
 use crate::schema::Schema;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
 
 impl Module {
     fn render(self, out: &mut impl Write) -> io::Result<()> {
@@ -22,8 +23,10 @@ impl Module {
     }
 }
 
-pub fn write_whatsapp(schema: &Schema, base: &str, out: &mut impl Write) -> io::Result<()> {
-    generate_modules(schema, base, true).render(out)
+pub fn write_whatsapp(schema: &Schema, base: &str, path: &Path) -> io::Result<()> {
+    let mut out = BufWriter::new(std::fs::File::create(path)?);
+    generate_modules(schema, base, true).render(&mut out)?;
+    out.flush()
 }
 
 #[cfg(test)]

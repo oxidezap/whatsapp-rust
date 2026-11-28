@@ -1,7 +1,7 @@
 //! Generate the protobuf model from the committed descriptor.
 
 use sha2::{Digest as _, Sha256};
-use std::io::{self, BufWriter, Read as _, Write as _};
+use std::io::{self, Read as _};
 
 #[cfg(test)]
 #[path = "build_support/api_guard.rs"]
@@ -94,9 +94,11 @@ fn main() -> io::Result<()> {
     let out = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is not set"))?,
     );
-    let mut source = BufWriter::new(std::fs::File::create(out.join("generated-whatsapp.rs"))?);
-    raw::write_whatsapp(&schema, "crate::protobuf::generated::whatsapp", &mut source)?;
-    source.flush()?;
+    raw::write_whatsapp(
+        &schema,
+        "crate::protobuf::generated::whatsapp",
+        &out.join("generated-whatsapp.rs"),
+    )?;
     std::fs::write(out.join("generated-tags.rs"), retained::tags(&descriptors))?;
     #[cfg(feature = "protobuf-reference")]
     reference::generate_reference()?;
